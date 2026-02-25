@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+
+VENV_DIR=".venv"
+
+if [ ! -d "$VENV_DIR" ]; then
+    echo "Creating virtual environment..."
+    python3 -m venv "$VENV_DIR"
+else
+    echo "Virtual environment already exists."
+fi
+
+source "$VENV_DIR/bin/activate"
+
+echo "Installing dependencies..."
+pip install --upgrade pip -q
+pip install -e . -q
+
+if [ -z "$WANDB_API_KEY" ]; then
+    echo ""
+    echo "  Enter your W&B API key (https://wandb.ai/authorize)"
+    echo "  Press Enter to skip."
+    printf "  > "
+    read WANDB_API_KEY || true
+    if [ -n "$WANDB_API_KEY" ]; then
+        export WANDB_API_KEY
+    fi
+fi
+
+needle --help
