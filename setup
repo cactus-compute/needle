@@ -53,8 +53,8 @@ echo "Installing dependencies..."
 pip install --upgrade pip -q
 pip install -e . -q
 
-# If running on a TPU VM, load drivers and install JAX with TPU support
-if lspci 2>/dev/null | grep -qi "google.*processing"; then
+# Detect accelerator and install the matching JAX variant
+if lspci 2>/dev/null | grep -qi "\[ff00\].*google\|google.*processing"; then
     echo "TPU hardware detected..."
 
     # Load kernel modules if not already loaded
@@ -79,6 +79,18 @@ if lspci 2>/dev/null | grep -qi "google.*processing"; then
         echo "Enabling transparent hugepages..."
         sudo sh -c "echo always > /sys/kernel/mm/transparent_hugepage/enabled" 2>/dev/null || true
     fi
+
+elif command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+    echo "NVIDIA GPU detected..."
+    GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+    echo "GPU devices: $GPU_COUNT"
+    nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -4
+
+    echo "Installing jax[cuda12]..."
+    pip install "jax[cuda12]" -q
+
+else
+    echo "No accelerator detected, using CPU-only JAX."
 fi
 
 if [ -z "$WANDB_API_KEY" ]; then

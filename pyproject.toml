@@ -12,6 +12,10 @@ dependencies = [
     "wandb",
 ]
 
+[project.optional-dependencies]
+tpu = ["jax[tpu]"]
+gpu = ["jax[cuda12]"]
+
 [project.scripts]
 needle = "src.cli:main"
 
