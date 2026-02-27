@@ -53,6 +53,34 @@ echo "Installing dependencies..."
 pip install --upgrade pip -q
 pip install -e . -q
 
+# If running on a TPU VM, load drivers and install JAX with TPU support
+if lspci 2>/dev/null | grep -qi "google.*processing"; then
+    echo "TPU hardware detected..."
+
+    # Load kernel modules if not already loaded
+    if ! ls /dev/accel* &>/dev/null 2>&1; then
+        echo "Loading TPU kernel modules..."
+        for mod in gasket tpu_common tpu_v2 tpu_v3 tpu_v4 tpu_v4_lite; do
+            sudo modprobe "$mod" 2>/dev/null || true
+        done
+    fi
+
+    if ls /dev/accel* &>/dev/null 2>&1; then
+        echo "TPU devices: $(ls /dev/accel* 2>/dev/null | wc -w) chip(s)"
+    else
+        echo "WARNING: TPU PCI devices found but no /dev/accel* — kernel drivers may not match hardware."
+        echo "         Recreate the VM with the correct --version for your accelerator type."
+    fi
+
+    echo "Installing jax[tpu]..."
+    pip install "jax[tpu]" -q -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+    if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
+        echo "Enabling transparent hugepages..."
+        sudo sh -c "echo always > /sys/kernel/mm/transparent_hugepage/enabled" 2>/dev/null || true
+    fi
+fi
+
 if [ -z "$WANDB_API_KEY" ]; then
     echo ""
     echo "  Enter your W&B API key (https://wandb.ai/authorize)"

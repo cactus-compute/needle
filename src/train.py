@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from tqdm import tqdm
+from flax import jax_utils
 from flax.training import train_state
 
 from .data import get_batches, get_tokenizer, load_tinystories, prepare_encoder_decoder_pairs
@@ -127,8 +128,7 @@ def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_
     )
 
 
-@jax.jit
-def train_step(state, src, tgt_in, tgt_out, causal_mask, dropout_rng):
+def _train_step(state, src, tgt_in, tgt_out, causal_mask, dropout_rng):
     pad_id = 50256
 
     def loss_fn(params):
@@ -152,12 +152,26 @@ def train_step(state, src, tgt_in, tgt_out, causal_mask, dropout_rng):
         return jnp.sum(loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
+    # Average gradients and loss across devices
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    loss = jax.lax.pmean(loss, axis_name="batch")
     grad_norm = optax.global_norm(grads)
     state = state.apply_gradients(grads=grads)
     return state, loss, grad_norm
 
 
+p_train_step = jax.pmap(_train_step, axis_name="batch")
+
+
+def shard_batch(batch, num_devices):
+    """Reshape a batch array so leading dim is (num_devices, per_device_batch, ...)."""
+    return batch.reshape(num_devices, -1, *batch.shape[1:])
+
+
 def train(args):
+    num_devices = jax.local_device_count()
+    print(f"Detected {num_devices} device(s) for data-parallel training")
+
     use_wandb = getattr(args, "wandb", False)
     if use_wandb:
         import wandb
@@ -177,6 +191,9 @@ def train(args):
     )
     print(f"Prepared {len(enc_inputs)} training pairs")
 
+    # Effective batch size must be divisible by num_devices
+    effective_batch_size = args.batch_size * num_devices
+
     config = TransformerConfig(
         d_model=args.d_model,
         num_heads=args.num_heads,
@@ -191,15 +208,19 @@ def train(args):
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
 
-    num_batches = len(enc_inputs) // args.batch_size
+    num_batches = len(enc_inputs) // effective_batch_size
     total_steps = num_batches * args.epochs
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
 
     muon_lr = getattr(args, "muon_lr", 0.02)
     state = create_train_state(init_rng, config, args.lr, muon_lr, total_steps, warmup_steps)
 
-    param_count = sum(x.size for x in jax.tree.leaves(state.params))
+    # Replicate state across all devices
+    state = jax_utils.replicate(state)
+
+    param_count = sum(x.size for x in jax.tree.leaves(jax_utils.unreplicate(state).params))
     print(f"Model parameters: {param_count:,}")
+    print(f"Devices: {num_devices}, per-device batch: {args.batch_size}, effective batch: {effective_batch_size}")
     print(f"LR schedule: warmup {warmup_steps} steps, cosine decay over {total_steps} steps")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -214,25 +235,30 @@ def train(args):
         init_value=0.0, peak_value=muon_lr,
         warmup_steps=warmup_steps, decay_steps=total_steps, end_value=muon_lr * 0.1,
     )
-    tokens_per_batch = args.batch_size * (args.max_enc_len + args.max_dec_len)
+    tokens_per_batch = effective_batch_size * (args.max_enc_len + args.max_dec_len)
 
     for epoch in range(args.epochs):
         losses = []
-        batches = get_batches(enc_inputs, dec_inputs, dec_targets, args.batch_size)
+        batches = get_batches(enc_inputs, dec_inputs, dec_targets, effective_batch_size)
         pbar = tqdm(batches, total=num_batches, desc=f"Epoch {epoch + 1}/{args.epochs}")
 
         for src, tgt_in, tgt_out in pbar:
             rng, dropout_rng = jax.random.split(rng)
+            # Give each device a different dropout rng
+            dropout_rngs = jax.random.split(dropout_rng, num_devices)
+
             t0 = time.perf_counter()
-            state, loss, grad_norm = train_step(
+            # Shard batch across devices: (num_devices, per_device_batch, seq_len)
+            state, loss, grad_norm = p_train_step(
                 state,
-                jnp.array(src),
-                jnp.array(tgt_in),
-                jnp.array(tgt_out),
+                shard_batch(jnp.array(src), num_devices),
+                shard_batch(jnp.array(tgt_in), num_devices),
+                shard_batch(jnp.array(tgt_out), num_devices),
                 causal_mask,
-                dropout_rng,
+                dropout_rngs,
             )
-            loss_val = float(loss)
+            # loss/grad_norm are replicated across devices; take first
+            loss_val = float(loss[0])
             losses.append(loss_val)
             global_step += 1
             dt = time.perf_counter() - t0
@@ -241,7 +267,7 @@ def train(args):
             if use_wandb:
                 wandb.log({
                     "train/loss": loss_val,
-                    "train/grad_norm": float(grad_norm),
+                    "train/grad_norm": float(grad_norm[0]),
                     "train/adam_lr": float(adam_schedule(global_step)),
                     "train/muon_lr": float(muon_schedule(global_step)),
                     "train/tokens_per_sec": tokens_per_batch / dt,
@@ -259,9 +285,10 @@ def train(args):
                 "epoch": epoch + 1,
             })
 
+        # Unreplicate state for checkpointing (save single copy)
         ckpt_name = f"needle_{args.num_layers}_{args.d_model}_{global_step}.pkl"
         ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
-        params_np = jax.tree.map(np.array, state.params)
+        params_np = jax.tree.map(np.array, jax_utils.unreplicate(state).params)
         with open(ckpt_path, "wb") as f:
             pickle.dump({"params": params_np, "config": config.__dict__}, f)
         print(f"Saved checkpoint: {ckpt_path}")
