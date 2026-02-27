@@ -26,8 +26,22 @@ else
     PYTHON=python3
 fi
 
+# Recreate venv if it doesn't exist or was built with the wrong Python
+RECREATE=0
 if [ ! -d "$VENV_DIR" ]; then
-    echo "Creating virtual environment..."
+    RECREATE=1
+elif [ ! -f "$VENV_DIR/bin/activate" ]; then
+    RECREATE=1
+elif [ -f "$VENV_DIR/bin/python3" ]; then
+    VENV_PY_OK=$("$VENV_DIR/bin/python3" -c "import sys; print(int(sys.version_info >= (3, 11)))" 2>/dev/null || echo "0")
+    if [ "$VENV_PY_OK" = "0" ]; then
+        RECREATE=1
+    fi
+fi
+
+if [ "$RECREATE" = "1" ]; then
+    echo "Creating virtual environment with $PYTHON..."
+    rm -rf "$VENV_DIR"
     $PYTHON -m venv "$VENV_DIR"
 else
     echo "Virtual environment already exists."
