@@ -225,7 +225,10 @@ def train(args):
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     global_step = 0
-    causal_mask = make_causal_mask(args.max_dec_len)
+    causal_mask = jnp.broadcast_to(
+        make_causal_mask(args.max_dec_len),
+        (num_devices, 1, args.max_dec_len, args.max_dec_len),
+    )
 
     adam_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0, peak_value=args.lr,
