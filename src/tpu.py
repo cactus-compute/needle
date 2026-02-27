@@ -6,6 +6,37 @@ import sys
 
 PROJECT = "needle-488623"
 
+VERSION_FOR_TYPE = {
+    "v2":         "tpu-ubuntu2204-base",
+    "v3":         "tpu-ubuntu2204-base",
+    "v4":         "tpu-ubuntu2204-base",
+    "v5litepod":  "v2-alpha-tpuv5-lite",
+    "v5e":        "v2-alpha-tpuv5-lite",
+    "v5p":        "v2-alpha-tpuv5",
+    "v6e":        "v2-alpha-tpuv6e",
+}
+
+
+def _resolve_version(accel_type, explicit_version):
+    """Pick the right software version for the accelerator type.
+
+    If the user explicitly passed --version, use that.
+    Otherwise, match on the accelerator type prefix (e.g. 'v6e-4' → 'v6e').
+    """
+    if explicit_version is not None:
+        return explicit_version
+    for prefix, version in sorted(VERSION_FOR_TYPE.items(), key=lambda kv: -len(kv[0])):
+        if accel_type.startswith(prefix):
+            return version
+            
+    print(
+        f"[tpu] WARNING: unknown accelerator type '{accel_type}', "
+        f"defaulting to tpu-ubuntu2204-base. Pass --version to override.",
+        file=sys.stderr,
+    )
+    return "tpu-ubuntu2204-base"
+
+
 ZONES = [
     "us-central1-a", "us-central1-b", "us-central1-f",
     "us-east1-b", "us-east1-c", "us-east1-d",
@@ -80,20 +111,94 @@ def _update_ssh_config(path, host_name, new_block):
         f.write(new_block)
 
 
+def _check_tpu_health(name, zone):
+    """SSH into the VM and verify /dev/accel* devices exist."""
+    print(f"[tpu] Verifying TPU devices on '{name}'...")
+    result = _run(
+        ["gcloud", "compute", "tpus", "tpu-vm", "ssh", name,
+         "--zone", zone, "--project", PROJECT,
+         "--command", "ls /dev/accel* 2>/dev/null && echo TPU_OK || echo TPU_MISSING"],
+        check=False, capture=True, quiet=True,
+    )
+    output = result.stdout.strip()
+    if "TPU_OK" in output:
+        devices = [l for l in output.splitlines() if l.startswith("/dev/accel")]
+        print(f"[tpu] TPU healthy: {len(devices)} device(s) found")
+        return True
+    else:
+        print(
+            f"[tpu] WARNING: no /dev/accel* devices found. "
+            f"The software version may not match the accelerator type.",
+            file=sys.stderr,
+        )
+        return False
+
+
+def _collect_git_config():
+    """Prompt for git user.name and user.email, with defaults from local git config."""
+    local_name = ""
+    local_email = ""
+    try:
+        local_name = subprocess.run(
+            ["git", "config", "user.name"], capture_output=True, text=True
+        ).stdout.strip()
+        local_email = subprocess.run(
+            ["git", "config", "user.email"], capture_output=True, text=True
+        ).stdout.strip()
+    except FileNotFoundError:
+        pass
+
+    prompt_name = f"  git user.name [{local_name}]: " if local_name else "  git user.name: "
+    prompt_email = f"  git user.email [{local_email}]: " if local_email else "  git user.email: "
+
+    print("[tpu] Configure git for the instance:")
+    name = input(prompt_name).strip() or local_name
+    email = input(prompt_email).strip() or local_email
+
+    if not name or not email:
+        print("[tpu] Skipping git config (name or email empty).")
+        return None, None
+    return name, email
+
+
+def _setup_git_on_instance(name, zone, git_name, git_email):
+    """SSH into the VM and configure git user.name/email."""
+    if not git_name or not git_email:
+        return
+    cmd = (
+        f'git config --global user.name "{git_name}" && '
+        f'git config --global user.email "{git_email}"'
+    )
+    print(f"[tpu] Configuring git as '{git_name} <{git_email}>'...")
+    _run(
+        ["gcloud", "compute", "tpus", "tpu-vm", "ssh", name,
+         "--zone", zone, "--project", PROJECT,
+         "--command", cmd],
+        check=False, capture=True, quiet=True,
+    )
+
+
 def tpu_create(args):
+    version = _resolve_version(args.accel_type, args.version)
+    print(f"[tpu] Accelerator: {args.accel_type}, software version: {version}")
+
+    git_name, git_email = _collect_git_config()
+
     for zone in ZONES:
         print(f"[tpu] Trying {zone}...")
         result = _run(
             ["gcloud", "compute", "tpus", "tpu-vm", "create", args.name,
              "--zone", zone,
              "--accelerator-type", args.accel_type,
-             "--version", args.version,
+             "--version", version,
              "--project", PROJECT],
             check=False, capture=True,
         )
         if result.returncode == 0:
             print(f"[tpu] SUCCESS: created '{args.name}' in {zone}")
             args.zone = zone
+            _check_tpu_health(args.name, zone)
+            _setup_git_on_instance(args.name, zone, git_name, git_email)
             tpu_claude(args)
             tpu_connect(args)
             return

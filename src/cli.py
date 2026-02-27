@@ -54,8 +54,8 @@ HELP = """
   │                                                                   │
   │   tpu                                                             │
   │     create NAME             Create TPU (auto-finds zone)          │
-  │       --type STR            Accelerator type (default:v5litepod-4)│
-  │       --version STR         TPU OS (default: tpu-ubuntu2204-base) │
+  │       --type STR            Accelerator type (default: v6e-4)     │
+  │       --version STR         TPU OS (auto-detected from --type)    │
   │     connect NAME            SSH config + connect (auto-zone)      │
   │     claude NAME             Install Claude Code on instance       │
   │     stop NAME               Stop instance (auto-zone)             │
@@ -140,8 +140,9 @@ def main():
 
     tp = tpu_sub.add_parser("create", add_help=False)
     tp.add_argument("name", type=str)
-    tp.add_argument("--type", dest="accel_type", type=str, default="v5litepod-4")
-    tp.add_argument("--version", type=str, default="tpu-ubuntu2204-base")
+    tp.add_argument("--type", dest="accel_type", type=str, default="v6e-4")
+    tp.add_argument("--version", type=str, default=None,
+                    help="Software version (auto-detected from --type if omitted)")
 
     tp = tpu_sub.add_parser("connect", add_help=False)
     tp.add_argument("name", type=str)
