@@ -46,7 +46,7 @@
 ## Usage
 
 ```
-git clone https://github.com/cactus-compute/model.git
+git clone https://github.com/cactus-compute/needle.git
 
 source ./setup
 
@@ -99,15 +99,102 @@ needle [command]
   └───────────────────────────────────────────────────────────────────┘
 ```
 
-## Project Structure
+## TPU Factsheet
 
 ```
-  src/
-   ├── model.py ······ Transformer architecture
-   ├── data.py ······· TinyStories loading & preprocessing
-   ├── train.py ······ Training loop
-   ├── run.py ········ Story generation from prompts
-   ├── test.py ······· Throughput & quality benchmarks
-   ├── evaluate.py ··· NLP benchmark evaluation
-   └── cli.py ········ CLI entry point
+┌────────────────────┬───────────────────┬──────────────────────┬────────────────────────────┐
+│                    │       v5e         │        v5p           │      v6e (Trillium)        │
+├────────────────────┼───────────────────┼──────────────────────┼────────────────────────────┤
+│ Optimized for      │ Train + inference │ Training (max perf)  │ Train + inference          │
+│ HBM per chip       │ 16 GB             │ 95 GB                │ 32 GB                      │
+│ FLOPS (BF16)       │ 197 TFLOPS        │ 459 TFLOPS           │ 918 TFLOPS                 │
+│ HBM bandwidth      │ 819 GB/s          │ 2,765 GB/s           │ 1,640 GB/s                 │
+│ ICI bandwidth      │ 1,600 Gbps        │ 4,800 Gbps           │ 3,584 Gbps                 │
+│ On-demand/chip/hr  │ $1.20             │ $4.20                │ $2.70                      │
+│ Spot/chip/hr       │ $0.60             │ $2.10                │ $1.35                      │
+│ Perf per $         │ 1x (baseline)     │ 0.5x                 │ 2x                         │
+├────────────────────┼───────────────────┴──────────────────────┴────────────────────────────┤
+│                    │                                                                       │
+│ DATASET            │                                                                       │
+│  Text              │ 100B tokens                                                           │
+│  Audio             │ 200k × 20s = ~200M audio tokens + ~13M transcription tokens           │
+│  Effective total   │ ~100.5B equivalent tokens (audio has ~2-3x encoder overhead)          │
+│  Storage           │ ~5 GB audio (compressed) + ~400 GB text corpus                        │
+│                    │                                                                       │
+├────────────────────┼───────────────────┬──────────────────────┬─────────────┬──────────────┤
+│ 300M multimodal    │   v5litepod-4     │      v6e-4           │    v6e-8    │    v6e-16    │
+├────────────────────┼───────────────────┼──────────────────────┼─────────────┼──────────────┤
+│ Chips              │ 4                 │ 4                    │ 8           │ 16           │
+│ Total HBM          │ 64 GB             │ 128 GB               │ 256 GB      │ 512 GB       │
+│ Est. time          │ ~16-21 days       │ ~4-5 days            │ ~2-3 days   │ ~1-1.5 days  │
+│ Spot $/hr          │ $2.40             │ $5.40                │ $10.80      │ $21.60       │
+│ Est. total cost    │ ~$900-1,200       │ ~$550-700            │ ~$550-750   │ ~$550-750    │
+└────────────────────┴───────────────────┴──────────────────────┴─────────────┴──────────────┘
+```
+
+## Setup For TPU/GCP 
+
+- Setup gcloud 1: download the `macOS ARM` from [here](https://docs.cloud.google.com/sdk/docs/install-sdk) and uzip.
+- Setup gcloud 2: open terminal, cd to ypur downloads and run `./google-cloud-sdk/install.sh`
+- Setup gcloud 3: run `gloud init`, sign in with cactus email, should prompt for project
+- Setup gcloud 4: else, set the project with `gcloud config set project needle-488623`
+- setup gcloud 5: run `gcloud help` and read carefully
+
+## TPU Guide
+
+```
+needle tpu [command]
+
+  ┌───────────────────────────────────────────────────────────────────┐
+  │                                                                   │
+  │   create NAME             Create TPU (auto-finds zone)            │
+  │     --type STR            Accelerator type (default: v5litepod-4) │
+  │     --version STR         TPU OS (default: tpu-ubuntu2204-base)   │
+  │                                                                   │
+  │   connect NAME            SSH config + first connect (auto-zone)  │
+  │   claude NAME             Install Claude Code on instance         │
+  │                                                                   │
+  │   stop NAME               Stop instance (keeps disk)              │
+  │   start NAME              Restart a stopped instance              │
+  │   delete NAME             Delete instance (prompts confirmation)  │
+  │   list                    List all TPU instances                  │
+  │                                                                   │
+  │     --zone ZONE           Override auto-detected zone (optional)  │
+  │                                                                   │
+  └───────────────────────────────────────────────────────────────────┘
+
+  Quota increases:
+   https://console.cloud.google.com/iam-admin/quotas?project=needle-488623
+```
+
+## Example Workflow
+
+```
+1. Create an instance (auto: finds zone → installs Claude Code → connects via SSH)
+   needle tpu create my-experiment
+   (exit with 'exit' or Ctrl+D)
+
+2. Reconnect anytime (exit with 'exit' or Ctrl+D)
+   ssh my-experiment
+   or VS Code: click the '><' in the bottom left → select my-experiment
+
+--- run from the instance ---
+
+3. Clone the repo on your instance
+   git clone https://github.com/cactus-compute/needle.git
+   cd needle
+
+4. Install needle
+   source ./setup
+
+5. Use needle as you normally would locally, like training
+   needle train --wandb
+
+--- back on your Mac ---
+
+6. Stop when done (saves disk, stops billing)
+   needle tpu stop my-experiment
+
+7. (Optional) Delete instance when no longer needed
+   needle tpu delete my-experiment
 ```
