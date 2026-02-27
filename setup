@@ -2,9 +2,33 @@
 
 VENV_DIR=".venv"
 
+# On Ubuntu/Debian, ensure Python >= 3.11 and venv are available
+if [ -f /etc/os-release ] && grep -qi 'ubuntu\|debian' /etc/os-release; then
+    PYTHON_OK=$(python3 -c "import sys; print(int(sys.version_info >= (3, 11)))" 2>/dev/null || echo "0")
+    if [ "$PYTHON_OK" = "0" ]; then
+        echo "Python >= 3.11 required. Installing..."
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq software-properties-common
+        sudo add-apt-repository -y ppa:deadsnakes/ppa
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq python3.11 python3.11-venv python3.11-dev
+        PYTHON=python3.11
+    else
+        PYTHON=python3
+        # Ensure venv package is installed
+        if ! $PYTHON -m venv --help &>/dev/null; then
+            echo "Installing python3-venv..."
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3-venv
+        fi
+    fi
+else
+    PYTHON=python3
+fi
+
 if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtual environment..."
-    python3 -m venv "$VENV_DIR"
+    $PYTHON -m venv "$VENV_DIR"
 else
     echo "Virtual environment already exists."
 fi
