@@ -44,6 +44,9 @@ ZONES = [
     "us-south1-a", "us-south1-b",
     "us-west1-a", "us-west1-b",
     "us-west4-a",
+    "europe-west4-a",
+    "asia-northeast1-b",
+    "southamerica-west1-a",
 ]
 
 TPU_HELP = """
@@ -135,29 +138,23 @@ def _check_tpu_health(name, zone):
 
 
 def _collect_git_config():
-    """Prompt for git user.name and user.email, with defaults from local git config."""
-    local_name = ""
-    local_email = ""
+    """Read git user.name and user.email from local git config."""
+    name = ""
+    email = ""
     try:
-        local_name = subprocess.run(
+        name = subprocess.run(
             ["git", "config", "user.name"], capture_output=True, text=True
         ).stdout.strip()
-        local_email = subprocess.run(
+        email = subprocess.run(
             ["git", "config", "user.email"], capture_output=True, text=True
         ).stdout.strip()
     except FileNotFoundError:
         pass
 
-    prompt_name = f"  git user.name [{local_name}]: " if local_name else "  git user.name: "
-    prompt_email = f"  git user.email [{local_email}]: " if local_email else "  git user.email: "
-
-    print("[tpu] Configure git for the instance:")
-    name = input(prompt_name).strip() or local_name
-    email = input(prompt_email).strip() or local_email
-
     if not name or not email:
-        print("[tpu] Skipping git config (name or email empty).")
+        print("[tpu] Skipping git config (user.name or user.email not set locally).")
         return None, None
+    print(f"[tpu] Using git config: {name} <{email}>")
     return name, email
 
 
