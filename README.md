@@ -184,7 +184,7 @@ needle tpu [command]
    git clone https://github.com/cactus-compute/needle.git
    cd needle
 
-4. Install needle
+4. Install needle (follow instruction to setup wandb)
    source ./setup
 
 5. Use needle as you normally would locally, like training
