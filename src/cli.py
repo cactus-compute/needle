@@ -52,6 +52,18 @@ HELP = """
   │     --benchmarks [...]      wikitext2 lambada hellaswag arc_easy  │
   │     --max-samples INT       Samples per benchmark (default: 500)  │
   │                                                                   │
+  │   tpu                                                             │
+  │     create NAME             Create TPU (auto-finds zone)          │
+  │       --type STR            Accelerator type (default:v5litepod-4)│
+  │       --version STR         TPU OS (default: tpu-ubuntu2204-base) │
+  │     connect NAME            SSH config + connect (auto-zone)      │
+  │     claude NAME             Install Claude Code on instance       │
+  │     stop NAME               Stop instance (auto-zone)             │
+  │     start NAME              Start stopped instance (auto-zone)    │
+  │     delete NAME             Delete instance (auto-zone)           │
+  │     list                    List all TPU instances                │
+  │       --zone ZONE           Override auto-detected zone           │
+  │                                                                   │
   └───────────────────────────────────────────────────────────────────┘
 """
 
@@ -123,6 +135,36 @@ def main():
                    choices=["wikitext2", "lambada", "hellaswag", "arc_easy"])
     p.add_argument("--max-samples", type=int, default=500)
 
+    p = sub.add_parser("tpu", add_help=False)
+    tpu_sub = p.add_subparsers(dest="tpu_action")
+
+    tp = tpu_sub.add_parser("create", add_help=False)
+    tp.add_argument("name", type=str)
+    tp.add_argument("--type", dest="accel_type", type=str, default="v5litepod-4")
+    tp.add_argument("--version", type=str, default="tpu-ubuntu2204-base")
+
+    tp = tpu_sub.add_parser("connect", add_help=False)
+    tp.add_argument("name", type=str)
+    tp.add_argument("--zone", type=str, default=None)
+
+    tp = tpu_sub.add_parser("claude", add_help=False)
+    tp.add_argument("name", type=str)
+    tp.add_argument("--zone", type=str, default=None)
+
+    tp = tpu_sub.add_parser("stop", add_help=False)
+    tp.add_argument("name", type=str)
+    tp.add_argument("--zone", type=str, default=None)
+
+    tp = tpu_sub.add_parser("start", add_help=False)
+    tp.add_argument("name", type=str)
+    tp.add_argument("--zone", type=str, default=None)
+
+    tp = tpu_sub.add_parser("delete", add_help=False)
+    tp.add_argument("name", type=str)
+    tp.add_argument("--zone", type=str, default=None)
+
+    tpu_sub.add_parser("list", add_help=False)
+
     args = parser.parse_args()
 
     if not args.command:
@@ -144,3 +186,6 @@ def main():
     elif args.command == "evaluate":
         from .evaluate import main as eval_main
         eval_main(args)
+    elif args.command == "tpu":
+        from .tpu import tpu_dispatch
+        tpu_dispatch(args)
