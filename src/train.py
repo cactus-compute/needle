@@ -149,9 +149,12 @@ def _train_step(state, src, tgt_in, tgt_out, causal_mask, dropout_rng):
             rngs={"dropout": dropout_rng},
         )
 
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tgt_out)
+        logits_f32 = logits.astype(jnp.float32)
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out)
         mask = (tgt_out != pad_id).astype(jnp.float32)
-        return jnp.sum(loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+        ce_loss = jnp.sum(loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+        z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
+        return ce_loss + z_loss
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
     # Average gradients and loss across devices
