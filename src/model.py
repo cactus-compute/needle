@@ -22,6 +22,7 @@ class TransformerConfig:
     vocab_size: int = 50257
     d_model: int = 128
     num_heads: int = 4
+    num_kv_heads: int = 2
     num_encoder_layers: int = 2
     num_decoder_layers: int = 2
     d_ff: int = 512
@@ -59,6 +60,7 @@ def apply_rope(x, cos, sin):
 
 class MultiHeadAttention(nn.Module):
     num_heads: int
+    num_kv_heads: int
     d_model: int
     num_layers: int
     dropout_rate: float = 0.1
@@ -67,18 +69,25 @@ class MultiHeadAttention(nn.Module):
     @nn.compact
     def __call__(self, q_input, kv_input, mask=None, rope=None, deterministic=True):
         head_dim = self.d_model // self.num_heads
+        kv_dim = self.num_kv_heads * head_dim
         B = q_input.shape[0]
 
         q = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="q_proj")(q_input)
-        k = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="k_proj")(kv_input)
-        v = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="v_proj")(kv_input)
+        k = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="k_proj")(kv_input)
+        v = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="v_proj")(kv_input)
 
         q = q.reshape(B, -1, self.num_heads, head_dim).transpose(0, 2, 1, 3)
-        k = k.reshape(B, -1, self.num_heads, head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(B, -1, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        k = k.reshape(B, -1, self.num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+        v = v.reshape(B, -1, self.num_kv_heads, head_dim).transpose(0, 2, 1, 3)
 
         q = nn.RMSNorm(dtype=self.dtype, name="q_norm")(q)
         k = nn.RMSNorm(dtype=self.dtype, name="k_norm")(k)
+
+        # Repeat KV heads to match Q heads
+        repeats = self.num_heads // self.num_kv_heads
+        if repeats > 1:
+            k = jnp.repeat(k, repeats, axis=1)
+            v = jnp.repeat(v, repeats, axis=1)
 
         if rope is not None:
             cos, sin = rope
@@ -118,6 +127,7 @@ class FeedForward(nn.Module):
 
 class EncoderBlock(nn.Module):
     num_heads: int
+    num_kv_heads: int
     d_model: int
     d_ff: int
     num_layers: int
@@ -128,7 +138,7 @@ class EncoderBlock(nn.Module):
     def __call__(self, x, mask=None, rope=None, deterministic=True):
         residual = x
         x = nn.RMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.d_model, self.num_layers, self.dropout_rate, self.dtype)(
+        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dropout_rate, self.dtype)(
             x, x, mask=mask, rope=rope, deterministic=deterministic
         )
         x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
@@ -144,6 +154,7 @@ class EncoderBlock(nn.Module):
 
 class DecoderBlock(nn.Module):
     num_heads: int
+    num_kv_heads: int
     d_model: int
     d_ff: int
     num_layers: int
@@ -155,7 +166,7 @@ class DecoderBlock(nn.Module):
         # Self-attention with RoPE
         residual = x
         x = nn.RMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.d_model, self.num_layers, self.dropout_rate, self.dtype, name="self_attn")(
+        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dropout_rate, self.dtype, name="self_attn")(
             x, x, mask=self_mask, rope=rope, deterministic=deterministic
         )
         x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
@@ -164,7 +175,7 @@ class DecoderBlock(nn.Module):
         # Cross-attention (no RoPE)
         residual = x
         x = nn.RMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.d_model, self.num_layers, self.dropout_rate, self.dtype, name="cross_attn")(
+        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dropout_rate, self.dtype, name="cross_attn")(
             x, encoder_out, mask=cross_mask, deterministic=deterministic
         )
         x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
@@ -190,7 +201,7 @@ class Encoder(nn.Module):
 
         for i in range(cfg.num_encoder_layers):
             x = EncoderBlock(
-                cfg.num_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, cfg.dropout_rate, dt, name=f"block_{i}"
+                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, cfg.dropout_rate, dt, name=f"block_{i}"
             )(x, mask=mask, rope=rope, deterministic=deterministic)
 
         x = nn.RMSNorm(dtype=dt)(x)
@@ -209,7 +220,7 @@ class Decoder(nn.Module):
 
         for i in range(cfg.num_decoder_layers):
             x = DecoderBlock(
-                cfg.num_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, cfg.dropout_rate, dt, name=f"block_{i}"
+                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, cfg.dropout_rate, dt, name=f"block_{i}"
             )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, deterministic=deterministic)
 
         x = nn.RMSNorm(dtype=dt)(x)
