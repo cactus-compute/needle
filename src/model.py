@@ -77,6 +77,9 @@ class MultiHeadAttention(nn.Module):
         k = k.reshape(B, -1, self.num_heads, head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, -1, self.num_heads, head_dim).transpose(0, 2, 1, 3)
 
+        q = nn.RMSNorm(dtype=self.dtype, name="q_norm")(q)
+        k = nn.RMSNorm(dtype=self.dtype, name="k_norm")(k)
+
         if rope is not None:
             cos, sin = rope
             q = apply_rope(q, cos, sin)
