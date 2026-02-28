@@ -87,3 +87,4 @@ marimo/_lsp/
 __marimo__/
 checkpoints/
 wandb/
+.data_cache/

@@ -23,6 +23,8 @@ from .model import (
 def _newton_schulz(G, steps=5):
     """Approximate polar decomposition via Newton-Schulz iteration."""
     a, b, c = 3.4445, -4.7750, 2.0315
+    orig_dtype = G.dtype
+    G = G.astype(jnp.float32)
     X = G / (jnp.linalg.norm(G) + 1e-7)
     transposed = G.shape[0] > G.shape[1]
     if transposed:
@@ -33,7 +35,7 @@ def _newton_schulz(G, steps=5):
         X = a * X + B @ X
     if transposed:
         X = X.T
-    return X
+    return X.astype(orig_dtype)
 
 
 class MuonState(NamedTuple):
@@ -147,7 +149,7 @@ def _train_step(state, src, tgt_in, tgt_out, causal_mask, dropout_rng):
             rngs={"dropout": dropout_rng},
         )
 
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits, tgt_out)
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tgt_out)
         mask = (tgt_out != pad_id).astype(jnp.float32)
         return jnp.sum(loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
 
@@ -160,7 +162,7 @@ def _train_step(state, src, tgt_in, tgt_out, causal_mask, dropout_rng):
     return state, loss, grad_norm
 
 
-p_train_step = jax.pmap(_train_step, axis_name="batch")
+p_train_step = jax.pmap(_train_step, axis_name="batch", donate_argnums=(0,))
 
 
 def shard_batch(batch, num_devices):
@@ -185,9 +187,8 @@ def train(args):
     ds = load_tinystories("train", max_samples=args.max_samples)
 
     print("Preparing encoder-decoder pairs...")
-    texts = [example["text"] for example in ds]
     enc_inputs, dec_inputs, dec_targets = prepare_encoder_decoder_pairs(
-        texts, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
+        ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
     print(f"Prepared {len(enc_inputs)} training pairs")
 
@@ -202,6 +203,7 @@ def train(args):
         d_ff=args.d_model * 4,
         max_seq_len=max(args.max_enc_len, args.max_dec_len),
         dropout_rate=args.dropout,
+        dtype=args.dtype,
     )
 
     np.random.seed(args.seed)
@@ -212,8 +214,12 @@ def train(args):
     total_steps = num_batches * args.epochs
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
 
-    muon_lr = getattr(args, "muon_lr", 0.02)
-    state = create_train_state(init_rng, config, args.lr, muon_lr, total_steps, warmup_steps)
+    # Scale LRs for data parallelism: linear for Adam, sqrt for Muon
+    # (Muon's Newton-Schulz orthogonalization is sensitive to large LRs).
+    import math
+    scaled_lr = args.lr * num_devices
+    muon_lr = getattr(args, "muon_lr", 0.02) * math.sqrt(num_devices)
+    state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps)
 
     # Replicate state across all devices
     state = jax_utils.replicate(state)
@@ -221,6 +227,7 @@ def train(args):
     param_count = sum(x.size for x in jax.tree.leaves(jax_utils.unreplicate(state).params))
     print(f"Model parameters: {param_count:,}")
     print(f"Devices: {num_devices}, per-device batch: {args.batch_size}, effective batch: {effective_batch_size}")
+    print(f"Adam LR: {args.lr} x {num_devices} = {scaled_lr}, Muon LR: {args.muon_lr} x sqrt({num_devices}) = {muon_lr:.4f}")
     print(f"LR schedule: warmup {warmup_steps} steps, cosine decay over {total_steps} steps")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -231,14 +238,18 @@ def train(args):
     )
 
     adam_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0, peak_value=args.lr,
-        warmup_steps=warmup_steps, decay_steps=total_steps, end_value=args.lr * 0.1,
+        init_value=0.0, peak_value=scaled_lr,
+        warmup_steps=warmup_steps, decay_steps=total_steps, end_value=scaled_lr * 0.1,
     )
     muon_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0, peak_value=muon_lr,
         warmup_steps=warmup_steps, decay_steps=total_steps, end_value=muon_lr * 0.1,
     )
     tokens_per_batch = effective_batch_size * (args.max_enc_len + args.max_dec_len)
+
+    enc_inputs = jnp.array(enc_inputs)
+    dec_inputs = jnp.array(dec_inputs)
+    dec_targets = jnp.array(dec_targets)
 
     for epoch in range(args.epochs):
         losses = []
@@ -254,9 +265,9 @@ def train(args):
             # Shard batch across devices: (num_devices, per_device_batch, seq_len)
             state, loss, grad_norm = p_train_step(
                 state,
-                shard_batch(jnp.array(src), num_devices),
-                shard_batch(jnp.array(tgt_in), num_devices),
-                shard_batch(jnp.array(tgt_out), num_devices),
+                shard_batch(src, num_devices),
+                shard_batch(tgt_in, num_devices),
+                shard_batch(tgt_out, num_devices),
                 causal_mask,
                 dropout_rngs,
             )
