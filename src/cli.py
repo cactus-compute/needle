@@ -135,6 +135,8 @@ def main():
     p.add_argument("--dtype", type=str, default=None, choices=["float32", "bfloat16"])
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--eval-every", type=int, default=100)
+    p.add_argument("--max-eval-samples", type=int, default=None)
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)

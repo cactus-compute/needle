@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import pickle
 import time
@@ -78,6 +79,20 @@ def _param_labels(params):
     return jax.tree_util.tree_map_with_path(_label, params)
 
 
+def _wsd_schedule(peak_value, total_steps, warmup_steps, decay_ratio=0.15):
+    """Warmup-Stable-Decay schedule: linear warmup, hold peak, linear decay."""
+    decay_steps = max(1, int(total_steps * decay_ratio))
+    stable_steps = total_steps - warmup_steps - decay_steps
+    return optax.join_schedules(
+        [
+            optax.linear_schedule(0.0, peak_value, warmup_steps),
+            optax.constant_schedule(peak_value),
+            optax.linear_schedule(peak_value, peak_value * 0.1, decay_steps),
+        ],
+        boundaries=[warmup_steps, warmup_steps + stable_steps],
+    )
+
+
 def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_steps):
     model = EncoderDecoderTransformer(config)
 
@@ -91,20 +106,8 @@ def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_
         deterministic=False,
     )
 
-    adam_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=learning_rate,
-        warmup_steps=warmup_steps,
-        decay_steps=total_steps,
-        end_value=learning_rate * 0.1,
-    )
-    muon_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=muon_lr,
-        warmup_steps=warmup_steps,
-        decay_steps=total_steps,
-        end_value=muon_lr * 0.1,
-    )
+    adam_schedule = _wsd_schedule(learning_rate, total_steps, warmup_steps)
+    muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
 
     muon_opt = optax.chain(
         scale_by_muon(momentum=0.95, ns_steps=5),
@@ -113,7 +116,7 @@ def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_
         optax.scale(-1.0),
     )
     adam_opt = optax.chain(
-        optax.adamw(adam_schedule, b2=0.95, weight_decay=0.01),
+        optax.adamw(adam_schedule, b2=0.95, weight_decay=0.0),
     )
 
     tx = optax.chain(
@@ -130,8 +133,9 @@ def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_
     )
 
 
-def _train_step(state, src, tgt_in, tgt_out, causal_mask, dropout_rng):
+def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask, dropout_rng):
     pad_id = 0
+    ema_decay = 0.999
 
     def loss_fn(params):
         src_mask = make_padding_mask(src, pad_id)
@@ -157,15 +161,32 @@ def _train_step(state, src, tgt_in, tgt_out, causal_mask, dropout_rng):
         return ce_loss + z_loss
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
-    # Average gradients and loss across devices
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
     grad_norm = optax.global_norm(grads)
     state = state.apply_gradients(grads=grads)
-    return state, loss, grad_norm
+    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
+    return state, ema_params, loss, grad_norm
 
 
-p_train_step = jax.pmap(_train_step, axis_name="batch", donate_argnums=(0,))
+p_train_step = jax.pmap(_train_step, axis_name="batch", donate_argnums=(0, 1))
+
+
+def _make_val_loss_fn(apply_fn):
+    @jax.jit
+    def val_loss_batch(params, src, tgt_in, tgt_out, causal_mask):
+        pad_id = 0
+        src_mask = make_padding_mask(src, pad_id)
+        tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+        logits = apply_fn(
+            {"params": params}, src, tgt_in,
+            src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=src_mask,
+            deterministic=True,
+        )
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tgt_out)
+        mask = (tgt_out != pad_id).astype(jnp.float32)
+        return jnp.sum(loss * mask), jnp.sum(mask)
+    return val_loss_batch
 
 
 def shard_batch(batch, num_devices):
@@ -188,12 +209,21 @@ def train(args):
 
     print("Loading TinyStories dataset...")
     ds = load_tinystories("train", max_samples=args.max_samples)
+    val_ds = load_tinystories("validation", max_samples=getattr(args, "max_eval_samples", None))
 
     print("Preparing encoder-decoder pairs...")
     enc_inputs, dec_inputs, dec_targets = prepare_encoder_decoder_pairs(
         ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
     print(f"Prepared {len(enc_inputs)} training pairs")
+
+    val_enc, val_dec_in, val_dec_tgt = prepare_encoder_decoder_pairs(
+        val_ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
+    )
+    val_enc = jnp.array(val_enc)
+    val_dec_in = jnp.array(val_dec_in)
+    val_dec_tgt = jnp.array(val_dec_tgt)
+    print(f"Prepared {len(val_enc)} validation pairs")
 
     # Effective batch size must be divisible by num_devices
     effective_batch_size = args.batch_size * num_devices
@@ -219,19 +249,23 @@ def train(args):
 
     # Scale LRs for data parallelism: linear for Adam, sqrt for Muon
     # (Muon's Newton-Schulz orthogonalization is sensitive to large LRs).
-    import math
     scaled_lr = args.lr * num_devices
     muon_lr = getattr(args, "muon_lr", 0.02) * math.sqrt(num_devices)
     state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps)
+    val_loss_fn = _make_val_loss_fn(state.apply_fn)
 
-    # Replicate state across all devices
+    # Replicate state and EMA params across all devices
+    ema_params = jax.tree.map(jnp.copy, state.params)
     state = jax_utils.replicate(state)
+    ema_params = jax_utils.replicate(ema_params)
 
     param_count = sum(x.size for x in jax.tree.leaves(jax_utils.unreplicate(state).params))
     print(f"Model parameters: {param_count:,}")
     print(f"Devices: {num_devices}, per-device batch: {args.batch_size}, effective batch: {effective_batch_size}")
     print(f"Adam LR: {args.lr} x {num_devices} = {scaled_lr}, Muon LR: {args.muon_lr} x sqrt({num_devices}) = {muon_lr:.4f}")
-    print(f"LR schedule: warmup {warmup_steps} steps, cosine decay over {total_steps} steps")
+    decay_steps = max(1, int(total_steps * 0.15))
+    stable_steps = total_steps - warmup_steps - decay_steps
+    print(f"LR schedule: warmup {warmup_steps}, stable {stable_steps}, decay {decay_steps} steps (WSD)")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     global_step = 0
@@ -240,14 +274,8 @@ def train(args):
         (num_devices, 1, args.max_dec_len, args.max_dec_len),
     )
 
-    adam_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0, peak_value=scaled_lr,
-        warmup_steps=warmup_steps, decay_steps=total_steps, end_value=scaled_lr * 0.1,
-    )
-    muon_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0, peak_value=muon_lr,
-        warmup_steps=warmup_steps, decay_steps=total_steps, end_value=muon_lr * 0.1,
-    )
+    adam_schedule = _wsd_schedule(scaled_lr, total_steps, warmup_steps)
+    muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
     tokens_per_batch = effective_batch_size * (args.max_enc_len + args.max_dec_len)
 
     enc_inputs = jnp.array(enc_inputs)
@@ -266,8 +294,9 @@ def train(args):
 
             t0 = time.perf_counter()
             # Shard batch across devices: (num_devices, per_device_batch, seq_len)
-            state, loss, grad_norm = p_train_step(
+            state, ema_params, loss, grad_norm = p_train_step(
                 state,
+                ema_params,
                 shard_batch(src, num_devices),
                 shard_batch(tgt_in, num_devices),
                 shard_batch(tgt_out, num_devices),
@@ -279,17 +308,32 @@ def train(args):
             losses.append(loss_val)
             global_step += 1
             dt = time.perf_counter() - t0
-            pbar.set_postfix(loss=f"{loss_val:.4f}")
+            eval_every = getattr(args, "eval_every", 100)
+            if global_step % eval_every == 0 or global_step == total_steps:
+                eval_params = jax_utils.unreplicate(ema_params)
+                val_causal = make_causal_mask(args.max_dec_len)
+                total_loss, total_toks = 0.0, 0.0
+                for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
+                    vl, vt = val_loss_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
+                    total_loss += float(vl)
+                    total_toks += float(vt)
+                val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
+                pbar.set_postfix(loss=f"{loss_val:.4f}", val_ppl=f"{val_ppl:.2f}")
+            else:
+                pbar.set_postfix(loss=f"{loss_val:.4f}")
 
             if use_wandb:
-                wandb.log({
+                log_dict = {
                     "train/loss": loss_val,
                     "train/grad_norm": float(grad_norm[0]),
                     "train/adam_lr": float(adam_schedule(global_step)),
                     "train/muon_lr": float(muon_schedule(global_step)),
                     "train/tokens_per_sec": tokens_per_batch / dt,
                     "train/step": global_step,
-                })
+                }
+                if global_step % eval_every == 0 or global_step == total_steps:
+                    log_dict["val/ppl"] = val_ppl
+                wandb.log(log_dict)
 
         epoch_avg_loss = sum(losses) / len(losses) if losses else float("nan")
         final_loss = losses[-1] if losses else float("nan")
@@ -302,10 +346,10 @@ def train(args):
                 "epoch": epoch + 1,
             })
 
-        # Unreplicate state for checkpointing (save single copy)
+        # Checkpoint EMA params (smoother, better for eval)
         ckpt_name = f"needle_{args.num_layers}_{args.d_model}_{global_step}.pkl"
         ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
-        params_np = jax.tree.map(np.array, jax_utils.unreplicate(state).params)
+        params_np = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
         with open(ckpt_path, "wb") as f:
             pickle.dump({"params": params_np, "config": config.__dict__}, f)
         print(f"Saved checkpoint: {ckpt_path}")
