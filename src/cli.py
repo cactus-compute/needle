@@ -85,7 +85,7 @@ TOY_CONFIG = {
 }
 
 BASE_CONFIG = {
-    "epochs": 3,
+    "epochs": 1,
     "batch_size": 32,
     "lr": 3e-4,
     "muon_lr": 0.02,
@@ -95,7 +95,7 @@ BASE_CONFIG = {
     "dropout": 0.0,
     "max_enc_len": 256,
     "max_dec_len": 256,
-    "max_samples": None,
+    "max_samples": 500000,
     "warmup_ratio": 0.05,
     "dtype": "float32",
     "seed": 42,

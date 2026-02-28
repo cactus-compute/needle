@@ -53,44 +53,24 @@ echo "Installing dependencies..."
 pip install --upgrade pip -q
 pip install -e . -q
 
-# Detect accelerator and install the matching JAX variant
-if lspci 2>/dev/null | grep -qi "\[ff00\].*google\|google.*processing"; then
-    echo "TPU hardware detected..."
+echo "Installing jax[tpu]..."
+pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
-    # Load kernel modules if not already loaded
-    if ! ls /dev/accel* &>/dev/null 2>&1; then
-        echo "Loading TPU kernel modules..."
-        for mod in gasket tpu_common tpu_v2 tpu_v3 tpu_v4 tpu_v4_lite; do
-            sudo modprobe "$mod" 2>/dev/null || true
-        done
-    fi
+# Load TPU kernel modules if not already loaded
+if ! ls /dev/accel* &>/dev/null 2>&1; then
+    echo "Loading TPU kernel modules..."
+    for mod in gasket tpu_common tpu_v2 tpu_v3 tpu_v4 tpu_v4_lite; do
+        sudo modprobe "$mod" 2>/dev/null || true
+    done
+fi
 
-    if ls /dev/accel* &>/dev/null 2>&1; then
-        echo "TPU devices: $(ls /dev/accel* 2>/dev/null | wc -w) chip(s)"
-    else
-        echo "WARNING: TPU PCI devices found but no /dev/accel* — kernel drivers may not match hardware."
-        echo "         Recreate the VM with the correct --version for your accelerator type."
-    fi
+if ls /dev/accel* &>/dev/null 2>&1; then
+    echo "TPU devices: $(ls /dev/accel* 2>/dev/null | wc -w) chip(s)"
+fi
 
-    echo "Installing jax[tpu]..."
-    pip install "jax[tpu]" -q -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-
-    if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
-        echo "Enabling transparent hugepages..."
-        sudo sh -c "echo always > /sys/kernel/mm/transparent_hugepage/enabled" 2>/dev/null || true
-    fi
-
-elif command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
-    echo "NVIDIA GPU detected..."
-    GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
-    echo "GPU devices: $GPU_COUNT"
-    nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -4
-
-    echo "Installing jax[cuda12]..."
-    pip install "jax[cuda12]" -q
-
-else
-    echo "No accelerator detected, using CPU-only JAX."
+if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
+    echo "Enabling transparent hugepages..."
+    sudo sh -c "echo always > /sys/kernel/mm/transparent_hugepage/enabled" 2>/dev/null || true
 fi
 
 if [ -z "$WANDB_API_KEY" ]; then
