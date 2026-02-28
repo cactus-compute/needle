@@ -163,9 +163,8 @@ def main(args):
 
     print(f"\nevaluating perplexity ({args.max_eval_samples} samples)...")
     ds = load_tinystories("validation", max_samples=args.max_eval_samples)
-    texts = [example["text"] for example in ds]
     enc_inputs, dec_inputs, dec_targets = prepare_encoder_decoder_pairs(
-        texts, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
+        ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
     ppl = compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, args.batch_size, config.pad_token_id)
     print(f"perplexity:  {ppl:.2f}")
