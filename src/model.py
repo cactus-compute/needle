@@ -17,6 +17,18 @@ def residual_init(num_layers):
 DTYPE_MAP = {"float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}
 
 
+class ZCRMSNorm(nn.Module):
+    """Zero-centred RMSNorm: scale initialized to 0, applied as (1 + γ) * x / RMS(x)."""
+    epsilon: float = 1e-6
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, x):
+        scale = self.param("scale", jinit.zeros, (x.shape[-1],))
+        rms = jnp.sqrt(jnp.mean(x.astype(jnp.float32) ** 2, axis=-1, keepdims=True) + self.epsilon)
+        return ((1 + scale) * x / rms).astype(self.dtype)
+
+
 @dataclass
 class TransformerConfig:
     vocab_size: int = 50257
@@ -80,8 +92,8 @@ class MultiHeadAttention(nn.Module):
         k = k.reshape(B, -1, self.num_kv_heads, head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, -1, self.num_kv_heads, head_dim).transpose(0, 2, 1, 3)
 
-        q = nn.RMSNorm(dtype=self.dtype, name="q_norm")(q)
-        k = nn.RMSNorm(dtype=self.dtype, name="k_norm")(k)
+        q = ZCRMSNorm(dtype=self.dtype, name="q_norm")(q)
+        k = ZCRMSNorm(dtype=self.dtype, name="k_norm")(k)
 
         # Repeat KV heads to match Q heads
         repeats = self.num_heads // self.num_kv_heads
@@ -137,7 +149,7 @@ class EncoderBlock(nn.Module):
     @nn.compact
     def __call__(self, x, mask=None, rope=None, deterministic=True):
         residual = x
-        x = nn.RMSNorm(dtype=self.dtype)(x)
+        x = ZCRMSNorm(dtype=self.dtype)(x)
         x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dropout_rate, self.dtype)(
             x, x, mask=mask, rope=rope, deterministic=deterministic
         )
@@ -145,7 +157,7 @@ class EncoderBlock(nn.Module):
         x = x + residual
 
         residual = x
-        x = nn.RMSNorm(dtype=self.dtype)(x)
+        x = ZCRMSNorm(dtype=self.dtype)(x)
         x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dropout_rate, self.dtype)(x, deterministic=deterministic)
         x = x + residual
 
@@ -165,7 +177,7 @@ class DecoderBlock(nn.Module):
     def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, deterministic=True):
         # Self-attention with RoPE
         residual = x
-        x = nn.RMSNorm(dtype=self.dtype)(x)
+        x = ZCRMSNorm(dtype=self.dtype)(x)
         x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dropout_rate, self.dtype, name="self_attn")(
             x, x, mask=self_mask, rope=rope, deterministic=deterministic
         )
@@ -174,7 +186,7 @@ class DecoderBlock(nn.Module):
 
         # Cross-attention (no RoPE)
         residual = x
-        x = nn.RMSNorm(dtype=self.dtype)(x)
+        x = ZCRMSNorm(dtype=self.dtype)(x)
         x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dropout_rate, self.dtype, name="cross_attn")(
             x, encoder_out, mask=cross_mask, deterministic=deterministic
         )
@@ -182,7 +194,7 @@ class DecoderBlock(nn.Module):
         x = x + residual
 
         residual = x
-        x = nn.RMSNorm(dtype=self.dtype)(x)
+        x = ZCRMSNorm(dtype=self.dtype)(x)
         x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dropout_rate, self.dtype)(x, deterministic=deterministic)
         x = x + residual
 
@@ -204,7 +216,7 @@ class Encoder(nn.Module):
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, cfg.dropout_rate, dt, name=f"block_{i}"
             )(x, mask=mask, rope=rope, deterministic=deterministic)
 
-        x = nn.RMSNorm(dtype=dt)(x)
+        x = ZCRMSNorm(dtype=dt)(x)
         return x
 
 
@@ -223,7 +235,7 @@ class Decoder(nn.Module):
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, cfg.dropout_rate, dt, name=f"block_{i}"
             )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, deterministic=deterministic)
 
-        x = nn.RMSNorm(dtype=dt)(x)
+        x = ZCRMSNorm(dtype=dt)(x)
         return x
 
 
