@@ -131,7 +131,7 @@ def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_
 
 
 def _train_step(state, src, tgt_in, tgt_out, causal_mask, dropout_rng):
-    pad_id = 50256
+    pad_id = 0
 
     def loss_fn(params):
         src_mask = make_padding_mask(src, pad_id)

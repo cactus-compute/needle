@@ -14,8 +14,9 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".data_cach
 
 
 def get_tokenizer():
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = AutoTokenizer.from_pretrained("LiquidAI/LFM2-1.2B")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
 
 
@@ -26,8 +27,8 @@ def load_tinystories(split="train", max_samples=None):
     return ds
 
 
-def _cache_key(n_samples, max_enc_len, max_dec_len):
-    key = f"tinystories_{n_samples}_{max_enc_len}_{max_dec_len}"
+def _cache_key(n_samples, max_enc_len, max_dec_len, tokenizer_name="lfm2"):
+    key = f"tinystories_{tokenizer_name}_{n_samples}_{max_enc_len}_{max_dec_len}"
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 

@@ -31,7 +31,7 @@ class ZCRMSNorm(nn.Module):
 
 @dataclass
 class TransformerConfig:
-    vocab_size: int = 50257
+    vocab_size: int = 65536
     d_model: int = 128
     num_heads: int = 4
     num_kv_heads: int = 2
@@ -40,7 +40,7 @@ class TransformerConfig:
     d_ff: int = 512
     max_seq_len: int = 128
     dropout_rate: float = 0.1
-    pad_token_id: int = 50256
+    pad_token_id: int = 0
     rope_theta: float = 10000.0
     dtype: str = "bfloat16"
 
