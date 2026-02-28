@@ -282,6 +282,7 @@ def train(args):
     dec_inputs = jnp.array(dec_inputs)
     dec_targets = jnp.array(dec_targets)
 
+    last_val_ppl = None
     for epoch in range(args.epochs):
         losses = []
         batches = get_batches(enc_inputs, dec_inputs, dec_targets, effective_batch_size)
@@ -317,10 +318,8 @@ def train(args):
                     vl, vt = val_loss_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
                     total_loss += float(vl)
                     total_toks += float(vt)
-                val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
-                pbar.set_postfix(loss=f"{loss_val:.4f}", val_ppl=f"{val_ppl:.2f}")
-            else:
-                pbar.set_postfix(loss=f"{loss_val:.4f}")
+                last_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
+            pbar.set_postfix(loss=f"{loss_val:.4f}", val_ppl=f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?")
 
             if use_wandb:
                 log_dict = {
@@ -332,7 +331,7 @@ def train(args):
                     "train/step": global_step,
                 }
                 if global_step % eval_every == 0 or global_step == total_steps:
-                    log_dict["val/ppl"] = val_ppl
+                    log_dict["val/ppl"] = last_val_ppl
                 wandb.log(log_dict)
 
         epoch_avg_loss = sum(losses) / len(losses) if losses else float("nan")
