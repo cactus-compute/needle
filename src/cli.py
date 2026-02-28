@@ -80,7 +80,7 @@ TOY_CONFIG = {
     "max_dec_len": 128,
     "max_samples": 10000,
     "warmup_ratio": 0.05,
-    "dtype": "float32",
+    "dtype": "bfloat16",
     "seed": 42,
 }
 
@@ -97,7 +97,7 @@ BASE_CONFIG = {
     "max_dec_len": 256,
     "max_samples": 500000,
     "warmup_ratio": 0.05,
-    "dtype": "float32",
+    "dtype": "bfloat16",
     "seed": 42,
 }
 
