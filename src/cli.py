@@ -67,6 +67,47 @@ HELP = """
   └───────────────────────────────────────────────────────────────────┘
 """
 
+TOY_CONFIG = {
+    "epochs": 1,
+    "batch_size": 32,
+    "lr": 3e-4,
+    "muon_lr": 0.02,
+    "d_model": 128,
+    "num_heads": 4,
+    "num_layers": 2,
+    "dropout": 0.1,
+    "max_enc_len": 128,
+    "max_dec_len": 128,
+    "max_samples": 10000,
+    "warmup_ratio": 0.05,
+    "dtype": "float32",
+    "seed": 42,
+}
+
+BASE_CONFIG = {
+    "epochs": 3,
+    "batch_size": 32,
+    "lr": 3e-4,
+    "muon_lr": 0.02,
+    "d_model": 256,
+    "num_heads": 4,
+    "num_layers": 4,
+    "dropout": 0.0,
+    "max_enc_len": 256,
+    "max_dec_len": 256,
+    "max_samples": None,
+    "warmup_ratio": 0.05,
+    "dtype": "float32",
+    "seed": 42,
+}
+
+
+def _apply_train_defaults(args):
+    config = TOY_CONFIG if args.toy else BASE_CONFIG
+    for key, value in config.items():
+        if getattr(args, key, None) is None:
+            setattr(args, key, value)
+
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
@@ -77,21 +118,23 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     p = sub.add_parser("train", add_help=False)
-    p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--muon-lr", type=float, default=0.02)
-    p.add_argument("--d-model", type=int, default=128)
-    p.add_argument("--num-heads", type=int, default=4)
-    p.add_argument("--num-layers", type=int, default=2)
-    p.add_argument("--dropout", type=float, default=0.1)
-    p.add_argument("--max-enc-len", type=int, default=128)
-    p.add_argument("--max-dec-len", type=int, default=128)
-    p.add_argument("--max-samples", type=int, default=20000)
-    p.add_argument("--warmup-ratio", type=float, default=0.05)
+    p.add_argument("--toy", action="store_true")
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--muon-lr", type=float, default=None)
+    p.add_argument("--d-model", type=int, default=None)
+    p.add_argument("--num-heads", type=int, default=None)
+    p.add_argument("--num-layers", type=int, default=None)
+    p.add_argument("--dropout", type=float, default=None)
+    p.add_argument("--max-enc-len", type=int, default=None)
+    p.add_argument("--max-dec-len", type=int, default=None)
+    p.add_argument("--max-samples", type=int, default=None)
+    p.add_argument("--warmup-ratio", type=float, default=None)
     p.add_argument("--wandb", action="store_true")
+    p.add_argument("--dtype", type=str, default=None, choices=["float32", "bfloat16"])
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, default=None)
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
@@ -126,6 +169,7 @@ def main():
     p.add_argument("--max-dec-len", type=int, default=128)
     p.add_argument("--max-samples", type=int, default=20000)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
+    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--seed", type=int, default=42)
 
@@ -173,6 +217,7 @@ def main():
         sys.exit(0)
 
     if args.command == "train":
+        _apply_train_defaults(args)
         from .train import train
         train(args)
     elif args.command == "sweep":
