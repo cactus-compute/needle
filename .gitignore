@@ -88,3 +88,4 @@ __marimo__/
 checkpoints/
 wandb/
 .data_cache/
+tokenizer/

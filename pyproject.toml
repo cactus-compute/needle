@@ -10,6 +10,7 @@ dependencies = [
     "datasets",
     "transformers",
     "wandb",
+    "sentencepiece",
 ]
 
 [project.optional-dependencies]
