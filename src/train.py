@@ -392,6 +392,7 @@ def train(args):
         max_seq_len=max(args.max_enc_len, args.max_dec_len),
         dropout_rate=args.dropout,
         dtype=args.dtype,
+        activation=getattr(args, "activation", "drelu"),
     )
 
     # Set group size for QAT and sparsification (captured by _train_step closure)
@@ -572,12 +573,36 @@ def train(args):
 
         epoch_avg_loss = sum(losses) / len(losses) if losses else float("nan")
         final_loss = losses[-1] if losses else float("nan")
-        print(f"Epoch {epoch + 1}/{args.epochs} — avg loss: {epoch_avg_loss:.4f}, final loss: {final_loss:.4f}")
+        final_ppl = math.exp(final_loss) if not math.isnan(final_loss) else float("nan")
+
+        # Compute val perplexity at end of epoch
+        eval_params = jax_utils.unreplicate(ema_params)
+        val_causal = make_causal_mask(args.max_dec_len)
+        total_loss, total_toks = 0.0, 0.0
+        for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
+            vl, vt = val_loss_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
+            total_loss += float(vl)
+            total_toks += float(vt)
+        last_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
+
+        epoch_params = jax.tree.map(np.array, eval_params)
+        total_params = sum(x.size for x in jax.tree.leaves(epoch_params))
+        near_zero = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(epoch_params))
+        sparsity = near_zero / total_params * 100
+
+        print(f"\n  Epoch {epoch + 1}/{args.epochs} report:")
+        print(f"    Avg loss:       {epoch_avg_loss:.4f}")
+        print(f"    Final loss:     {final_loss:.4f}")
+        print(f"    Perplexity:     {final_ppl:.2f}")
+        print(f"    Val perplexity: {last_val_ppl:.2f}")
+        print(f"    Weight sparsity: {sparsity:.2f}% ({near_zero:,}/{total_params:,} near-zero)")
 
         if use_wandb:
             wandb.log({
                 "epoch/avg_loss": epoch_avg_loss,
                 "epoch/final_loss": final_loss,
+                "epoch/val_ppl": last_val_ppl,
+                "epoch/weight_sparsity": sparsity,
                 "epoch": epoch + 1,
             })
 
@@ -589,27 +614,9 @@ def train(args):
             pickle.dump({"params": params_np, "config": config.__dict__}, f)
         print(f"Saved checkpoint: {ckpt_path}")
 
-    final_params = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
-    total_params = sum(x.size for x in jax.tree.leaves(final_params))
-    near_zero = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(final_params))
-    sparsity = near_zero / total_params * 100
-
-    final_loss = losses[-1] if losses else float("nan")
-    final_ppl = math.exp(final_loss) if not math.isnan(final_loss) else float("nan")
-
-    print("\n" + "=" * 50)
-    print("TRAINING REPORT")
-    print("=" * 50)
-    print(f"  Final loss:       {final_loss:.4f}")
-    print(f"  Final perplexity: {final_ppl:.2f}")
-    print(f"  Val perplexity:   {last_val_ppl:.2f}" if last_val_ppl is not None else "  Val perplexity:   N/A")
-    print(f"  Weight sparsity:  {sparsity:.2f}% ({near_zero:,}/{total_params:,} near-zero)")
-    print("=" * 50)
-
     if use_wandb:
-        wandb.log({"final/loss": final_loss, "final/ppl": final_ppl, "final/weight_sparsity": sparsity})
         wandb.finish()
-    print("Training complete.")
+    print("\nTraining complete.")
 
 
 def sweep(args):

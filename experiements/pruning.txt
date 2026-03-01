@@ -19,8 +19,9 @@ Independent variables:
   B. Layer prune ratio l     ∈ {0.0, 0.125, 0.25, 0.375, 0.50}
   C. Group size g            ∈ {16, 32, 64, 128}
   D. Pruning schedule        ∈ {staged, simultaneous, reverse-order}
-  E. Model scale             ∈ {BASE-256, LARGE-512}
-  F. QAT                     ∈ {off, int4-group32}
+  E. FFN activation           ∈ {dReLU, SwiGLU, GeGLU}
+  F. Model scale             ∈ {BASE-256, LARGE-512}
+  G. QAT                     ∈ {off, int4-group32}
 
 Dependent variables (measured):
   - Validation perplexity (TinyStories)
@@ -263,7 +264,65 @@ Deliverables:
     bits and 32/g is amortized scale overhead per weight.
 
 -------------------------------------------------------------------------------
-GROUP 9: Inference Efficiency Validation (Table 8, Figure 7)
+GROUP 9: Activation Function × Pruning Interaction (Table 8, Figure 8)
+              *** KEY FINDING ***
+-------------------------------------------------------------------------------
+Purpose: Test whether activation function choice determines pruning robustness.
+Early observation: dReLU dramatically increases post-prune perplexity compared
+to SwiGLU. This group systematically characterises the interaction.
+
+Activation definitions:
+  - dReLU:  ReLU(gate) * ReLU(up)          — naturally ~75% sparse activations
+  - SwiGLU: SiLU(gate) * up                — smooth, dense activations
+  - GeGLU:  GELU(gate) * up                — smooth, nearly dense activations
+
+Requires: --activation CLI flag wired to FeedForward module.
+
+  9a. Dense baselines (no pruning) — isolate activation quality
+      For act in {drelu, swiglu, geglu}:
+        needle train --epochs 3 --activation {act} --sparsity-ratio 0.0 \
+          --layer-prune-ratio 0.0 --seed {42,137,256}
+
+  9b. Sparsification only — test pruning robustness per activation
+      For act in {drelu, swiglu, geglu}, s in {0.25, 0.50}:
+        needle train --epochs 3 --activation {act} --sparsity-ratio {s} \
+          --seed {42,137,256}
+
+  9c. Joint sparsification + layer pruning — full compression
+      For act in {drelu, swiglu, geglu}:
+        needle train --epochs 4 --activation {act} --sparsity-ratio 0.25 \
+          --layer-prune-ratio 0.25 --seed {42,137,256}
+
+  9d. LARGE-512 validation on best and worst activation from 9b-9c
+      needle train --epochs 4 --d-model 512 --num-heads 8 --num-layers 8 \
+        --activation {act} --sparsity-ratio 0.25 --layer-prune-ratio 0.25 \
+        --seed {42,137,256}
+
+Deliverables:
+  - Grouped bar chart: activation × {dense, s=0.25, s=0.50} → val ppl (Fig 8a)
+  - Table: full metrics for all activation × compression combos
+  - Relative degradation plot: (pruned_ppl / dense_ppl) per activation (Fig 8b)
+    — THIS IS THE KEY CHART: shows pruning *robustness* not just raw quality
+  - Analysis of competing hypotheses:
+    (a) dReLU hurts pruning because its ~75% activation sparsity means fewer
+        active paths compensate for zeroed weights — the network has less
+        redundancy to absorb pruning damage
+    (b) dReLU helps pruning because its natural sparsity pattern means weight
+        blocks that process mostly-zero activations are truly unimportant
+        and can be safely pruned (better signal for the pruning criterion)
+    (c) Smooth activations (SwiGLU/GeGLU) spread information across more
+        weights, creating redundancy that makes the model more robust to
+        weight removal but harder to compress efficiently
+  - Recommendation: which activation to use when pruning is planned vs not
+
+  Additional metric for this group:
+  - Activation sparsity: measure % of zeros in FFN intermediate activations
+    for each activation function at each pruning level. Report as:
+      act_sparsity = E[fraction of zeros in ReLU(gate) * ReLU(up)]
+    This connects weight sparsity to activation sparsity.
+
+-------------------------------------------------------------------------------
+GROUP 10: Inference Efficiency Validation (Table 9, Figure 9)
 -------------------------------------------------------------------------------
 Purpose: Translate theoretical compression into real speedup.
 
@@ -315,7 +374,8 @@ Tables:
   T5. Schedule ablation (3 schedules)
   T6. QAT interaction (4 methods × {on,off})
   T7. Group size ablation (4 sizes × 2 sparsity levels + joint)
-  T8. Inference efficiency (Pareto-optimal checkpoints)
+  T8. Activation × pruning interaction (3 activations × 4 compression levels)
+  T9. Inference efficiency (Pareto-optimal checkpoints)
 
 Figures:
   F1. Sparsity-only Pareto: sparsity % vs perplexity + LAMBADA
@@ -325,6 +385,8 @@ Figures:
   F5. Compression ratio vs actual inference speedup
   F6. Group size: (a) g vs perplexity at s=0.25/0.50, (b) g vs LAMBADA
   F7. Effective bits-per-param vs quality across group sizes
+  F8. Activation × pruning: (a) grouped bars, (b) relative degradation ratio
+  F9. Activation sparsity vs weight sparsity interaction
 
 ================================================================================
 SECTION 6 — COMPUTE BUDGET
@@ -342,11 +404,13 @@ Estimated total runs:
   Group 6:  5 epoch counts × 3 seeds                       =  15 runs
   Group 7:  4 methods × 2 (QAT on/off) × 3 seeds          =  24 runs
   Group 8:  4 sizes × 3 configs (s=.25, s=.50, joint) × 3 =  36 runs
-  Group 9:  evaluation only (reuses checkpoints)            =   0 runs
+  Group 9:  3 act × (3 dense + 6 sparse + 3 joint) × 3    =  36 runs
+            + 2 act × 3 seeds (large validation)            =   6 runs
+  Group 10: evaluation only (reuses checkpoints)            =   0 runs
   ─────────────────────────────────────────────────────────────────────
-  Total:                                                     177 runs
+  Total:                                                     219 runs
 
-At ~12 min/run: ~35 TPU-hours (very manageable on v5litepod-4)
+At ~12 min/run: ~44 TPU-hours (very manageable on v5litepod-4)
 
 ================================================================================
 SECTION 7 — ABLATION CHECKLIST
@@ -363,6 +427,8 @@ Before submission, verify these are addressed:
   [ ] Pruning bias: report which layers (enc vs dec) get pruned
   [ ] Generation quality: not just perplexity, show actual text samples
   [ ] Group size sensitivity: optimal g, and does it interact with model scale?
+  [ ] Activation × pruning: does dReLU help or hurt compression robustness?
+  [ ] Activation sparsity measured: connect weight sparsity to activation sparsity
   [ ] Honest limitations: sparse matmuls don't accelerate on current JAX
 
 ================================================================================
@@ -381,7 +447,11 @@ Phase 3 (Day 3): Groups 5 + 6 + 7 + 8 (84 runs, ~17 hrs)
   Ablations: schedule, recovery, QAT interaction, group size.
   Immediate deliverable: complete ablation tables.
 
-Phase 4 (Day 4): Group 9 + writing
+Phase 4 (Day 4): Group 9 (42 runs, ~8 hrs)
+  Activation × pruning interaction study.
+  Immediate deliverable: activation robustness table + degradation plot.
+
+Phase 5 (Day 5): Group 10 + writing
   Run inference benchmarks on all Pareto-optimal checkpoints.
   Begin paper draft with all tables and figures populated.
 

@@ -43,6 +43,7 @@ class TransformerConfig:
     pad_token_id: int = 0
     rope_theta: float = 10000.0
     dtype: str = "bfloat16"
+    activation: str = "drelu"
 
     @property
     def jax_dtype(self):
@@ -126,12 +127,18 @@ class FeedForward(nn.Module):
     num_layers: int
     dropout_rate: float = 0.1
     dtype: jnp.dtype = jnp.bfloat16
+    activation: str = "drelu"
 
     @nn.compact
     def __call__(self, x, deterministic=True):
         gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="gate_proj")(x)
         up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="up_proj")(x)
-        x = nn.silu(gate) * up
+        if self.activation == "swiglu":
+            x = nn.silu(gate) * up
+        elif self.activation == "geglu":
+            x = nn.gelu(gate) * up
+        else:  # drelu
+            x = nn.relu(gate) * nn.relu(up)
         x = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="down_proj")(x)
         x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
         return x
@@ -145,6 +152,7 @@ class EncoderBlock(nn.Module):
     num_layers: int
     dropout_rate: float = 0.1
     dtype: jnp.dtype = jnp.bfloat16
+    activation: str = "drelu"
 
     @nn.compact
     def __call__(self, x, mask=None, rope=None, deterministic=True):
@@ -158,7 +166,7 @@ class EncoderBlock(nn.Module):
 
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dropout_rate, self.dtype)(x, deterministic=deterministic)
+        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dropout_rate, self.dtype, self.activation)(x, deterministic=deterministic)
         x = x + residual
 
         return x
@@ -172,6 +180,7 @@ class DecoderBlock(nn.Module):
     num_layers: int
     dropout_rate: float = 0.1
     dtype: jnp.dtype = jnp.bfloat16
+    activation: str = "drelu"
 
     @nn.compact
     def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, deterministic=True):
@@ -195,7 +204,7 @@ class DecoderBlock(nn.Module):
 
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dropout_rate, self.dtype)(x, deterministic=deterministic)
+        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dropout_rate, self.dtype, self.activation)(x, deterministic=deterministic)
         x = x + residual
 
         return x
@@ -213,7 +222,7 @@ class Encoder(nn.Module):
 
         for i in range(cfg.num_encoder_layers):
             x = EncoderBlock(
-                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, cfg.dropout_rate, dt, name=f"block_{i}"
+                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, cfg.dropout_rate, dt, cfg.activation, name=f"block_{i}"
             )(x, mask=mask, rope=rope, deterministic=deterministic)
 
         x = ZCRMSNorm(dtype=dt)(x)
@@ -232,7 +241,7 @@ class Decoder(nn.Module):
 
         for i in range(cfg.num_decoder_layers):
             x = DecoderBlock(
-                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, cfg.dropout_rate, dt, name=f"block_{i}"
+                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, cfg.dropout_rate, dt, cfg.activation, name=f"block_{i}"
             )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, deterministic=deterministic)
 
         x = ZCRMSNorm(dtype=dt)(x)
