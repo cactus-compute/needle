@@ -137,6 +137,7 @@ def main():
     p.add_argument("--layer-prune-ratio", type=float, default=0.33)
     p.add_argument("--group-size", type=int, default=32)
     p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu"])
+    p.add_argument("--num-memory-slots", type=int, default=64)
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
