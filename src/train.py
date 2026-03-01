@@ -133,6 +133,43 @@ def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_
     )
 
 
+def _fake_quantize_int4(w, group_size=32):
+    """Symmetric group-wise INT4 fake quantization with STE.
+
+    Divides the input dimension (axis 0) into groups of `group_size` elements,
+    each with its own scale factor. Falls back to per-channel if in_features < group_size.
+    """
+    in_feat, out_feat = w.shape
+    gs = min(group_size, in_feat)
+
+    pad = (gs - in_feat % gs) % gs
+    if pad > 0:
+        w_padded = jnp.pad(w, ((0, pad), (0, 0)))
+    else:
+        w_padded = w
+    
+    num_groups = w_padded.shape[0] // gs
+    w_grouped = w_padded.reshape(num_groups, gs, out_feat)
+    
+    scale = jnp.max(jnp.abs(w_grouped), axis=1, keepdims=True) / 7.0
+    scale = jnp.maximum(scale, 1e-8)
+    w_q = jnp.clip(jnp.round(w_grouped / scale), -8, 7) * scale
+    
+    w_q = w_q.reshape(-1, out_feat)[:in_feat]
+    
+    return w + jax.lax.stop_gradient(w_q - w)
+
+
+def _quantize_params(params):
+    """Fake-quantize all Dense kernels in the param tree."""
+    def _maybe_quantize(path, leaf):
+        name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
+        if name == "kernel":
+            return _fake_quantize_int4(leaf)
+        return leaf
+    return jax.tree_util.tree_map_with_path(_maybe_quantize, params)
+
+
 def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask, dropout_rng):
     pad_id = 0
     ema_decay = 0.999
@@ -143,7 +180,7 @@ def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask, dropout_rn
         cross_mask = src_mask
 
         logits = state.apply_fn(
-            {"params": params},
+            {"params": _quantize_params(params)},
             src,
             tgt_in,
             src_mask=src_mask,
@@ -247,14 +284,11 @@ def train(args):
     total_steps = num_batches * args.epochs
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
 
-    # Scale LRs for data parallelism: linear for Adam, sqrt for Muon
-    # (Muon's Newton-Schulz orthogonalization is sensitive to large LRs).
     scaled_lr = args.lr * num_devices
     muon_lr = getattr(args, "muon_lr", 0.02) * math.sqrt(num_devices)
     state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps)
     val_loss_fn = _make_val_loss_fn(state.apply_fn)
 
-    # Replicate state and EMA params across all devices
     ema_params = jax.tree.map(jnp.copy, state.params)
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
