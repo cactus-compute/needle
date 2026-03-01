@@ -137,7 +137,9 @@ def main():
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--max-eval-samples", type=int, default=None)
-    p.add_argument("--prune-ratio", type=float, default=0.0)
+    p.add_argument("--sparsity-ratio", type=float, default=0.33)
+    p.add_argument("--layer-prune-ratio", type=float, default=0.33)
+    p.add_argument("--group-size", type=int, default=32)
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
