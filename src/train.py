@@ -388,6 +388,7 @@ def train(args):
         max_seq_len=max(args.max_enc_len, args.max_dec_len),
         dtype=args.dtype,
         activation=getattr(args, "activation", "drelu"),
+        num_memory_slots=getattr(args, "num_memory_slots", 64),
     )
 
     # Set group size for QAT and sparsification (captured by _train_step closure)
