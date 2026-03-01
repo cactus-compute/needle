@@ -286,8 +286,9 @@ def _quantize_params(params, group_size=32):
 _GROUP_SIZE = 32
 
 
-def _compute_grads(state, src, tgt_in, tgt_out, causal_mask):
+def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
     pad_id = 0
+    ema_decay = 0.999
 
     def loss_fn(params):
         src_mask = make_padding_mask(src, pad_id)
@@ -313,23 +314,14 @@ def _compute_grads(state, src, tgt_in, tgt_out, causal_mask):
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
-    return loss, grads
-
-
-def _apply_grads(state, ema_params, grads):
-    ema_decay = 0.999
     grad_norm = optax.global_norm(grads)
     state = state.apply_gradients(grads=grads)
     ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
-    return state, ema_params, grad_norm
+    return state, ema_params, loss, grad_norm
 
 
-def _make_p_compute_grads():
-    return jax.pmap(_compute_grads, axis_name="batch")
-
-
-def _make_p_apply_grads():
-    return jax.pmap(_apply_grads, axis_name="batch", donate_argnums=(0, 1))
+def _make_p_train_step():
+    return jax.pmap(_train_step, axis_name="batch", donate_argnums=(0, 1))
 
 
 def _make_val_loss_fn(apply_fn):
@@ -401,17 +393,14 @@ def train(args):
     # Set group size for QAT and sparsification (captured by _train_step closure)
     global _GROUP_SIZE
     _GROUP_SIZE = getattr(args, "group_size", 32)
-    grad_accum_steps = getattr(args, "grad_accum_steps", 1)
-    p_compute_grads = _make_p_compute_grads()
-    p_apply_grads = _make_p_apply_grads()
+    p_train_step = _make_p_train_step()
 
     np.random.seed(args.seed)
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
 
     num_batches = len(enc_inputs) // effective_batch_size
-    optimizer_steps_per_epoch = num_batches // grad_accum_steps
-    total_steps = optimizer_steps_per_epoch * args.epochs
+    total_steps = num_batches * args.epochs
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
 
     scaled_lr = args.lr * num_devices
@@ -425,8 +414,7 @@ def train(args):
 
     param_count = sum(x.size for x in jax.tree.leaves(jax_utils.unreplicate(state).params))
     print(f"Model parameters: {param_count:,}")
-    accum_batch = effective_batch_size * grad_accum_steps
-    print(f"Devices: {num_devices}, per-device batch: {args.batch_size}, effective batch: {effective_batch_size}, grad accum: {grad_accum_steps}x = {accum_batch}")
+    print(f"Devices: {num_devices}, per-device batch: {args.batch_size}, effective batch: {effective_batch_size}")
     print(f"Adam LR: {args.lr} x {num_devices} = {scaled_lr}, Muon LR: {args.muon_lr} x sqrt({num_devices}) = {muon_lr:.4f}")
     decay_steps = max(1, int(total_steps * 0.15))
     stable_steps = total_steps - warmup_steps - decay_steps
@@ -525,46 +513,28 @@ def train(args):
             print(f"Continuing training with {config.num_encoder_layers}+{config.num_decoder_layers} layers...\n")
 
         losses = []
-        batches = list(get_batches(enc_inputs, dec_inputs, dec_targets, effective_batch_size))
-        pbar = tqdm(range(optimizer_steps_per_epoch), desc=f"Epoch {epoch + 1}/{args.epochs}")
+        batches = get_batches(enc_inputs, dec_inputs, dec_targets, effective_batch_size)
+        pbar = tqdm(batches, total=num_batches, desc=f"Epoch {epoch + 1}/{args.epochs}")
 
-        for opt_step in pbar:
+        for src, tgt_in, tgt_out in pbar:
             t0 = time.perf_counter()
-            accum_grads = None
-            accum_loss = 0.0
 
-            for micro in range(grad_accum_steps):
-                batch_idx = opt_step * grad_accum_steps + micro
-                if batch_idx >= len(batches):
-                    break
-                src, tgt_in, tgt_out = batches[batch_idx]
-
-                loss, grads = p_compute_grads(
-                    state,
-                    shard_batch(src, num_devices),
-                    shard_batch(tgt_in, num_devices),
-                    shard_batch(tgt_out, num_devices),
-                    causal_mask,
-                )
-
-                if accum_grads is None:
-                    accum_grads = grads
-                else:
-                    accum_grads = jax.tree.map(lambda a, g: a + g, accum_grads, grads)
-                accum_loss += float(loss[0])
-
-            # Average accumulated gradients
-            accum_grads = jax.tree.map(lambda g: g / grad_accum_steps, accum_grads)
-            accum_loss /= grad_accum_steps
-
-            state, ema_params, grad_norm = p_apply_grads(state, ema_params, accum_grads)
+            state, ema_params, loss, grad_norm = p_train_step(
+                state,
+                ema_params,
+                shard_batch(src, num_devices),
+                shard_batch(tgt_in, num_devices),
+                shard_batch(tgt_out, num_devices),
+                causal_mask,
+            )
 
             # Re-apply prune mask to keep pruned weights at zero
             if prune_mask is not None:
                 state = state.replace(params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
                 ema_params = jax.tree.map(lambda w, m: w * m, ema_params, prune_mask)
 
-            losses.append(accum_loss)
+            loss_val = float(loss[0])
+            losses.append(loss_val)
             global_step += 1
             dt = time.perf_counter() - t0
             eval_every = getattr(args, "eval_every", 100)
@@ -577,15 +547,15 @@ def train(args):
                     total_loss += float(vl)
                     total_toks += float(vt)
                 last_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
-            pbar.set_postfix(loss=f"{accum_loss:.4f}", val_ppl=f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?")
+            pbar.set_postfix(loss=f"{loss_val:.4f}", val_ppl=f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?")
 
             if use_wandb:
                 log_dict = {
-                    "train/loss": accum_loss,
+                    "train/loss": loss_val,
                     "train/grad_norm": float(grad_norm[0]),
                     "train/adam_lr": float(adam_schedule(global_step)),
                     "train/muon_lr": float(muon_schedule(global_step)),
-                    "train/tokens_per_sec": tokens_per_batch * grad_accum_steps / dt,
+                    "train/tokens_per_sec": tokens_per_batch / dt,
                     "train/step": global_step,
                 }
                 if global_step % eval_every == 0 or global_step == total_steps:
