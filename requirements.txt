@@ -6,3 +6,4 @@ datasets
 transformers
 wandb
 pyyaml
+sentencepiece

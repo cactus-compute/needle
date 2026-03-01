@@ -167,7 +167,8 @@ def _block_prune_params(params, prune_ratio=0.25, group_size=32):
     and the bottom `prune_ratio` fraction (globally) are zeroed out.
     """
     all_scores = []
-    for _, leaf in jax.tree_util.tree_leaves_with_path(params):
+    for path, leaf in jax.tree_util.tree_leaves_with_path(params):
+        name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
         if leaf.ndim != 2:
             continue
         w = np.array(leaf)
@@ -186,6 +187,7 @@ def _block_prune_params(params, prune_ratio=0.25, group_size=32):
     threshold = np.percentile(np.concatenate(all_scores), prune_ratio * 100)
 
     def _prune_weight(path, leaf):
+        name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
         if leaf.ndim != 2:
             return leaf
         w = np.array(leaf)
@@ -222,17 +224,14 @@ def _layer_prune(params, config, layer_prune_ratio=0.25):
     enc_scores = _score_blocks(p["encoder"], "encoder")
     dec_scores = _score_blocks(p["decoder"], "decoder")
 
-    # Pool all block scores, find global threshold
     all_scores = list(enc_scores.values()) + list(dec_scores.values())
     if not all_scores:
         return params, config
 
-    # Keep at least 1 encoder and 1 decoder block
     num_enc = len(enc_scores)
     num_dec = len(dec_scores)
     total_to_remove = max(0, int(len(all_scores) * layer_prune_ratio))
 
-    # Score and rank all blocks together
     tagged = [(s, "encoder", k) for k, s in enc_scores.items()] + \
              [(s, "decoder", k) for k, s in dec_scores.items()]
     tagged.sort(key=lambda x: x[0])
@@ -282,7 +281,6 @@ def _quantize_params(params, group_size=32):
     return jax.tree_util.tree_map_with_path(_maybe_quantize, params)
 
 
-# Module-level group_size used by _train_step (set before pmap in train())
 _GROUP_SIZE = 32
 
 
@@ -295,13 +293,14 @@ def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
         tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
         cross_mask = src_mask
 
-        logits = state.apply_fn(
+        logits, slot_div = state.apply_fn(
             {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
             src,
             tgt_in,
             src_mask=src_mask,
             tgt_mask=tgt_mask,
             cross_mask=cross_mask,
+            method="forward_with_aux",
         )
 
         logits_f32 = logits.astype(jnp.float32)
@@ -309,7 +308,8 @@ def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
         mask = (tgt_out != pad_id).astype(jnp.float32)
         ce_loss = jnp.sum(loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
         z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
-        return ce_loss + z_loss
+        div_loss = 1e-4 * slot_div
+        return ce_loss + z_loss + div_loss
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
@@ -347,7 +347,6 @@ def shard_batch(batch, num_devices):
 
 def train(args):
     num_devices = jax.local_device_count()
-    print(f"Detected {num_devices} device(s) for data-parallel training")
 
     use_wandb = getattr(args, "wandb", False)
     if use_wandb:
@@ -355,31 +354,30 @@ def train(args):
         if wandb.run is None:
             wandb.init(project="needle-v1", config=vars(args))
 
-    print("Loading tokenizer...")
+    print(f"\n[1/4] Detecting devices...")
+    print(f"      {num_devices} device(s) for data-parallel training")
+
+    print(f"\n[2/4] Loading tokenizer...")
     tokenizer = get_tokenizer()
 
-    print("Loading TinyStories dataset...")
+    print(f"\n[3/4] Loading TinyStories dataset...")
     ds = load_tinystories("train", max_samples=args.max_samples)
     val_ds = load_tinystories("validation", max_samples=getattr(args, "max_eval_samples", None))
 
-    print("Preparing encoder-decoder pairs...")
+    print(f"\n[4/4] Preparing encoder-decoder pairs...")
     enc_inputs, dec_inputs, dec_targets = prepare_encoder_decoder_pairs(
         ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
-    print(f"Prepared {len(enc_inputs)} training pairs")
-
     val_enc, val_dec_in, val_dec_tgt = prepare_encoder_decoder_pairs(
         val_ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
     val_enc = jnp.array(val_enc)
     val_dec_in = jnp.array(val_dec_in)
     val_dec_tgt = jnp.array(val_dec_tgt)
-    print(f"Prepared {len(val_enc)} validation pairs")
+    print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val pairs")
 
-    # Effective batch size must be divisible by num_devices
     effective_batch_size = args.batch_size * num_devices
 
-    # Load config from checkpoint or build from CLI args
     resume_checkpoint = getattr(args, "checkpoint", None)
     if resume_checkpoint:
         print(f"Resuming from checkpoint: {resume_checkpoint}")
@@ -401,7 +399,6 @@ def train(args):
             num_memory_slots=getattr(args, "num_memory_slots", 64),
         )
 
-    # Set module-level config (captured by _train_step closure)
     global _GROUP_SIZE
     _GROUP_SIZE = getattr(args, "group_size", 32)
     p_train_step = _make_p_train_step()
@@ -419,7 +416,6 @@ def train(args):
     state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps)
     val_loss_fn = _make_val_loss_fn(state.apply_fn)
 
-    # Override with checkpoint params if resuming
     if resume_checkpoint:
         state = state.replace(params=ckpt_params)
         print(f"  Loaded checkpoint params into train state")
@@ -429,12 +425,26 @@ def train(args):
     ema_params = jax_utils.replicate(ema_params)
 
     param_count = sum(x.size for x in jax.tree.leaves(jax_utils.unreplicate(state).params))
-    print(f"Model parameters: {param_count:,}")
-    print(f"Devices: {num_devices}, per-device batch: {args.batch_size}, effective batch: {effective_batch_size}")
-    print(f"Adam LR: {args.lr} x {num_devices} = {scaled_lr}, Muon LR: {args.muon_lr} x sqrt({num_devices}) = {muon_lr:.4f}")
     decay_steps = max(1, int(total_steps * 0.15))
     stable_steps = total_steps - warmup_steps - decay_steps
-    print(f"LR schedule: warmup {warmup_steps}, stable {stable_steps}, decay {decay_steps} steps (WSD)")
+
+    print(f"\n  ─────────────────────────────────────")
+    print(f"  Parameters    {param_count:>12,}")
+    print(f"  d_model       {config.d_model:>12}")
+    print(f"  Heads         {config.num_heads:>7} ({config.num_kv_heads} KV)")
+    print(f"  Layers        {config.num_encoder_layers:>7} enc / {config.num_decoder_layers} dec")
+    print(f"  Memory slots  {config.num_memory_slots:>12}")
+    print(f"  Activation    {config.activation:>12}")
+    print(f"  Dtype         {config.dtype:>12}")
+    print(f"  ─────────────────────────────────────")
+    print(f"  Devices       {num_devices:>12}")
+    print(f"  Batch         {args.batch_size:>7} x {num_devices} = {effective_batch_size}")
+    print(f"  Adam LR       {args.lr:>7} x {num_devices} = {scaled_lr}")
+    print(f"  Muon LR       {args.muon_lr:>7.4f} -> {muon_lr:.4f}")
+    print(f"  Schedule      {warmup_steps}w / {stable_steps}s / {decay_steps}d (WSD)")
+    print(f"  Total steps   {total_steps:>12,}")
+    print(f"  Epochs        {args.epochs:>12}")
+    print(f"  ─────────────────────────────────────\n")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     global_step = 0
@@ -456,15 +466,10 @@ def train(args):
     layer_prune_ratio = getattr(args, "layer_prune_ratio", 0.0)
     prune_mask = None
 
-    # Determine which epoch each pruning type fires on:
-    #   both flags:              group sparsify @ epoch 1, layer prune @ epoch 2
-    #   only --sparsity-ratio:   group sparsify @ epoch 1
-    #   only --layer-prune:      layer prune    @ epoch 1
     weight_prune_epoch = 1 if sparsity_ratio > 0 else -1
     layer_prune_epoch = (2 if sparsity_ratio > 0 else 1) if layer_prune_ratio > 0 else -1
 
     for epoch in range(args.epochs):
-        # --- Weight block pruning ---
         if epoch == weight_prune_epoch and prune_mask is None:
             print(f"\nGroup-wise sparsification: {sparsity_ratio*100:.0f}% of blocks (group_size={_GROUP_SIZE})...")
             pruned_params = _block_prune_params(jax_utils.unreplicate(ema_params), prune_ratio=sparsity_ratio, group_size=_GROUP_SIZE)
@@ -490,15 +495,13 @@ def train(args):
             prune_mask = jax_utils.replicate(prune_mask)
             state = jax_utils.replicate(state)
             ema_params = jax_utils.replicate(ema_params)
-            print(f"Continuing training with sparsity mask locked...\n")
+            print(f"\nContinuing training with sparsity mask locked...\n")
 
-        # --- Layer pruning ---
         if epoch == layer_prune_epoch:
             print(f"\nLayer pruning: removing {layer_prune_ratio*100:.0f}% of layers...")
             current_params = jax_utils.unreplicate(ema_params)
             new_params, config = _layer_prune(current_params, config, layer_prune_ratio=layer_prune_ratio)
 
-            # Rebuild train state with new config/model so tree types are consistent
             rng, reinit_rng = jax.random.split(rng)
             state = create_train_state(reinit_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps)
             matched_params = jax.tree.map(lambda init_leaf, prune_leaf: prune_leaf, state.params, new_params)
@@ -508,7 +511,6 @@ def train(args):
             param_count = sum(x.size for x in jax.tree.leaves(matched_params))
             print(f"  Parameters: {param_count:,}")
 
-            # Eval val perplexity after layer pruning
             val_loss_fn = _make_val_loss_fn(state.apply_fn)
             val_causal = make_causal_mask(args.max_dec_len)
             total_loss, total_toks = 0.0, 0.0
@@ -519,14 +521,13 @@ def train(args):
             layer_prune_ppl = float(math.exp(total_loss / max(total_toks, 1)))
             print(f"  Post-layer-prune val ppl: {layer_prune_ppl:.2f} (was {last_val_ppl:.2f})" if last_val_ppl is not None else f"  Post-layer-prune val ppl: {layer_prune_ppl:.2f}")
 
-            # Rebuild prune mask if weight pruning was already applied
             if prune_mask is not None:
                 prune_mask = jax.tree.map(lambda w: (jnp.abs(w) > 1e-8).astype(jnp.float32), matched_params)
                 prune_mask = jax_utils.replicate(prune_mask)
 
             state = jax_utils.replicate(state)
             ema_params = jax_utils.replicate(ema_params)
-            print(f"Continuing training with {config.num_encoder_layers}+{config.num_decoder_layers} layers...\n")
+            print(f"\nContinuing training with {config.num_encoder_layers}+{config.num_decoder_layers} layers...\n")
 
         losses = []
         batches = get_batches(enc_inputs, dec_inputs, dec_targets, effective_batch_size)
@@ -544,7 +545,6 @@ def train(args):
                 causal_mask,
             )
 
-            # Re-apply prune mask to keep pruned weights at zero
             if prune_mask is not None:
                 state = state.replace(params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
                 ema_params = jax.tree.map(lambda w, m: w * m, ema_params, prune_mask)
@@ -582,7 +582,6 @@ def train(args):
         final_loss = losses[-1] if losses else float("nan")
         final_ppl = math.exp(final_loss) if not math.isnan(final_loss) else float("nan")
 
-        # Compute val perplexity at end of epoch
         eval_params = jax_utils.unreplicate(ema_params)
         val_causal = make_causal_mask(args.max_dec_len)
         total_loss, total_toks = 0.0, 0.0
@@ -592,7 +591,6 @@ def train(args):
             total_toks += float(vt)
         last_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
 
-        # Quantized val perplexity (INT4 fake-quantized weights)
         q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE)
         q_total_loss, q_total_toks = 0.0, 0.0
         for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
@@ -606,13 +604,40 @@ def train(args):
         near_zero = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(epoch_params))
         sparsity = near_zero / total_params * 100
 
-        print(f"\n  Epoch {epoch + 1}/{args.epochs} report:")
-        print(f"    Avg loss:       {epoch_avg_loss:.4f}")
-        print(f"    Final loss:     {final_loss:.4f}")
-        print(f"    Perplexity:     {final_ppl:.2f}")
-        print(f"    Val perplexity: {last_val_ppl:.2f}")
-        print(f"    Quant val ppl:  {quant_val_ppl:.2f} (INT4 g{_GROUP_SIZE})")
-        print(f"    Weight sparsity: {sparsity:.2f}% ({near_zero:,}/{total_params:,} near-zero)")
+        ckpt_name = f"needle_{args.num_layers}_{args.d_model}_{global_step}.pkl"
+        ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
+        params_np = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
+
+        with open(ckpt_path, "wb") as f:
+            pickle.dump({"params": params_np, "config": config.__dict__}, f)
+
+        from .test import measure_throughput, benchmark_generation_quality
+        model = EncoderDecoderTransformer(config)
+        tp = measure_throughput(model, eval_params, tokenizer, num_runs=5)
+        prompts = ["Once upon a time", "The little dog", "She was very happy because"]
+        quality = benchmark_generation_quality(model, eval_params, tokenizer, prompts, max_gen_len=64, temperature=0.8)
+
+        print(f"\n  ─────────────────────────────────────")
+        print(f"  Epoch {epoch + 1}/{args.epochs}")
+        print(f"  ─────────────────────────────────────")
+        print(f"  Avg loss       {epoch_avg_loss:>12.4f}")
+        print(f"  Final loss     {final_loss:>12.4f}")
+        print(f"  Train ppl      {final_ppl:>12.2f}")
+        print(f"  Val ppl        {last_val_ppl:>12.2f}")
+        print(f"  Quant val ppl  {quant_val_ppl:>12.2f}  (INT4 g{_GROUP_SIZE})")
+        print(f"  Sparsity       {sparsity:>11.2f}%  ({near_zero:,}/{total_params:,})")
+        print(f"  ─────────────────────────────────────")
+        print(f"  Throughput     {tp['tokens_per_second']:>10.1f} tok/s")
+        print(f"  Latency        {tp['avg_latency_s']:>11.3f}s")
+        print(f"  Gen length     {quality['avg_generation_length']:>10.1f} tok")
+        print(f"  Repetition     {quality['bigram_repetition_rate']:>12.3f}")
+        print(f"  ─────────────────────────────────────")
+        for prompt, gen in quality["generations"]:
+            print(f"  [{prompt}]")
+            print(f"    {gen[:100]}")
+        print(f"  ─────────────────────────────────────")
+        print(f"  Checkpoint: {ckpt_path}")
+        print(f"  ─────────────────────────────────────\n")
 
         if use_wandb:
             wandb.log({
@@ -623,28 +648,6 @@ def train(args):
                 "epoch/weight_sparsity": sparsity,
                 "epoch": epoch + 1,
             })
-
-        ckpt_name = f"needle_{args.num_layers}_{args.d_model}_{global_step}.pkl"
-        ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
-        params_np = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
-
-        with open(ckpt_path, "wb") as f:
-            pickle.dump({"params": params_np, "config": config.__dict__}, f)
-        print(f"Saved checkpoint: {ckpt_path}")
-
-        from .test import measure_throughput, benchmark_generation_quality
-        model = EncoderDecoderTransformer(config)
-
-        print(f"\n  Throughput:")
-        tp = measure_throughput(model, eval_params, tokenizer, num_runs=5)
-        print(f"    {tp['tokens_per_second']:.1f} tok/s, {tp['avg_latency_s']:.3f}s avg latency")
-
-        prompts = ["Once upon a time", "The little dog", "She was very happy because"]
-        print(f"  Generation samples:")
-        quality = benchmark_generation_quality(model, eval_params, tokenizer, prompts, max_gen_len=64, temperature=0.8)
-        print(f"    Avg length: {quality['avg_generation_length']:.1f} tok, repetition: {quality['bigram_repetition_rate']:.3f}")
-        for prompt, gen in quality["generations"]:
-            print(f"    [{prompt}] {gen[:100]}")
 
     if use_wandb:
         wandb.finish()

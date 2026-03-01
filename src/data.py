@@ -8,16 +8,105 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import AutoTokenizer
+import sentencepiece as spm
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".data_cache")
+TOKENIZER_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tokenizer")
+TOKENIZER_PREFIX = os.path.join(TOKENIZER_DIR, "needle")
+
+PAD_ID = 0
+EOS_ID = 1
+BOS_ID = 2
+
+
+class NeedleTokenizer:
+    """Wrapper around SentencePiece providing the interface the codebase expects."""
+
+    def __init__(self, model_path):
+        self.sp = spm.SentencePieceProcessor()
+        self.sp.Load(model_path)
+
+    @property
+    def pad_token_id(self):
+        return PAD_ID
+
+    @property
+    def eos_token_id(self):
+        return EOS_ID
+
+    @property
+    def bos_token_id(self):
+        return BOS_ID
+
+    @property
+    def vocab_size(self):
+        return self.sp.GetPieceSize()
+
+    def encode(self, text):
+        return self.sp.Encode(text, out_type=int)
+
+    def decode(self, ids):
+        if isinstance(ids, (list, tuple)) and len(ids) > 0 and isinstance(ids[0], (list, tuple)):
+            return [self.sp.Decode(seq) for seq in ids]
+        return self.sp.Decode(list(ids))
+
+    def __call__(self, texts, truncation=True, max_length=None, **kwargs):
+        all_ids = []
+        for text in texts:
+            ids = self.sp.Encode(text, out_type=int)
+            if truncation and max_length:
+                ids = ids[:max_length]
+            all_ids.append(ids)
+        return {"input_ids": all_ids}
+
+
+def train_tokenizer(vocab_size=8192, max_samples=100000):
+    """Train a SentencePiece BPE tokenizer on TinyStories."""
+    model_path = TOKENIZER_PREFIX + ".model"
+    if os.path.exists(model_path):
+        print(f"Tokenizer already exists at {model_path}")
+        return model_path
+
+    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+
+    print(f"Training SentencePiece BPE tokenizer (vocab_size={vocab_size})...")
+    ds = load_dataset("roneneldan/TinyStories", split="train")
+    indices = range(min(max_samples, len(ds)))
+    ds_subset = ds.select(indices)
+
+    corpus_path = os.path.join(TOKENIZER_DIR, "corpus.txt")
+    with open(corpus_path, "w") as f:
+        for example in tqdm(ds_subset, desc="Writing corpus"):
+            text = example["text"].strip()
+            if text:
+                f.write(text + "\n")
+
+    spm.SentencePieceTrainer.Train(
+        input=corpus_path,
+        model_prefix=TOKENIZER_PREFIX,
+        vocab_size=vocab_size,
+        model_type="bpe",
+        pad_id=PAD_ID,
+        eos_id=EOS_ID,
+        bos_id=BOS_ID,
+        unk_id=3,
+        byte_fallback=True,
+        normalization_rule_name="identity",
+        num_threads=os.cpu_count(),
+        train_extremely_large_corpus=False,
+        minloglevel=2,
+    )
+
+    os.remove(corpus_path)
+    print(f"Tokenizer saved to {model_path}")
+    return model_path
 
 
 def get_tokenizer():
-    tokenizer = AutoTokenizer.from_pretrained("LiquidAI/LFM2-1.2B")
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
+    model_path = TOKENIZER_PREFIX + ".model"
+    if not os.path.exists(model_path):
+        train_tokenizer()
+    return NeedleTokenizer(model_path)
 
 
 def load_tinystories(split="train", max_samples=None):
@@ -27,13 +116,13 @@ def load_tinystories(split="train", max_samples=None):
     return ds
 
 
-def _cache_key(n_samples, max_enc_len, max_dec_len, tokenizer_name="lfm2"):
+def _cache_key(n_samples, max_enc_len, max_dec_len, tokenizer_name="needle_spm"):
     key = f"tinystories_{tokenizer_name}_{n_samples}_{max_enc_len}_{max_dec_len}"
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
 def prepare_encoder_decoder_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=128, split_ratio=0.3):
-    
+
     cache_id = _cache_key(len(ds), max_enc_len, max_dec_len)
     cache_path = os.path.join(CACHE_DIR, cache_id)
     if os.path.exists(cache_path + "_enc.npy"):
@@ -52,7 +141,6 @@ def prepare_encoder_decoder_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=12
     texts = list(ds["text"])
     all_tokens = tokenizer(
         texts, truncation=True, max_length=max_total,
-        return_attention_mask=False, return_token_type_ids=False,
     )["input_ids"]
 
     n = len(all_tokens)
