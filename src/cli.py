@@ -140,6 +140,7 @@ def main():
     p.add_argument("--sparsity-ratio", type=float, default=0.33)
     p.add_argument("--layer-prune-ratio", type=float, default=0.33)
     p.add_argument("--group-size", type=int, default=32)
+    p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu"])
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
