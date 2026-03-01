@@ -585,6 +585,15 @@ def train(args):
             total_toks += float(vt)
         last_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
 
+        # Quantized val perplexity (INT4 fake-quantized weights)
+        q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE)
+        q_total_loss, q_total_toks = 0.0, 0.0
+        for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
+            vl, vt = val_loss_fn(q_params, vb[0], vb[1], vb[2], val_causal)
+            q_total_loss += float(vl)
+            q_total_toks += float(vt)
+        quant_val_ppl = float(math.exp(q_total_loss / max(q_total_toks, 1)))
+
         epoch_params = jax.tree.map(np.array, eval_params)
         total_params = sum(x.size for x in jax.tree.leaves(epoch_params))
         near_zero = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(epoch_params))
@@ -595,6 +604,7 @@ def train(args):
         print(f"    Final loss:     {final_loss:.4f}")
         print(f"    Perplexity:     {final_ppl:.2f}")
         print(f"    Val perplexity: {last_val_ppl:.2f}")
+        print(f"    Quant val ppl:  {quant_val_ppl:.2f} (INT4 g{_GROUP_SIZE})")
         print(f"    Weight sparsity: {sparsity:.2f}% ({near_zero:,}/{total_params:,} near-zero)")
 
         if use_wandb:
@@ -602,6 +612,7 @@ def train(args):
                 "epoch/avg_loss": epoch_avg_loss,
                 "epoch/final_loss": final_loss,
                 "epoch/val_ppl": last_val_ppl,
+                "epoch/quant_val_ppl": quant_val_ppl,
                 "epoch/weight_sparsity": sparsity,
                 "epoch": epoch + 1,
             })
