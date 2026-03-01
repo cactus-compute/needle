@@ -160,6 +160,50 @@ def _fake_quantize_int4(w, group_size=32):
     return w + jax.lax.stop_gradient(w_q - w)
 
 
+def _block_prune_params(params, prune_ratio=0.25, group_size=32):
+    """Block magnitude pruning aligned to quantization groups.
+
+    All 2D weight matrices (Dense kernels + embeddings) are divided into
+    (group_size, 1) blocks along axis 0. Blocks are scored by L1 norm,
+    and the bottom `prune_ratio` fraction (globally) are zeroed out.
+    """
+    all_scores = []
+    for _, leaf in jax.tree_util.tree_leaves_with_path(params):
+        if leaf.ndim != 2:
+            continue
+        w = np.array(leaf)
+        in_feat, out_feat = w.shape
+        gs = min(group_size, in_feat)
+        pad = (gs - in_feat % gs) % gs
+        if pad:
+            w = np.pad(w, ((0, pad), (0, 0)))
+        w_grouped = w.reshape(-1, gs, out_feat)
+        scores = np.sum(np.abs(w_grouped), axis=1).ravel()
+        all_scores.append(scores)
+
+    if not all_scores:
+        return params
+
+    threshold = np.percentile(np.concatenate(all_scores), prune_ratio * 100)
+
+    def _prune_weight(path, leaf):
+        if leaf.ndim != 2:
+            return leaf
+        w = np.array(leaf)
+        in_feat, out_feat = w.shape
+        gs = min(group_size, in_feat)
+        pad = (gs - in_feat % gs) % gs
+        if pad:
+            w = np.pad(w, ((0, pad), (0, 0)))
+        w_grouped = w.reshape(-1, gs, out_feat)
+        scores = np.sum(np.abs(w_grouped), axis=1, keepdims=True)
+        mask = (scores > threshold).astype(np.float32)
+        w_pruned = (w_grouped * mask).reshape(-1, out_feat)[:in_feat]
+        return jnp.array(w_pruned)
+
+    return jax.tree_util.tree_map_with_path(_prune_weight, params)
+
+
 def _quantize_params(params):
     """Fake-quantize all Dense kernels in the param tree."""
     def _maybe_quantize(path, leaf):
@@ -317,7 +361,40 @@ def train(args):
     dec_targets = jnp.array(dec_targets)
 
     last_val_ppl = None
+    prune_ratio = getattr(args, "prune_ratio", 0.0)
+    prune_mask = None
+
     for epoch in range(args.epochs):
+        # After first epoch, prune and lock the mask for remaining epochs
+        if epoch == 1 and prune_ratio > 0 and prune_mask is None:
+            print(f"\nPruning {prune_ratio*100:.0f}% of weight blocks (group_size=32)...")
+            pruned_params = _block_prune_params(jax_utils.unreplicate(ema_params), prune_ratio=prune_ratio)
+
+            pruned_np = jax.tree.map(np.array, pruned_params)
+            total_p = sum(x.size for x in jax.tree.leaves(pruned_np))
+            zero_p = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(pruned_np))
+            print(f"  Post-prune sparsity: {zero_p/total_p*100:.2f}% ({zero_p:,}/{total_p:,} near-zero)")
+
+            # Eval val perplexity after pruning
+            val_causal = make_causal_mask(args.max_dec_len)
+            total_loss, total_toks = 0.0, 0.0
+            for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
+                vl, vt = val_loss_fn(pruned_params, vb[0], vb[1], vb[2], val_causal)
+                total_loss += float(vl)
+                total_toks += float(vt)
+            prune_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
+            print(f"  Post-prune val ppl:  {prune_val_ppl:.2f} (was {last_val_ppl:.2f})" if last_val_ppl is not None else f"  Post-prune val ppl:  {prune_val_ppl:.2f}")
+
+            # Inject pruned params and build frozen mask
+            state = jax_utils.unreplicate(state)
+            state = state.replace(params=pruned_params)
+            ema_params = jax.tree.map(jnp.copy, pruned_params)
+            prune_mask = jax.tree.map(lambda w: (jnp.abs(w) > 1e-8).astype(jnp.float32), pruned_params)
+            prune_mask = jax_utils.replicate(prune_mask)
+            state = jax_utils.replicate(state)
+            ema_params = jax_utils.replicate(ema_params)
+            print(f"Continuing training with pruning mask locked...\n")
+
         losses = []
         batches = get_batches(enc_inputs, dec_inputs, dec_targets, effective_batch_size)
         pbar = tqdm(batches, total=num_batches, desc=f"Epoch {epoch + 1}/{args.epochs}")
@@ -327,7 +404,7 @@ def train(args):
             dropout_rngs = jax.random.split(dropout_rng, num_devices)
 
             t0 = time.perf_counter()
-            
+
             state, ema_params, loss, grad_norm = p_train_step(
                 state,
                 ema_params,
@@ -337,7 +414,12 @@ def train(args):
                 causal_mask,
                 dropout_rngs,
             )
-            
+
+            # Re-apply prune mask to keep pruned weights at zero
+            if prune_mask is not None:
+                state = state.replace(params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
+                ema_params = jax.tree.map(lambda w, m: w * m, ema_params, prune_mask)
+
             loss_val = float(loss[0])
             losses.append(loss_val)
             global_step += 1
