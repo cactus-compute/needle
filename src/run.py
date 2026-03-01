@@ -31,7 +31,7 @@ def generate(model, params, tokenizer, prompt, max_gen_len=128, temperature=0.8,
 
     src_mask = make_padding_mask(enc_input, pad_id)
     encoder_out = model.apply(
-        {"params": params}, enc_input, src_mask=src_mask, deterministic=True, method="encode"
+        {"params": params}, enc_input, src_mask=src_mask, method="encode"
     )
 
     # Fixed-size buffer so JAX compiles once
@@ -47,8 +47,7 @@ def generate(model, params, tokenizer, prompt, max_gen_len=128, temperature=0.8,
             encoder_out,
             self_mask=tgt_mask,
             cross_mask=src_mask,
-            deterministic=True,
-            method="decode",
+                       method="decode",
         )
         return logits
 

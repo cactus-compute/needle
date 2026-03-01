@@ -39,8 +39,7 @@ def compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, batch
         logits = model.apply(
             {"params": params}, src, tgt_in,
             src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=cross_mask,
-            deterministic=True,
-        )
+                   )
 
         loss = optax.softmax_cross_entropy_with_integer_labels(logits, tgt_out)
         mask = (tgt_out != pad_id).astype(jnp.float32)
@@ -64,13 +63,13 @@ def measure_throughput(model, params, tokenizer, num_runs=10, prompt="Once upon 
     def decode_step(dec_buffer, encoder_out, src_mask):
         logits = model.apply(
             {"params": params}, dec_buffer, encoder_out,
-            self_mask=tgt_mask, cross_mask=src_mask, deterministic=True, method="decode",
+            self_mask=tgt_mask, cross_mask=src_mask, method="decode",
         )
         return logits
 
     # Warmup — compile once
     encoder_out = model.apply(
-        {"params": params}, enc_input, src_mask=src_mask, deterministic=True, method="encode"
+        {"params": params}, enc_input, src_mask=src_mask, method="encode"
     )
     dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
     dec_buffer = dec_buffer.at[0, 0].set(eos_id)
@@ -87,7 +86,7 @@ def measure_throughput(model, params, tokenizer, num_runs=10, prompt="Once upon 
 
         start = time.perf_counter()
         encoder_out = model.apply(
-            {"params": params}, enc_input, src_mask=src_mask, deterministic=True, method="encode"
+            {"params": params}, enc_input, src_mask=src_mask, method="encode"
         )
         logits = decode_step(dec_buffer, encoder_out, src_mask)
 

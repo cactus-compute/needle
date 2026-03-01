@@ -17,7 +17,6 @@ HELP = """
   │     --d-model INT           Model dimension (default: 128)        │
   │     --num-heads INT         Attention heads (default: 4)          │
   │     --num-layers INT        Encoder/decoder layers (default: 2)   │
-  │     --dropout FLOAT         Dropout rate (default: 0.1)           │
   │     --max-enc-len INT       Max encoder seq length (default: 128) │
   │     --max-dec-len INT       Max decoder seq length (default: 128) │
   │     --max-samples INT       Training samples (default: 20000)     │
@@ -75,7 +74,6 @@ TOY_CONFIG = {
     "d_model": 128,
     "num_heads": 4,
     "num_layers": 2,
-    "dropout": 0.1,
     "max_enc_len": 128,
     "max_dec_len": 128,
     "max_samples": 10000,
@@ -92,7 +90,6 @@ BASE_CONFIG = {
     "d_model": 256,
     "num_heads": 4,
     "num_layers": 4,
-    "dropout": 0.0,
     "max_enc_len": 256,
     "max_dec_len": 256,
     "max_samples": 500000,
@@ -126,7 +123,6 @@ def main():
     p.add_argument("--d-model", type=int, default=None)
     p.add_argument("--num-heads", type=int, default=None)
     p.add_argument("--num-layers", type=int, default=None)
-    p.add_argument("--dropout", type=float, default=None)
     p.add_argument("--max-enc-len", type=int, default=None)
     p.add_argument("--max-dec-len", type=int, default=None)
     p.add_argument("--max-samples", type=int, default=None)
@@ -141,6 +137,7 @@ def main():
     p.add_argument("--layer-prune-ratio", type=float, default=0.33)
     p.add_argument("--group-size", type=int, default=32)
     p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu"])
+    p.add_argument("--grad-accum-steps", type=int, default=1)
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
@@ -170,7 +167,6 @@ def main():
     p.add_argument("--d-model", type=int, default=128)
     p.add_argument("--num-heads", type=int, default=4)
     p.add_argument("--num-layers", type=int, default=2)
-    p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--max-enc-len", type=int, default=128)
     p.add_argument("--max-dec-len", type=int, default=128)
     p.add_argument("--max-samples", type=int, default=20000)
