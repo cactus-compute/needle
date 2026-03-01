@@ -1,46 +1,58 @@
 ```
-  ┌────────────────────────────────────────────────────────┐
-  │                                                        │
-  │      ┌─┐┌─┐┌─┐┌┬┐┬ ┬┌─┐  ┌┐┌┌─┐┌─┐┌┬┐┬  ┌─┐            │
-  │      │  ├─┤│   │ │ │└─┐  │││├┤ ├┤  │││  ├┤             │
-  │      └─┘┴ ┴└─┘ ┴ └─┘└─┘  ┘└┘└─┘└─┘─┴┘┴─┘└─┘            │
-  │      ...the tiny model to rule them all...             │
-  └────────────────────────────────────────────────────────┘
+         ┌────────────────────────────────────────────────────────┐
+         │                                                        │
+         │       ┌─┐┌─┐┌─┐┌┬┐┬ ┬┌─┐  ┌┐┌┌─┐┌─┐┌┬┐┬  ┌─┐           │
+         │       │  ├─┤│   │ │ │└─┐  │││├┤ ├┤  │││  ├┤            │
+         │       └─┘┴ ┴└─┘ ┴ └─┘└─┘  ┘└┘└─┘└─┘─┴┘┴─┘└─┘           │
+         │       ...the tiny model to rule them all...            │
+         └────────────────────────────────────────────────────────┘
+
+  Architecture                                        Training Pipeline
+  ────────────                                        ─────────────────
 
                           ┌─────────────┐
-                          │   Softmax   │
-                          └──────┬──────┘
-                          ┌──────┴──────┐
-                          │  Linear (T) │  ← tied weights
-                          └──────┬──────┘
-                          ┌──────┴──────┐
-                          │  LayerNorm  │
-                          └──────┬──────┘
-                       ┌─────────┴─────────┐
-                       │   Decoder x 2     │
-                       │ ┌───────────────┐ │
-                       │ │ Masked Self   │ │
-  ┌──────────────┐     │ │ Attn + RoPE   │ │
-  │              │     │ ├───────────────┤ │
-  │ Encoder x 2  │     │ │   Cross       │ │
-  │ ┌──────────┐ │────────▶  Attention   │ │
-  │ │  Self    │ │     │ ├───────────────┤ │
-  │ │Attn+RoPE │ │     │ │ Feed-Forward  │ │
-  │ ├──────────┤ │     │ └───────────────┘ │
-  │ │  Feed-   │ │     └─────────┬─────────┘
-  │ │ Forward  │ │        ┌──────┴──────┐
-  │ └──────────┘ │        │  Embedding  │  ← shared
-  └──────┬───────┘        └──────┬──────┘
-  ┌──────┴───────┐               │
-  │  Embedding   │ ← shared      │
-  └──────┬───────┘               │
-         │                       │
-    ┌────┴────┐            ┌─────┴─────┐
-    │ Encoder │            │  Decoder  │
-    │  Input  │            │   Input   │
-    └─────────┘            └───────────┘
+                          │   Softmax   │             ┌──────────────────────┐
+                          └──────┬──────┘             │ Forward pass with    │
+                          ┌──────┴──────┐             │ INT4 fake-quantized  │
+                          │  Linear (T) │  ← tied     │ weights (g=32, STE)  │
+                          └──────┬──────┘             └──────────┬───────────┘
+                          ┌──────┴──────┐                        │
+                          │  ZCRMSNorm  │             ┌──────────┴───────────┐
+                          └──────┬──────┘             │ Muon  (2D kernels)   │
+                       ┌─────────┴─────────┐          │ AdamW (everything    │
+                       │   Decoder x N     │          │       else)          │
+                       │ ┌───────────────┐ │          │ WSD LR schedule      │
+                       │ │ Masked Self   │ │          └──────────┬───────────┘
+                       │ │ Attn + RoPE   │ │                     │
+                       │ ├───────────────┤ │          ┌──────────┴───────────┐
+  ┌──────────────┐  S  │ │   Cross       │ │          │ EMA params (β=0.999) │
+  │ MemoryMixer  │─────────▶ Attention   │ │          └──────────┬───────────┘
+  │ Encoder x N  │     │ ├───────────────┤ │                     │
+  │              │     │ │ Feed-Forward  │ │          ┌──────────┴───────────┐
+  │ ┌──────────┐ │     │ │   (dReLU)     │ │          │ Block Prune          │
+  │ │Pack:     │ │     │ └───────────────┘ │          │  after epoch 1       │
+  │ │ S←X Attn │ │     └─────────┬─────────┘          │  group magnitude     │
+  │ ├──────────┤ │        ┌──────┴──────┐             │  lock sparsity mask  │
+  │ │Mix:      │ │        │  Embedding  │  ← shared   └──────────┬───────────┘
+  │ │ MLP-Mixer│ │        └──────┬──────┘                        │
+  │ │ on S     │ │               │                    ┌──────────┴───────────┐
+  │ ├──────────┤ │         ┌─────┴─────┐              │ Layer Prune          │
+  │ │Local:    │ │         │  Decoder  │              │  after epoch 2       │
+  │ │ FFN on X │ │         │   Input   │              │  L1 block scoring    │
+  │ └──────────┘ │         └───────────┘              │  keep ≥1 enc & dec   │
+  │  S ∈ (M, d)  │                                    └──────────┬───────────┘
+  └──────┬───────┘                                               │
+  ┌──────┴───────┐                                    ┌──────────┴───────────┐
+  │  Embedding   │ ← shared                           │ Checkpoint           │
+  └──────┬───────┘                                    │  sparse + INT4       │
+         │                                            └──────────────────────┘
+    ┌────┴────┐
+    │ Encoder │
+    │  Input  │
+    └─────────┘
 
-    ~7.5M params · d=128 · 4 heads · 2+2 layers · RoPE
+    d=128 · 4 heads · 2 KV heads · 64 memory slots
+    dReLU · ZCRMSNorm · RoPE · INT4 QAT · Muon
 ```
 
 ## Usage
@@ -62,7 +74,6 @@ needle [command]
   │     --d-model INT           Model dimension (default: 128)        │
   │     --num-heads INT         Attention heads (default: 4)          │
   │     --num-layers INT        Encoder/decoder layers (default: 2)   │
-  │     --dropout FLOAT         Dropout rate (default: 0.1)           │
   │     --max-enc-len INT       Max encoder seq length (default: 128) │
   │     --max-dec-len INT       Max decoder seq length (default: 128) │
   │     --max-samples INT       Training samples (default: 20000)     │
