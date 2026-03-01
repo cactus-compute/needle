@@ -29,7 +29,7 @@ def _make_p_encode(model):
     """Create a pmap'd encode function."""
     def _encode(params, src, src_mask):
         return model.apply(
-            {"params": params}, src, src_mask=src_mask, deterministic=True, method="encode",
+            {"params": params}, src, src_mask=src_mask, method="encode",
         )
     return jax.pmap(_encode, axis_name="batch")
 
@@ -39,7 +39,7 @@ def _make_p_decode(model):
     def _decode(params, dec_input, encoder_out, tgt_mask, cross_mask):
         return model.apply(
             {"params": params}, dec_input, encoder_out,
-            self_mask=tgt_mask, cross_mask=cross_mask, deterministic=True, method="decode",
+            self_mask=tgt_mask, cross_mask=cross_mask, method="decode",
         )
     return jax.pmap(_decode, axis_name="batch")
 
@@ -50,8 +50,7 @@ def _make_p_forward(model):
         return model.apply(
             {"params": params}, src, tgt_in,
             src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=cross_mask,
-            deterministic=True,
-        )
+                   )
     return jax.pmap(_forward, axis_name="batch")
 
 
@@ -78,7 +77,7 @@ def score_sequence(model, params, enc_tokens, dec_tokens, pad_id, p_encode=None,
     else:
         p = params if num_devices <= 1 else jax_utils.unreplicate(params)
         encoder_out = model.apply(
-            {"params": p}, enc_input, src_mask=src_mask, deterministic=True, method="encode",
+            {"params": p}, enc_input, src_mask=src_mask, method="encode",
         )
 
     dec_in = [pad_id] + list(dec_tokens[:-1])
@@ -96,7 +95,7 @@ def score_sequence(model, params, enc_tokens, dec_tokens, pad_id, p_encode=None,
         p = params if num_devices <= 1 else jax_utils.unreplicate(params)
         logits = model.apply(
             {"params": p}, dec_input, encoder_out,
-            self_mask=tgt_mask, cross_mask=cross_mask, deterministic=True, method="decode",
+            self_mask=tgt_mask, cross_mask=cross_mask, method="decode",
         )[0]
 
     log_probs = jax.nn.log_softmax(logits if logits.ndim == 2 else logits[0])
@@ -140,7 +139,7 @@ def eval_wikitext2(model, params, tokenizer, max_samples=500, max_len=256,
             encoder_out = p_encode(params, enc_s, src_mask_s)[0:1]
         else:
             encoder_out = model.apply(
-                {"params": single_params}, enc_input, src_mask=src_mask, deterministic=True, method="encode",
+                {"params": single_params}, enc_input, src_mask=src_mask, method="encode",
             )
 
         dec_in = [pad_id] + list(dec_tokens[:-1])
@@ -156,7 +155,7 @@ def eval_wikitext2(model, params, tokenizer, max_samples=500, max_len=256,
         else:
             logits = model.apply(
                 {"params": single_params}, dec_input, encoder_out,
-                self_mask=tgt_mask, cross_mask=src_mask, deterministic=True, method="decode",
+                self_mask=tgt_mask, cross_mask=src_mask, method="decode",
             )
 
         log_probs = jax.nn.log_softmax(logits[0] if logits.ndim == 3 else logits[0])
@@ -207,7 +206,7 @@ def eval_lambada(model, params, tokenizer, max_samples=500,
             encoder_out = p_encode(params, enc_s, src_mask_s)[0:1]
         else:
             encoder_out = model.apply(
-                {"params": single_params}, enc_input, src_mask=src_mask, deterministic=True, method="encode",
+                {"params": single_params}, enc_input, src_mask=src_mask, method="encode",
             )
 
         dec_in = jnp.array([[pad_id]])
@@ -222,7 +221,7 @@ def eval_lambada(model, params, tokenizer, max_samples=500,
         else:
             logits = model.apply(
                 {"params": single_params}, dec_in, encoder_out,
-                self_mask=tgt_mask, cross_mask=src_mask, deterministic=True, method="decode",
+                self_mask=tgt_mask, cross_mask=src_mask, method="decode",
             )
 
         predicted = int(jnp.argmax(logits[0, 0] if logits.ndim == 3 else logits[0, 0]))

@@ -39,7 +39,6 @@ class TransformerConfig:
     num_decoder_layers: int = 2
     d_ff: int = 512
     max_seq_len: int = 128
-    dropout_rate: float = 0.1
     pad_token_id: int = 0
     rope_theta: float = 10000.0
     dtype: str = "bfloat16"
@@ -76,11 +75,10 @@ class MultiHeadAttention(nn.Module):
     num_kv_heads: int
     d_model: int
     num_layers: int
-    dropout_rate: float = 0.1
     dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, q_input, kv_input, mask=None, rope=None, deterministic=True):
+    def __call__(self, q_input, kv_input, mask=None, rope=None):
         head_dim = self.d_model // self.num_heads
         kv_dim = self.num_kv_heads * head_dim
         B = q_input.shape[0]
@@ -114,7 +112,6 @@ class MultiHeadAttention(nn.Module):
             attn_weights = jnp.where(mask, attn_weights, jnp.finfo(attn_weights.dtype).min)
 
         attn_weights = nn.softmax(attn_weights, axis=-1)
-        attn_weights = nn.Dropout(rate=self.dropout_rate)(attn_weights, deterministic=deterministic)
 
         out = jnp.matmul(attn_weights, v)
         out = out.transpose(0, 2, 1, 3).reshape(B, -1, self.d_model)
@@ -125,12 +122,11 @@ class FeedForward(nn.Module):
     d_model: int
     d_ff: int
     num_layers: int
-    dropout_rate: float = 0.1
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
 
     @nn.compact
-    def __call__(self, x, deterministic=True):
+    def __call__(self, x):
         gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="gate_proj")(x)
         up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="up_proj")(x)
         if self.activation == "swiglu":
@@ -139,9 +135,7 @@ class FeedForward(nn.Module):
             x = nn.gelu(gate) * up
         else:  # drelu
             x = nn.relu(gate) * nn.relu(up)
-        x = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="down_proj")(x)
-        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
-        return x
+        return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="down_proj")(x)
 
 
 class EncoderBlock(nn.Module):
@@ -150,23 +144,21 @@ class EncoderBlock(nn.Module):
     d_model: int
     d_ff: int
     num_layers: int
-    dropout_rate: float = 0.1
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
 
     @nn.compact
-    def __call__(self, x, mask=None, rope=None, deterministic=True):
+    def __call__(self, x, mask=None, rope=None):
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dropout_rate, self.dtype)(
-            x, x, mask=mask, rope=rope, deterministic=deterministic
+        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype)(
+            x, x, mask=mask, rope=rope
         )
-        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
         x = x + residual
 
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dropout_rate, self.dtype, self.activation)(x, deterministic=deterministic)
+        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x)
         x = x + residual
 
         return x
@@ -178,33 +170,30 @@ class DecoderBlock(nn.Module):
     d_model: int
     d_ff: int
     num_layers: int
-    dropout_rate: float = 0.1
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
 
     @nn.compact
-    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, deterministic=True):
+    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None):
         # Self-attention with RoPE
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dropout_rate, self.dtype, name="self_attn")(
-            x, x, mask=self_mask, rope=rope, deterministic=deterministic
+        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
+            x, x, mask=self_mask, rope=rope
         )
-        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
         x = x + residual
 
         # Cross-attention (no RoPE)
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dropout_rate, self.dtype, name="cross_attn")(
-            x, encoder_out, mask=cross_mask, deterministic=deterministic
+        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="cross_attn")(
+            x, encoder_out, mask=cross_mask
         )
-        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
         x = x + residual
 
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dropout_rate, self.dtype, self.activation)(x, deterministic=deterministic)
+        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x)
         x = x + residual
 
         return x
@@ -214,16 +203,15 @@ class Encoder(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, x, mask=None, rope=None, deterministic=True):
+    def __call__(self, x, mask=None, rope=None):
         cfg = self.config
         dt = cfg.jax_dtype
         x = x.astype(dt)
-        x = nn.Dropout(rate=cfg.dropout_rate)(x, deterministic=deterministic)
 
         for i in range(cfg.num_encoder_layers):
             x = EncoderBlock(
-                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, cfg.dropout_rate, dt, cfg.activation, name=f"block_{i}"
-            )(x, mask=mask, rope=rope, deterministic=deterministic)
+                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
+            )(x, mask=mask, rope=rope)
 
         x = ZCRMSNorm(dtype=dt)(x)
         return x
@@ -233,16 +221,15 @@ class Decoder(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, deterministic=True):
+    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None):
         cfg = self.config
         dt = cfg.jax_dtype
         x = x.astype(dt)
-        x = nn.Dropout(rate=cfg.dropout_rate)(x, deterministic=deterministic)
 
         for i in range(cfg.num_decoder_layers):
             x = DecoderBlock(
-                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, cfg.dropout_rate, dt, cfg.activation, name=f"block_{i}"
-            )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, deterministic=deterministic)
+                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
+            )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope)
 
         x = ZCRMSNorm(dtype=dt)(x)
         return x
@@ -254,6 +241,7 @@ class EncoderDecoderTransformer(nn.Module):
 
     def setup(self):
         self.embedding = nn.Embed(self.config.vocab_size, self.config.d_model, embedding_init=jinit.normal(stddev=0.02))
+        self.embed_scale = math.sqrt(self.config.d_model)
         self.encoder = Encoder(self.config)
         self.decoder = Decoder(self.config)
 
@@ -261,24 +249,24 @@ class EncoderDecoderTransformer(nn.Module):
         head_dim = self.config.d_model // self.config.num_heads
         return precompute_rope_freqs(head_dim, seq_len, self.config.rope_theta)
 
-    def encode(self, src, src_mask=None, deterministic=True):
-        x = self.embedding(src)
+    def encode(self, src, src_mask=None):
+        x = self.embedding(src) * self.embed_scale
         rope = self._rope(src.shape[1])
-        return self.encoder(x, mask=src_mask, rope=rope, deterministic=deterministic)
+        return self.encoder(x, mask=src_mask, rope=rope)
 
-    def decode(self, tgt, encoder_out, self_mask=None, cross_mask=None, deterministic=True):
-        x = self.embedding(tgt)
+    def decode(self, tgt, encoder_out, self_mask=None, cross_mask=None):
+        x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
         x = self.decoder(
-            x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, deterministic=deterministic
+            x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope
         )
         logits = x.astype(jnp.float32) @ self.embedding.embedding.T
         return logits
 
-    def __call__(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, deterministic=True):
-        encoder_out = self.encode(src, src_mask=src_mask, deterministic=deterministic)
+    def __call__(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None):
+        encoder_out = self.encode(src, src_mask=src_mask)
         logits = self.decode(
-            tgt, encoder_out, self_mask=tgt_mask, cross_mask=cross_mask, deterministic=deterministic
+            tgt, encoder_out, self_mask=tgt_mask, cross_mask=cross_mask
         )
         return logits
 
