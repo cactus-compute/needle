@@ -116,6 +116,7 @@ def main():
 
     p = sub.add_parser("train", add_help=False)
     p.add_argument("--toy", action="store_true")
+    p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
@@ -133,12 +134,11 @@ def main():
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--max-eval-samples", type=int, default=None)
-    p.add_argument("--sparsity-ratio", type=float, default=0.33)
-    p.add_argument("--layer-prune-ratio", type=float, default=0.33)
+    p.add_argument("--sparsity-ratio", type=float, default=0.0)
+    p.add_argument("--layer-prune-ratio", type=float, default=0.0)
     p.add_argument("--group-size", type=int, default=32)
     p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu"])
     p.add_argument("--num-memory-slots", type=int, default=64)
-    p.add_argument("--ortho-weight", type=float, default=1e-4)
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)

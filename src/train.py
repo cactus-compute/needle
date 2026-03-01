@@ -282,29 +282,8 @@ def _quantize_params(params, group_size=32):
     return jax.tree_util.tree_map_with_path(_maybe_quantize, params)
 
 
-# Module-level config used by _train_step (set before pmap in train())
+# Module-level group_size used by _train_step (set before pmap in train())
 _GROUP_SIZE = 32
-_ORTHO_WEIGHT = 1e-4
-
-
-def _ortho_reg(params):
-    """Orthogonal regularization: avg ||WᵀW - I||²_F over 2D kernels."""
-    penalty = jnp.float32(0.0)
-    count = 0
-    for path, leaf in jax.tree_util.tree_leaves_with_path(params):
-        name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
-        if name == "kernel" and leaf.ndim == 2:
-            w = leaf.astype(jnp.float32)
-            m, n = w.shape
-            if m >= n:
-                gram = w.T @ w
-                eye = jnp.eye(n)
-            else:
-                gram = w @ w.T
-                eye = jnp.eye(m)
-            penalty = penalty + jnp.mean((gram - eye) ** 2)
-            count += 1
-    return penalty / max(count, 1)
 
 
 def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
@@ -330,8 +309,7 @@ def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
         mask = (tgt_out != pad_id).astype(jnp.float32)
         ce_loss = jnp.sum(loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
         z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
-        ortho_loss = _ORTHO_WEIGHT * _ortho_reg(params)
-        return ce_loss + z_loss + ortho_loss
+        return ce_loss + z_loss
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
@@ -401,22 +379,31 @@ def train(args):
     # Effective batch size must be divisible by num_devices
     effective_batch_size = args.batch_size * num_devices
 
-    config = TransformerConfig(
-        d_model=args.d_model,
-        num_heads=args.num_heads,
-        num_encoder_layers=args.num_layers,
-        num_decoder_layers=args.num_layers,
-        d_ff=args.d_model * 4,
-        max_seq_len=max(args.max_enc_len, args.max_dec_len),
-        dtype=args.dtype,
-        activation=getattr(args, "activation", "drelu"),
-        num_memory_slots=getattr(args, "num_memory_slots", 64),
-    )
+    # Load config from checkpoint or build from CLI args
+    resume_checkpoint = getattr(args, "checkpoint", None)
+    if resume_checkpoint:
+        print(f"Resuming from checkpoint: {resume_checkpoint}")
+        with open(resume_checkpoint, "rb") as f:
+            ckpt_data = pickle.load(f)
+        ckpt_params = jax.tree.map(jnp.array, ckpt_data["params"])
+        config = TransformerConfig(**ckpt_data["config"])
+        print(f"  Config: d={config.d_model}, heads={config.num_heads}, layers={config.num_encoder_layers}/{config.num_decoder_layers}")
+    else:
+        config = TransformerConfig(
+            d_model=args.d_model,
+            num_heads=args.num_heads,
+            num_encoder_layers=args.num_layers,
+            num_decoder_layers=args.num_layers,
+            d_ff=args.d_model * 4,
+            max_seq_len=max(args.max_enc_len, args.max_dec_len),
+            dtype=args.dtype,
+            activation=getattr(args, "activation", "drelu"),
+            num_memory_slots=getattr(args, "num_memory_slots", 64),
+        )
 
     # Set module-level config (captured by _train_step closure)
-    global _GROUP_SIZE, _ORTHO_WEIGHT
+    global _GROUP_SIZE
     _GROUP_SIZE = getattr(args, "group_size", 32)
-    _ORTHO_WEIGHT = getattr(args, "ortho_weight", 1e-4)
     p_train_step = _make_p_train_step()
 
     np.random.seed(args.seed)
@@ -431,6 +418,11 @@ def train(args):
     muon_lr = getattr(args, "muon_lr", 0.02) * math.sqrt(num_devices)
     state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps)
     val_loss_fn = _make_val_loss_fn(state.apply_fn)
+
+    # Override with checkpoint params if resuming
+    if resume_checkpoint:
+        state = state.replace(params=ckpt_params)
+        print(f"  Loaded checkpoint params into train state")
 
     ema_params = jax.tree.map(jnp.copy, state.params)
     state = jax_utils.replicate(state)
@@ -639,6 +631,20 @@ def train(args):
         with open(ckpt_path, "wb") as f:
             pickle.dump({"params": params_np, "config": config.__dict__}, f)
         print(f"Saved checkpoint: {ckpt_path}")
+
+        from .test import measure_throughput, benchmark_generation_quality
+        model = EncoderDecoderTransformer(config)
+
+        print(f"\n  Throughput:")
+        tp = measure_throughput(model, eval_params, tokenizer, num_runs=5)
+        print(f"    {tp['tokens_per_second']:.1f} tok/s, {tp['avg_latency_s']:.3f}s avg latency")
+
+        prompts = ["Once upon a time", "The little dog", "She was very happy because"]
+        print(f"  Generation samples:")
+        quality = benchmark_generation_quality(model, eval_params, tokenizer, prompts, max_gen_len=64, temperature=0.8)
+        print(f"    Avg length: {quality['avg_generation_length']:.1f} tok, repetition: {quality['bigram_repetition_rate']:.3f}")
+        for prompt, gen in quality["generations"]:
+            print(f"    [{prompt}] {gen[:100]}")
 
     if use_wandb:
         wandb.finish()
