@@ -290,11 +290,10 @@ def train(args):
 
         for src, tgt_in, tgt_out in pbar:
             rng, dropout_rng = jax.random.split(rng)
-            # Give each device a different dropout rng
             dropout_rngs = jax.random.split(dropout_rng, num_devices)
 
             t0 = time.perf_counter()
-            # Shard batch across devices: (num_devices, per_device_batch, seq_len)
+            
             state, ema_params, loss, grad_norm = p_train_step(
                 state,
                 ema_params,
@@ -304,7 +303,7 @@ def train(args):
                 causal_mask,
                 dropout_rngs,
             )
-            # loss/grad_norm are replicated across devices; take first
+            
             loss_val = float(loss[0])
             losses.append(loss_val)
             global_step += 1
@@ -345,15 +344,33 @@ def train(args):
                 "epoch": epoch + 1,
             })
 
-        # Checkpoint EMA params (smoother, better for eval)
         ckpt_name = f"needle_{args.num_layers}_{args.d_model}_{global_step}.pkl"
         ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
         params_np = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
+
         with open(ckpt_path, "wb") as f:
             pickle.dump({"params": params_np, "config": config.__dict__}, f)
         print(f"Saved checkpoint: {ckpt_path}")
 
+    final_params = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
+    total_params = sum(x.size for x in jax.tree.leaves(final_params))
+    near_zero = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(final_params))
+    sparsity = near_zero / total_params * 100
+
+    final_loss = losses[-1] if losses else float("nan")
+    final_ppl = math.exp(final_loss) if not math.isnan(final_loss) else float("nan")
+
+    print("\n" + "=" * 50)
+    print("TRAINING REPORT")
+    print("=" * 50)
+    print(f"  Final loss:       {final_loss:.4f}")
+    print(f"  Final perplexity: {final_ppl:.2f}")
+    print(f"  Val perplexity:   {last_val_ppl:.2f}" if last_val_ppl is not None else "  Val perplexity:   N/A")
+    print(f"  Weight sparsity:  {sparsity:.2f}% ({near_zero:,}/{total_params:,} near-zero)")
+    print("=" * 50)
+
     if use_wandb:
+        wandb.log({"final/loss": final_loss, "final/ppl": final_ppl, "final/weight_sparsity": sparsity})
         wandb.finish()
     print("Training complete.")
 
