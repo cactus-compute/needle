@@ -138,100 +138,48 @@ class FeedForward(nn.Module):
         return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="down_proj")(x)
 
 
-class MLPMixer(nn.Module):
-    """MLP-Mixer operating on fixed-size memory slots (B, M, d)."""
-    num_slots: int
-    d_model: int
-    d_ff: int
-    dtype: jnp.dtype = jnp.bfloat16
-    activation: str = "drelu"
-
-    @nn.compact
-    def __call__(self, s):
-        residual = s
-        s = ZCRMSNorm(dtype=self.dtype, name="token_mix_norm")(s)
-        s = s.transpose(0, 2, 1)
-        gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="token_mix_gate")(s)
-        up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="token_mix_up")(s)
-        if self.activation == "swiglu":
-            s = nn.silu(gate) * up
-        elif self.activation == "geglu":
-            s = nn.gelu(gate) * up
-        else:
-            s = nn.relu(gate) * nn.relu(up)
-        s = nn.Dense(self.num_slots, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="token_mix_down")(s)
-        s = s.transpose(0, 2, 1)
-        s = s + residual
-
-        residual = s
-        s = ZCRMSNorm(dtype=self.dtype, name="channel_mix_norm")(s)
-        gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="channel_mix_gate")(s)
-        up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="channel_mix_up")(s)
-        if self.activation == "swiglu":
-            s = nn.silu(gate) * up
-        elif self.activation == "geglu":
-            s = nn.gelu(gate) * up
-        else:
-            s = nn.relu(gate) * nn.relu(up)
-        s = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="channel_mix_down")(s)
-        s = s + residual
-
-        return s
-
-
-class MemoryMixerBlock(nn.Module):
-    """Block 4a: Pack (cross-attn) → Mix (MLP-Mixer) → Local Update (MLP)."""
+class EncoderBlock(nn.Module):
     num_heads: int
     num_kv_heads: int
     d_model: int
     d_ff: int
-    num_slots: int
     num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
 
     @nn.compact
-    def __call__(self, x, s, mask=None):
-        s_norm = ZCRMSNorm(dtype=self.dtype, name="pack_s_norm")(s)
-        x_norm = ZCRMSNorm(dtype=self.dtype, name="pack_x_norm")(x)
-        s = s + MultiHeadAttention(
-            self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="pack_attn"
-        )(s_norm, x_norm, mask=mask)
-
-        s = s + MLPMixer(self.num_slots, self.d_model, self.d_ff, self.dtype, self.activation, name="mixer")(
-            ZCRMSNorm(dtype=self.dtype, name="mix_norm")(s)
-        )
-
+    def __call__(self, x, mask=None, rope=None):
         residual = x
-        x = ZCRMSNorm(dtype=self.dtype, name="local_norm")(x)
-        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation, name="local_ffn")(x)
+        x = ZCRMSNorm(dtype=self.dtype)(x)
+        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype)(
+            x, x, mask=mask, rope=rope
+        )
         x = x + residual
 
-        return x, s
+        residual = x
+        x = ZCRMSNorm(dtype=self.dtype)(x)
+        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x)
+        x = x + residual
+
+        return x
 
 
-class MemoryMixerEncoder(nn.Module):
-    """Encoder using MemoryMixer blocks. Output is the final memory slots S."""
+class Encoder(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, x, mask=None):
+    def __call__(self, x, mask=None, rope=None):
         cfg = self.config
         dt = cfg.jax_dtype
         x = x.astype(dt)
 
-        s = self.param("memory_slots", jinit.normal(stddev=0.02), (1, cfg.num_memory_slots, cfg.d_model))
-        s = jnp.broadcast_to(s.astype(dt), (x.shape[0], cfg.num_memory_slots, cfg.d_model))
-
         for i in range(cfg.num_encoder_layers):
-            x, s = MemoryMixerBlock(
-                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
-                cfg.num_memory_slots, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
-            )(x, s, mask=mask)
+            x = EncoderBlock(
+                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
+            )(x, mask=mask, rope=rope)
 
-        s = ZCRMSNorm(dtype=dt, name="final_norm")(s)
-        return s
-
+        x = ZCRMSNorm(dtype=dt)(x)
+        return x
 
 
 class DecoderBlock(nn.Module):
@@ -293,7 +241,7 @@ class EncoderDecoderTransformer(nn.Module):
     def setup(self):
         self.embedding = nn.Embed(self.config.vocab_size, self.config.d_model, embedding_init=jinit.normal(stddev=0.02))
         self.embed_scale = math.sqrt(self.config.d_model)
-        self.encoder = MemoryMixerEncoder(self.config)
+        self.encoder = Encoder(self.config)
         self.decoder = Decoder(self.config)
 
     def _rope(self, seq_len):
@@ -302,13 +250,14 @@ class EncoderDecoderTransformer(nn.Module):
 
     def encode(self, src, src_mask=None):
         x = self.embedding(src) * self.embed_scale
-        return self.encoder(x, mask=src_mask)
+        rope = self._rope(src.shape[1])
+        return self.encoder(x, mask=src_mask, rope=rope)
 
     def decode(self, tgt, encoder_out, self_mask=None, cross_mask=None):
         x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
         x = self.decoder(
-            x, encoder_out, self_mask=self_mask, cross_mask=None, rope=rope
+            x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope
         )
         logits = x.astype(jnp.float32) @ self.embedding.embedding.T
         return logits
@@ -316,7 +265,7 @@ class EncoderDecoderTransformer(nn.Module):
     def __call__(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None):
         encoder_out = self.encode(src, src_mask=src_mask)
         logits = self.decode(
-            tgt, encoder_out, self_mask=tgt_mask
+            tgt, encoder_out, self_mask=tgt_mask, cross_mask=cross_mask
         )
         return logits
 
