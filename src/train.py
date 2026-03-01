@@ -282,8 +282,29 @@ def _quantize_params(params, group_size=32):
     return jax.tree_util.tree_map_with_path(_maybe_quantize, params)
 
 
-# Module-level group_size used by _train_step (set before pmap in train())
+# Module-level config used by _train_step (set before pmap in train())
 _GROUP_SIZE = 32
+_ORTHO_WEIGHT = 1e-4
+
+
+def _ortho_reg(params):
+    """Orthogonal regularization: avg ||WᵀW - I||²_F over 2D kernels."""
+    penalty = jnp.float32(0.0)
+    count = 0
+    for path, leaf in jax.tree_util.tree_leaves_with_path(params):
+        name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
+        if name == "kernel" and leaf.ndim == 2:
+            w = leaf.astype(jnp.float32)
+            m, n = w.shape
+            if m >= n:
+                gram = w.T @ w
+                eye = jnp.eye(n)
+            else:
+                gram = w @ w.T
+                eye = jnp.eye(m)
+            penalty = penalty + jnp.mean((gram - eye) ** 2)
+            count += 1
+    return penalty / max(count, 1)
 
 
 def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
@@ -309,7 +330,8 @@ def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
         mask = (tgt_out != pad_id).astype(jnp.float32)
         ce_loss = jnp.sum(loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
         z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
-        return ce_loss + z_loss
+        ortho_loss = _ORTHO_WEIGHT * _ortho_reg(params)
+        return ce_loss + z_loss + ortho_loss
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
@@ -391,9 +413,10 @@ def train(args):
         num_memory_slots=getattr(args, "num_memory_slots", 64),
     )
 
-    # Set group size for QAT and sparsification (captured by _train_step closure)
-    global _GROUP_SIZE
+    # Set module-level config (captured by _train_step closure)
+    global _GROUP_SIZE, _ORTHO_WEIGHT
     _GROUP_SIZE = getattr(args, "group_size", 32)
+    _ORTHO_WEIGHT = getattr(args, "ortho_weight", 1e-4)
     p_train_step = _make_p_train_step()
 
     np.random.seed(args.seed)
