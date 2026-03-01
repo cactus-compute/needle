@@ -204,14 +204,87 @@ def _block_prune_params(params, prune_ratio=0.25, group_size=32):
     return jax.tree_util.tree_map_with_path(_prune_weight, params)
 
 
-def _quantize_params(params):
+def _layer_prune(params, config, layer_prune_ratio=0.25):
+    """Remove the lowest-scoring encoder/decoder blocks by L1 magnitude.
+
+    Returns (new_params, new_config) with surviving blocks renumbered.
+    """
+    from flax.core import unfreeze
+    p = unfreeze(params)
+
+    def _score_blocks(module_params, prefix):
+        scores = {}
+        for key, val in module_params.items():
+            if key.startswith("block_"):
+                s = sum(float(np.sum(np.abs(np.array(l)))) for l in jax.tree.leaves(val))
+                scores[key] = s
+        return scores
+
+    enc_scores = _score_blocks(p["encoder"], "encoder")
+    dec_scores = _score_blocks(p["decoder"], "decoder")
+
+    # Pool all block scores, find global threshold
+    all_scores = list(enc_scores.values()) + list(dec_scores.values())
+    if not all_scores:
+        return params, config
+
+    # Keep at least 1 encoder and 1 decoder block
+    num_enc = len(enc_scores)
+    num_dec = len(dec_scores)
+    total_to_remove = max(0, int(len(all_scores) * layer_prune_ratio))
+
+    # Score and rank all blocks together
+    tagged = [(s, "encoder", k) for k, s in enc_scores.items()] + \
+             [(s, "decoder", k) for k, s in dec_scores.items()]
+    tagged.sort(key=lambda x: x[0])
+
+    remove_enc = set()
+    remove_dec = set()
+    for score, module, key in tagged:
+        if len(remove_enc) + len(remove_dec) >= total_to_remove:
+            break
+        if module == "encoder" and (num_enc - len(remove_enc)) > 1:
+            remove_enc.add(key)
+        elif module == "decoder" and (num_dec - len(remove_dec)) > 1:
+            remove_dec.add(key)
+
+    # Rebuild with surviving blocks renumbered
+    def _keep_and_renumber(module_params, remove_set):
+        surviving = [(k, v) for k, v in sorted(module_params.items()) if k.startswith("block_") and k not in remove_set]
+        non_blocks = {k: v for k, v in module_params.items() if not k.startswith("block_")}
+        new = dict(non_blocks)
+        for i, (_, v) in enumerate(surviving):
+            new[f"block_{i}"] = v
+        return new
+
+    p["encoder"] = _keep_and_renumber(p["encoder"], remove_enc)
+    p["decoder"] = _keep_and_renumber(p["decoder"], remove_dec)
+
+    new_num_enc = num_enc - len(remove_enc)
+    new_num_dec = num_dec - len(remove_dec)
+    print(f"  Encoder: {num_enc} -> {new_num_enc} blocks (removed {len(remove_enc)})")
+    print(f"  Decoder: {num_dec} -> {new_num_dec} blocks (removed {len(remove_dec)})")
+
+    from dataclasses import replace as dc_replace
+    new_config = dc_replace(config,
+                            num_encoder_layers=new_num_enc,
+                            num_decoder_layers=new_num_dec)
+
+    return p, new_config
+
+
+def _quantize_params(params, group_size=32):
     """Fake-quantize all Dense kernels in the param tree."""
     def _maybe_quantize(path, leaf):
         name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
         if name == "kernel":
-            return _fake_quantize_int4(leaf)
+            return _fake_quantize_int4(leaf, group_size=group_size)
         return leaf
     return jax.tree_util.tree_map_with_path(_maybe_quantize, params)
+
+
+# Module-level group_size used by _train_step (set before pmap in train())
+_GROUP_SIZE = 32
 
 
 def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask, dropout_rng):
@@ -224,7 +297,7 @@ def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask, dropout_rn
         cross_mask = src_mask
 
         logits = state.apply_fn(
-            {"params": _quantize_params(params)},
+            {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
             src,
             tgt_in,
             src_mask=src_mask,
@@ -250,7 +323,8 @@ def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask, dropout_rn
     return state, ema_params, loss, grad_norm
 
 
-p_train_step = jax.pmap(_train_step, axis_name="batch", donate_argnums=(0, 1))
+def _make_p_train_step():
+    return jax.pmap(_train_step, axis_name="batch", donate_argnums=(0, 1))
 
 
 def _make_val_loss_fn(apply_fn):
@@ -320,6 +394,11 @@ def train(args):
         dtype=args.dtype,
     )
 
+    # Set group size for QAT and sparsification (captured by _train_step closure)
+    global _GROUP_SIZE
+    _GROUP_SIZE = getattr(args, "group_size", 32)
+    p_train_step = _make_p_train_step()
+
     np.random.seed(args.seed)
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
@@ -361,21 +440,28 @@ def train(args):
     dec_targets = jnp.array(dec_targets)
 
     last_val_ppl = None
-    prune_ratio = getattr(args, "prune_ratio", 0.0)
+    sparsity_ratio = getattr(args, "sparsity_ratio", 0.0)
+    layer_prune_ratio = getattr(args, "layer_prune_ratio", 0.0)
     prune_mask = None
 
+    # Determine which epoch each pruning type fires on:
+    #   both flags:              group sparsify @ epoch 1, layer prune @ epoch 2
+    #   only --sparsity-ratio:   group sparsify @ epoch 1
+    #   only --layer-prune:      layer prune    @ epoch 1
+    weight_prune_epoch = 1 if sparsity_ratio > 0 else -1
+    layer_prune_epoch = (2 if sparsity_ratio > 0 else 1) if layer_prune_ratio > 0 else -1
+
     for epoch in range(args.epochs):
-        # After first epoch, prune and lock the mask for remaining epochs
-        if epoch == 1 and prune_ratio > 0 and prune_mask is None:
-            print(f"\nPruning {prune_ratio*100:.0f}% of weight blocks (group_size=32)...")
-            pruned_params = _block_prune_params(jax_utils.unreplicate(ema_params), prune_ratio=prune_ratio)
+        # --- Weight block pruning ---
+        if epoch == weight_prune_epoch and prune_mask is None:
+            print(f"\nGroup-wise sparsification: {sparsity_ratio*100:.0f}% of blocks (group_size={_GROUP_SIZE})...")
+            pruned_params = _block_prune_params(jax_utils.unreplicate(ema_params), prune_ratio=sparsity_ratio, group_size=_GROUP_SIZE)
 
             pruned_np = jax.tree.map(np.array, pruned_params)
             total_p = sum(x.size for x in jax.tree.leaves(pruned_np))
             zero_p = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(pruned_np))
             print(f"  Post-prune sparsity: {zero_p/total_p*100:.2f}% ({zero_p:,}/{total_p:,} near-zero)")
 
-            # Eval val perplexity after pruning
             val_causal = make_causal_mask(args.max_dec_len)
             total_loss, total_toks = 0.0, 0.0
             for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
@@ -385,7 +471,6 @@ def train(args):
             prune_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
             print(f"  Post-prune val ppl:  {prune_val_ppl:.2f} (was {last_val_ppl:.2f})" if last_val_ppl is not None else f"  Post-prune val ppl:  {prune_val_ppl:.2f}")
 
-            # Inject pruned params and build frozen mask
             state = jax_utils.unreplicate(state)
             state = state.replace(params=pruned_params)
             ema_params = jax.tree.map(jnp.copy, pruned_params)
@@ -393,7 +478,43 @@ def train(args):
             prune_mask = jax_utils.replicate(prune_mask)
             state = jax_utils.replicate(state)
             ema_params = jax_utils.replicate(ema_params)
-            print(f"Continuing training with pruning mask locked...\n")
+            print(f"Continuing training with sparsity mask locked...\n")
+
+        # --- Layer pruning ---
+        if epoch == layer_prune_epoch:
+            print(f"\nLayer pruning: removing {layer_prune_ratio*100:.0f}% of layers...")
+            current_params = jax_utils.unreplicate(ema_params)
+            new_params, config = _layer_prune(current_params, config, layer_prune_ratio=layer_prune_ratio)
+
+            # Rebuild train state with new config/model so tree types are consistent
+            rng, reinit_rng = jax.random.split(rng)
+            state = create_train_state(reinit_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps)
+            matched_params = jax.tree.map(lambda init_leaf, prune_leaf: prune_leaf, state.params, new_params)
+            state = state.replace(params=matched_params)
+            ema_params = jax.tree.map(jnp.copy, matched_params)
+
+            param_count = sum(x.size for x in jax.tree.leaves(matched_params))
+            print(f"  Parameters: {param_count:,}")
+
+            # Eval val perplexity after layer pruning
+            val_loss_fn = _make_val_loss_fn(state.apply_fn)
+            val_causal = make_causal_mask(args.max_dec_len)
+            total_loss, total_toks = 0.0, 0.0
+            for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
+                vl, vt = val_loss_fn(matched_params, vb[0], vb[1], vb[2], val_causal)
+                total_loss += float(vl)
+                total_toks += float(vt)
+            layer_prune_ppl = float(math.exp(total_loss / max(total_toks, 1)))
+            print(f"  Post-layer-prune val ppl: {layer_prune_ppl:.2f} (was {last_val_ppl:.2f})" if last_val_ppl is not None else f"  Post-layer-prune val ppl: {layer_prune_ppl:.2f}")
+
+            # Rebuild prune mask if weight pruning was already applied
+            if prune_mask is not None:
+                prune_mask = jax.tree.map(lambda w: (jnp.abs(w) > 1e-8).astype(jnp.float32), matched_params)
+                prune_mask = jax_utils.replicate(prune_mask)
+
+            state = jax_utils.replicate(state)
+            ema_params = jax_utils.replicate(ema_params)
+            print(f"Continuing training with {config.num_encoder_layers}+{config.num_decoder_layers} layers...\n")
 
         losses = []
         batches = get_batches(enc_inputs, dec_inputs, dec_targets, effective_batch_size)

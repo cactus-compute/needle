@@ -1,0 +1,388 @@
+================================================================================
+STRUCTURED COMPRESSION OF SMALL ENCODER-DECODER TRANSFORMERS:
+JOINT GROUP-WISE SPARSIFICATION AND LAYER PRUNING
+================================================================================
+Target venue: ICML 2026
+
+Thesis: Structured compression (group-aligned block sparsity + layer removal)
+applied in a staged schedule during training yields Pareto-optimal accuracy-
+efficiency tradeoffs for small encoder-decoder models, matching or exceeding
+post-hoc pruning at equivalent FLOPs reduction while preserving INT4
+quantization compatibility.
+
+================================================================================
+SECTION 1 — EXPERIMENTAL AXES
+================================================================================
+
+Independent variables:
+  A. Sparsity ratio s        ∈ {0.0, 0.10, 0.25, 0.40, 0.50}
+  B. Layer prune ratio l     ∈ {0.0, 0.125, 0.25, 0.375, 0.50}
+  C. Group size g            ∈ {16, 32, 64, 128}
+  D. Pruning schedule        ∈ {staged, simultaneous, reverse-order}
+  E. Model scale             ∈ {BASE-256, LARGE-512}
+  F. QAT                     ∈ {off, int4-group32}
+
+Dependent variables (measured):
+  - Validation perplexity (TinyStories)
+  - WikiText-2 perplexity
+  - LAMBADA accuracy
+  - HellaSwag accuracy
+  - ARC-Easy accuracy
+  - Throughput (tokens/sec on inference)
+  - Bigram repetition rate (generation diversity)
+  - Parameter count (absolute and % of dense baseline)
+  - Effective FLOPs (params * density)
+  - Weight sparsity (% near-zero, measured at threshold < 1e-6)
+
+================================================================================
+SECTION 2 — MODEL CONFIGURATIONS
+================================================================================
+
+BASE-256 (25.4M params, default):
+  d_model=256, num_heads=4, num_kv_heads=2, num_layers=4,
+  d_ff=1024, max_seq_len=256, vocab=65536, dtype=bfloat16
+
+LARGE-512 (≈100M params, scaling study):
+  d_model=512, num_heads=8, num_kv_heads=4, num_layers=8,
+  d_ff=2048, max_seq_len=256, vocab=65536, dtype=bfloat16
+
+Both trained on TinyStories (500K samples, encoder-decoder split at 30%).
+Optimizer: Muon (kernels) + AdamW (embeddings/norms), WSD schedule.
+
+================================================================================
+SECTION 3 — EXPERIMENT GROUPS
+================================================================================
+
+All experiments use 3 seeds (42, 137, 256) for statistical significance.
+Report mean ± std on all metrics.
+
+-------------------------------------------------------------------------------
+GROUP 1: Dense Baselines (Table 1)
+-------------------------------------------------------------------------------
+Purpose: Establish upper-bound quality for each model scale.
+
+  1a. BASE-256, 3 epochs, no pruning, no QAT
+      needle train --epochs 3 --seed {42,137,256}
+
+  1b. BASE-256, 3 epochs, no pruning, with QAT (int4-group32)
+      [QAT is always on in current code — this IS the baseline]
+
+  1c. LARGE-512, 3 epochs, no pruning
+      needle train --epochs 3 --d-model 512 --num-heads 8 --num-layers 8 \
+        --max-enc-len 256 --max-dec-len 256 --seed {42,137,256}
+
+Deliverables:
+  - Val perplexity, benchmark scores, throughput, generation samples
+  - These are the denominators for all relative comparisons
+
+-------------------------------------------------------------------------------
+GROUP 2: Group-Wise Sparsification Only (Table 2, Figure 1)
+-------------------------------------------------------------------------------
+Purpose: Characterise accuracy-sparsity Pareto frontier for block pruning alone.
+Schedule: Epoch 1 dense, epochs 2-3 with sparsity mask locked.
+
+  For s in {0.10, 0.25, 0.40, 0.50}:
+    2a. BASE-256, 3 epochs, --sparsity-ratio s
+        needle train --epochs 3 --sparsity-ratio {s} --seed {42,137,256}
+
+  For s in {0.10, 0.25, 0.40, 0.50}:
+    2b. LARGE-512, 3 epochs, --sparsity-ratio s
+        needle train --epochs 3 --d-model 512 --num-heads 8 --num-layers 8 \
+          --sparsity-ratio {s} --seed {42,137,256}
+
+Deliverables:
+  - Pareto curve: sparsity % vs val perplexity (Figure 1a)
+  - Pareto curve: sparsity % vs LAMBADA accuracy (Figure 1b)
+  - Table: all metrics at each sparsity level
+  - Analysis: at what sparsity does quality degrade >5% relative to baseline?
+
+-------------------------------------------------------------------------------
+GROUP 3: Layer Pruning Only (Table 3, Figure 2)
+-------------------------------------------------------------------------------
+Purpose: Characterise accuracy-compression frontier for layer removal alone.
+Schedule: Epoch 1 dense, epochs 2-3 with reduced architecture.
+
+  For l in {0.125, 0.25, 0.375, 0.50}:
+    3a. BASE-256 (4+4 layers), 3 epochs, --layer-prune-ratio l
+        needle train --epochs 3 --layer-prune-ratio {l} --seed {42,137,256}
+        Expected surviving layers: 7, 6, 5, 4 (of 8 total)
+
+  For l in {0.125, 0.25, 0.375, 0.50}:
+    3b. LARGE-512 (8+8 layers), 3 epochs, --layer-prune-ratio l
+        needle train --epochs 3 --d-model 512 --num-heads 8 --num-layers 8 \
+          --layer-prune-ratio {l} --seed {42,137,256}
+        Expected surviving layers: 14, 12, 10, 8 (of 16 total)
+
+Deliverables:
+  - Pareto curve: layer ratio vs val perplexity (Figure 2a)
+  - Pareto curve: parameter count vs LAMBADA accuracy (Figure 2b)
+  - Table: per-run encoder/decoder surviving layer counts
+  - Analysis: does the pruner prefer removing encoder or decoder layers?
+    (Hypothesis: encoder layers are pruned more aggressively since the
+     decoder carries more of the generation burden.)
+
+-------------------------------------------------------------------------------
+GROUP 4: Joint Sparsification + Layer Pruning (Table 4, Figure 3)
+        *** CORE CONTRIBUTION ***
+-------------------------------------------------------------------------------
+Purpose: Show that combining both methods outperforms either alone at matched
+compression ratio. This is the central claim of the paper.
+
+Schedule (staged):
+  Epoch 1: dense training
+  Epoch 2: apply group-wise sparsification, train with mask
+  Epoch 3: apply layer pruning, train with reduced architecture + mask
+  Epoch 4: recovery fine-tuning
+
+  For (s, l) in grid:
+    {(0.10, 0.125), (0.10, 0.25),
+     (0.25, 0.125), (0.25, 0.25), (0.25, 0.375),
+     (0.40, 0.125), (0.40, 0.25),
+     (0.50, 0.25),  (0.50, 0.50)}
+
+  4a. BASE-256, 4 epochs
+      needle train --epochs 4 --sparsity-ratio {s} --layer-prune-ratio {l} \
+        --seed {42,137,256}
+
+  4b. LARGE-512, select best 4 (s,l) pairs from 4a, 4 epochs
+      needle train --epochs 4 --d-model 512 --num-heads 8 --num-layers 8 \
+        --sparsity-ratio {s} --layer-prune-ratio {l} --seed {42,137,256}
+
+Deliverables:
+  - 2D heatmap: (s, l) → val perplexity (Figure 3a)
+  - 2D heatmap: (s, l) → effective parameter count (Figure 3b)
+  - Pareto overlay: joint vs sparsity-only vs layer-only at matched
+    compression (Figure 3c) — THIS IS THE KEY FIGURE
+  - Table: full metrics for all (s, l) pairs
+  - Analysis: multiplicative vs additive compression benefit
+
+-------------------------------------------------------------------------------
+GROUP 5: Schedule Ablation (Table 5)
+-------------------------------------------------------------------------------
+Purpose: Justify the staged schedule (sparsify first, then prune layers).
+
+Pick the best (s, l) pair from Group 4a. Run 3 schedules:
+
+  5a. Staged (default): sparsify epoch 2, layer prune epoch 3, recover epoch 4
+      needle train --epochs 4 --sparsity-ratio {s} --layer-prune-ratio {l}
+
+  5b. Reverse: layer prune epoch 2, sparsify epoch 3, recover epoch 4
+      [Requires code change to swap epoch triggers]
+
+  5c. Simultaneous: both at epoch 2, recover epochs 3-4
+      [Requires code change to apply both at same epoch]
+
+Deliverables:
+  - Table: val perplexity and benchmark scores for each schedule
+  - Analysis: why staged order matters (hypothesis: sparsification is
+    lower-risk, lets model adapt before the more destructive layer removal)
+
+-------------------------------------------------------------------------------
+GROUP 6: Recovery Epoch Scaling (Figure 4)
+-------------------------------------------------------------------------------
+Purpose: How many recovery epochs are needed after compression?
+
+Pick the best (s, l) pair from Group 4a. Vary total epochs:
+
+  For E in {2, 3, 4, 5, 6}:
+    6a. BASE-256, E epochs, --sparsity-ratio {s} --layer-prune-ratio {l}
+        (pruning always at epochs 2 and 3; recovery = E - 3 epochs)
+
+Deliverables:
+  - Line plot: recovery epochs vs val perplexity (Figure 4)
+  - Analysis: diminishing returns curve, recommend minimum recovery budget
+
+-------------------------------------------------------------------------------
+GROUP 7: QAT Interaction Study (Table 6)
+-------------------------------------------------------------------------------
+Purpose: Show that group-wise sparsification is compatible with INT4 QAT
+because both operate on the same group_size=32 granularity.
+
+  7a. Dense + QAT (baseline, = Group 1b)
+  7b. Sparsified (s=0.25) + QAT
+  7c. Layer-pruned (l=0.25) + QAT
+  7d. Joint (s=0.25, l=0.25) + QAT
+
+  For comparison, also run 7b-7d WITHOUT QAT by modifying _train_step
+  to not call _quantize_params.
+
+Deliverables:
+  - Table: QAT on vs off for each compression method
+  - Analysis: does QAT hurt more when combined with sparsification?
+    (Hypothesis: no, because zeroed groups have no quantization error)
+  - Effective compression ratio: sparsity + INT4 → bits per parameter
+
+-------------------------------------------------------------------------------
+GROUP 8: Group Size Ablation (Table 7, Figure 6)
+-------------------------------------------------------------------------------
+Purpose: Determine optimal granularity for block sparsification. Smaller groups
+give finer-grained pruning decisions (better accuracy retention) but produce
+less structured sparsity (harder to exploit in hardware). Larger groups are
+more hardware-friendly but coarser. The group size also controls QAT
+quantization granularity, so this directly tests the sparsity-quantization
+co-design hypothesis.
+
+Note: requires adding --group-size CLI flag and threading it through to
+_block_prune_params and _fake_quantize_int4.
+
+Fixed configuration: BASE-256, s=0.25, 3 epochs, QAT on.
+
+  For g in {16, 32, 64, 128}:
+    8a. Sparsification only (isolate group size effect on pruning)
+        needle train --epochs 3 --sparsity-ratio 0.25 --group-size {g} \
+          --seed {42,137,256}
+
+    8b. Joint sparsification + layer pruning (best l from Group 4a)
+        needle train --epochs 4 --sparsity-ratio 0.25 --layer-prune-ratio {l} \
+          --group-size {g} --seed {42,137,256}
+
+Additional comparison at high sparsity to stress-test granularity:
+
+  For g in {16, 32, 64, 128}:
+    8c. s=0.50, sparsification only
+        needle train --epochs 3 --sparsity-ratio 0.50 --group-size {g} \
+          --seed {42,137,256}
+
+Deliverables:
+  - Line plot: group size vs val perplexity at s=0.25 and s=0.50 (Figure 6a)
+  - Line plot: group size vs LAMBADA accuracy (Figure 6b)
+  - Table: all metrics at each group size for both sparsity levels
+  - Analysis of key tradeoffs:
+    (a) g=16: finest granularity, best accuracy, but 2× more scale factors
+        to store than g=32 and least structured pattern
+    (b) g=32: default, matches common INT4 quantization group size,
+        good balance of accuracy and structure
+    (c) g=64: coarser, each pruning decision covers 64 weights,
+        more aggressive but more hardware-friendly
+    (d) g=128: coarsest, each block is a full row for d_model=128,
+        approaches per-channel granularity, may degrade significantly
+  - Cross-reference with QAT: when group_size is shared between sparsification
+    and quantization, zeroed groups save both weight storage AND scale storage
+    (no scale needed for an all-zero group). Report effective bits-per-param
+    accounting for this: bpp = (1 - sparsity) × (4 + 32/g) where 4 is INT4
+    bits and 32/g is amortized scale overhead per weight.
+
+-------------------------------------------------------------------------------
+GROUP 9: Inference Efficiency Validation (Table 8, Figure 7)
+-------------------------------------------------------------------------------
+Purpose: Translate theoretical compression into real speedup.
+
+For each Pareto-optimal checkpoint from Groups 2-4:
+  needle test --checkpoint {path} --throughput-runs 50
+
+Measure:
+  - Tokens/sec (decode throughput)
+  - Latency per generation (ms)
+  - Peak memory (via JAX profiler)
+
+Deliverables:
+  - Scatter plot: compression ratio vs actual speedup (Figure 5)
+  - Table: all Pareto-optimal models with throughput + quality
+  - Analysis: does structured sparsity translate to real speedup?
+    (Note: dense JAX matmuls don't skip zeros — speedup comes from
+     layer removal. Sparsity benefit is in model size / memory only
+     until sparse kernel support is added.)
+
+================================================================================
+SECTION 4 — EVALUATION PROTOCOL
+================================================================================
+
+For every checkpoint:
+
+  1. Validation perplexity (TinyStories val split, full)
+     needle test --checkpoint {path} --max-eval-samples 5000
+
+  2. Benchmark suite
+     needle evaluate --checkpoint {path} \
+       --benchmarks wikitext2 lambada hellaswag arc_easy --max-samples 500
+
+  3. Generation quality (qualitative + bigram diversity)
+     needle test --checkpoint {path}
+     → Inspect 10 sample generations, report bigram repetition rate
+
+  4. Throughput measurement
+     needle test --checkpoint {path} --throughput-runs 50
+
+================================================================================
+SECTION 5 — EXPECTED TABLES AND FIGURES
+================================================================================
+
+Tables:
+  T1. Dense baselines (2 scales × {with,without} QAT)
+  T2. Group-wise sparsification sweep (2 scales × 4 ratios)
+  T3. Layer pruning sweep (2 scales × 4 ratios)
+  T4. Joint compression grid (9 pairs × 2 scales)
+  T5. Schedule ablation (3 schedules)
+  T6. QAT interaction (4 methods × {on,off})
+  T7. Group size ablation (4 sizes × 2 sparsity levels + joint)
+  T8. Inference efficiency (Pareto-optimal checkpoints)
+
+Figures:
+  F1. Sparsity-only Pareto: sparsity % vs perplexity + LAMBADA
+  F2. Layer-prune-only Pareto: param count vs perplexity + LAMBADA
+  F3. Joint compression: (a) heatmap, (b) param heatmap, (c) Pareto overlay
+  F4. Recovery epoch scaling curve
+  F5. Compression ratio vs actual inference speedup
+  F6. Group size: (a) g vs perplexity at s=0.25/0.50, (b) g vs LAMBADA
+  F7. Effective bits-per-param vs quality across group sizes
+
+================================================================================
+SECTION 6 — COMPUTE BUDGET
+================================================================================
+
+Per-run cost (BASE-256, 4 epochs, 500K samples, 4× TPU v5 lite):
+  ~10 minutes training + ~2 minutes evaluation
+
+Estimated total runs:
+  Group 1:  2 configs × 3 seeds                           =   6 runs
+  Group 2:  4 ratios × 2 scales × 3 seeds                 =  24 runs
+  Group 3:  4 ratios × 2 scales × 3 seeds                 =  24 runs
+  Group 4:  9 pairs × 3 seeds + 4 pairs × 3 seeds (large) =  39 runs
+  Group 5:  3 schedules × 3 seeds                          =   9 runs
+  Group 6:  5 epoch counts × 3 seeds                       =  15 runs
+  Group 7:  4 methods × 2 (QAT on/off) × 3 seeds          =  24 runs
+  Group 8:  4 sizes × 3 configs (s=.25, s=.50, joint) × 3 =  36 runs
+  Group 9:  evaluation only (reuses checkpoints)            =   0 runs
+  ─────────────────────────────────────────────────────────────────────
+  Total:                                                     177 runs
+
+At ~12 min/run: ~35 TPU-hours (very manageable on v5litepod-4)
+
+================================================================================
+SECTION 7 — ABLATION CHECKLIST
+================================================================================
+
+Before submission, verify these are addressed:
+
+  [ ] Statistical significance: 3 seeds, report mean ± std
+  [ ] Matched comparisons: compare joint vs individual at SAME compression
+  [ ] Scaling behavior: BASE-256 and LARGE-512 show consistent trends
+  [ ] Schedule sensitivity: staged vs reverse vs simultaneous
+  [ ] Recovery saturation: diminishing returns on fine-tuning epochs
+  [ ] QAT compatibility: sparsity + quantization are not antagonistic
+  [ ] Pruning bias: report which layers (enc vs dec) get pruned
+  [ ] Generation quality: not just perplexity, show actual text samples
+  [ ] Group size sensitivity: optimal g, and does it interact with model scale?
+  [ ] Honest limitations: sparse matmuls don't accelerate on current JAX
+
+================================================================================
+SECTION 8 — EXECUTION ORDER
+================================================================================
+
+Phase 1 (Day 1): Groups 1 + 2 + 3  (54 runs, ~11 hrs)
+  Run all baselines and single-method sweeps in parallel across seeds.
+  Immediate deliverable: Pareto curves for each method alone.
+
+Phase 2 (Day 2): Group 4 (39 runs, ~8 hrs)
+  Joint compression grid. This produces the key result.
+  Immediate deliverable: heatmaps and overlay Pareto.
+
+Phase 3 (Day 3): Groups 5 + 6 + 7 + 8 (84 runs, ~17 hrs)
+  Ablations: schedule, recovery, QAT interaction, group size.
+  Immediate deliverable: complete ablation tables.
+
+Phase 4 (Day 4): Group 9 + writing
+  Run inference benchmarks on all Pareto-optimal checkpoints.
+  Begin paper draft with all tables and figures populated.
+
+================================================================================
