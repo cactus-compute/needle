@@ -3,4 +3,12 @@ Task: Design the training strategy & loss functions for training a transcribe+to
 Deliverable: A well-executed ablation of all strategies against SOTA.
 Assignee: Karen Mosoyan & Satyajit Kumar
 Deadline: 7th March 
-================================================================================
+================================================================================ 
+Notes:
+1. We use EMA of weights & this is a deterministic task.
+2. What is the best contrastive learning? SiGLip or CLIP?
+3. How do we pretrain the encoder?
+3. Can we improve the sparsification schedule?
+4. How can we incorporate iimplicit VAD?
+5. To allow simultaneous generation, use 3 small heads for: transcribe, json.
+================================================================================ 

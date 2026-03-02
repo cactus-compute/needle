@@ -83,8 +83,8 @@ TOY_CONFIG = {
 
 MAIN_CONFIG = {
     "num_heads": 4,
-    "num_layers": 24,
-    "num_dec_layers": 4,
+    "num_layers": 4,
+    "num_dec_layers": 2,
     "max_enc_len": 256,
     "max_dec_len": 256,
     "max_samples": None,
