@@ -37,16 +37,16 @@
   │ ┌──────────┐ │     │ └───────────────┘ │          └──────────┬───────────┘
   │ │Pack:     │ │     └─────────┬─────────┘                     │
   │ │ S←X Attn │ │        ┌──────┴──────┐             ┌──────────┴───────────┐
-  │ │ RoPE keys│ │        │  Embedding  │  ← shared   │ Layer Prune          │
-  │ ├──────────┤ │        └──────┬──────┘             │  after epoch 2       │
-  │ │Mix:      │ │               │                    │  L1 block scoring    │
-  │ │ MLP-Mixer│ │         ┌─────┴─────┐              │  keep ≥1 enc & dec   │
-  │ │ on S     │ │         │  Decoder  │              └──────────┬───────────┘
-  │ ├──────────┤ │         │   Input   │                         │
-  │ │Local:    │ │         └───────────┘              ┌──────────┴───────────┐
-  │ │ FFN on X │ │                                    │ Checkpoint           │
-  │ └──────────┘ │                                    │  MRL + sparse + INT4 │
-  │  S ∈ (M, d)  │                                    └──────────────────────┘
+  │ │ RoPE keys│ │        │  Embedding  │  ← shared   │ MRL Checkpoint       │
+  │ ├──────────┤ │        └──────┬──────┘             │  save per mrl_dim    │
+  │ │Mix:      │ │               │                    │  {512,256,128,64}    │
+  │ │ MLP-Mixer│ │         ┌─────┴─────┐              │  sparse + INT4       │
+  │ │ on S     │ │         │  Decoder  │              └──────────────────────┘
+  │ ├──────────┤ │         │   Input   │
+  │ │Local:    │ │         └───────────┘
+  │ │ FFN on X │ │
+  │ └──────────┘ │
+  │  S ∈ (M, d)  │
   └──────┬───────┘
   ┌──────┴───────┐
   │  Embedding   │ ← shared
@@ -75,7 +75,7 @@ needle [command]
   │                                                                   │
   │   train                                                           │
   │     --toy                  Use toy config for quick iteration     │
-  │     --epochs INT           Training epochs (default: 3)           │
+  │     --epochs INT           Training epochs (default: 2)           │
   │     --batch-size INT       Batch size (default: 32)               │
   │     --lr FLOAT             AdamW learning rate (default: 3e-4)    │
   │     --muon-lr FLOAT        Muon learning rate (default: 0.02)     │
@@ -125,7 +125,7 @@ needle [command]
   │                                                                   │
   │   tpu                                                             │
   │     create NAME            Create TPU (auto-finds zone)           │
-  │       --type STR           Accelerator (default: v6e-4)           │
+  │       --type STR           Accelerator (default: v6e-8)           │
   │       --version STR        TPU OS (auto-detected from --type)     │
   │     connect NAME           SSH config + connect (auto-zone)       │
   │     claude NAME            Install Claude Code on instance        │
@@ -166,17 +166,17 @@ needle [command]
   MFU (300M model)    ~15% → ~138 effective TFLOPS/chip
   Audio overhead      <1% of total (negligible)
 
-  ┌────────────────────┬──────────┬──────────┬──────────┐
-  │                    │  v6e-4   │  v6e-8   │  v6e-16  │
-  ├────────────────────┼──────────┼──────────┼──────────┤
-  │ Chips              │ 4        │ 8        │ 16       │
-  │ Total HBM          │ 128 GB   │ 256 GB   │ 512 GB   │
-  │ Scaling eff.       │ 1.0×     │ 0.9×     │ 0.8×     │
-  │ Eff. TFLOPS        │ 551      │ 992      │ 1,766    │
-  │ Est. time          │ ~96h     │ ~50h     │ ~29h     │
-  │ On-demand $/hr     │ $10.80   │ $21.60   │ $43.20   │
-  │ Est. total cost    │ ~$1,040  │ ~$1,080  │ ~$1,250  │
-  └────────────────────┴──────────┴──────────┴──────────┘
+  ┌────────────────────┬──────────┬──────────┐
+  │                    │  v6e-8   │  v6e-16  │
+  ├────────────────────┼──────────┼──────────┤
+  │ Chips              │ 8        │ 16       │
+  │ Total HBM          │ 256 GB   │ 512 GB   │
+  │ Scaling eff.       │ 0.9×     │ 0.8×     │
+  │ Eff. TFLOPS        │ 992      │ 1,766    │
+  │ Est. time          │ ~50h     │ ~29h     │
+  │ On-demand $/hr     │ $21.60   │ $43.20   │
+  │ Est. total cost    │ ~$1,080  │ ~$1,250  │
+  └────────────────────┴──────────┴──────────┘
 ```
 
 ## Setup For TPU/GCP
@@ -195,7 +195,7 @@ needle tpu [command]
   ┌───────────────────────────────────────────────────────────────────┐
   │                                                                   │
   │   create NAME             Create TPU (auto-finds zone)            │
-  │     --type STR            Accelerator type (default: v6e-4)       │
+  │     --type STR            Accelerator type (default: v6e-8)       │
   │     --version STR         TPU OS (auto-detected from --type)      │
   │                                                                   │
   │   connect NAME            SSH config + first connect (auto-zone)  │
@@ -241,11 +241,17 @@ needle tpu [command]
 6. Use needle as you normally would locally, like training
    needle train --wandb
 
+7. Use tmux for long training runs (survives SSH disconnects)
+   tmux new -s train          # start a named session
+   needle train --wandb       # run training inside it
+   Ctrl+B, then D             # detach (keeps running)
+   tmux attach -t train       # reattach later
+
 --- back on your Mac ---
 
-7. Stop when done (saves disk, stops billing)
+8. Stop when done (saves disk, stops billing)
    needle tpu stop my-experiment
 
-8. (Optional) Delete instance when no longer needed
+9. (Optional) Delete instance when no longer needed
    needle tpu delete my-experiment
 ```
