@@ -426,23 +426,31 @@ def _make_mrl_val_loss_fn(apply_fn, mrl_dim):
 
 
 def _estimate_mrl_params(config, d_prime):
-    """Estimate parameter count if model were deployed at dimension d_prime."""
+    """Estimate parameter count of an exported sub-model at dimension d_prime.
+
+    Slicing rules (matching what an actual MRL export would produce):
+      - Embedding:  [vocab, d_prime]  (first d_prime cols)
+      - Heads:      same head_dim, fewer heads → n_h = d_prime // head_dim
+      - KV heads:   min(original, n_h)
+      - FFN:        proportional  → d_ff' = d_ff * d_prime // d_model
+      - Memory:     slots unchanged, but projections shrink with d / d_ff
+    """
     d = d_prime
     v = config.vocab_size
     n_enc = config.num_encoder_layers
     n_dec = config.num_decoder_layers
-    n_h = config.num_heads
-    n_kv = config.num_kv_heads
-    d_ff = d * 4  
+    head_dim = config.d_model // config.num_heads
+    n_h = max(1, d // head_dim)
+    n_kv = min(config.num_kv_heads, n_h)
+    d_ff = config.d_ff * d // config.d_model
     m = config.num_memory_slots
 
     emb = v * d
-    head_dim = d // n_h
     kv_dim = n_kv * head_dim
-    attn = d * d + d * kv_dim * 2 + d * d  
-    ffn = d * d_ff * 3 
-    mixer_token = d * d_ff * 2 + d_ff * m  
-    mixer_channel = d * d_ff * 3 
+    attn = d * d + d * kv_dim * 2 + d * d
+    ffn = d * d_ff * 3
+    mixer_token = d * d_ff * 2 + d_ff * m
+    mixer_channel = d * d_ff * 3
     enc_block = attn + ffn + mixer_token + mixer_channel
     dec_block = attn * 2 + ffn
     total = emb + n_enc * enc_block + n_dec * dec_block
@@ -499,9 +507,10 @@ def train(args):
         config = TransformerConfig(
             d_model=args.d_model,
             num_heads=args.num_heads,
+            num_kv_heads=getattr(args, "num_kv_heads", None) or args.num_heads,
             num_encoder_layers=args.num_layers,
             num_decoder_layers=getattr(args, "num_dec_layers", args.num_layers),
-            d_ff=args.d_model * 4,
+            d_ff=getattr(args, "d_ff", None) or args.d_model * 4,
             max_seq_len=max(args.max_enc_len, args.max_dec_len),
             dtype=args.dtype,
             activation=getattr(args, "activation", "drelu"),
@@ -783,12 +792,14 @@ def train(args):
         print(f"  Sparsity       {sparsity:>11.2f}%  ({near_zero:,}/{total_params:,})")
         if mrl_results:
             print(f"  ─────────────────────────────────────")
-            print(f"  MRL dimension pruning:")
-            print(f"  {'dim':>6}  {'val ppl':>10}  {'est. params':>12}")
-            print(f"  {config.d_model:>6}  {last_val_ppl:>10.2f}  {total_params:>12,}  (full)")
+            print(f"  MRL exportable sub-models:")
+            print(f"  {'dim':>6}  {'val ppl':>10}  {'params':>12}  {'heads':>5}")
+            head_dim = config.d_model // config.num_heads
+            print(f"  {config.d_model:>6}  {last_val_ppl:>10.2f}  {total_params:>12,}  {config.num_heads:>5}  (full)")
             for d_prime in sorted(mrl_results.keys(), reverse=True):
                 mrl_ppl, mrl_params = mrl_results[d_prime]
-                print(f"  {d_prime:>6}  {mrl_ppl:>10.2f}  {mrl_params:>12,}")
+                n_h = max(1, d_prime // head_dim)
+                print(f"  {d_prime:>6}  {mrl_ppl:>10.2f}  {mrl_params:>12,}  {n_h:>5}")
         print(f"  ─────────────────────────────────────")
         print(f"  Throughput     {tp['tokens_per_second']:>10.1f} tok/s")
         print(f"  Latency        {tp['avg_latency_s']:>11.3f}s")
