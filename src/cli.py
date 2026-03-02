@@ -11,7 +11,7 @@ HELP = """
   │                                                                   │
   │   train                                                           │
   │     --toy                   Use toy config for quick iteration    │
-  │     --epochs INT            Training epochs (default: 3)          │
+  │     --epochs INT            Training epochs (default: 2)          │
   │     --batch-size INT        Batch size (default: 32)              │
   │     --lr FLOAT              AdamW learning rate (default: 3e-4)   │
   │     --muon-lr FLOAT         Muon learning rate (default: 0.02)    │
@@ -61,7 +61,7 @@ HELP = """
   │                                                                   │
   │   tpu                                                             │
   │     create NAME             Create TPU (auto-finds zone)          │
-  │       --type STR            Accelerator (default: v6e-4)          │
+  │       --type STR            Accelerator (default: v6e-8)          │
   │       --version STR         TPU OS (auto-detected from --type)    │
   │     connect NAME            SSH config + connect (auto-zone)      │
   │     claude NAME             Install Claude Code on instance       │
@@ -113,7 +113,7 @@ def main():
     p = sub.add_parser("train", add_help=False)
     p.add_argument("--toy", action="store_true")
     p.add_argument("--checkpoint", type=str, default=None)
-    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
@@ -186,7 +186,7 @@ def main():
 
     tp = tpu_sub.add_parser("create", add_help=False)
     tp.add_argument("name", type=str)
-    tp.add_argument("--type", dest="accel_type", type=str, default="v6e-4")
+    tp.add_argument("--type", dest="accel_type", type=str, default="v6e-8")
     tp.add_argument("--version", type=str, default=None,
                     help="Software version (auto-detected from --type if omitted)")
 

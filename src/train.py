@@ -775,7 +775,7 @@ def sweep(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train encoder-decoder transformer on TinyStories")
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--muon-lr", type=float, default=0.02)
