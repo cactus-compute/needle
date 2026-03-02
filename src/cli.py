@@ -26,9 +26,9 @@ HELP = """
   │     --sparsity-ratio FLOAT  Block prune ratio (default: 0.33)     │
   │     --layer-prune-ratio FL  Layer prune ratio (default: 0.0)      │
   │     --group-size INT        Quant/prune group size (default: 32)  │
-  │     --prune-interval INT   Steps between mask updates (def: 100)  │
-  │     --prune-start-frac FL  Start pruning at this frac (def: 0.33) │
-  │     --prune-end-frac FL    Lock mask at this frac (def: 0.67)     │
+  │     --prune-interval INT    Steps between mask updates (def: 100) │
+  │     --prune-start-frac FL   Start pruning at this frac (def: 0.33)│
+  │     --prune-end-frac FL     Lock mask at this frac (def: 0.67)    │
   │     --activation STR        drelu|swiglu|geglu (default: drelu)   │
   │     --warmup-ratio FLOAT    LR warmup ratio (default: 0.05)       │
   │     --eval-every INT        Val eval interval (default: 1000)     │
