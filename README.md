@@ -227,21 +227,25 @@ needle tpu [command]
 
 --- run from the instance ---
 
-3. Clone the repo on your instance
-   git clone https://github.com/cactus-compute/needle.git
+3. Create a GitHub Personal Access Token (PAT)
+   GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)
+   Generate a token with 'repo' scope
+
+4. Clone the repo on your instance using your PAT
+   git clone https://<your-PAT>@github.com/cactus-compute/needle.git
    cd needle
 
-4. Install needle (follow instruction to setup wandb)
+5. Install needle (follow instruction to setup wandb)
    source ./setup
 
-5. Use needle as you normally would locally, like training
+6. Use needle as you normally would locally, like training
    needle train --wandb
 
 --- back on your Mac ---
 
-6. Stop when done (saves disk, stops billing)
+7. Stop when done (saves disk, stops billing)
    needle tpu stop my-experiment
 
-7. (Optional) Delete instance when no longer needed
+8. (Optional) Delete instance when no longer needed
    needle tpu delete my-experiment
 ```
