@@ -1,7 +1,6 @@
 import math
 from dataclasses import dataclass
 
-import jax
 import jax.numpy as jnp
 import jax.nn.initializers as jinit
 import flax.linen as nn
@@ -141,66 +140,6 @@ class FeedForward(nn.Module):
         return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="down_proj")(x)
 
 
-class GatedDeltaNet(nn.Module):
-    """Gated Delta Network: linear-time recurrence replacing causal self-attention.
-
-    Maintains a (head_dim, head_dim) state matrix per head, updated via the delta rule:
-        S_t = S_{t-1} + β_t · k_t ⊗ (v_t − S_{t-1}^T k_t)
-        o_t = q_t · S_t
-    Inherently causal — no mask needed. O(T·d²) training, O(d²) per decode step.
-    """
-    num_heads: int
-    d_model: int
-    num_layers: int
-    dtype: jnp.dtype = jnp.bfloat16
-
-    @nn.compact
-    def __call__(self, x):
-        B, T, _ = x.shape
-        head_dim = self.d_model // self.num_heads
-
-        q = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False,
-                     kernel_init=default_init(), name="q_proj")(x)
-        k = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False,
-                     kernel_init=default_init(), name="k_proj")(x)
-        v = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False,
-                     kernel_init=default_init(), name="v_proj")(x)
-        beta = nn.Dense(self.num_heads, dtype=self.dtype, use_bias=True,
-                        name="beta_proj")(x)
-        beta = nn.sigmoid(beta)  # (B, T, H)
-
-        q = q.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
-        k = k.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
-        beta = beta.transpose(0, 2, 1)  # (B, H, T)
-
-        # L2-normalise keys for a stable delta rule
-        k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
-
-        def delta_step(S, inputs):
-            q_t, k_t, v_t, b_t = inputs
-            v_old = k_t @ S                                  # (head_dim,)
-            S = S + b_t * jnp.outer(k_t, v_t - v_old)       # (hd, hd)
-            o_t = q_t @ S                                    # (head_dim,)
-            return S, o_t
-
-        def per_head(q_h, k_h, v_h, b_h):
-            S0 = jnp.zeros((head_dim, head_dim), dtype=jnp.float32)
-            _, o = jax.lax.scan(delta_step, S0,
-                                (q_h.astype(jnp.float32),
-                                 k_h.astype(jnp.float32),
-                                 v_h.astype(jnp.float32),
-                                 b_h.astype(jnp.float32)))
-            return o  # (T, head_dim)
-
-        out = jax.vmap(jax.vmap(per_head))(q, k, v, beta)   # (B, H, T, hd)
-        out = ZCRMSNorm(dtype=self.dtype, name="out_norm")(out)
-        out = out.transpose(0, 2, 1, 3).reshape(B, T, self.d_model)
-        return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False,
-                        kernel_init=residual_init(self.num_layers),
-                        name="out_proj")(out)
-
-
 class MLPMixer(nn.Module):
     """MLP-Mixer operating on fixed-size memory slots (B, M, d)."""
     num_slots: int
@@ -323,10 +262,11 @@ class DecoderBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None):
-        # Gated Delta Net (inherently causal — self_mask and rope unused)
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = GatedDeltaNet(self.num_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(x)
+        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
+            x, x, mask=self_mask, rope=rope
+        )
         x = x + residual
 
         residual = x

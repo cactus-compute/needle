@@ -4,10 +4,10 @@ import sys
 HELP = """
   ┌───────────────────────────────────────────────────────────────────┐
   │                                                                   │
-  │              ┌─┐┌─┐┌─┐┌┬┐┬ ┬┌─┐  ┌┐┌┌─┐┌─┐┌┬┐┬  ┌─┐               │
-  │              │  ├─┤│   │ │ │└─┐  │││├┤ ├┤  │││  ├┤                │
-  │              └─┘┴ ┴└─┘ ┴ └─┘└─┘  ┘└┘└─┘└─┘─┴┘┴─┘└─┘               │
-  │              ...the tiny model to rule them all...                │
+  │      ┌─┐┌─┐┌─┐┌┬┐┬ ┬┌─┐  ┌┐┌┌─┐┌─┐┌┬┐┬  ┌─┐                       │
+  │      │  ├─┤│   │ │ │└─┐  │││├┤ ├┤  │││  ├┤                        │
+  │      └─┘┴ ┴└─┘ ┴ └─┘└─┘  ┘└┘└─┘└─┘─┴┘┴─┘└─┘                       │
+  │      ...the tiny model to rule them all...                        │
   │                                                                   │
   │   train                                                           │
   │     --toy                   Use toy config for quick iteration    │
@@ -52,11 +52,6 @@ HELP = """
   │     --temperature FLOAT     Sampling temperature (default: 0.8)   │
   │     --throughput-runs INT   Throughput runs (default: 10)         │
   │                                                                   │
-  │   export                                                          │
-  │     --checkpoint PATH       Path to model checkpoint (required)   │
-  │     --dim INT               Target d_model dimension (required)   │
-  │     --output PATH           Output path (default: auto-named)     │
-  │                                                                   │
   │   evaluate                                                        │
   │     --checkpoint PATH       Path to model checkpoint (required)   │
   │     --benchmarks [...]      wikitext2 lambada hellaswag arc_easy  │
@@ -87,11 +82,9 @@ TOY_CONFIG = {
 }
 
 MAIN_CONFIG = {
-    "num_heads": 16,
-    "num_kv_heads": 8,
-    "num_layers": 28,
-    "num_dec_layers": 8,
-    "d_ff": 4096,
+    "num_heads": 4,
+    "num_layers": 24,
+    "num_dec_layers": 4,
     "max_enc_len": 256,
     "max_dec_len": 256,
     "max_samples": None,
@@ -124,10 +117,8 @@ def main():
     p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--d-model", type=int, default=None)
     p.add_argument("--num-heads", type=int, default=None)
-    p.add_argument("--num-kv-heads", type=int, default=None)
     p.add_argument("--num-layers", type=int, default=None)
     p.add_argument("--num-dec-layers", type=int, default=None)
-    p.add_argument("--d-ff", type=int, default=None)
     p.add_argument("--max-enc-len", type=int, default=None)
     p.add_argument("--max-dec-len", type=int, default=None)
     p.add_argument("--max-samples", type=int, default=None)
@@ -168,11 +159,6 @@ def main():
     p.add_argument("--max-gen-len", type=int, default=128)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--throughput-runs", type=int, default=10)
-
-    p = sub.add_parser("export", add_help=False)
-    p.add_argument("--checkpoint", type=str, required=True)
-    p.add_argument("--dim", type=int, required=True)
-    p.add_argument("--output", type=str, default=None)
 
     p = sub.add_parser("evaluate", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
@@ -227,9 +213,6 @@ def main():
     elif args.command == "test":
         from .test import main as test_main
         test_main(args)
-    elif args.command == "export":
-        from .export import main as export_main
-        export_main(args)
     elif args.command == "evaluate":
         from .evaluate import main as eval_main
         eval_main(args)
