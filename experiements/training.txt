@@ -1,0 +1,6 @@
+================================================================================
+Task: Design the training strategy & loss functions for training a transcribe+tools model.
+Deliverable: A well-executed ablation of all strategies against SOTA.
+Assignee: Karen Mosoyan & Satyajit Kumar
+Deadline: 7th March 
+================================================================================
