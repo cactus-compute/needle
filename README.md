@@ -12,47 +12,54 @@
 
                           ┌─────────────┐
                           │   Softmax   │             ┌──────────────────────┐
-                          └──────┬──────┘             │ Forward pass with    │
-                          ┌──────┴──────┐             │ INT4 fake-quantized  │
-                          │  Linear (T) │  ← tied     │ weights (g=32, STE)  │
-                          └──────┬──────┘             └──────────┬───────────┘
+                          └──────┬──────┘             │ Forward with MRL     │
+                    ┌─────┬──────┴──────┬─────┐       │ loss at dims         │
+                    │  @E[:d'] for each d'    │       │ {512,256,128,64}     │
+                    │  in mrl_dims            │       │ + INT4 QAT (g=32)    │
+                    └─────┬──────┬──────┬─────┘       └──────────┬───────────┘
                           ┌──────┴──────┐                        │
-                          │  ZCRMSNorm  │             ┌──────────┴───────────┐
+                          │  Linear (T) │  ← tied     ┌──────────┴───────────┐
                           └──────┬──────┘             │ Muon  (2D kernels)   │
-                       ┌─────────┴─────────┐          │ AdamW (everything    │
-                       │   Decoder x N     │          │       else)          │
-                       │ ┌───────────────┐ │          │ WSD LR schedule      │
-                       │ │ Masked Self   │ │          └──────────┬───────────┘
-                       │ │ Attn + RoPE   │ │                     │
-                       │ ├───────────────┤ │          ┌──────────┴───────────┐
-  ┌──────────────┐  S  │ │   Cross       │ │          │ EMA params (β=0.999) │
-  │ MemoryMixer  │─────────▶ Attention   │ │          └──────────┬───────────┘
-  │ Encoder x N  │     │ ├───────────────┤ │                     │
-  │              │     │ │ Feed-Forward  │ │          ┌──────────┴───────────┐
-  │ ┌──────────┐ │     │ │   (dReLU)     │ │          │ Block Prune          │
-  │ │Pack:     │ │     │ └───────────────┘ │          │  after epoch 1       │
-  │ │ S←X Attn │ │     └─────────┬─────────┘          │  group magnitude     │
-  │ ├──────────┤ │        ┌──────┴──────┐             │  lock sparsity mask  │
-  │ │Mix:      │ │        │  Embedding  │  ← shared   └──────────┬───────────┘
-  │ │ MLP-Mixer│ │        └──────┬──────┘                        │
-  │ │ on S     │ │               │                    ┌──────────┴───────────┐
-  │ ├──────────┤ │         ┌─────┴─────┐              │ Layer Prune          │
-  │ │Local:    │ │         │  Decoder  │              │  after epoch 2       │
-  │ │ FFN on X │ │         │   Input   │              │  L1 block scoring    │
-  │ └──────────┘ │         └───────────┘              │  keep ≥1 enc & dec   │
-  │  S ∈ (M, d)  │                                    └──────────┬───────────┘
-  └──────┬───────┘                                               │
-  ┌──────┴───────┐                                    ┌──────────┴───────────┐
-  │  Embedding   │ ← shared                           │ Checkpoint           │
-  └──────┬───────┘                                    │  sparse + INT4       │
-         │                                            └──────────────────────┘
+                          ┌──────┴──────┐             │ AdamW (everything    │
+                          │  ZCRMSNorm  │             │       else)          │
+                          └──────┬──────┘             │ WSD LR schedule      │
+                       ┌─────────┴─────────┐          └──────────┬───────────┘
+                       │  Decoder x N_dec  │                     │
+                       │ ┌───────────────┐ │          ┌──────────┴───────────┐
+                       │ │ Masked Self   │ │          │ EMA params (β=0.999) │
+                       │ │ Attn + RoPE   │ │          └──────────┬───────────┘
+                       │ ├───────────────┤ │                     │
+  ┌──────────────┐  S  │ │   Cross       │ │          ┌──────────┴───────────┐
+  │ MemoryMixer  │─────────▶ Attention   │ │          │ Block Prune          │
+  │ Encoder      │     │ ├───────────────┤ │          │  after epoch 1       │
+  │  x N_enc     │     │ │ Feed-Forward  │ │          │  group magnitude     │
+  │              │     │ │   (dReLU)     │ │          │  lock sparsity mask  │
+  │ ┌──────────┐ │     │ └───────────────┘ │          └──────────┬───────────┘
+  │ │Pack:     │ │     └─────────┬─────────┘                     │
+  │ │ S←X Attn │ │        ┌──────┴──────┐             ┌──────────┴───────────┐
+  │ │ RoPE keys│ │        │  Embedding  │  ← shared   │ Layer Prune          │
+  │ ├──────────┤ │        └──────┬──────┘             │  after epoch 2       │
+  │ │Mix:      │ │               │                    │  L1 block scoring    │
+  │ │ MLP-Mixer│ │         ┌─────┴─────┐              │  keep ≥1 enc & dec   │
+  │ │ on S     │ │         │  Decoder  │              └──────────┬───────────┘
+  │ ├──────────┤ │         │   Input   │                         │
+  │ │Local:    │ │         └───────────┘              ┌──────────┴───────────┐
+  │ │ FFN on X │ │                                    │ Checkpoint           │
+  │ └──────────┘ │                                    │  MRL + sparse + INT4 │
+  │  S ∈ (M, d)  │                                    └──────────────────────┘
+  └──────┬───────┘
+  ┌──────┴───────┐
+  │  Embedding   │ ← shared
+  └──────┬───────┘
+         │
     ┌────┴────┐
     │ Encoder │
     │  Input  │
     └─────────┘
 
-    d=128 · 4 heads · 2 KV heads · 64 memory slots
-    dReLU · ZCRMSNorm · RoPE · INT4 QAT · Muon
+    d=max(mrl_dims) · 4 heads · 2 KV heads · 64 memory slots
+    SentencePiece BPE (8192) · dReLU · ZCRMSNorm · RoPE
+    Matryoshka dims · INT4 QAT · Muon + AdamW
 ```
 
 ## Usage
@@ -67,45 +74,66 @@ needle [command]
   ┌───────────────────────────────────────────────────────────────────┐
   │                                                                   │
   │   train                                                           │
-  │     --epochs INT            Training epochs (default: 1)          │
-  │     --batch-size INT        Batch size (default: 32)              │
-  │     --lr FLOAT              AdamW learning rate (default: 3e-4)   │
-  │     --muon-lr FLOAT         Muon learning rate (default: 0.02)    │
-  │     --d-model INT           Model dimension (default: 128)        │
-  │     --num-heads INT         Attention heads (default: 4)          │
-  │     --num-layers INT        Encoder/decoder layers (default: 2)   │
-  │     --max-enc-len INT       Max encoder seq length (default: 128) │
-  │     --max-dec-len INT       Max decoder seq length (default: 128) │
-  │     --max-samples INT       Training samples (default: 20000)     │
-  │     --warmup-ratio FLOAT    LR warmup ratio (default: 0.05)       │
-  │     --wandb                 Enable W&B logging                    │
-  │     --checkpoint-dir DIR    Checkpoint directory                  │
-  │     --seed INT              Random seed (default: 42)             │
+  │     --toy                  Use toy config for quick iteration     │
+  │     --epochs INT           Training epochs (default: 3)           │
+  │     --batch-size INT       Batch size (default: 32)               │
+  │     --lr FLOAT             AdamW learning rate (default: 3e-4)    │
+  │     --muon-lr FLOAT        Muon learning rate (default: 0.02)     │
+  │     --d-model INT          Model dim (default: max of mrl-dims)   │
+  │     --num-heads INT        Attention heads (default: 4)           │
+  │     --num-layers INT       Encoder layers (default: 12)           │
+  │     --num-dec-layers INT   Decoder layers (default: 4)            │
+  │     --max-enc-len INT      Max encoder seq length (default: 256)  │
+  │     --max-dec-len INT      Max decoder seq length (default: 256)  │
+  │     --max-samples INT      Training samples (default: 1000000)    │
+  │     --mrl-dims INT [...]   MRL dim targets (default: 512 256 128) │
+  │     --sparsity-ratio FLOAT Block prune ratio (default: 0.33)      │
+  │     --layer-prune-ratio FL Layer prune ratio (default: 0.0)       │
+  │     --group-size INT       Quant/prune group size (default: 32)   │
+  │     --activation STR       drelu|swiglu|geglu (default: drelu)    │
+  │     --warmup-ratio FLOAT   LR warmup ratio (default: 0.05)       │
+  │     --eval-every INT       Val eval interval (default: 1000)      │
+  │     --wandb                Enable W&B logging                     │
+  │     --checkpoint PATH      Resume from checkpoint                 │
+  │     --checkpoint-dir DIR   Checkpoint directory                   │
+  │     --seed INT             Random seed (default: 42)              │
   │                                                                   │
   │   sweep                                                           │
-  │     --sweep-config PATH     Sweep YAML config                     │
-  │     --project STR           W&B project name (default: needle-v1) │
-  │     --count INT             Number of trials (default: 20)        │
+  │     --sweep-config PATH    Sweep YAML config                      │
+  │     --project STR          W&B project name (default: needle-v1)  │
+  │     --count INT            Number of trials (default: 20)         │
   │                                                                   │
   │   run                                                             │
-  │     --checkpoint PATH       Path to model checkpoint (required)   │
-  │     --prompts STR [...]     One or more prompts to continue       │
-  │     --max-len INT           Max tokens to generate (default: 128) │
-  │     --temperature FLOAT     Sampling temperature (default: 0.8)   │
-  │     --seed INT              Random seed (default: 0)              │
+  │     --checkpoint PATH      Path to model checkpoint (required)    │
+  │     --prompts STR [...]    One or more prompts to continue        │
+  │     --max-len INT          Max tokens to generate (default: 128)  │
+  │     --temperature FLOAT    Sampling temperature (default: 0.8)    │
+  │     --seed INT             Random seed (default: 0)               │
   │                                                                   │
   │   test                                                            │
-  │     --checkpoint PATH       Path to model checkpoint (required)   │
-  │     --batch-size INT        Batch size (default: 32)              │
-  │     --max-eval-samples INT  Evaluation samples (default: 1000)    │
-  │     --max-gen-len INT       Max generation length (default: 128)  │
-  │     --temperature FLOAT     Sampling temperature (default: 0.8)   │
-  │     --throughput-runs INT   Throughput runs (default: 10)         │
+  │     --checkpoint PATH      Path to model checkpoint (required)    │
+  │     --batch-size INT       Batch size (default: 32)               │
+  │     --max-eval-samples INT Evaluation samples (default: 1000)     │
+  │     --max-gen-len INT      Max generation length (default: 128)   │
+  │     --temperature FLOAT    Sampling temperature (default: 0.8)    │
+  │     --throughput-runs INT  Throughput runs (default: 10)          │
   │                                                                   │
   │   evaluate                                                        │
-  │     --checkpoint PATH       Path to model checkpoint (required)   │
-  │     --benchmarks [...]      wikitext2 lambada hellaswag arc_easy  │
-  │     --max-samples INT       Samples per benchmark (default: 500)  │
+  │     --checkpoint PATH      Path to model checkpoint (required)    │
+  │     --benchmarks [...]     wikitext2 lambada hellaswag arc_easy   │
+  │     --max-samples INT      Samples per benchmark (default: 500)   │
+  │                                                                   │
+  │   tpu                                                             │
+  │     create NAME            Create TPU (auto-finds zone)           │
+  │       --type STR           Accelerator (default: v6e-4)           │
+  │       --version STR        TPU OS (auto-detected from --type)     │
+  │     connect NAME           SSH config + connect (auto-zone)       │
+  │     claude NAME            Install Claude Code on instance        │
+  │     stop NAME              Stop instance (auto-zone)              │
+  │     start NAME             Start stopped instance (auto-zone)     │
+  │     delete NAME            Delete instance (auto-zone)            │
+  │     list                   List all TPU instances                 │
+  │       --zone ZONE          Override auto-detected zone            │
   │                                                                   │
   └───────────────────────────────────────────────────────────────────┘
 ```
@@ -113,37 +141,45 @@ needle [command]
 ## TPU Factsheet
 
 ```
-┌────────────────────┬───────────────────┬──────────────────────┬────────────────────────────┐
-│                    │       v5e         │        v5p           │      v6e (Trillium)        │
-├────────────────────┼───────────────────┼──────────────────────┼────────────────────────────┤
-│ Optimized for      │ Train + inference │ Training (max perf)  │ Train + inference          │
-│ HBM per chip       │ 16 GB             │ 95 GB                │ 32 GB                      │
-│ FLOPS (BF16)       │ 197 TFLOPS        │ 459 TFLOPS           │ 918 TFLOPS                 │
-│ HBM bandwidth      │ 819 GB/s          │ 2,765 GB/s           │ 1,640 GB/s                 │
-│ ICI bandwidth      │ 1,600 Gbps        │ 4,800 Gbps           │ 3,584 Gbps                 │
-│ On-demand/chip/hr  │ $1.20             │ $4.20                │ $2.70                      │
-│ Spot/chip/hr       │ $0.60             │ $2.10                │ $1.35                      │
-│ Perf per $         │ 1x (baseline)     │ 0.5x                 │ 2x                         │
-├────────────────────┼───────────────────┴──────────────────────┴────────────────────────────┤
-│                    │                                                                       │
-│ DATASET            │                                                                       │
-│  Text              │ 100B tokens                                                           │
-│  Audio             │ 200k × 20s = ~200M audio tokens + ~13M transcription tokens           │
-│  Effective total   │ ~100.5B equivalent tokens (audio has ~2-3x encoder overhead)          │
-│  Storage           │ ~5 GB audio (compressed) + ~400 GB text corpus                        │
-│                    │                                                                       │
-├────────────────────┼───────────────────┬──────────────────────┬─────────────┬──────────────┤
-│ 300M multimodal    │   v5litepod-4     │      v6e-4           │    v6e-8    │    v6e-16    │
-├────────────────────┼───────────────────┼──────────────────────┼─────────────┼──────────────┤
-│ Chips              │ 4                 │ 4                    │ 8           │ 16           │
-│ Total HBM          │ 64 GB             │ 128 GB               │ 256 GB      │ 512 GB       │
-│ Est. time          │ ~16-21 days       │ ~4-5 days            │ ~2-3 days   │ ~1-1.5 days  │
-│ Spot $/hr          │ $2.40             │ $5.40                │ $10.80      │ $21.60       │
-│ Est. total cost    │ ~$900-1,200       │ ~$550-700            │ ~$550-750   │ ~$550-750    │
-└────────────────────┴───────────────────┴──────────────────────┴─────────────┴──────────────┘
+  Trillium (v6e)
+  ──────────────────────────────────────────
+  HBM per chip        32 GB
+  BF16 FLOPS          918 TFLOPS
+  HBM bandwidth       1,640 GB/s
+  ICI bandwidth       3,584 Gbps
+  On-demand/chip/hr   $2.70 (US regions)
+  ──────────────────────────────────────────
+
+  Dataset
+  ──────────────────────────────────────────
+  Text                100B tokens (~400 GB)
+  Audio               Emilia subset
+                      200k × 20s clips (~1.1k hrs)
+                      ~200M audio tokens
+                      ~13M transcription tokens
+                      ~27 GB (from ~4.5 TB full dataset)
+  ──────────────────────────────────────────
+
+  300M multimodal training estimates
+  ──────────────────────────────────────────
+  Total FLOPs         6 × 300M × 100B = 1.8e20
+  MFU (300M model)    ~15% → ~138 effective TFLOPS/chip
+  Audio overhead      <1% of total (negligible)
+
+  ┌────────────────────┬──────────┬──────────┬──────────┐
+  │                    │  v6e-4   │  v6e-8   │  v6e-16  │
+  ├────────────────────┼──────────┼──────────┼──────────┤
+  │ Chips              │ 4        │ 8        │ 16       │
+  │ Total HBM          │ 128 GB   │ 256 GB   │ 512 GB   │
+  │ Scaling eff.       │ 1.0×     │ 0.9×     │ 0.8×     │
+  │ Eff. TFLOPS        │ 551      │ 992      │ 1,766    │
+  │ Est. time          │ ~96h     │ ~50h     │ ~29h     │
+  │ On-demand $/hr     │ $10.80   │ $21.60   │ $43.20   │
+  │ Est. total cost    │ ~$1,040  │ ~$1,080  │ ~$1,250  │
+  └────────────────────┴──────────┴──────────┴──────────┘
 ```
 
-## Setup For TPU/GCP 
+## Setup For TPU/GCP
 
 - Setup gcloud 1: download the `macOS ARM` from [here](https://docs.cloud.google.com/sdk/docs/install-sdk) and uzip.
 - Setup gcloud 2: open terminal, cd to ypur downloads and run `./google-cloud-sdk/install.sh`
@@ -159,8 +195,8 @@ needle tpu [command]
   ┌───────────────────────────────────────────────────────────────────┐
   │                                                                   │
   │   create NAME             Create TPU (auto-finds zone)            │
-  │     --type STR            Accelerator type (default: v5litepod-4) │
-  │     --version STR         TPU OS (default: tpu-ubuntu2204-base)   │
+  │     --type STR            Accelerator type (default: v6e-4)       │
+  │     --version STR         TPU OS (auto-detected from --type)      │
   │                                                                   │
   │   connect NAME            SSH config + first connect (auto-zone)  │
   │   claude NAME             Install Claude Code on instance         │

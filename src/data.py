@@ -63,7 +63,7 @@ class NeedleTokenizer:
         return {"input_ids": all_ids}
 
 
-def train_tokenizer(vocab_size=8192, max_samples=100000):
+def train_tokenizer(vocab_size=8192, max_samples=None):
     """Train a SentencePiece BPE tokenizer on TinyStories."""
     model_path = TOKENIZER_PREFIX + ".model"
     if os.path.exists(model_path):
@@ -72,14 +72,15 @@ def train_tokenizer(vocab_size=8192, max_samples=100000):
 
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
 
-    print(f"Training SentencePiece BPE tokenizer (vocab_size={vocab_size})...")
     ds = load_dataset("roneneldan/TinyStories", split="train")
-    indices = range(min(max_samples, len(ds)))
-    ds_subset = ds.select(indices)
+    if max_samples:
+        ds = ds.select(range(min(max_samples, len(ds))))
+
+    print(f"Training SentencePiece BPE tokenizer (vocab_size={vocab_size}, samples={len(ds):,})...")
 
     corpus_path = os.path.join(TOKENIZER_DIR, "corpus.txt")
     with open(corpus_path, "w") as f:
-        for example in tqdm(ds_subset, desc="Writing corpus"):
+        for example in tqdm(ds, desc="Writing corpus"):
             text = example["text"].strip()
             if text:
                 f.write(text + "\n")
@@ -105,10 +106,10 @@ def train_tokenizer(vocab_size=8192, max_samples=100000):
     return model_path
 
 
-def get_tokenizer():
+def get_tokenizer(max_samples=None):
     model_path = TOKENIZER_PREFIX + ".model"
     if not os.path.exists(model_path):
-        train_tokenizer()
+        train_tokenizer(max_samples=max_samples)
     return NeedleTokenizer(model_path)
 
 
@@ -119,8 +120,18 @@ def load_tinystories(split="train", max_samples=None):
     return ds
 
 
-def _cache_key(n_samples, max_enc_len, max_dec_len, tokenizer_name="needle_spm"):
-    key = f"tinystories_{tokenizer_name}_{n_samples}_{max_enc_len}_{max_dec_len}"
+def _tokenizer_hash():
+    """Hash the tokenizer model file to detect retraining."""
+    model_path = TOKENIZER_PREFIX + ".model"
+    if os.path.exists(model_path):
+        with open(model_path, "rb") as f:
+            return hashlib.md5(f.read()).hexdigest()[:8]
+    return "none"
+
+
+def _cache_key(n_samples, max_enc_len, max_dec_len):
+    tok_hash = _tokenizer_hash()
+    key = f"tinystories_{tok_hash}_{n_samples}_{max_enc_len}_{max_dec_len}"
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
