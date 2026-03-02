@@ -282,6 +282,7 @@ def _quantize_params(params, group_size=32):
 
 
 _GROUP_SIZE = 32
+_MRL_DIMS = ()
 
 
 def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
@@ -293,23 +294,37 @@ def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
         tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
         cross_mask = src_mask
 
-        logits, slot_div = state.apply_fn(
+        logits, slot_div, mrl_logits = state.apply_fn(
             {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
             src,
             tgt_in,
             src_mask=src_mask,
             tgt_mask=tgt_mask,
             cross_mask=cross_mask,
+            mrl_dims=_MRL_DIMS if _MRL_DIMS else None,
             method="forward_with_aux",
         )
 
         logits_f32 = logits.astype(jnp.float32)
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out)
         mask = (tgt_out != pad_id).astype(jnp.float32)
-        ce_loss = jnp.sum(loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+        ce_loss = jnp.sum(
+            optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
+        ) / jnp.maximum(jnp.sum(mask), 1.0)
+
+        total_loss = ce_loss
+        num_scales = 1
+        for mrl_log in mrl_logits:
+            mrl_log_f32 = mrl_log.astype(jnp.float32)
+            aux_loss = jnp.sum(
+                optax.softmax_cross_entropy_with_integer_labels(mrl_log_f32, tgt_out) * mask
+            ) / jnp.maximum(jnp.sum(mask), 1.0)
+            total_loss = total_loss + aux_loss
+            num_scales = num_scales + 1
+        total_loss = total_loss / num_scales
+
         z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
         div_loss = 1e-4 * slot_div
-        return ce_loss + z_loss + div_loss
+        return total_loss + z_loss + div_loss
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
@@ -340,6 +355,50 @@ def _make_val_loss_fn(apply_fn):
     return val_loss_batch
 
 
+def _make_mrl_val_loss_fn(apply_fn, mrl_dim):
+    """Val loss using truncated decoder hidden states and embedding at dimension mrl_dim."""
+    @jax.jit
+    def val_loss_batch(params, src, tgt_in, tgt_out, causal_mask):
+        pad_id = 0
+        src_mask = make_padding_mask(src, pad_id)
+        tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+        logits, _, mrl_logits = apply_fn(
+            {"params": params}, src, tgt_in,
+            src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=src_mask,
+            mrl_dims=(mrl_dim,),
+            method="forward_with_aux",
+        )
+        trunc_logits = mrl_logits[0].astype(jnp.float32)
+        loss = optax.softmax_cross_entropy_with_integer_labels(trunc_logits, tgt_out)
+        mask = (tgt_out != pad_id).astype(jnp.float32)
+        return jnp.sum(loss * mask), jnp.sum(mask)
+    return val_loss_batch
+
+
+def _estimate_mrl_params(config, d_prime):
+    """Estimate parameter count if model were deployed at dimension d_prime."""
+    d = d_prime
+    v = config.vocab_size
+    n_enc = config.num_encoder_layers
+    n_dec = config.num_decoder_layers
+    n_h = config.num_heads
+    n_kv = config.num_kv_heads
+    d_ff = d * 4  
+    m = config.num_memory_slots
+
+    emb = v * d
+    head_dim = d // n_h
+    kv_dim = n_kv * head_dim
+    attn = d * d + d * kv_dim * 2 + d * d  
+    ffn = d * d_ff * 3 
+    mixer_token = d * d_ff * 2 + d_ff * m  
+    mixer_channel = d * d_ff * 3 
+    enc_block = attn + ffn + mixer_token + mixer_channel
+    dec_block = attn * 2 + ffn
+    total = emb + n_enc * enc_block + n_dec * dec_block
+    return int(total)
+
+
 def shard_batch(batch, num_devices):
     """Reshape a batch array so leading dim is (num_devices, per_device_batch, ...)."""
     return batch.reshape(num_devices, -1, *batch.shape[1:])
@@ -358,7 +417,7 @@ def train(args):
     print(f"      {num_devices} device(s) for data-parallel training")
 
     print(f"\n[2/4] Loading tokenizer...")
-    tokenizer = get_tokenizer()
+    tokenizer = get_tokenizer(max_samples=args.max_samples)
 
     print(f"\n[3/4] Loading TinyStories dataset...")
     ds = load_tinystories("train", max_samples=args.max_samples)
@@ -371,9 +430,9 @@ def train(args):
     val_enc, val_dec_in, val_dec_tgt = prepare_encoder_decoder_pairs(
         val_ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
-    val_enc = jnp.array(val_enc)
-    val_dec_in = jnp.array(val_dec_in)
-    val_dec_tgt = jnp.array(val_dec_tgt)
+    val_enc = np.array(val_enc)
+    val_dec_in = np.array(val_dec_in)
+    val_dec_tgt = np.array(val_dec_tgt)
     print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val pairs")
 
     effective_batch_size = args.batch_size * num_devices
@@ -399,8 +458,13 @@ def train(args):
             num_memory_slots=getattr(args, "num_memory_slots", 64),
         )
 
-    global _GROUP_SIZE
+    global _GROUP_SIZE, _MRL_DIMS
     _GROUP_SIZE = getattr(args, "group_size", 32)
+    mrl_dims_raw = getattr(args, "mrl_dims", None)
+    if mrl_dims_raw:
+        _MRL_DIMS = tuple(d for d in mrl_dims_raw if d < config.d_model)
+    else:
+        _MRL_DIMS = ()
     p_train_step = _make_p_train_step()
 
     np.random.seed(args.seed)
@@ -457,9 +521,9 @@ def train(args):
     muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
     tokens_per_batch = effective_batch_size * (args.max_enc_len + args.max_dec_len)
 
-    enc_inputs = jnp.array(enc_inputs)
-    dec_inputs = jnp.array(dec_inputs)
-    dec_targets = jnp.array(dec_targets)
+    enc_inputs = np.array(enc_inputs)
+    dec_inputs = np.array(dec_inputs)
+    dec_targets = np.array(dec_targets)
 
     last_val_ppl = None
     sparsity_ratio = getattr(args, "sparsity_ratio", 0.0)
@@ -555,13 +619,14 @@ def train(args):
             dt = time.perf_counter() - t0
             eval_every = getattr(args, "eval_every", 100)
             if global_step % eval_every == 0 or global_step == total_steps:
-                eval_params = jax_utils.unreplicate(ema_params)
+                _eval_params = jax_utils.unreplicate(ema_params)
                 val_causal = make_causal_mask(args.max_dec_len)
                 total_loss, total_toks = 0.0, 0.0
                 for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
-                    vl, vt = val_loss_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
+                    vl, vt = val_loss_fn(_eval_params, vb[0], vb[1], vb[2], val_causal)
                     total_loss += float(vl)
                     total_toks += float(vt)
+                del _eval_params
                 last_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
             pbar.set_postfix(loss=f"{loss_val:.4f}", val_ppl=f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?")
 
@@ -598,24 +663,46 @@ def train(args):
             q_total_loss += float(vl)
             q_total_toks += float(vt)
         quant_val_ppl = float(math.exp(q_total_loss / max(q_total_toks, 1)))
+        del q_params  # free device memory
 
-        epoch_params = jax.tree.map(np.array, eval_params)
-        total_params = sum(x.size for x in jax.tree.leaves(epoch_params))
-        near_zero = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(epoch_params))
+        # MRL per-dimension evaluation (reuse val_loss_fn's apply_fn)
+        mrl_results = {}
+        if _MRL_DIMS:
+            apply_fn = jax_utils.unreplicate(state).apply_fn
+            for d_prime in _MRL_DIMS:
+                mrl_vl_fn = _make_mrl_val_loss_fn(apply_fn, d_prime)
+                mrl_total_loss, mrl_total_toks = 0.0, 0.0
+                for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
+                    vl, vt = mrl_vl_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
+                    mrl_total_loss += float(vl)
+                    mrl_total_toks += float(vt)
+                avg_loss = mrl_total_loss / max(mrl_total_toks, 1)
+                mrl_ppl = float(math.exp(min(avg_loss, 20)))
+                mrl_params = _estimate_mrl_params(config, d_prime)
+                mrl_results[d_prime] = (mrl_ppl, mrl_params)
+            del apply_fn
+
+        # Sparsity + checkpoint — move to CPU, reuse single copy
+        params_np = jax.tree.map(np.array, eval_params)
+        del eval_params  # free device memory
+        total_params = sum(x.size for x in jax.tree.leaves(params_np))
+        near_zero = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(params_np))
         sparsity = near_zero / total_params * 100
 
         ckpt_name = f"needle_{args.num_layers}_{args.d_model}_{global_step}.pkl"
         ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
-        params_np = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
 
         with open(ckpt_path, "wb") as f:
             pickle.dump({"params": params_np, "config": config.__dict__}, f)
 
         from .test import measure_throughput, benchmark_generation_quality
+        eval_params_jnp = jax.tree.map(jnp.array, params_np)
+        del params_np  # free CPU memory
         model = EncoderDecoderTransformer(config)
-        tp = measure_throughput(model, eval_params, tokenizer, num_runs=5)
+        tp = measure_throughput(model, eval_params_jnp, tokenizer, num_runs=5)
         prompts = ["Once upon a time", "The little dog", "She was very happy because"]
-        quality = benchmark_generation_quality(model, eval_params, tokenizer, prompts, max_gen_len=64, temperature=0.8)
+        quality = benchmark_generation_quality(model, eval_params_jnp, tokenizer, prompts, max_gen_len=64, temperature=0.8)
+        del eval_params_jnp  # free device memory
 
         print(f"\n  ─────────────────────────────────────")
         print(f"  Epoch {epoch + 1}/{args.epochs}")
@@ -626,6 +713,14 @@ def train(args):
         print(f"  Val ppl        {last_val_ppl:>12.2f}")
         print(f"  Quant val ppl  {quant_val_ppl:>12.2f}  (INT4 g{_GROUP_SIZE})")
         print(f"  Sparsity       {sparsity:>11.2f}%  ({near_zero:,}/{total_params:,})")
+        if mrl_results:
+            print(f"  ─────────────────────────────────────")
+            print(f"  MRL dimension pruning:")
+            print(f"  {'dim':>6}  {'val ppl':>10}  {'est. params':>12}")
+            print(f"  {config.d_model:>6}  {last_val_ppl:>10.2f}  {total_params:>12,}  (full)")
+            for d_prime in sorted(mrl_results.keys(), reverse=True):
+                mrl_ppl, mrl_params = mrl_results[d_prime]
+                print(f"  {d_prime:>6}  {mrl_ppl:>10.2f}  {mrl_params:>12,}")
         print(f"  ─────────────────────────────────────")
         print(f"  Throughput     {tp['tokens_per_second']:>10.1f} tok/s")
         print(f"  Latency        {tp['avg_latency_s']:>11.3f}s")
@@ -640,14 +735,18 @@ def train(args):
         print(f"  ─────────────────────────────────────\n")
 
         if use_wandb:
-            wandb.log({
+            log_dict = {
                 "epoch/avg_loss": epoch_avg_loss,
                 "epoch/final_loss": final_loss,
                 "epoch/val_ppl": last_val_ppl,
                 "epoch/quant_val_ppl": quant_val_ppl,
                 "epoch/weight_sparsity": sparsity,
                 "epoch": epoch + 1,
-            })
+            }
+            for d_prime, (mrl_ppl, mrl_params) in mrl_results.items():
+                log_dict[f"epoch/mrl_ppl_d{d_prime}"] = mrl_ppl
+                log_dict[f"epoch/mrl_params_d{d_prime}"] = mrl_params
+            wandb.log(log_dict)
 
     if use_wandb:
         wandb.finish()

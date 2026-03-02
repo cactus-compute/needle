@@ -7,12 +7,6 @@ import sys
 PROJECT = "needle-488623"
 
 VERSION_FOR_TYPE = {
-    "v2":         "tpu-ubuntu2204-base",
-    "v3":         "tpu-ubuntu2204-base",
-    "v4":         "tpu-ubuntu2204-base",
-    "v5litepod":  "v2-alpha-tpuv5-lite",
-    "v5e":        "v2-alpha-tpuv5-lite",
-    "v5p":        "v2-alpha-tpuv5",
     "v6e":        "v2-alpha-tpuv6e",
 }
 
@@ -37,16 +31,15 @@ def _resolve_version(accel_type, explicit_version):
     return "tpu-ubuntu2204-base"
 
 
+# Trillium (v6e) zones, ordered by on-demand price (cheapest first)
+# us-east1/us-east5: $2.70/chip/hr
+# europe-west4:      $2.97/chip/hr
+# asia-northeast1:   $3.24/chip/hr
 ZONES = [
-    "us-central1-a", "us-central1-b", "us-central1-f",
     "us-east1-b", "us-east1-c", "us-east1-d",
     "us-east5-a", "us-east5-b",
-    "us-south1-a", "us-south1-b",
-    "us-west1-a", "us-west1-b",
-    "us-west4-a",
     "europe-west4-a",
     "asia-northeast1-b",
-    "southamerica-west1-a",
 ]
 
 TPU_HELP = """

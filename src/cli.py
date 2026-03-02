@@ -10,26 +10,34 @@ HELP = """
   │      ...the tiny model to rule them all...                        │
   │                                                                   │
   │   train                                                           │
-  │     --epochs INT            Training epochs (default: 1)          │
+  │     --toy                   Use toy config for quick iteration    │
+  │     --epochs INT            Training epochs (default: 3)          │
   │     --batch-size INT        Batch size (default: 32)              │
   │     --lr FLOAT              AdamW learning rate (default: 3e-4)   │
   │     --muon-lr FLOAT         Muon learning rate (default: 0.02)    │
-  │     --d-model INT           Model dimension (default: 128)        │
+  │     --d-model INT           Model dim (default: max of mrl-dims)  │
   │     --num-heads INT         Attention heads (default: 4)          │
-  │     --num-layers INT        Encoder/decoder layers (default: 2)   │
-  │     --max-enc-len INT       Max encoder seq length (default: 128) │
-  │     --max-dec-len INT       Max decoder seq length (default: 128) │
-  │     --max-samples INT       Training samples (default: 20000)     │
+  │     --num-layers INT        Encoder layers (default: 12)          │
+  │     --num-dec-layers INT    Decoder layers (default: 4)           │
+  │     --max-enc-len INT       Max encoder seq length (default: 256) │
+  │     --max-dec-len INT       Max decoder seq length (default: 256) │
+  │     --max-samples INT       Training samples (default: 1000000)   │
+  │     --mrl-dims INT [...]    MRL dim targets (default: 512 256 ..) │
+  │     --sparsity-ratio FLOAT  Block prune ratio (default: 0.33)     │
+  │     --layer-prune-ratio FL  Layer prune ratio (default: 0.0)      │
+  │     --group-size INT        Quant/prune group size (default: 32)  │
+  │     --activation STR        drelu|swiglu|geglu (default: drelu)   │
+  │     --warmup-ratio FLOAT    LR warmup ratio (default: 0.05)       │
+  │     --eval-every INT        Val eval interval (default: 1000)     │
+  │     --wandb                 Enable W&B logging                    │
+  │     --checkpoint PATH       Resume from checkpoint                │
   │     --checkpoint-dir DIR    Checkpoint directory                  │
-  │     --warmup-ratio FLOAT     LR warmup ratio (default: 0.05)      │
   │     --seed INT              Random seed (default: 42)             │
   │                                                                   │
-  │                                                                   │
-  │   sweep                                                          │
-  │     --sweep-config PATH     Sweep YAML config (default: sweep.yaml)│
-  │     --project STR           W&B project name (default: needle-v1)│
-  │     --count INT             Number of trials (default: 20)       │
-  │     (also accepts all train flags as defaults for non-swept params)│
+  │   sweep                                                           │
+  │     --sweep-config PATH     Sweep YAML config                     │
+  │     --project STR           W&B project name (default: needle-v1) │
+  │     --count INT             Number of trials (default: 20)        │
   │                                                                   │
   │   run                                                             │
   │     --checkpoint PATH       Path to model checkpoint (required)   │
@@ -53,7 +61,7 @@ HELP = """
   │                                                                   │
   │   tpu                                                             │
   │     create NAME             Create TPU (auto-finds zone)          │
-  │       --type STR            Accelerator (default: v5litepod-4)    │
+  │       --type STR            Accelerator (default: v6e-4)          │
   │       --version STR         TPU OS (auto-detected from --type)    │
   │     connect NAME            SSH config + connect (auto-zone)      │
   │     claude NAME             Install Claude Code on instance       │
@@ -67,45 +75,31 @@ HELP = """
 """
 
 TOY_CONFIG = {
-    "epochs": 1,
-    "batch_size": 32,
-    "lr": 3e-4,
-    "muon_lr": 0.02,
-    "d_model": 128,
     "num_heads": 4,
     "num_layers": 2,
     "num_dec_layers": 2,
     "max_enc_len": 128,
     "max_dec_len": 128,
     "max_samples": 10000,
-    "warmup_ratio": 0.05,
-    "dtype": "bfloat16",
-    "seed": 42,
 }
 
-BASE_CONFIG = {
-    "epochs": 1,
-    "batch_size": 32,
-    "lr": 3e-4,
-    "muon_lr": 0.02,
-    "d_model": 512,
+MAIN_CONFIG = {
     "num_heads": 4,
-    "num_layers": 4,
-    "num_dec_layers": 2,
+    "num_layers": 12,
+    "num_dec_layers": 4,
     "max_enc_len": 256,
     "max_dec_len": 256,
-    "max_samples": 500000,
-    "warmup_ratio": 0.05,
-    "dtype": "bfloat16",
-    "seed": 42,
+    "max_samples": 1000000,
 }
 
 
 def _apply_train_defaults(args):
-    config = TOY_CONFIG if args.toy else BASE_CONFIG
+    config = TOY_CONFIG if args.toy else MAIN_CONFIG
     for key, value in config.items():
         if getattr(args, key, None) is None:
             setattr(args, key, value)
+    if getattr(args, "d_model", None) is None:
+        args.d_model = max(args.mrl_dims)
 
 
 def main():
@@ -119,10 +113,10 @@ def main():
     p = sub.add_parser("train", add_help=False)
     p.add_argument("--toy", action="store_true")
     p.add_argument("--checkpoint", type=str, default=None)
-    p.add_argument("--epochs", type=int, default=None)
-    p.add_argument("--batch-size", type=int, default=None)
-    p.add_argument("--lr", type=float, default=None)
-    p.add_argument("--muon-lr", type=float, default=None)
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--d-model", type=int, default=None)
     p.add_argument("--num-heads", type=int, default=None)
     p.add_argument("--num-layers", type=int, default=None)
@@ -130,18 +124,20 @@ def main():
     p.add_argument("--max-enc-len", type=int, default=None)
     p.add_argument("--max-dec-len", type=int, default=None)
     p.add_argument("--max-samples", type=int, default=None)
-    p.add_argument("--warmup-ratio", type=float, default=None)
+    p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--wandb", action="store_true")
-    p.add_argument("--dtype", type=str, default=None, choices=["float32", "bfloat16"])
+    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--max-eval-samples", type=int, default=None)
-    p.add_argument("--sparsity-ratio", type=float, default=0.0)
+    p.add_argument("--sparsity-ratio", type=float, default=0.33)
     p.add_argument("--layer-prune-ratio", type=float, default=0.0)
     p.add_argument("--group-size", type=int, default=32)
     p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu"])
     p.add_argument("--num-memory-slots", type=int, default=64)
+    p.add_argument("--mrl-dims", type=int, nargs="*", default=[512, 256, 128, 64],
+                   help="MRL dimension pruning targets (default: 512 256 128 64)")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
@@ -165,7 +161,7 @@ def main():
     p.add_argument("--project", type=str, default="needle-v1")
     p.add_argument("--count", type=int, default=20)
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--d-model", type=int, default=128)
@@ -190,7 +186,7 @@ def main():
 
     tp = tpu_sub.add_parser("create", add_help=False)
     tp.add_argument("name", type=str)
-    tp.add_argument("--type", dest="accel_type", type=str, default="v5litepod-4")
+    tp.add_argument("--type", dest="accel_type", type=str, default="v6e-4")
     tp.add_argument("--version", type=str, default=None,
                     help="Software version (auto-detected from --type if omitted)")
 
