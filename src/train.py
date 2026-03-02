@@ -53,7 +53,7 @@ def scale_by_muon(momentum=0.95, ns_steps=5):
         del params
 
         def ortho(g):
-            if g.ndim >= 2:
+            if g.ndim == 2:
                 return _newton_schulz(g, steps=ns_steps)
             return g
 
@@ -70,9 +70,9 @@ def scale_by_muon(momentum=0.95, ns_steps=5):
 def _param_labels(params):
     """Label each param: 'muon' for Dense kernels, 'adam' for the rest."""
 
-    def _label(path, _):
+    def _label(path, leaf):
         name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
-        if name == "kernel":
+        if name == "kernel" and leaf.ndim == 2:
             return "muon"
         return "adam"
 
@@ -325,7 +325,7 @@ def _quantize_params(params, group_size=32):
     """Fake-quantize all Dense kernels in the param tree."""
     def _maybe_quantize(path, leaf):
         name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
-        if name == "kernel":
+        if name == "kernel" and leaf.ndim == 2:
             return _fake_quantize_int4(leaf, group_size=group_size)
         return leaf
     return jax.tree_util.tree_map_with_path(_maybe_quantize, params)
