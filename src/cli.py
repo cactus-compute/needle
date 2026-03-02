@@ -74,6 +74,7 @@ TOY_CONFIG = {
     "d_model": 128,
     "num_heads": 4,
     "num_layers": 2,
+    "num_dec_layers": 2,
     "max_enc_len": 128,
     "max_dec_len": 128,
     "max_samples": 10000,
@@ -87,9 +88,10 @@ BASE_CONFIG = {
     "batch_size": 32,
     "lr": 3e-4,
     "muon_lr": 0.02,
-    "d_model": 256,
+    "d_model": 512,
     "num_heads": 4,
     "num_layers": 4,
+    "num_dec_layers": 2,
     "max_enc_len": 256,
     "max_dec_len": 256,
     "max_samples": 500000,
@@ -124,6 +126,7 @@ def main():
     p.add_argument("--d-model", type=int, default=None)
     p.add_argument("--num-heads", type=int, default=None)
     p.add_argument("--num-layers", type=int, default=None)
+    p.add_argument("--num-dec-layers", type=int, default=None)
     p.add_argument("--max-enc-len", type=int, default=None)
     p.add_argument("--max-dec-len", type=int, default=None)
     p.add_argument("--max-samples", type=int, default=None)

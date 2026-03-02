@@ -391,7 +391,7 @@ def train(args):
             d_model=args.d_model,
             num_heads=args.num_heads,
             num_encoder_layers=args.num_layers,
-            num_decoder_layers=args.num_layers,
+            num_decoder_layers=getattr(args, "num_dec_layers", args.num_layers),
             d_ff=args.d_model * 4,
             max_seq_len=max(args.max_enc_len, args.max_dec_len),
             dtype=args.dtype,
