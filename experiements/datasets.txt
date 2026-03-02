@@ -1,0 +1,26 @@
+================================================================================
+
+Task: Design & gather multimodal dataset, text tokenization, speech processing, and tool call strategy.
+Deliverable: A pipleine of preprocessed dataset, from which the codebase can stream datasets from. 
+Assignee: Parkirat Sandhu & Jakub Mroz
+Deadline: 7th March 
+
+================================================================================
+
+Text dataset: SYNTH (https://huggingface.co/datasets/PleIAs/SYNTH)
+Transcribe datasets: Emilia-Large, SPGI Speech 
+Text tool call datasets: xlam-function-calling-60k, xlam-irrelevance-7.5k, Salesforce/APIGen-MT-5k, APIGen-Irrelevant-5k, glaive-function-calling, Team-ACE/ToolACE
+Voice tool call datasets: Use a good TTS model to generate voice commands from the tool call dataset prompts
+
+================================================================================
+
+Note:
+1. LEAP makes sense as we wish the dataset to preprocess and pretokenize the inputs before injesting into the model. 
+2. We are training a cutom sentencepiece tokenizer with a small vocab size, given how constrained the decode is.
+3. Requires solid cloud infra experience, latency in injestion will slow down training. 
+4. Record all obersvations, they will go into the paper!
+5. Design the batching (mix of speech and text and tools) experimantally.
+6. We should have a <transcribe> and <tools> tag for the two tasks we train on.
+
+================================================================================
+

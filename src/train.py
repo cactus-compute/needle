@@ -205,6 +205,56 @@ def _block_prune_params(params, prune_ratio=0.25, group_size=32):
     return jax.tree_util.tree_map_with_path(_prune_weight, params)
 
 
+def _cubic_sparsity_schedule(step, t_start, t_end, s_final):
+    """Cubic sparsity ramp (Zhu & Gupta 2017). Returns target sparsity at *step*."""
+    if step < t_start:
+        return 0.0
+    if step >= t_end:
+        return s_final
+    frac = (step - t_start) / (t_end - t_start)
+    return s_final * (1.0 - (1.0 - frac) ** 3)
+
+
+def _make_prune_mask(params, sparsity, group_size):
+    """Compute block-prune mask entirely on-device (no numpy round-trips).
+
+    Returns (pruned_params, binary_mask).
+    """
+    # Pass 1: collect block L1 scores as JAX arrays
+    all_scores = []
+    for _, leaf in jax.tree_util.tree_leaves_with_path(params):
+        if leaf.ndim != 2:
+            continue
+        in_feat, out_feat = leaf.shape
+        gs = min(group_size, in_feat)
+        pad = (gs - in_feat % gs) % gs
+        w = jnp.pad(leaf, ((0, pad), (0, 0))) if pad else leaf
+        scores = jnp.sum(jnp.abs(w.reshape(-1, gs, out_feat)), axis=1).ravel()
+        all_scores.append(scores)
+
+    if not all_scores:
+        ones = jax.tree.map(jnp.ones_like, params)
+        return params, ones
+
+    threshold = jnp.percentile(jnp.concatenate(all_scores), sparsity * 100)
+
+    # Pass 2: build per-leaf binary mask
+    def _leaf_mask(path, leaf):
+        if leaf.ndim != 2:
+            return jnp.ones_like(leaf)
+        in_feat, out_feat = leaf.shape
+        gs = min(group_size, in_feat)
+        pad = (gs - in_feat % gs) % gs
+        w = jnp.pad(leaf, ((0, pad), (0, 0))) if pad else leaf
+        w_grouped = w.reshape(-1, gs, out_feat)
+        block_keep = (jnp.sum(jnp.abs(w_grouped), axis=1, keepdims=True) > threshold)
+        return jnp.broadcast_to(block_keep, w_grouped.shape).reshape(-1, out_feat)[:in_feat].astype(jnp.float32)
+
+    mask = jax.tree_util.tree_map_with_path(_leaf_mask, params)
+    pruned = jax.tree.map(lambda w, m: w * m, params, mask)
+    return pruned, mask
+
+
 def _layer_prune(params, config, layer_prune_ratio=0.25):
     """Remove the lowest-scoring encoder/decoder blocks by L1 magnitude.
 
@@ -529,37 +579,22 @@ def train(args):
     sparsity_ratio = getattr(args, "sparsity_ratio", 0.0)
     layer_prune_ratio = getattr(args, "layer_prune_ratio", 0.0)
     prune_mask = None
+    gradual_pruning_done = False
 
-    weight_prune_epoch = 1 if sparsity_ratio > 0 else -1
-    layer_prune_epoch = (2 if sparsity_ratio > 0 else 1) if layer_prune_ratio > 0 else -1
+    prune_interval = getattr(args, "prune_interval", 100)
+    prune_start_frac = getattr(args, "prune_start_frac", 0.33)
+    prune_end_frac = getattr(args, "prune_end_frac", 0.67)
+
+    weight_prune_epoch = 0 if sparsity_ratio > 0 else -1
+    layer_prune_epoch = (1 if sparsity_ratio > 0 else 0) if layer_prune_ratio > 0 else -1
 
     for epoch in range(args.epochs):
-        if epoch == weight_prune_epoch and prune_mask is None:
-            print(f"\nGroup-wise sparsification: {sparsity_ratio*100:.0f}% of blocks (group_size={_GROUP_SIZE})...")
-            pruned_params = _block_prune_params(jax_utils.unreplicate(ema_params), prune_ratio=sparsity_ratio, group_size=_GROUP_SIZE)
-
-            pruned_np = jax.tree.map(np.array, pruned_params)
-            total_p = sum(x.size for x in jax.tree.leaves(pruned_np))
-            zero_p = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(pruned_np))
-            print(f"  Post-prune sparsity: {zero_p/total_p*100:.2f}% ({zero_p:,}/{total_p:,} near-zero)")
-
-            val_causal = make_causal_mask(args.max_dec_len)
-            total_loss, total_toks = 0.0, 0.0
-            for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
-                vl, vt = val_loss_fn(pruned_params, vb[0], vb[1], vb[2], val_causal)
-                total_loss += float(vl)
-                total_toks += float(vt)
-            prune_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
-            print(f"  Post-prune val ppl:  {prune_val_ppl:.2f} (was {last_val_ppl:.2f})" if last_val_ppl is not None else f"  Post-prune val ppl:  {prune_val_ppl:.2f}")
-
-            state = jax_utils.unreplicate(state)
-            state = state.replace(params=pruned_params)
-            ema_params = jax.tree.map(jnp.copy, pruned_params)
-            prune_mask = jax.tree.map(lambda w: (jnp.abs(w) > 1e-8).astype(jnp.float32), pruned_params)
-            prune_mask = jax_utils.replicate(prune_mask)
-            state = jax_utils.replicate(state)
-            ema_params = jax_utils.replicate(ema_params)
-            print(f"\nContinuing training with sparsity mask locked...\n")
+        if epoch == weight_prune_epoch and not gradual_pruning_done:
+            t_start = int(num_batches * prune_start_frac)
+            t_end = int(num_batches * prune_end_frac)
+            print(f"\nGradual magnitude pruning: 0% -> {sparsity_ratio*100:.0f}% over epoch {epoch+1} "
+                  f"(steps {t_start}-{t_end}/{num_batches}, interval={prune_interval}, group_size={_GROUP_SIZE})")
+            epoch_step = 0
 
         if epoch == layer_prune_epoch:
             print(f"\nLayer pruning: removing {layer_prune_ratio*100:.0f}% of layers...")
@@ -609,6 +644,15 @@ def train(args):
                 causal_mask,
             )
 
+            # --- Gradual magnitude pruning (epoch 1 only) ---
+            if epoch == weight_prune_epoch and not gradual_pruning_done:
+                epoch_step += 1
+                current_sparsity = _cubic_sparsity_schedule(epoch_step, t_start, t_end, sparsity_ratio)
+                if epoch_step >= t_start and epoch_step % prune_interval == 0 and current_sparsity > 0:
+                    ema_unr = jax_utils.unreplicate(ema_params)
+                    _, mask = _make_prune_mask(ema_unr, current_sparsity, _GROUP_SIZE)
+                    prune_mask = jax_utils.replicate(mask)
+
             if prune_mask is not None:
                 state = state.replace(params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
                 ema_params = jax.tree.map(lambda w, m: w * m, ema_params, prune_mask)
@@ -628,7 +672,12 @@ def train(args):
                     total_toks += float(vt)
                 del _eval_params
                 last_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
-            pbar.set_postfix(loss=f"{loss_val:.4f}", val_ppl=f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?")
+
+            # --- tqdm postfix with sparsity during epoch 1 ---
+            postfix = {"loss": f"{loss_val:.4f}", "val_ppl": f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?"}
+            if epoch == weight_prune_epoch and not gradual_pruning_done:
+                postfix["sparsity"] = f"{current_sparsity*100:.1f}%"
+            pbar.set_postfix(**postfix)
 
             if use_wandb:
                 log_dict = {
@@ -639,9 +688,28 @@ def train(args):
                     "train/tokens_per_sec": tokens_per_batch / dt,
                     "train/step": global_step,
                 }
+                if epoch == weight_prune_epoch and not gradual_pruning_done:
+                    log_dict["train/scheduled_sparsity"] = current_sparsity
                 if global_step % eval_every == 0 or global_step == total_steps:
                     log_dict["val/ppl"] = last_val_ppl
                 wandb.log(log_dict)
+
+        # --- Lock mask after epoch 1 gradual pruning ---
+        if epoch == weight_prune_epoch and not gradual_pruning_done:
+            gradual_pruning_done = True
+            if prune_mask is None:
+                # Edge case: epoch had fewer steps than t_start
+                ema_unr = jax_utils.unreplicate(ema_params)
+                _, mask = _make_prune_mask(ema_unr, sparsity_ratio, _GROUP_SIZE)
+                prune_mask = jax_utils.replicate(mask)
+                state = state.replace(params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
+                ema_params = jax.tree.map(lambda w, m: w * m, ema_params, prune_mask)
+            final_pruned = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
+            total_p = sum(x.size for x in jax.tree.leaves(final_pruned))
+            zero_p = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(final_pruned))
+            print(f"\n  Gradual pruning complete — mask locked.")
+            print(f"  Final sparsity: {zero_p/total_p*100:.2f}% ({zero_p:,}/{total_p:,} near-zero)")
+            del final_pruned
 
         epoch_avg_loss = sum(losses) / len(losses) if losses else float("nan")
         final_loss = losses[-1] if losses else float("nan")
@@ -753,44 +821,3 @@ def train(args):
     print("\nTraining complete.")
 
 
-def sweep(args):
-    import wandb
-    import yaml
-
-    with open(args.sweep_config) as f:
-        sweep_config = yaml.safe_load(f)
-
-    def sweep_train():
-        wandb.init(project=args.project)
-        for key, value in dict(wandb.config).items():
-            if hasattr(args, key):
-                setattr(args, key, value)
-        args.wandb = True
-        train(args)
-        wandb.finish()
-
-    sweep_id = wandb.sweep(sweep_config, project=args.project)
-    wandb.agent(sweep_id, function=sweep_train, count=args.count)
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train encoder-decoder transformer on TinyStories")
-    parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--muon-lr", type=float, default=0.02)
-    parser.add_argument("--d-model", type=int, default=128)
-    parser.add_argument("--num-heads", type=int, default=4)
-    parser.add_argument("--num-layers", type=int, default=2)
-    parser.add_argument("--max-enc-len", type=int, default=128)
-    parser.add_argument("--max-dec-len", type=int, default=128)
-    parser.add_argument("--max-samples", type=int, default=10000)
-    parser.add_argument("--log-every", type=int, default=50)
-    parser.add_argument("--warmup-ratio", type=float, default=0.05)
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    parser.add_argument("--seed", type=int, default=42)
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    train(parse_args())

@@ -1,4 +1,5 @@
 import hashlib
+import multiprocessing as mp
 import os
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
@@ -61,6 +62,23 @@ class NeedleTokenizer:
                 ids = ids[:max_length]
             all_ids.append(ids)
         return {"input_ids": all_ids}
+
+
+_worker_sp = None
+_worker_max_len = None
+
+
+def _init_worker(model_path, max_length):
+    """Initializer for multiprocessing pool — loads SP model once per worker."""
+    global _worker_sp, _worker_max_len
+    _worker_sp = spm.SentencePieceProcessor()
+    _worker_sp.Load(model_path)
+    _worker_max_len = max_length
+
+
+def _tokenize_chunk(texts):
+    """Encode a chunk of texts in a worker process."""
+    return [_worker_sp.Encode(t, out_type=int)[:_worker_max_len] for t in texts]
 
 
 def train_tokenizer(vocab_size=8192, max_samples=None):
@@ -151,47 +169,54 @@ def prepare_encoder_decoder_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=12
     bos_id = tokenizer.eos_token_id
     max_total = max_enc_len + max_dec_len
 
-    print("Tokenizing...")
+    # --- Parallel tokenization ---
     texts = list(ds["text"])
-    all_tokens = tokenizer(
-        texts, truncation=True, max_length=max_total,
-    )["input_ids"]
+    num_workers = min(os.cpu_count() or 1, 8)
+    model_path = TOKENIZER_PREFIX + ".model"
+    chunk_size = max(1, len(texts) // (num_workers * 4))
+    chunks = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
 
-    n = len(all_tokens)
-    enc_inputs = np.full((n, max_enc_len), pad_id, dtype=np.int32)
-    dec_inputs = np.full((n, max_dec_len), pad_id, dtype=np.int32)
-    dec_targets = np.full((n, max_dec_len), pad_id, dtype=np.int32)
+    print(f"Tokenizing ({num_workers} workers)...")
+    with mp.Pool(num_workers, initializer=_init_worker,
+                 initargs=(model_path, max_total)) as pool:
+        results = pool.map(_tokenize_chunk, chunks)
+    all_tokens = [tok for chunk in results for tok in chunk]
 
-    kept = 0
-    for tokens in tqdm(all_tokens, desc="Building pairs"):
-        if len(tokens) < 6:
-            continue
+    # --- Pre-filter by length to reduce loop iterations ---
+    lengths = np.array([len(t) for t in all_tokens])
+    valid_mask = lengths >= 6
+    valid_indices = np.where(valid_mask)[0]
 
-        split_point = max(2, int(len(tokens) * split_ratio))
-        enc_tokens = tokens[:split_point][:max_enc_len]
-        dec_tokens = tokens[split_point:][:max_dec_len]
+    split_points = np.maximum(2, (lengths[valid_indices] * split_ratio).astype(np.int32))
+    enc_lens = np.minimum(split_points, max_enc_len)
+    dec_lens = np.minimum(lengths[valid_indices] - split_points, max_dec_len)
+    keep = dec_lens >= 2
 
-        if len(dec_tokens) < 2:
-            continue
+    valid_indices = valid_indices[keep]
+    split_points = split_points[keep]
+    enc_lens = enc_lens[keep]
+    dec_lens = dec_lens[keep]
 
-        enc_len = len(enc_tokens)
-        dec_len = len(dec_tokens)
-        enc_inputs[kept, :enc_len] = enc_tokens
-        dec_inputs[kept, 0] = bos_id
-        dec_inputs[kept, 1:dec_len] = dec_tokens[:dec_len - 1]
-        dec_targets[kept, :dec_len] = dec_tokens
-        kept += 1
+    n_keep = len(valid_indices)
+    enc_inputs = np.full((n_keep, max_enc_len), pad_id, dtype=np.int32)
+    dec_inputs = np.full((n_keep, max_dec_len), pad_id, dtype=np.int32)
+    dec_targets = np.full((n_keep, max_dec_len), pad_id, dtype=np.int32)
 
-    enc_inputs = enc_inputs[:kept]
-    dec_inputs = dec_inputs[:kept]
-    dec_targets = dec_targets[:kept]
+    for i, (idx, sp, el, dl) in enumerate(
+        zip(valid_indices, split_points, enc_lens, dec_lens)
+    ):
+        tokens = all_tokens[idx]
+        enc_inputs[i, :el] = tokens[:sp][:max_enc_len]
+        dec_inputs[i, 0] = bos_id
+        dec_inputs[i, 1:dl] = tokens[sp:][:dl - 1]
+        dec_targets[i, :dl] = tokens[sp:][:max_dec_len]
 
     # Save cache
     os.makedirs(CACHE_DIR, exist_ok=True)
     np.save(cache_path + "_enc.npy", enc_inputs)
     np.save(cache_path + "_dec_in.npy", dec_inputs)
     np.save(cache_path + "_dec_tgt.npy", dec_targets)
-    print(f"Cached data to {CACHE_DIR}/{cache_id}")
+    print(f"Cached {n_keep:,} pairs to {CACHE_DIR}/{cache_id}")
 
     return enc_inputs, dec_inputs, dec_targets
 
