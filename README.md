@@ -12,16 +12,16 @@
 
                           ┌─────────────┐
                           │   Softmax   │             ┌──────────────────────┐
-                          └──────┬──────┘             │ Forward with MRL     │
-                    ┌─────┬──────┴──────┬─────┐       │ loss at dims         │
-                    │  @E[:d'] for each d'    │       │ {512,256,128,64}     │
-                    │  in mrl_dims            │       │ + INT4 QAT (g=32)    │
+                          └──────┬──────┘             │ MRL loss at dims     │
+                    ┌─────┬──────┴──────┬─────┐       │ {512,256,128,64}     │
+                    │  @E[:d'] for each d'    │       │ + INT4 QAT (g=32)    │
+                    │  in mrl_dims            │       │ + z-loss + slot div  │
                     └─────┬──────┬──────┬─────┘       └──────────┬───────────┘
                           ┌──────┴──────┐                        │
                           │  Linear (T) │  ← tied     ┌──────────┴───────────┐
-                          └──────┬──────┘             │ Muon  (2D kernels)   │
-                          ┌──────┴──────┐             │ AdamW (everything    │
-                          │  ZCRMSNorm  │             │       else)          │
+                          └──────┬──────┘             │ Grad clip (norm 1.0) │
+                          ┌──────┴──────┐             │ Muon  (2D kernels)   │
+                          │  ZCRMSNorm  │             │ AdamW (all else)     │
                           └──────┬──────┘             │ WSD LR schedule      │
                        ┌─────────┴─────────┐          └──────────┬───────────┘
                        │  Decoder x N_dec  │                     │
@@ -30,22 +30,26 @@
                        │ │ Attn + RoPE   │ │          └──────────┬───────────┘
                        │ ├───────────────┤ │                     │
   ┌──────────────┐  S  │ │   Cross       │ │          ┌──────────┴───────────┐
-  │ MemoryMixer  │─────────▶ Attention   │ │          │ Block Prune          │
-  │ Encoder      │     │ ├───────────────┤ │          │  after epoch 1       │
-  │  x N_enc     │     │ │ Feed-Forward  │ │          │  group magnitude     │
-  │              │     │ │   (dReLU)     │ │          │  lock sparsity mask  │
-  │ ┌──────────┐ │     │ └───────────────┘ │          └──────────┬───────────┘
-  │ │Pack:     │ │     └─────────┬─────────┘                     │
-  │ │ S←X Attn │ │        ┌──────┴──────┐             ┌──────────┴───────────┐
-  │ │ RoPE keys│ │        │  Embedding  │  ← shared   │ MRL Checkpoint       │
-  │ ├──────────┤ │        └──────┬──────┘             │  save per mrl_dim    │
-  │ │Mix:      │ │               │                    │  {512,256,128,64}    │
-  │ │ MLP-Mixer│ │         ┌─────┴─────┐              │  sparse + INT4       │
-  │ │ on S     │ │         │  Decoder  │              └──────────────────────┘
-  │ ├──────────┤ │         │   Input   │
-  │ │Local:    │ │         └───────────┘
-  │ │ FFN on X │ │
+  │ MemoryMixer  │─────────▶ Attention   │ │          │   Sparsification     │
+  │ Encoder      │     │ ├───────────────┤ │          │  cubic schedule      │
+  │  x N_enc     │     │ │  Gated FFN    │ │          │  mask every N steps  │
+  │              │     │ └───────────────┘ │          └──────────┬───────────┘
+  │ ┌──────────┐ │     └─────────┬─────────┘                     │
+  │ │Pack:     │ │        ┌──────┴──────┐             ┌──────────┴───────────┐
+  │ │ S←X Attn │ │        │  Embedding  │  ← shared   │ Checkpoint           │
+  │ │ RoPE keys│ │        └──────┬──────┘             │  full params, can    │
+  │ ├──────────┤ │               │                    │  export MRL slices   │
+  │ │Mix:      │ │         ┌─────┴─────┐              └──────────────────────┘
+  │ │ MLP-Mixer│ │         │  Decoder  │
+  │ │ on S     │ │         │   Input   │
+  │ ├──────────┤ │         └───────────┘
+  │ │Local:    │ │
+  │ │Gated FFN │ │
+  │ │ on X     │ │
   │ └──────────┘ │
+  │              │
+  │  Slot Init   │  learnable + input-dependent
+  │  DW Conv ↓2  │  stride-2 depthwise-separable
   │  S ∈ (M, d)  │
   └──────┬───────┘
   ┌──────┴───────┐
@@ -57,9 +61,9 @@
     │  Input  │
     └─────────┘
 
-    d=max(mrl_dims) · 4 heads · 2 KV heads · 64 memory slots
-    SentencePiece BPE (8192) · dReLU · ZCRMSNorm · RoPE
-    Matryoshka dims · INT4 QAT · Muon + AdamW
+    d=max(mrl_dims) · GQA (4 heads, 2 KV) · QK-norm · 64 slots
+    SentencePiece BPE (8192) · gated dReLU · ZCRMSNorm · RoPE
+    strided DW conv · Matryoshka dims · INT4 QAT · Muon + AdamW
 ```
 
 ## Usage
@@ -74,34 +78,30 @@ needle [command]
   ┌───────────────────────────────────────────────────────────────────┐
   │                                                                   │
   │   train                                                           │
-  │     --toy                  Use toy config for quick iteration     │
-  │     --epochs INT           Training epochs (default: 2)           │
+  │     --epochs INT           Training epochs (default: 1)           │
   │     --batch-size INT       Batch size (default: 32)               │
   │     --lr FLOAT             AdamW learning rate (default: 3e-4)    │
   │     --muon-lr FLOAT        Muon learning rate (default: 0.02)     │
   │     --d-model INT          Model dim (default: max of mrl-dims)   │
   │     --num-heads INT        Attention heads (default: 4)           │
-  │     --num-layers INT       Encoder layers (default: 12)           │
-  │     --num-dec-layers INT   Decoder layers (default: 4)            │
+  │     --num-layers INT       Encoder layers (default: 4)            │
+  │     --num-dec-layers INT   Decoder layers (default: 2)            │
   │     --max-enc-len INT      Max encoder seq length (default: 256)  │
   │     --max-dec-len INT      Max decoder seq length (default: 256)  │
-  │     --max-samples INT      Training samples (default: 1000000)    │
-  │     --mrl-dims INT [...]   MRL dim targets (default: 512 256 128) │
-  │     --sparsity-ratio FLOAT Block prune ratio (default: 0.33)      │
-  │     --layer-prune-ratio FL Layer prune ratio (default: 0.0)       │
+  │     --max-samples INT      Training samples (default: all)        │
+  │     --mrl-dims INT [...]   MRL dim targets (default: 1024 512..)  │
+  │     --sparsity-ratio FLOAT Block prune ratio (default: 0.5)       │
   │     --group-size INT       Quant/prune group size (default: 32)   │
+  │     --prune-interval INT   Steps between mask updates (def: 100)  │
+  │     --prune-start-frac FL  Start pruning at this frac (def: 0.33) │
+  │     --prune-end-frac FL    Lock mask at this frac (def: 0.67)     │
   │     --activation STR       drelu|swiglu|geglu (default: drelu)    │
-  │     --warmup-ratio FLOAT   LR warmup ratio (default: 0.05)       │
+  │     --warmup-ratio FLOAT   LR warmup ratio (default: 0.05)        │
   │     --eval-every INT       Val eval interval (default: 1000)      │
   │     --wandb                Enable W&B logging                     │
   │     --checkpoint PATH      Resume from checkpoint                 │
   │     --checkpoint-dir DIR   Checkpoint directory                   │
   │     --seed INT             Random seed (default: 42)              │
-  │                                                                   │
-  │   sweep                                                           │
-  │     --sweep-config PATH    Sweep YAML config                      │
-  │     --project STR          W&B project name (default: needle-v1)  │
-  │     --count INT            Number of trials (default: 20)         │
   │                                                                   │
   │   run                                                             │
   │     --checkpoint PATH      Path to model checkpoint (required)    │

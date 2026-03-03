@@ -10,21 +10,19 @@ HELP = """
   │      ...the tiny model to rule them all...                        │
   │                                                                   │
   │   train                                                           │
-  │     --toy                   Use toy config for quick iteration    │
   │     --epochs INT            Training epochs (default: 1)          │
   │     --batch-size INT        Batch size (default: 32)              │
   │     --lr FLOAT              AdamW learning rate (default: 3e-4)   │
   │     --muon-lr FLOAT         Muon learning rate (default: 0.02)    │
   │     --d-model INT           Model dim (default: max of mrl-dims)  │
   │     --num-heads INT         Attention heads (default: 4)          │
-  │     --num-layers INT        Encoder layers (default: 12)          │
-  │     --num-dec-layers INT    Decoder layers (default: 4)           │
+  │     --num-layers INT        Encoder layers (default: 4)           │
+  │     --num-dec-layers INT    Decoder layers (default: 2)           │
   │     --max-enc-len INT       Max encoder seq length (default: 256) │
   │     --max-dec-len INT       Max decoder seq length (default: 256) │
-  │     --max-samples INT       Training samples (default: 1000000)   │
-  │     --mrl-dims INT [...]    MRL dim targets (default: 512 256 ..) │
-  │     --sparsity-ratio FLOAT  Block prune ratio (default: 0.33)     │
-  │     --layer-prune-ratio FL  Layer prune ratio (default: 0.0)      │
+  │     --max-samples INT       Training samples (default: all)       │
+  │     --mrl-dims INT [...]    MRL dim targets (default: 1024 512..) │
+  │     --sparsity-ratio FLOAT  Block prune ratio (default: 0.5)      │
   │     --group-size INT        Quant/prune group size (default: 32)  │
   │     --prune-interval INT    Steps between mask updates (def: 100) │
   │     --prune-start-frac FL   Start pruning at this frac (def: 0.33)│
@@ -72,34 +70,6 @@ HELP = """
   └───────────────────────────────────────────────────────────────────┘
 """
 
-TOY_CONFIG = {
-    "num_heads": 4,
-    "num_layers": 2,
-    "num_dec_layers": 2,
-    "max_enc_len": 128,
-    "max_dec_len": 128,
-    "max_samples": 10000,
-}
-
-MAIN_CONFIG = {
-    "num_heads": 4,
-    "num_layers": 4,
-    "num_dec_layers": 2,
-    "max_enc_len": 256,
-    "max_dec_len": 256,
-    "max_samples": None,
-}
-
-
-def _apply_train_defaults(args):
-    config = TOY_CONFIG if args.toy else MAIN_CONFIG
-    for key, value in config.items():
-        if getattr(args, key, None) is None:
-            setattr(args, key, value)
-    if getattr(args, "d_model", None) is None:
-        args.d_model = max(args.mrl_dims)
-
-
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
         print(HELP)
@@ -109,18 +79,17 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     p = sub.add_parser("train", add_help=False)
-    p.add_argument("--toy", action="store_true")
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--d-model", type=int, default=None)
-    p.add_argument("--num-heads", type=int, default=None)
-    p.add_argument("--num-layers", type=int, default=None)
-    p.add_argument("--num-dec-layers", type=int, default=None)
-    p.add_argument("--max-enc-len", type=int, default=None)
-    p.add_argument("--max-dec-len", type=int, default=None)
+    p.add_argument("--num-heads", type=int, default=4)
+    p.add_argument("--num-layers", type=int, default=4)
+    p.add_argument("--num-dec-layers", type=int, default=2)
+    p.add_argument("--max-enc-len", type=int, default=256)
+    p.add_argument("--max-dec-len", type=int, default=256)
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--wandb", action="store_true")
@@ -130,7 +99,6 @@ def main():
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--max-eval-samples", type=int, default=None)
     p.add_argument("--sparsity-ratio", type=float, default=0.5)
-    p.add_argument("--layer-prune-ratio", type=float, default=0.0)
     p.add_argument("--group-size", type=int, default=32)
     p.add_argument("--prune-interval", type=int, default=100,
                    help="Steps between mask updates during gradual pruning (default: 100)")
@@ -204,7 +172,8 @@ def main():
         sys.exit(0)
 
     if args.command == "train":
-        _apply_train_defaults(args)
+        if args.d_model is None:
+            args.d_model = max(args.mrl_dims)
         from .train import train
         train(args)
     elif args.command == "run":
