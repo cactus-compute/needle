@@ -11,11 +11,13 @@ dependencies = [
     "transformers",
     "wandb",
     "sentencepiece",
+    "jax-metal; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
 tpu = ["jax[tpu]"]
 gpu = ["jax[cuda12]"]
+metal = ["jax-metal"]
 
 [project.scripts]
 needle = "src.cli:main"

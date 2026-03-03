@@ -64,7 +64,7 @@ def generate(model, params, tokenizer, prompt, max_gen_len=128, temperature=0.8,
     for i in range(max_gen_len - 1):
         next_logits = logits[0, i] / temperature
         rng, sample_rng = jax.random.split(rng)
-        next_token = jax.random.categorical(sample_rng, next_logits).item()
+        next_token = int(jax.random.categorical(sample_rng, next_logits))
 
         if next_token == eos_id:
             break

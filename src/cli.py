@@ -78,7 +78,8 @@ TOY_CONFIG = {
     "num_dec_layers": 2,
     "max_enc_len": 128,
     "max_dec_len": 128,
-    "max_samples": 10000,
+    "max_samples": 10_000,
+    "max_eval_samples": 1024,
 }
 
 MAIN_CONFIG = {

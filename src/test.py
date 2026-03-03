@@ -93,7 +93,7 @@ def measure_throughput(model, params, tokenizer, num_runs=10, prompt="Once upon 
         num_tokens = 0
         for i in range(max_gen_len - 1):
             rng, sample_rng = jax.random.split(rng)
-            next_token = jax.random.categorical(sample_rng, logits[0, i]).item()
+            next_token = int(jax.random.categorical(sample_rng, logits[0, i]))
 
             if next_token == eos_id:
                 break

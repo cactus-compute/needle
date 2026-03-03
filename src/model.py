@@ -1,9 +1,12 @@
 import math
 from dataclasses import dataclass
 
+import jax
 import jax.numpy as jnp
 import jax.nn.initializers as jinit
 import flax.linen as nn
+
+IS_MAC = jax.default_backend() == "METAL"
 
 
 def default_init():
@@ -213,6 +216,33 @@ class MemoryMixerBlock(nn.Module):
         return x, s
 
 
+class DepthwiseConv1d(nn.Module):
+    """Depthwise 1D convolution with Metal fallback."""
+    features: int
+    kernel_size: int = 4
+    strides: int = 2
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, x):
+        if IS_MAC:
+            k = self.param("kernel", default_init(), (self.kernel_size, self.features))
+            k = k.astype(self.dtype)
+            T = x.shape[1]
+            pad_left = (self.kernel_size - 1) // 2
+            pad_right = self.kernel_size - 1 - pad_left
+            x_padded = jnp.pad(x, ((0, 0), (pad_left, pad_right), (0, 0)))
+            indices = jnp.arange(0, T, self.strides)[:, None] + jnp.arange(self.kernel_size)[None, :]
+            x_windows = x_padded[:, indices, :]
+            return jnp.sum(x_windows * k[None, None, :, :], axis=2)
+        return nn.Conv(
+            features=self.features, kernel_size=(self.kernel_size,),
+            strides=(self.strides,), padding='SAME',
+            feature_group_count=self.features,
+            dtype=self.dtype, use_bias=False,
+        )(x)
+
+
 class MemoryMixerEncoder(nn.Module):
     """Encoder using MemoryMixer blocks. Output is the final memory slots S."""
     config: TransformerConfig
@@ -228,9 +258,7 @@ class MemoryMixerEncoder(nn.Module):
         s_bias = nn.Dense(cfg.d_model, dtype=dt, use_bias=False, kernel_init=jinit.zeros, name="slot_init")(x_pool)
         s = jnp.broadcast_to(s_base.astype(dt), (x.shape[0], cfg.num_memory_slots, cfg.d_model)) + s_bias[:, None, :]
 
-        x = nn.Conv(features=cfg.d_model, kernel_size=(4,), strides=(2,),
-                    padding='SAME', feature_group_count=cfg.d_model,
-                    dtype=dt, use_bias=False, name="downsample_dw")(x)
+        x = DepthwiseConv1d(cfg.d_model, kernel_size=4, strides=2, dtype=dt, name="downsample_dw")(x)
         x = nn.Dense(cfg.d_model, dtype=dt, use_bias=False,
                      kernel_init=default_init(), name="downsample_pw")(x)
 
@@ -238,7 +266,7 @@ class MemoryMixerEncoder(nn.Module):
             T_new = x.shape[1]
             if mask.shape[-1] % 2:
                 mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 0), (0, 1)))
-            mask = mask.reshape(mask.shape[0], 1, 1, -1, 2).any(axis=-1)
+            mask = mask.reshape(mask.shape[0], 1, 1, -1, 2).any(axis=-1) if not IS_MAC else mask.reshape(mask.shape[0], 1, 1, -1, 2).max(axis=-1)
             mask = mask[..., :T_new]
 
         for i in range(cfg.num_encoder_layers):
@@ -361,10 +389,12 @@ class EncoderDecoderTransformer(nn.Module):
 
 
 def make_causal_mask(seq_len):
-    mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
+    mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_ if not IS_MAC else jnp.int32))
     return mask[None, None, :, :]
 
 
 def make_padding_mask(tokens, pad_token_id):
     mask = tokens != pad_token_id
+    if IS_MAC:
+        mask = mask.astype(jnp.int32)
     return mask[:, None, None, :]

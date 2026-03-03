@@ -1,0 +1,10 @@
+#!/bin/sh
+grep -qs "^Signed-off-by: " "$1" || {
+    name=$(git config user.name)
+    email=$(git config user.email)
+
+    if [ -n "$name" ] && [ -n "$email" ]; then
+        echo "" >> "$1"
+        echo "Signed-off-by: $name <$email>" >> "$1"
+    fi
+}
