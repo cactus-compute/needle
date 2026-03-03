@@ -44,6 +44,30 @@ class TransformerConfig:
     dtype: str = "bfloat16"
     activation: str = "drelu"
     num_memory_slots: int = 64
+    gate_pack_attn: bool = False
+    use_sink_token: bool = False
+    gate_decoder_attn: bool = False
+
+    def __post_init__(self):
+        """Auto-reduce d_ff so gated and ungated models have equal params at 1/2 MRL scale.
+
+        Gate overhead is constant (d_model fixed across MRL scales), but d_ff
+        halves at half scale, so savings per unit of Δd_ff also halve.  We need
+        2× the full-scale reduction to compensate at the half-scale point.
+        """
+        num_gates = 0
+        if self.gate_pack_attn:
+            num_gates += self.num_encoder_layers
+        if self.gate_decoder_attn:
+            num_gates += 2 * self.num_decoder_layers
+        if num_gates > 0:
+            gate_overhead = num_gates * self.d_model ** 2
+            slots = self.num_memory_slots + (1 if self.use_sink_token else 0)
+            cost_per_dff = 3 * (self.num_encoder_layers * (2 * self.d_model + slots)
+                                + self.num_decoder_layers * self.d_model)
+            raw = self.d_ff - 2 * gate_overhead / cost_per_dff
+            # Round down to nearest multiple of 16 so d_ff divides cleanly at 1/2, 1/4, 1/8
+            self.d_ff = int(raw) // 16 * 16
 
     @property
     def jax_dtype(self):
@@ -191,15 +215,21 @@ class MemoryMixerBlock(nn.Module):
     num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
+    gate_pack_attn: bool = False
 
     @nn.compact
     def __call__(self, x, s, mask=None, rope=None):
         s_norm = ZCRMSNorm(dtype=self.dtype, name="pack_s_norm")(s)
         x_norm = ZCRMSNorm(dtype=self.dtype, name="pack_x_norm")(x)
-        s = s + MultiHeadAttention(
+        attn_out = MultiHeadAttention(
             self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype,
             rope_keys_only=True, name="pack_attn"
         )(s_norm, x_norm, mask=mask, rope=rope)
+        if self.gate_pack_attn:
+            gate = nn.sigmoid(nn.Dense(self.d_model, dtype=self.dtype, use_bias=False,
+                                       kernel_init=jinit.zeros, name="pack_gate")(s_norm))
+            attn_out = gate * attn_out
+        s = s + attn_out
 
         s = s + MLPMixer(self.num_slots, self.d_model, self.d_ff, self.dtype, self.activation, name="mixer")(
             ZCRMSNorm(dtype=self.dtype, name="mix_norm")(s)
@@ -228,6 +258,13 @@ class MemoryMixerEncoder(nn.Module):
         s_bias = nn.Dense(cfg.d_model, dtype=dt, use_bias=False, kernel_init=jinit.zeros, name="slot_init")(x_pool)
         s = jnp.broadcast_to(s_base.astype(dt), (x.shape[0], cfg.num_memory_slots, cfg.d_model)) + s_bias[:, None, :]
 
+        if cfg.use_sink_token:
+            sink = self.param("sink_token", jinit.normal(stddev=0.02), (1, 1, cfg.d_model))
+            sink = jnp.broadcast_to(sink.astype(dt), (x.shape[0], 1, cfg.d_model))
+            s = jnp.concatenate([sink, s], axis=1)
+
+        actual_slots = cfg.num_memory_slots + (1 if cfg.use_sink_token else 0)
+
         x = nn.Conv(features=cfg.d_model, kernel_size=(4,), strides=(2,),
                     padding='SAME', feature_group_count=cfg.d_model,
                     dtype=dt, use_bias=False, name="downsample_dw")(x)
@@ -244,8 +281,12 @@ class MemoryMixerEncoder(nn.Module):
         for i in range(cfg.num_encoder_layers):
             x, s = MemoryMixerBlock(
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
-                cfg.num_memory_slots, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
+                actual_slots, cfg.total_layers, dt, cfg.activation,
+                cfg.gate_pack_attn, name=f"block_{i}"
             )(x, s, mask=mask, rope=rope)
+
+        if cfg.use_sink_token:
+            s = s[:, 1:, :]
 
         s = ZCRMSNorm(dtype=dt, name="final_norm")(s)
         return s
@@ -259,22 +300,31 @@ class DecoderBlock(nn.Module):
     num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
+    gate_attn: bool = False
 
     @nn.compact
     def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None):
         residual = x
-        x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
-            x, x, mask=self_mask, rope=rope
+        x_norm = ZCRMSNorm(dtype=self.dtype)(x)
+        attn_out = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
+            x_norm, x_norm, mask=self_mask, rope=rope
         )
-        x = x + residual
+        if self.gate_attn:
+            gate = nn.sigmoid(nn.Dense(self.d_model, dtype=self.dtype, use_bias=False,
+                                       kernel_init=jinit.zeros, name="self_attn_gate")(x_norm))
+            attn_out = gate * attn_out
+        x = attn_out + residual
 
         residual = x
-        x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="cross_attn")(
-            x, encoder_out, mask=cross_mask
+        x_norm = ZCRMSNorm(dtype=self.dtype)(x)
+        attn_out = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="cross_attn")(
+            x_norm, encoder_out, mask=cross_mask
         )
-        x = x + residual
+        if self.gate_attn:
+            gate = nn.sigmoid(nn.Dense(self.d_model, dtype=self.dtype, use_bias=False,
+                                       kernel_init=jinit.zeros, name="cross_attn_gate")(x_norm))
+            attn_out = gate * attn_out
+        x = attn_out + residual
 
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
@@ -296,7 +346,8 @@ class Decoder(nn.Module):
 
         for i in range(cfg.num_decoder_layers):
             x = DecoderBlock(
-                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
+                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation,
+                cfg.gate_decoder_attn, name=f"block_{i}"
             )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope)
 
         x = ZCRMSNorm(dtype=dt)(x)

@@ -140,6 +140,9 @@ def main():
                    help="Fraction of epoch at which pruning finishes and mask locks (default: 0.67)")
     p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu"])
     p.add_argument("--num-memory-slots", type=int, default=64)
+    p.add_argument("--gate-pack-attn", action="store_true", default=False)
+    p.add_argument("--use-sink-token", action="store_true", default=False)
+    p.add_argument("--gate-decoder-attn", action="store_true", default=False)
     p.add_argument("--mrl-dims", type=int, nargs="*", default=[1024, 512, 256, 128, 64],
                    help="MRL dimension pruning targets (default: 1024 512 256 128 64)")
 

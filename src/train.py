@@ -515,6 +515,9 @@ def train(args):
             dtype=args.dtype,
             activation=getattr(args, "activation", "drelu"),
             num_memory_slots=getattr(args, "num_memory_slots", 64),
+            gate_pack_attn=getattr(args, "gate_pack_attn", False),
+            use_sink_token=getattr(args, "use_sink_token", False),
+            gate_decoder_attn=getattr(args, "gate_decoder_attn", False),
         )
 
     global _GROUP_SIZE, _MRL_DIMS
