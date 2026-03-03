@@ -726,8 +726,9 @@ def train(args):
 
         eval_params = jax_utils.unreplicate(ema_params)
         val_causal = make_causal_mask(args.max_dec_len)
+        num_val_batches = len(val_enc) // args.batch_size
         total_loss, total_toks = 0.0, 0.0
-        for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
+        for vb in tqdm(get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False), total=num_val_batches, desc="  Val", leave=False):
             vl, vt = val_loss_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
             total_loss += float(vl)
             total_toks += float(vt)
@@ -735,7 +736,7 @@ def train(args):
 
         q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE)
         q_total_loss, q_total_toks = 0.0, 0.0
-        for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
+        for vb in tqdm(get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False), total=num_val_batches, desc="  Quant val", leave=False):
             vl, vt = val_loss_fn(q_params, vb[0], vb[1], vb[2], val_causal)
             q_total_loss += float(vl)
             q_total_toks += float(vt)
@@ -749,7 +750,7 @@ def train(args):
             for d_prime in _MRL_DIMS:
                 mrl_vl_fn = _make_mrl_val_loss_fn(apply_fn, d_prime)
                 mrl_total_loss, mrl_total_toks = 0.0, 0.0
-                for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
+                for vb in tqdm(get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False), total=num_val_batches, desc=f"  MRL d={d_prime}", leave=False):
                     vl, vt = mrl_vl_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
                     mrl_total_loss += float(vl)
                     mrl_total_toks += float(vt)
@@ -769,13 +770,17 @@ def train(args):
         ckpt_name = f"needle_{args.num_layers}_{args.d_model}_{global_step}.pkl"
         ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
 
+        print(f"  Saving checkpoint...", flush=True)
         with open(ckpt_path, "wb") as f:
             pickle.dump({"params": params_np, "config": config.__dict__}, f)
 
         from .test import measure_throughput, benchmark_generation_quality
         eval_params_jnp = jax.tree.map(jnp.array, params_np)
         del params_np  # free CPU memory
+        # Sync device before benchmarking to flush pending async operations
+        jax.tree.map(lambda x: x.block_until_ready(), eval_params_jnp)
         model = EncoderDecoderTransformer(config)
+        print(f"  Benchmarking...", flush=True)
         tp = measure_throughput(model, eval_params_jnp, tokenizer, num_runs=5)
         prompts = ["Once upon a time", "The little dog", "She was very happy because"]
         quality = benchmark_generation_quality(model, eval_params_jnp, tokenizer, prompts, max_gen_len=64, temperature=0.8)
