@@ -129,14 +129,18 @@ class FeedForward(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="gate_proj")(x)
-        up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="up_proj")(x)
-        if self.activation == "swiglu":
-            x = nn.silu(gate) * up
-        elif self.activation == "geglu":
-            x = nn.gelu(gate) * up
-        else:  # drelu
-            x = nn.relu(gate) * nn.relu(up)
+        if self.activation == "relu2":
+            x = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="up_proj")(x)
+            x = nn.relu(x) ** 2
+        else:
+            gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="gate_proj")(x)
+            up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="up_proj")(x)
+            if self.activation == "swiglu":
+                x = nn.silu(gate) * up
+            elif self.activation == "geglu":
+                x = nn.gelu(gate) * up
+            else:  # drelu
+                x = nn.relu(gate) * nn.relu(up)
         return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="down_proj")(x)
 
 
@@ -153,28 +157,36 @@ class MLPMixer(nn.Module):
         residual = s
         s = ZCRMSNorm(dtype=self.dtype, name="token_mix_norm")(s)
         s = s.transpose(0, 2, 1)
-        gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="token_mix_gate")(s)
-        up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="token_mix_up")(s)
-        if self.activation == "swiglu":
-            s = nn.silu(gate) * up
-        elif self.activation == "geglu":
-            s = nn.gelu(gate) * up
+        if self.activation == "relu2":
+            s = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="token_mix_up")(s)
+            s = nn.relu(s) ** 2
         else:
-            s = nn.relu(gate) * nn.relu(up)
+            gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="token_mix_gate")(s)
+            up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="token_mix_up")(s)
+            if self.activation == "swiglu":
+                s = nn.silu(gate) * up
+            elif self.activation == "geglu":
+                s = nn.gelu(gate) * up
+            else:
+                s = nn.relu(gate) * nn.relu(up)
         s = nn.Dense(self.num_slots, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="token_mix_down")(s)
         s = s.transpose(0, 2, 1)
         s = s + residual
 
         residual = s
         s = ZCRMSNorm(dtype=self.dtype, name="channel_mix_norm")(s)
-        gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="channel_mix_gate")(s)
-        up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="channel_mix_up")(s)
-        if self.activation == "swiglu":
-            s = nn.silu(gate) * up
-        elif self.activation == "geglu":
-            s = nn.gelu(gate) * up
+        if self.activation == "relu2":
+            s = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="channel_mix_up")(s)
+            s = nn.relu(s) ** 2
         else:
-            s = nn.relu(gate) * nn.relu(up)
+            gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="channel_mix_gate")(s)
+            up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="channel_mix_up")(s)
+            if self.activation == "swiglu":
+                s = nn.silu(gate) * up
+            elif self.activation == "geglu":
+                s = nn.gelu(gate) * up
+            else:
+                s = nn.relu(gate) * nn.relu(up)
         s = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="channel_mix_down")(s)
         s = s + residual
 

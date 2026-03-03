@@ -444,13 +444,15 @@ def _estimate_mrl_params(config, d_prime):
     n_kv = min(config.num_kv_heads, n_h)
     d_ff = config.d_ff * d // config.d_model
     m = config.num_memory_slots
+    is_gated = config.activation != "relu2"
+    ffn_proj = 3 if is_gated else 2
 
     emb = v * d
     kv_dim = n_kv * head_dim
     attn = d * d + d * kv_dim * 2 + d * d
-    ffn = d * d_ff * 3
-    mixer_token = d * d_ff * 2 + d_ff * m
-    mixer_channel = d * d_ff * 3
+    ffn = d * d_ff * ffn_proj
+    mixer_token = d * d_ff * (2 if is_gated else 1) + d_ff * m
+    mixer_channel = d * d_ff * ffn_proj
     enc_block = attn + ffn + mixer_token + mixer_channel
     dec_block = attn * 2 + ffn
     total = emb + n_enc * enc_block + n_dec * dec_block
@@ -510,7 +512,7 @@ def train(args):
             num_kv_heads=getattr(args, "num_kv_heads", None) or args.num_heads,
             num_encoder_layers=args.num_layers,
             num_decoder_layers=getattr(args, "num_dec_layers", args.num_layers),
-            d_ff=getattr(args, "d_ff", None) or args.d_model * 4,
+            d_ff=getattr(args, "d_ff", None) or args.d_model * (6 if getattr(args, "activation", "drelu") == "relu2" else 4),
             max_seq_len=max(args.max_enc_len, args.max_dec_len),
             dtype=args.dtype,
             activation=getattr(args, "activation", "drelu"),

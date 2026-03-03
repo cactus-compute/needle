@@ -138,7 +138,7 @@ def main():
                    help="Fraction of epoch to train before starting gradual pruning (default: 0.33)")
     p.add_argument("--prune-end-frac", type=float, default=0.67,
                    help="Fraction of epoch at which pruning finishes and mask locks (default: 0.67)")
-    p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu"])
+    p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu", "relu2"])
     p.add_argument("--num-memory-slots", type=int, default=64)
     p.add_argument("--mrl-dims", type=int, nargs="*", default=[1024, 512, 256, 128, 64],
                    help="MRL dimension pruning targets (default: 1024 512 256 128 64)")
