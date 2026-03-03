@@ -255,72 +255,6 @@ def _make_prune_mask(params, sparsity, group_size):
     return pruned, mask
 
 
-def _layer_prune(params, config, layer_prune_ratio=0.25):
-    """Remove the lowest-scoring encoder/decoder blocks by L1 magnitude.
-
-    Returns (new_params, new_config) with surviving blocks renumbered.
-    """
-    from flax.core import unfreeze
-    p = unfreeze(params)
-
-    def _score_blocks(module_params, prefix):
-        scores = {}
-        for key, val in module_params.items():
-            if key.startswith("block_"):
-                s = sum(float(np.sum(np.abs(np.array(l)))) for l in jax.tree.leaves(val))
-                scores[key] = s
-        return scores
-
-    enc_scores = _score_blocks(p["encoder"], "encoder")
-    dec_scores = _score_blocks(p["decoder"], "decoder")
-
-    all_scores = list(enc_scores.values()) + list(dec_scores.values())
-    if not all_scores:
-        return params, config
-
-    num_enc = len(enc_scores)
-    num_dec = len(dec_scores)
-    total_to_remove = max(0, int(len(all_scores) * layer_prune_ratio))
-
-    tagged = [(s, "encoder", k) for k, s in enc_scores.items()] + \
-             [(s, "decoder", k) for k, s in dec_scores.items()]
-    tagged.sort(key=lambda x: x[0])
-
-    remove_enc = set()
-    remove_dec = set()
-    for score, module, key in tagged:
-        if len(remove_enc) + len(remove_dec) >= total_to_remove:
-            break
-        if module == "encoder" and (num_enc - len(remove_enc)) > 1:
-            remove_enc.add(key)
-        elif module == "decoder" and (num_dec - len(remove_dec)) > 1:
-            remove_dec.add(key)
-
-    # Rebuild with surviving blocks renumbered
-    def _keep_and_renumber(module_params, remove_set):
-        surviving = [(k, v) for k, v in sorted(module_params.items()) if k.startswith("block_") and k not in remove_set]
-        non_blocks = {k: v for k, v in module_params.items() if not k.startswith("block_")}
-        new = dict(non_blocks)
-        for i, (_, v) in enumerate(surviving):
-            new[f"block_{i}"] = v
-        return new
-
-    p["encoder"] = _keep_and_renumber(p["encoder"], remove_enc)
-    p["decoder"] = _keep_and_renumber(p["decoder"], remove_dec)
-
-    new_num_enc = num_enc - len(remove_enc)
-    new_num_dec = num_dec - len(remove_dec)
-    print(f"  Encoder: {num_enc} -> {new_num_enc} blocks (removed {len(remove_enc)})")
-    print(f"  Decoder: {num_dec} -> {new_num_dec} blocks (removed {len(remove_dec)})")
-
-    from dataclasses import replace as dc_replace
-    new_config = dc_replace(config,
-                            num_encoder_layers=new_num_enc,
-                            num_decoder_layers=new_num_dec)
-
-    return p, new_config
-
-
 def _quantize_params(params, group_size=32):
     """Fake-quantize all Dense kernels in the param tree."""
     def _maybe_quantize(path, leaf):
@@ -586,56 +520,22 @@ def train(args):
 
     last_val_ppl = None
     sparsity_ratio = getattr(args, "sparsity_ratio", 0.0)
-    layer_prune_ratio = getattr(args, "layer_prune_ratio", 0.0)
     prune_mask = None
-    gradual_pruning_done = False
+    gradual_sparsify_done = False
 
     prune_interval = getattr(args, "prune_interval", 100)
     prune_start_frac = getattr(args, "prune_start_frac", 0.33)
     prune_end_frac = getattr(args, "prune_end_frac", 0.67)
 
     weight_prune_epoch = 0 if sparsity_ratio > 0 else -1
-    layer_prune_epoch = (1 if sparsity_ratio > 0 else 0) if layer_prune_ratio > 0 else -1
 
     for epoch in range(args.epochs):
-        if epoch == weight_prune_epoch and not gradual_pruning_done:
+        if epoch == weight_prune_epoch and not gradual_sparsify_done:
             t_start = int(num_batches * prune_start_frac)
             t_end = int(num_batches * prune_end_frac)
-            print(f"\nGradual magnitude pruning: 0% -> {sparsity_ratio*100:.0f}% over epoch {epoch+1} "
+            print(f"\nGradual magnitude sparsification: 0% -> {sparsity_ratio*100:.0f}% over epoch {epoch+1} "
                   f"(steps {t_start}-{t_end}/{num_batches}, interval={prune_interval}, group_size={_GROUP_SIZE})")
             epoch_step = 0
-
-        if epoch == layer_prune_epoch:
-            print(f"\nLayer pruning: removing {layer_prune_ratio*100:.0f}% of layers...")
-            current_params = jax_utils.unreplicate(ema_params)
-            new_params, config = _layer_prune(current_params, config, layer_prune_ratio=layer_prune_ratio)
-
-            rng, reinit_rng = jax.random.split(rng)
-            state = create_train_state(reinit_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps)
-            matched_params = jax.tree.map(lambda init_leaf, prune_leaf: prune_leaf, state.params, new_params)
-            state = state.replace(params=matched_params)
-            ema_params = jax.tree.map(jnp.copy, matched_params)
-
-            param_count = sum(x.size for x in jax.tree.leaves(matched_params))
-            print(f"  Parameters: {param_count:,}")
-
-            val_loss_fn = _make_val_loss_fn(state.apply_fn)
-            val_causal = make_causal_mask(args.max_dec_len)
-            total_loss, total_toks = 0.0, 0.0
-            for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
-                vl, vt = val_loss_fn(matched_params, vb[0], vb[1], vb[2], val_causal)
-                total_loss += float(vl)
-                total_toks += float(vt)
-            layer_prune_ppl = float(math.exp(total_loss / max(total_toks, 1)))
-            print(f"  Post-layer-prune val ppl: {layer_prune_ppl:.2f} (was {last_val_ppl:.2f})" if last_val_ppl is not None else f"  Post-layer-prune val ppl: {layer_prune_ppl:.2f}")
-
-            if prune_mask is not None:
-                prune_mask = jax.tree.map(lambda w: (jnp.abs(w) > 1e-8).astype(jnp.float32), matched_params)
-                prune_mask = jax_utils.replicate(prune_mask)
-
-            state = jax_utils.replicate(state)
-            ema_params = jax_utils.replicate(ema_params)
-            print(f"\nContinuing training with {config.num_encoder_layers}+{config.num_decoder_layers} layers...\n")
 
         losses = []
         batches = get_batches(enc_inputs, dec_inputs, dec_targets, effective_batch_size)
@@ -653,8 +553,8 @@ def train(args):
                 causal_mask,
             )
 
-            # --- Gradual magnitude pruning (epoch 1 only) ---
-            if epoch == weight_prune_epoch and not gradual_pruning_done:
+            # --- Gradual magnitude sparsification (epoch 1 only) ---
+            if epoch == weight_prune_epoch and not gradual_sparsify_done:
                 epoch_step += 1
                 current_sparsity = _cubic_sparsity_schedule(epoch_step, t_start, t_end, sparsity_ratio)
                 if epoch_step >= t_start and epoch_step % prune_interval == 0 and current_sparsity > 0:
@@ -684,7 +584,7 @@ def train(args):
 
             # --- tqdm postfix with sparsity during epoch 1 ---
             postfix = {"loss": f"{loss_val:.4f}", "val_ppl": f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?"}
-            if epoch == weight_prune_epoch and not gradual_pruning_done:
+            if epoch == weight_prune_epoch and not gradual_sparsify_done:
                 postfix["sparsity"] = f"{current_sparsity*100:.1f}%"
             pbar.set_postfix(**postfix)
 
@@ -697,15 +597,15 @@ def train(args):
                     "train/tokens_per_sec": tokens_per_batch / dt,
                     "train/step": global_step,
                 }
-                if epoch == weight_prune_epoch and not gradual_pruning_done:
+                if epoch == weight_prune_epoch and not gradual_sparsify_done:
                     log_dict["train/scheduled_sparsity"] = current_sparsity
                 if global_step % eval_every == 0 or global_step == total_steps:
                     log_dict["val/ppl"] = last_val_ppl
                 wandb.log(log_dict)
 
-        # --- Lock mask after epoch 1 gradual pruning ---
-        if epoch == weight_prune_epoch and not gradual_pruning_done:
-            gradual_pruning_done = True
+        # --- Lock mask after epoch 1 gradual sparsification ---
+        if epoch == weight_prune_epoch and not gradual_sparsify_done:
+            gradual_sparsify_done = True
             if prune_mask is None:
                 # Edge case: epoch had fewer steps than t_start
                 ema_unr = jax_utils.unreplicate(ema_params)
@@ -716,7 +616,7 @@ def train(args):
             final_pruned = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
             total_p = sum(x.size for x in jax.tree.leaves(final_pruned))
             zero_p = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(final_pruned))
-            print(f"\n  Gradual pruning complete — mask locked.")
+            print(f"\n  Gradual sparsification complete — mask locked.")
             print(f"  Final sparsity: {zero_p/total_p*100:.2f}% ({zero_p:,}/{total_p:,} near-zero)")
             del final_pruned
 
