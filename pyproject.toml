@@ -11,6 +11,8 @@ dependencies = [
     "transformers",
     "wandb",
     "sentencepiece",
+    "soundfile",
+    "scipy",
 ]
 
 [project.optional-dependencies]

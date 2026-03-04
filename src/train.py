@@ -13,12 +13,16 @@ from tqdm import tqdm
 from flax import jax_utils
 from flax.training import train_state
 
-from .data import get_batches, get_tokenizer, load_tinystories, prepare_encoder_decoder_pairs
+from .data import (
+    get_batches, get_tokenizer, load_tinystories, prepare_text_pairs,
+    load_librispeech, prepare_speech_pairs, get_speech_batches,
+)
 from .model import (
     EncoderDecoderTransformer,
     TransformerConfig,
     make_causal_mask,
     make_padding_mask,
+    make_mel_padding_mask,
 )
 
 def _newton_schulz(G, steps=5):
@@ -99,10 +103,13 @@ def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_
     rng, init_rng = jax.random.split(rng)
     dummy_src = jnp.ones((1, 128), dtype=jnp.int32)
     dummy_tgt = jnp.ones((1, 128), dtype=jnp.int32)
+    dummy_mel = jnp.ones((1, 128, config.n_mels), dtype=jnp.float32)
     variables = model.init(
         {"params": init_rng},
         dummy_src,
         dummy_tgt,
+        dummy_mel,
+        method="init_all",
     )
 
     adam_schedule = _wsd_schedule(learning_rate, total_steps, warmup_steps)
@@ -220,23 +227,9 @@ _GROUP_SIZE = 32
 _MRL_DIMS = ()
 
 
-def _loss_fn(state, params, src, tgt_in, tgt_out, causal_mask):
+def _compute_loss(logits, slot_div, mrl_logits, tgt_out):
+    """Shared CE + MRL + z-loss + slot-div computation."""
     pad_id = 0
-    src_mask = make_padding_mask(src, pad_id)
-    tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
-    cross_mask = src_mask
-
-    logits, slot_div, mrl_logits = state.apply_fn(
-        {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
-        src,
-        tgt_in,
-        src_mask=src_mask,
-        tgt_mask=tgt_mask,
-        cross_mask=cross_mask,
-        mrl_dims=_MRL_DIMS if _MRL_DIMS else None,
-        method="forward_with_aux",
-    )
-
     logits_f32 = logits.astype(jnp.float32)
     mask = (tgt_out != pad_id).astype(jnp.float32)
     ce_loss = jnp.sum(
@@ -259,10 +252,45 @@ def _loss_fn(state, params, src, tgt_in, tgt_out, causal_mask):
     return total_loss + z_loss + div_loss
 
 
-def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
+def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask):
+    pad_id = 0
+    src_mask = make_padding_mask(src, pad_id)
+    tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+
+    logits, slot_div, mrl_logits = state.apply_fn(
+        {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
+        src,
+        tgt_in,
+        src_mask=src_mask,
+        tgt_mask=tgt_mask,
+        cross_mask=src_mask,
+        mrl_dims=_MRL_DIMS if _MRL_DIMS else None,
+        method="forward_with_aux",
+    )
+    return _compute_loss(logits, slot_div, mrl_logits, tgt_out)
+
+
+def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask):
+    pad_id = 0
+    src_mask = make_mel_padding_mask(mel)
+    tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+
+    logits, slot_div, mrl_logits = state.apply_fn(
+        {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
+        mel,
+        tgt_in,
+        src_mask=src_mask,
+        tgt_mask=tgt_mask,
+        mrl_dims=_MRL_DIMS if _MRL_DIMS else None,
+        method="forward_speech_with_aux",
+    )
+    return _compute_loss(logits, slot_div, mrl_logits, tgt_out)
+
+
+def _train_step_text(state, ema_params, src, tgt_in, tgt_out, causal_mask):
     ema_decay = 0.999
     loss, grads = jax.value_and_grad(
-        lambda p: _loss_fn(state, p, src, tgt_in, tgt_out, causal_mask)
+        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -272,11 +300,40 @@ def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
     return state, ema_params, loss, grad_norm
 
 
-def _train_step_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask):
-    """Training step with fused mask application — avoids post-pmap copies."""
+def _train_step_text_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask):
+    """Text training step with fused mask application."""
     ema_decay = 0.999
     loss, grads = jax.value_and_grad(
-        lambda p: _loss_fn(state, p, src, tgt_in, tgt_out, causal_mask)
+        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask)
+    )(state.params)
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    loss = jax.lax.pmean(loss, axis_name="batch")
+    grad_norm = optax.global_norm(grads)
+    state = state.apply_gradients(grads=grads)
+    masked_params = jax.tree.map(lambda w, m: w * m, state.params, prune_mask)
+    state = state.replace(params=masked_params)
+    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, masked_params)
+    return state, ema_params, loss, grad_norm
+
+
+def _train_step_speech(state, ema_params, mel, tgt_in, tgt_out, causal_mask):
+    ema_decay = 0.999
+    loss, grads = jax.value_and_grad(
+        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask)
+    )(state.params)
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    loss = jax.lax.pmean(loss, axis_name="batch")
+    grad_norm = optax.global_norm(grads)
+    state = state.apply_gradients(grads=grads)
+    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
+    return state, ema_params, loss, grad_norm
+
+
+def _train_step_speech_masked(state, ema_params, mel, tgt_in, tgt_out, causal_mask, prune_mask):
+    """Speech training step with fused mask application."""
+    ema_decay = 0.999
+    loss, grads = jax.value_and_grad(
+        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -289,11 +346,19 @@ def _train_step_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask, pru
 
 
 def _make_p_train_step():
-    return jax.pmap(_train_step, axis_name="batch", donate_argnums=(0, 1))
+    return jax.pmap(_train_step_text, axis_name="batch", donate_argnums=(0, 1))
 
 
 def _make_p_train_step_masked():
-    return jax.pmap(_train_step_masked, axis_name="batch", donate_argnums=(0, 1))
+    return jax.pmap(_train_step_text_masked, axis_name="batch", donate_argnums=(0, 1))
+
+
+def _make_p_train_step_speech():
+    return jax.pmap(_train_step_speech, axis_name="batch", donate_argnums=(0, 1))
+
+
+def _make_p_train_step_speech_masked():
+    return jax.pmap(_train_step_speech_masked, axis_name="batch", donate_argnums=(0, 1))
 
 
 def _make_val_loss_fn(apply_fn):
@@ -327,6 +392,23 @@ def _make_mrl_val_loss_fn(apply_fn, mrl_dim):
         )
         trunc_logits = mrl_logits[0].astype(jnp.float32)
         loss = optax.softmax_cross_entropy_with_integer_labels(trunc_logits, tgt_out)
+        mask = (tgt_out != pad_id).astype(jnp.float32)
+        return jnp.sum(loss * mask), jnp.sum(mask)
+    return val_loss_batch
+
+
+def _make_speech_val_loss_fn(apply_fn):
+    @jax.jit
+    def val_loss_batch(params, mel, tgt_in, tgt_out, causal_mask):
+        pad_id = 0
+        src_mask = make_mel_padding_mask(mel)
+        tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+        logits, _, _ = apply_fn(
+            {"params": params}, mel, tgt_in,
+            src_mask=src_mask, tgt_mask=tgt_mask,
+            method="forward_speech_with_aux",
+        )
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tgt_out)
         mask = (tgt_out != pad_id).astype(jnp.float32)
         return jnp.sum(loss * mask), jnp.sum(mask)
     return val_loss_batch
@@ -370,7 +452,13 @@ def shard_batch(batch, num_devices):
 
 
 def train(args):
+    import itertools
+
     num_devices = jax.local_device_count()
+    no_speech = getattr(args, "no_speech", False)
+    speech_every = getattr(args, "speech_every", 3)
+    n_mels = getattr(args, "n_mels", 80)
+    max_mel_len = getattr(args, "max_mel_len", 1024)
 
     use_wandb = getattr(args, "wandb", False)
     if use_wandb:
@@ -378,27 +466,60 @@ def train(args):
         if wandb.run is None:
             wandb.init(project="needle-v1", config=vars(args))
 
-    print(f"\n[1/4] Detecting devices...")
+    total_data_steps = 6 if not no_speech else 4
+    step_idx = 0
+
+    step_idx += 1
+    print(f"\n[{step_idx}/{total_data_steps}] Detecting devices...")
     print(f"      {num_devices} device(s) for data-parallel training")
 
-    print(f"\n[2/4] Loading tokenizer...")
+    step_idx += 1
+    print(f"\n[{step_idx}/{total_data_steps}] Loading tokenizer...")
     tokenizer = get_tokenizer(max_samples=args.max_samples)
 
-    print(f"\n[3/4] Loading TinyStories dataset...")
+    step_idx += 1
+    print(f"\n[{step_idx}/{total_data_steps}] Loading TinyStories dataset...")
     ds = load_tinystories("train", max_samples=args.max_samples)
     val_ds = load_tinystories("validation", max_samples=getattr(args, "max_eval_samples", None))
 
-    print(f"\n[4/4] Preparing encoder-decoder pairs...")
-    enc_inputs, dec_inputs, dec_targets = prepare_encoder_decoder_pairs(
+    step_idx += 1
+    print(f"\n[{step_idx}/{total_data_steps}] Preparing text pairs...")
+    enc_inputs, dec_inputs, dec_targets = prepare_text_pairs(
         ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
-    val_enc, val_dec_in, val_dec_tgt = prepare_encoder_decoder_pairs(
+    val_enc, val_dec_in, val_dec_tgt = prepare_text_pairs(
         val_ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
     val_enc = np.array(val_enc)
     val_dec_in = np.array(val_dec_in)
     val_dec_tgt = np.array(val_dec_tgt)
-    print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val pairs")
+    print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val text pairs")
+
+    # --- Speech data ---
+    speech_mel = speech_dec_in = speech_dec_tgt = None
+    val_speech_mel = val_speech_dec_in = val_speech_dec_tgt = None
+    if not no_speech:
+        step_idx += 1
+        max_speech_samples = getattr(args, "max_speech_samples", None)
+        print(f"\n[{step_idx}/{total_data_steps}] Loading LibriSpeech...")
+        speech_ds = load_librispeech("train.clean.100", max_samples=max_speech_samples)
+        speech_val_ds = load_librispeech("validation.clean", max_samples=getattr(args, "max_eval_samples", None))
+
+        step_idx += 1
+        print(f"\n[{step_idx}/{total_data_steps}] Preparing speech pairs...")
+        speech_mel, speech_dec_in, speech_dec_tgt = prepare_speech_pairs(
+            speech_ds, tokenizer, n_mels=n_mels, max_mel_len=max_mel_len, max_dec_len=args.max_dec_len
+        )
+        val_speech_mel, val_speech_dec_in, val_speech_dec_tgt = prepare_speech_pairs(
+            speech_val_ds, tokenizer, n_mels=n_mels, max_mel_len=max_mel_len, max_dec_len=args.max_dec_len
+        )
+        speech_mel = np.array(speech_mel)
+        speech_dec_in = np.array(speech_dec_in)
+        speech_dec_tgt = np.array(speech_dec_tgt)
+        val_speech_mel = np.array(val_speech_mel)
+        val_speech_dec_in = np.array(val_speech_dec_in)
+        val_speech_dec_tgt = np.array(val_speech_dec_tgt)
+        print(f"      {len(speech_mel):,} train / {len(val_speech_mel):,} val speech pairs")
 
     effective_batch_size = args.batch_size * num_devices
 
@@ -422,6 +543,7 @@ def train(args):
             dtype=args.dtype,
             activation=getattr(args, "activation", "drelu"),
             num_memory_slots=getattr(args, "num_memory_slots", 64),
+            n_mels=n_mels,
         )
 
     global _GROUP_SIZE, _MRL_DIMS
@@ -433,12 +555,16 @@ def train(args):
         _MRL_DIMS = ()
     p_train_step = _make_p_train_step()
     p_train_step_masked = _make_p_train_step_masked()
+    p_train_step_speech = _make_p_train_step_speech()
+    p_train_step_speech_masked = _make_p_train_step_speech_masked()
 
     np.random.seed(args.seed)
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
 
-    num_batches = len(enc_inputs) // effective_batch_size
+    text_batches_per_epoch = len(enc_inputs) // effective_batch_size
+    speech_batches_per_epoch = text_batches_per_epoch // speech_every if (not no_speech and speech_mel is not None) else 0
+    num_batches = text_batches_per_epoch + speech_batches_per_epoch
     total_steps = num_batches * args.epochs
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
 
@@ -467,6 +593,12 @@ def train(args):
     print(f"  Memory slots  {config.num_memory_slots:>12}")
     print(f"  Activation    {config.activation:>12}")
     print(f"  Dtype         {config.dtype:>12}")
+    if not no_speech:
+        print(f"  Speech        every {speech_every} text steps")
+        print(f"  n_mels        {n_mels:>12}")
+        print(f"  max_mel_len   {max_mel_len:>12}")
+    else:
+        print(f"  Speech               disabled")
     print(f"  ─────────────────────────────────────")
     print(f"  Devices       {num_devices:>12}")
     print(f"  Batch         {args.batch_size:>7} x {num_devices} = {effective_batch_size}")
@@ -511,11 +643,22 @@ def train(args):
                   f"(steps {t_start}-{t_end}/{num_batches}, interval={prune_interval}, group_size={_GROUP_SIZE})")
             epoch_step = 0
 
-        losses = []
-        batches = get_batches(enc_inputs, dec_inputs, dec_targets, effective_batch_size)
-        pbar = tqdm(batches, total=num_batches, desc=f"Epoch {epoch + 1}/{args.epochs}")
+        text_losses = []
+        speech_losses = []
+        text_batches = get_batches(enc_inputs, dec_inputs, dec_targets, effective_batch_size)
+
+        # Speech batches cycle via itertools.cycle
+        speech_iter = None
+        if not no_speech and speech_mel is not None:
+            speech_iter = iter(itertools.cycle(
+                get_speech_batches(speech_mel, speech_dec_in, speech_dec_tgt, effective_batch_size)
+            ))
+
+        text_step_in_epoch = 0
+        pbar = tqdm(text_batches, total=text_batches_per_epoch, desc=f"Epoch {epoch + 1}/{args.epochs}")
 
         for src, tgt_in, tgt_out in pbar:
+            # --- Text step ---
             t0 = time.perf_counter()
             src_b = shard_batch(src, num_devices)
             tgt_in_b = shard_batch(tgt_in, num_devices)
@@ -530,6 +673,31 @@ def train(args):
                     state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask,
                 )
 
+            text_loss_val = float(loss[0])
+            text_losses.append(text_loss_val)
+            global_step += 1
+            text_step_in_epoch += 1
+
+            # --- Speech step (every speech_every text steps) ---
+            speech_loss_val = None
+            if speech_iter is not None and text_step_in_epoch % speech_every == 0:
+                mel_batch, sp_tgt_in, sp_tgt_out = next(speech_iter)
+                mel_b = shard_batch(mel_batch, num_devices)
+                sp_tgt_in_b = shard_batch(sp_tgt_in, num_devices)
+                sp_tgt_out_b = shard_batch(sp_tgt_out, num_devices)
+
+                if prune_mask is not None:
+                    state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech_masked(
+                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, prune_mask,
+                    )
+                else:
+                    state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech(
+                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask,
+                    )
+                speech_loss_val = float(sp_loss[0])
+                speech_losses.append(speech_loss_val)
+                global_step += 1
+
             # --- Gradual magnitude sparsification (epoch 1 only) ---
             if epoch == weight_prune_epoch and not gradual_sparsify_done:
                 epoch_step += 1
@@ -541,9 +709,6 @@ def train(args):
                     prune_mask = jax_utils.replicate(mask)
                     del mask
 
-            loss_val = float(loss[0])
-            losses.append(loss_val)
-            global_step += 1
             dt = time.perf_counter() - t0
             eval_every = getattr(args, "eval_every", 100)
             if global_step % eval_every == 0 or global_step == total_steps:
@@ -554,28 +719,36 @@ def train(args):
                     vl, vt = val_loss_fn(_eval_params, vb[0], vb[1], vb[2], val_causal)
                     total_loss += float(vl)
                     total_toks += float(vt)
-                del _eval_params
                 last_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
 
-            # --- tqdm postfix with sparsity during epoch 1 ---
-            postfix = {"loss": f"{loss_val:.4f}", "val_ppl": f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?"}
+                del _eval_params
+
+            # --- tqdm postfix ---
+            postfix = {
+                "text_loss": f"{text_loss_val:.4f}",
+                "text_ppl": f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?",
+            }
+            if speech_loss_val is not None:
+                postfix["speech_loss"] = f"{speech_loss_val:.4f}"
             if epoch == weight_prune_epoch and not gradual_sparsify_done:
-                postfix["sparsity"] = f"{current_sparsity*100:.1f}%"
+                postfix["prune"] = f"{current_sparsity*100:.1f}%"
             pbar.set_postfix(**postfix)
 
             if use_wandb:
                 log_dict = {
-                    "train/loss": loss_val,
+                    "train/text_loss": text_loss_val,
                     "train/grad_norm": float(grad_norm[0]),
                     "train/adam_lr": float(adam_schedule(global_step)),
                     "train/muon_lr": float(muon_schedule(global_step)),
                     "train/tokens_per_sec": tokens_per_batch / dt,
                     "train/step": global_step,
                 }
+                if speech_loss_val is not None:
+                    log_dict["train/speech_loss"] = speech_loss_val
                 if epoch == weight_prune_epoch and not gradual_sparsify_done:
                     log_dict["train/scheduled_sparsity"] = current_sparsity
                 if global_step % eval_every == 0 or global_step == total_steps:
-                    log_dict["val/ppl"] = last_val_ppl
+                    log_dict["val/text_ppl"] = last_val_ppl
                 wandb.log(log_dict)
 
         # --- Lock mask after epoch 1 gradual sparsification ---
@@ -599,8 +772,8 @@ def train(args):
             print(f"  Final sparsity: {zero_p/total_p*100:.2f}% ({zero_p:,}/{total_p:,} near-zero)")
             del final_pruned
 
-        epoch_avg_loss = sum(losses) / len(losses) if losses else float("nan")
-        final_loss = losses[-1] if losses else float("nan")
+        epoch_avg_loss = sum(text_losses) / len(text_losses) if text_losses else float("nan")
+        final_loss = text_losses[-1] if text_losses else float("nan")
         final_ppl = math.exp(final_loss) if not math.isnan(final_loss) else float("nan")
 
         eval_params = jax_utils.unreplicate(ema_params)
@@ -651,13 +824,33 @@ def train(args):
         with open(ckpt_path, "wb") as f:
             pickle.dump({"params": params_np, "config": config.__dict__}, f)
 
-        from .test import measure_throughput, benchmark_generation_quality
+        from .test import measure_throughput, benchmark_generation_quality, compute_wer
+        from .run import generate, transcribe
+        from .data import _decode_audio
         eval_params_jnp = jax.tree.map(jnp.array, params_np)
         del params_np  # free CPU memory
         model = EncoderDecoderTransformer(config)
         tp = measure_throughput(model, eval_params_jnp, tokenizer, num_runs=5)
         prompts = ["Once upon a time", "The little dog", "She was very happy because"]
         quality = benchmark_generation_quality(model, eval_params_jnp, tokenizer, prompts, max_gen_len=64, temperature=0.8)
+
+        speech_wer = None
+        transcribe_samples = []
+        if not no_speech and val_speech_mel is not None:
+            speech_val_ds = load_librispeech("validation.clean", max_samples=3)
+            hyps, refs = [], []
+            for i, example in enumerate(speech_val_ds):
+                audio, sr = _decode_audio(example["audio"])
+                ref_text = example["text"].strip().lower()
+                hyp_text = transcribe(
+                    model, eval_params_jnp, tokenizer, audio, sr=sr,
+                    max_gen_len=64, temperature=0.0, seed=i, stream=False,
+                ).strip().lower()
+                hyps.append(hyp_text)
+                refs.append(ref_text)
+                transcribe_samples.append((ref_text, hyp_text))
+            speech_wer = compute_wer(hyps, refs)
+
         del eval_params_jnp  # free device memory
 
         print(f"\n  ─────────────────────────────────────")
@@ -666,7 +859,11 @@ def train(args):
         print(f"  Avg loss       {epoch_avg_loss:>12.4f}")
         print(f"  Final loss     {final_loss:>12.4f}")
         print(f"  Train ppl      {final_ppl:>12.2f}")
-        print(f"  Val ppl        {last_val_ppl:>12.2f}")
+        print(f"  Text val ppl   {last_val_ppl:>12.2f}")
+        if speech_wer is not None:
+            print(f"  Speech WER     {speech_wer:>12.4f}")
+            epoch_avg_speech = sum(speech_losses) / len(speech_losses) if speech_losses else float("nan")
+            print(f"  Avg speech loss{epoch_avg_speech:>12.4f}")
         print(f"  Quant val ppl  {quant_val_ppl:>12.2f}  (INT4 g{_GROUP_SIZE})")
         print(f"  Sparsity       {sparsity:>11.2f}%  ({near_zero:,}/{total_params:,})")
         if mrl_results:
@@ -686,21 +883,31 @@ def train(args):
         print(f"  Repetition     {quality['bigram_repetition_rate']:>12.3f}")
         print(f"  ─────────────────────────────────────")
         for prompt, gen in quality["generations"]:
-            print(f"  [{prompt}]")
-            print(f"    {gen[:100]}")
+            gen_clean = gen.replace("<story>", "").replace("<transcribe>", "").strip()
+            print(f"  <story>[{prompt}] {gen_clean[:80]}")
+        if transcribe_samples:
+            print(f"  ─────────────────────────────────────")
+            print(f"  Transcribe (WER={speech_wer:.4f}):")
+            for ref, hyp in transcribe_samples:
+                print(f"  <transcribe> ref: {ref[:80]}")
+                print(f"               hyp: {hyp[:80]}")
         print(f"  ─────────────────────────────────────")
         print(f"  Checkpoint: {ckpt_path}")
         print(f"  ─────────────────────────────────────\n")
 
         if use_wandb:
             log_dict = {
-                "epoch/avg_loss": epoch_avg_loss,
-                "epoch/final_loss": final_loss,
-                "epoch/val_ppl": last_val_ppl,
+                "epoch/avg_text_loss": epoch_avg_loss,
+                "epoch/final_text_loss": final_loss,
+                "epoch/text_val_ppl": last_val_ppl,
                 "epoch/quant_val_ppl": quant_val_ppl,
                 "epoch/weight_sparsity": sparsity,
                 "epoch": epoch + 1,
             }
+            if speech_wer is not None:
+                log_dict["epoch/speech_wer"] = speech_wer
+            if speech_losses:
+                log_dict["epoch/avg_speech_loss"] = sum(speech_losses) / len(speech_losses)
             for d_prime, (mrl_ppl, mrl_params) in mrl_results.items():
                 log_dict[f"epoch/mrl_ppl_d{d_prime}"] = mrl_ppl
                 log_dict[f"epoch/mrl_params_d{d_prime}"] = mrl_params

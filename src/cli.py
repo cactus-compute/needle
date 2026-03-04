@@ -36,10 +36,16 @@ HELP = """
   │     --checkpoint PATH        Resume from checkpoint               │
   │     --checkpoint-dir DIR     Checkpoint directory                 │
   │     --seed INT               Random seed (default: 42)            │
+  │     --no-speech             Disable speech (text-only training)   │
+  │     --speech-every INT      Speech step every N text (default: 3) │
+  │     --max-mel-len INT       Max mel frames (default: 1024)        │
+  │     --n-mels INT            Mel frequency bins (default: 80)      │
+  │     --max-speech-samples INT  Max LibriSpeech samples             │
   │                                                                   │
   │   run                                                             │
   │     --checkpoint PATH       Path to model checkpoint (required)   │
   │     --prompts STR [...]     One or more prompts to continue       │
+  │     --audio PATH [...]      Audio files to transcribe             │
   │     --max-len INT           Max tokens to generate (default: 128) │
   │     --temperature FLOAT     Sampling temperature (default: 0.8)   │
   │     --seed INT              Random seed (default: 0)              │
@@ -114,10 +120,20 @@ def main():
     p.add_argument("--num-memory-slots", type=int, default=64)
     p.add_argument("--mrl-dims", type=int, nargs="*", default=[256, 128, 64],
                    help="MRL dimension targets (default: 256 128 64)")
+    p.add_argument("--no-speech", action="store_true", help="Disable speech training (text-only)")
+    p.add_argument("--speech-every", type=int, default=3,
+                   help="Do one speech step every N text steps (default: 3)")
+    p.add_argument("--max-mel-len", type=int, default=1024,
+                   help="Max mel spectrogram frames (default: 1024)")
+    p.add_argument("--n-mels", type=int, default=80,
+                   help="Number of mel frequency bins (default: 80)")
+    p.add_argument("--max-speech-samples", type=int, default=None,
+                   help="Max LibriSpeech training samples (default: all)")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--prompts", type=str, nargs="*")
+    p.add_argument("--audio", type=str, nargs="*", help="Audio file paths to transcribe")
     p.add_argument("--max-len", type=int, default=128)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--seed", type=int, default=0)

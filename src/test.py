@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from .data import get_batches, get_tokenizer, load_tinystories, prepare_encoder_decoder_pairs
+from .data import get_batches, get_tokenizer, load_tinystories, prepare_text_pairs, load_librispeech
 from .model import (
     EncoderDecoderTransformer,
     TransformerConfig,
@@ -150,6 +150,64 @@ def benchmark_generation_quality(model, params, tokenizer, prompts, max_gen_len=
     }
 
 
+def compute_wer(hypotheses, references):
+    """Compute word error rate using edit distance."""
+    total_edits = 0
+    total_ref_words = 0
+
+    for hyp, ref in zip(hypotheses, references):
+        hyp_words = hyp.lower().split()
+        ref_words = ref.lower().split()
+        n = len(ref_words)
+        m = len(hyp_words)
+
+        # DP edit distance
+        d = [[0] * (m + 1) for _ in range(n + 1)]
+        for i in range(n + 1):
+            d[i][0] = i
+        for j in range(m + 1):
+            d[0][j] = j
+        for i in range(1, n + 1):
+            for j in range(1, m + 1):
+                if ref_words[i - 1] == hyp_words[j - 1]:
+                    d[i][j] = d[i - 1][j - 1]
+                else:
+                    d[i][j] = 1 + min(d[i - 1][j], d[i][j - 1], d[i - 1][j - 1])
+
+        total_edits += d[n][m]
+        total_ref_words += n
+
+    return total_edits / max(total_ref_words, 1)
+
+
+def benchmark_asr(model, params, tokenizer, num_samples=100):
+    """Transcribe LibriSpeech test-clean samples and report WER."""
+    from .run import transcribe
+    from .data import load_librispeech
+
+    ds = load_librispeech("test.clean", max_samples=num_samples)
+
+    hypotheses = []
+    references = []
+
+    for example in ds:
+        audio_data = example["audio"]
+        audio = np.array(audio_data["array"], dtype=np.float32)
+        sr = audio_data["sampling_rate"]
+        ref_text = example["text"].strip().lower()
+
+        hyp_text = transcribe(
+            model, params, tokenizer, audio, sr=sr,
+            max_gen_len=128, temperature=0.0, seed=0, stream=False,
+        ).strip().lower()
+
+        hypotheses.append(hyp_text)
+        references.append(ref_text)
+
+    wer = compute_wer(hypotheses, references)
+    return {"wer": wer, "num_samples": len(hypotheses)}
+
+
 def main(args):
     params, config = load_checkpoint(args.checkpoint)
     model = EncoderDecoderTransformer(config)
@@ -160,13 +218,19 @@ def main(args):
     print(f"parameters:  {param_count:,}")
     print(f"config:      d={config.d_model}, heads={config.num_heads}, layers={config.num_encoder_layers}/{config.num_decoder_layers}")
 
-    print(f"\nevaluating perplexity ({args.max_eval_samples} samples)...")
+    print(f"\nevaluating text perplexity ({args.max_eval_samples} samples)...")
     ds = load_tinystories("validation", max_samples=args.max_eval_samples)
-    enc_inputs, dec_inputs, dec_targets = prepare_encoder_decoder_pairs(
+    enc_inputs, dec_inputs, dec_targets = prepare_text_pairs(
         ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
     ppl = compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, args.batch_size, config.pad_token_id)
-    print(f"perplexity:  {ppl:.2f}")
+    print(f"text ppl:    {ppl:.2f}")
+
+    asr_samples = getattr(args, "asr_samples", 50)
+    if asr_samples > 0:
+        print(f"\nevaluating ASR WER ({asr_samples} samples)...")
+        asr_results = benchmark_asr(model, params, tokenizer, num_samples=asr_samples)
+        print(f"ASR WER:     {asr_results['wer']:.4f} ({asr_results['num_samples']} samples)")
 
     print(f"\nmeasuring throughput ({args.throughput_runs} runs)...")
     throughput = measure_throughput(model, params, tokenizer, num_runs=args.throughput_runs)
