@@ -84,6 +84,87 @@ def generate(model, params, tokenizer, prompt, max_gen_len=128, temperature=0.8,
     return tokenizer.decode(generated_tokens)
 
 
+def ctc_collapse(tokens, blank_id):
+    """Remove blanks and merge consecutive duplicate tokens."""
+    result = []
+    prev = -1
+    for t in tokens:
+        t = int(t)
+        if t == blank_id:
+            prev = -1  # blank resets dedup so same token can appear again
+            continue
+        if t == prev:
+            continue
+        result.append(t)
+        prev = t
+    return result
+
+
+def generate_nar(model, params, tokenizer, prompt, stream=True, max_enc_len=256, max_passes=10):
+    """Chained NAR generation: repeat forward passes until EOS or max_passes.
+
+    Each pass: encode(context) → decode queries → collapse → append to context.
+    Produces up to num_queries tokens per pass, chained for longer output.
+    """
+    pad_id = tokenizer.pad_token_id
+    eos_id = tokenizer.eos_token_id
+    blank_id = model.config.blank_token_id
+
+    enc_tokens = tokenizer.encode(prompt)
+    all_generated = []
+
+    @jax.jit
+    def nar_forward(enc_input, src_mask):
+        return model.apply(
+            {"params": params}, enc_input, src_mask=src_mask,
+            method="forward_nar",
+        )
+
+    for pass_idx in range(max_passes):
+        # Pad encoder input to fixed length for JIT reuse
+        context = enc_tokens + all_generated
+        if len(context) > max_enc_len:
+            context = context[-max_enc_len:]  # keep most recent context
+        padded = context + [pad_id] * (max_enc_len - len(context))
+        enc_input = jnp.array([padded])
+        src_mask = make_padding_mask(enc_input, pad_id)
+
+        logits, _ = nar_forward(enc_input, src_mask)
+        pred_tokens = jnp.argmax(logits[0], axis=-1)
+        collapsed = ctc_collapse(pred_tokens, blank_id)
+
+        # Check for EOS
+        hit_eos = False
+        new_tokens = []
+        for t in collapsed:
+            if t == eos_id:
+                hit_eos = True
+                break
+            if t != pad_id:
+                new_tokens.append(t)
+
+        if not new_tokens:
+            break  # model produced nothing — stop
+
+        all_generated.extend(new_tokens)
+
+        if stream:
+            chunk_text = tokenizer.decode(new_tokens)
+            if pass_idx == 0:
+                sys.stdout.write(f"\n{prompt}")
+            sys.stdout.write(chunk_text)
+            sys.stdout.flush()
+
+        if hit_eos:
+            break
+
+    if stream:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    return tokenizer.decode(all_generated)
+
+
 def main(args):
     print(f"Loading checkpoint: {args.checkpoint}")
     params, config = load_checkpoint(args.checkpoint)
@@ -91,22 +172,28 @@ def main(args):
     model = EncoderDecoderTransformer(config)
     tokenizer = get_tokenizer()
 
+    nar_mode = getattr(args, "nar", False) or config.num_queries > 0
     param_count = sum(x.size for x in jax.tree.leaves(params))
     print(f"Model parameters: {param_count:,}")
+    if nar_mode:
+        print(f"Mode: NAR (num_queries={config.num_queries})")
 
     prompts = args.prompts or ["Once upon a time", "The little dog", "She was very happy because"]
 
     for i, prompt in enumerate(prompts):
-        generate(
-            model,
-            params,
-            tokenizer,
-            prompt,
-            max_gen_len=args.max_len,
-            temperature=args.temperature,
-            seed=args.seed + i,
-            stream=True,
-        )
+        if nar_mode:
+            generate_nar(model, params, tokenizer, prompt, stream=True)
+        else:
+            generate(
+                model,
+                params,
+                tokenizer,
+                prompt,
+                max_gen_len=args.max_len,
+                temperature=args.temperature,
+                seed=args.seed + i,
+                stream=True,
+            )
 
 
 def parse_args():

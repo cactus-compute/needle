@@ -325,11 +325,78 @@ def eval_arc_easy(model, params, tokenizer, max_samples=500,
     return {"accuracy": acc, "correct": correct, "total": total}
 
 
+def eval_nar_wikitext2(model, params, tokenizer, max_samples=500, max_len=256,
+                       num_devices=1, **kwargs):
+    """CTC loss on WikiText-2 test split for NAR models."""
+    import optax
+    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+
+    pad_id = tokenizer.pad_token_id
+    blank_id = model.config.blank_token_id
+
+    @jax.jit
+    def nar_loss_single(params, src, tgt):
+        src_mask = make_padding_mask(src, pad_id)
+        logits, _ = model.apply(
+            {"params": params}, src, src_mask=src_mask,
+            method="forward_nar",
+        )
+        B, N = logits.shape[0], logits.shape[1]
+        logit_paddings = jnp.zeros((B, N), dtype=jnp.float32)
+        label_paddings = (tgt == pad_id).astype(jnp.float32)
+        loss = optax.ctc_loss(logits, logit_paddings, tgt, label_paddings,
+                              blank_id=blank_id)
+        # zero_infinity: clamp infeasible samples
+        loss = jnp.where(jnp.isfinite(loss), loss, 0.0)
+        loss = jnp.minimum(loss, 1e4)
+        return loss[0]
+
+    single_params = jax_utils.unreplicate(params) if num_devices > 1 else params
+
+    total_loss = 0.0
+    evaluated = 0
+    num_queries = model.config.num_queries
+
+    for example in ds:
+        text = example["text"].strip()
+        if len(text) < 20:
+            continue
+
+        tokens = tokenizer.encode(text)
+        if len(tokens) < 6:
+            continue
+
+        tokens = tokens[:max_len]
+        split = max(2, len(tokens) // 3)
+        enc_tokens = tokens[:split]
+        dec_tokens = tokens[split:]
+
+        # Pad to fixed lengths for jit
+        enc_padded = enc_tokens + [pad_id] * (max_len - len(enc_tokens))
+        dec_padded = dec_tokens + [pad_id] * (max_len - len(dec_tokens))
+        enc_input = jnp.array([enc_padded[:max_len]])
+        dec_target = jnp.array([dec_padded[:max_len]])
+
+        loss = nar_loss_single(single_params, enc_input, dec_target)
+        total_loss += float(loss)
+        evaluated += 1
+
+        if evaluated >= max_samples:
+            break
+
+    avg_loss = total_loss / max(evaluated, 1)
+    return {"ctc_loss": avg_loss, "samples": evaluated}
+
+
 BENCHMARKS = {
     "wikitext2": eval_wikitext2,
     "lambada": eval_lambada,
     "hellaswag": eval_hellaswag,
     "arc_easy": eval_arc_easy,
+}
+
+NAR_BENCHMARKS = {
+    "wikitext2": eval_nar_wikitext2,
 }
 
 
@@ -342,8 +409,11 @@ def main(args):
     model = EncoderDecoderTransformer(config)
     tokenizer = get_tokenizer()
 
+    nar_mode = config.num_queries > 0
     param_count = sum(x.size for x in jax.tree.leaves(params))
     print(f"Model parameters: {param_count:,}")
+    if nar_mode:
+        print(f"Mode: NAR (num_queries={config.num_queries})")
 
     # Replicate params across devices for pmap
     if num_devices > 1:
@@ -355,19 +425,23 @@ def main(args):
         p_encode = None
         p_decode = None
 
-    benchmarks = args.benchmarks or list(BENCHMARKS.keys())
+    available = NAR_BENCHMARKS if nar_mode else BENCHMARKS
+    benchmarks = args.benchmarks or list(available.keys())
 
     results = {}
     for name in benchmarks:
-        if name not in BENCHMARKS:
-            print(f"Unknown benchmark: {name}, skipping")
+        if name not in available:
+            if nar_mode:
+                print(f"Skipping {name} (not supported for NAR models)")
+            else:
+                print(f"Unknown benchmark: {name}, skipping")
             continue
 
         print(f"\n{'=' * 50}")
         print(f"Benchmark: {name}")
         print("=" * 50)
 
-        result = BENCHMARKS[name](
+        result = available[name](
             model, params, tokenizer, max_samples=args.max_samples,
             num_devices=num_devices, p_encode=p_encode, p_decode=p_decode,
         )
@@ -383,8 +457,12 @@ def main(args):
     print("Summary")
     print("=" * 50)
     for name, result in results.items():
-        metric = "perplexity" if "perplexity" in result else "accuracy"
-        print(f"  {name:>12s}: {result[metric]:.4f} ({metric})")
+        if "ctc_loss" in result:
+            print(f"  {name:>12s}: {result['ctc_loss']:.4f} (ctc_loss)")
+        elif "perplexity" in result:
+            print(f"  {name:>12s}: {result['perplexity']:.4f} (perplexity)")
+        else:
+            print(f"  {name:>12s}: {result['accuracy']:.4f} (accuracy)")
 
 
 def parse_args():

@@ -44,6 +44,9 @@ class TransformerConfig:
     dtype: str = "bfloat16"
     activation: str = "drelu"
     num_memory_slots: int = 64
+    num_queries: int = 0          # 0 = AR mode, >0 = NAR mode
+    blank_token_id: int = 8192    # appended to vocab for CTC blank
+    query_init: str = "normal"    # "normal" or "orthogonal"
 
     @property
     def jax_dtype(self):
@@ -312,6 +315,18 @@ class EncoderDecoderTransformer(nn.Module):
         self.embed_scale = math.sqrt(self.config.d_model)
         self.encoder = MemoryMixerEncoder(self.config)
         self.decoder = Decoder(self.config)
+        if self.config.num_queries > 0:
+            q_init = jinit.orthogonal() if self.config.query_init == "orthogonal" else jinit.normal(stddev=0.02)
+            self.query_embed = self.param(
+                "query_embed",
+                q_init,
+                (self.config.num_queries, self.config.d_model),
+            )
+            self.blank_embed = self.param(
+                "blank_embed",
+                jinit.normal(stddev=0.02),
+                (1, self.config.d_model),
+            )
 
     def _rope(self, seq_len):
         head_dim = self.config.d_model // self.config.num_heads
@@ -358,6 +373,26 @@ class EncoderDecoderTransformer(nn.Module):
         diag_sq = jnp.sum(jnp.diagonal(gram, axis1=1, axis2=2) ** 2)
         slot_div = (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
         return logits, slot_div, mrl_logits
+
+    def forward_nar(self, src, src_mask=None):
+        """NAR forward: learned queries through decoder with bidirectional attention."""
+        encoder_out = self.encode(src, src_mask=src_mask)
+
+        B = src.shape[0]
+        queries = jnp.broadcast_to(
+            self.query_embed[None] * self.embed_scale,
+            (B, self.config.num_queries, self.config.d_model),
+        )
+
+        rope = self._rope(self.config.num_queries)
+        x = self.decoder(queries, encoder_out, self_mask=None, cross_mask=None, rope=rope)
+
+        x_f32 = x.astype(jnp.float32)
+        emb = self.embedding.embedding  # (vocab_size, d_model)
+        blank_proj = self.blank_embed.astype(jnp.float32)  # (1, d_model)
+        full_emb = jnp.concatenate([emb.astype(jnp.float32), blank_proj], axis=0)  # (vocab_size+1, d_model)
+        logits = x_f32 @ full_emb.T  # (B, num_queries, vocab_size+1)
+        return logits, encoder_out
 
 
 def make_causal_mask(seq_len):

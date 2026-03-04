@@ -36,6 +36,10 @@ HELP = """
   │     --checkpoint PATH       Resume from checkpoint                │
   │     --checkpoint-dir DIR    Checkpoint directory                  │
   │     --seed INT              Random seed (default: 42)             │
+  │     --nar                   Enable NAR (Query-CTC) training       │
+  │     --num-queries INT       NAR query tokens (default: 0 = AR)    │
+  │     --nar-checkpoint PATH   AR teacher for knowledge distillation │
+  │     --kd-weight FLOAT       KD loss weight (default: 1.0)         │
   │                                                                   │
   │   run                                                             │
   │     --checkpoint PATH       Path to model checkpoint (required)   │
@@ -43,6 +47,7 @@ HELP = """
   │     --max-len INT           Max tokens to generate (default: 128) │
   │     --temperature FLOAT     Sampling temperature (default: 0.8)   │
   │     --seed INT              Random seed (default: 0)              │
+  │     --nar                   Use NAR decoding (auto if checkpoint)  │
   │                                                                   │
   │   test                                                            │
   │     --checkpoint PATH       Path to model checkpoint (required)   │
@@ -142,6 +147,21 @@ def main():
     p.add_argument("--num-memory-slots", type=int, default=64)
     p.add_argument("--mrl-dims", type=int, nargs="*", default=[1024, 512, 256, 128, 64],
                    help="MRL dimension pruning targets (default: 1024 512 256 128 64)")
+    p.add_argument("--nar", action="store_true", help="Enable NAR (Query-CTC) training mode")
+    p.add_argument("--num-queries", type=int, default=0,
+                   help="Number of learnable query tokens for NAR (default: 0 = AR)")
+    p.add_argument("--nar-checkpoint", type=str, default=None,
+                   help="AR teacher checkpoint for knowledge distillation")
+    p.add_argument("--kd-weight", type=float, default=1.0,
+                   help="KD loss weight (default: 1.0)")
+    p.add_argument("--query-init", type=str, default="normal", choices=["normal", "orthogonal"],
+                   help="Query embedding init: normal or orthogonal (default: normal)")
+    p.add_argument("--adamw-only", action="store_true",
+                   help="Use AdamW only (no Muon) for NAR training")
+    p.add_argument("--nar-sliding", action="store_true",
+                   help="Use sliding window pairs for NAR (full dataset coverage)")
+    p.add_argument("--nar-stride", type=int, default=None,
+                   help="Stride for sliding window (default: num_queries // 2)")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
@@ -149,6 +169,7 @@ def main():
     p.add_argument("--max-len", type=int, default=128)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--nar", action="store_true", help="Use NAR decoding")
 
     p = sub.add_parser("test", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)

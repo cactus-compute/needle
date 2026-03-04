@@ -231,3 +231,160 @@ def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True):
 
     for i in range(0, n - batch_size + 1, batch_size):
         yield enc_inputs[i : i + batch_size], dec_inputs[i : i + batch_size], dec_targets[i : i + batch_size]
+
+
+def prepare_nar_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=128, split_ratio=0.3, max_target_len=None):
+    """Like prepare_encoder_decoder_pairs but targets have no BOS prefix (for CTC).
+
+    max_target_len: if set, cap target sequences to this length and filter out
+                    samples that would be longer. Should be <= num_queries for
+                    CTC feasibility.
+    """
+    if max_target_len is not None:
+        max_dec_len = min(max_dec_len, max_target_len)
+    cache_id = _cache_key(len(ds), max_enc_len, max_dec_len) + "_nar"
+    cache_path = os.path.join(CACHE_DIR, cache_id)
+    if os.path.exists(cache_path + "_enc.npy"):
+        print(f"Loading cached NAR data ({cache_id})...")
+        return (
+            np.load(cache_path + "_enc.npy"),
+            np.load(cache_path + "_dec_tgt.npy"),
+        )
+
+    pad_id = tokenizer.pad_token_id
+    max_total = max_enc_len + max_dec_len
+
+    texts = list(ds["text"])
+    num_workers = min(os.cpu_count() or 1, 8)
+    model_path = TOKENIZER_PREFIX + ".model"
+    chunk_size = max(1, len(texts) // (num_workers * 4))
+    chunks = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
+
+    print(f"Tokenizing NAR ({num_workers} workers)...")
+    with mp.Pool(num_workers, initializer=_init_worker,
+                 initargs=(model_path, max_total)) as pool:
+        results = pool.map(_tokenize_chunk, chunks)
+    all_tokens = [tok for chunk in results for tok in chunk]
+
+    lengths = np.array([len(t) for t in all_tokens])
+    valid_mask = lengths >= 6
+    valid_indices = np.where(valid_mask)[0]
+
+    split_points = np.maximum(2, (lengths[valid_indices] * split_ratio).astype(np.int32))
+    enc_lens = np.minimum(split_points, max_enc_len)
+    dec_lens = np.minimum(lengths[valid_indices] - split_points, max_dec_len)
+    keep = dec_lens >= 2
+
+    valid_indices = valid_indices[keep]
+    split_points = split_points[keep]
+    enc_lens = enc_lens[keep]
+    dec_lens = dec_lens[keep]
+
+    n_keep = len(valid_indices)
+    enc_inputs = np.full((n_keep, max_enc_len), pad_id, dtype=np.int32)
+    dec_targets = np.full((n_keep, max_dec_len), pad_id, dtype=np.int32)
+
+    for i, (idx, sp, el, dl) in enumerate(
+        zip(valid_indices, split_points, enc_lens, dec_lens)
+    ):
+        tokens = all_tokens[idx]
+        enc_inputs[i, :el] = tokens[:sp][:max_enc_len]
+        # No BOS prefix — raw token sequence for CTC alignment
+        dec_targets[i, :dl] = tokens[sp:][:max_dec_len]
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    np.save(cache_path + "_enc.npy", enc_inputs)
+    np.save(cache_path + "_dec_tgt.npy", dec_targets)
+    print(f"Cached {n_keep:,} NAR pairs to {CACHE_DIR}/{cache_id}")
+
+    return enc_inputs, dec_targets
+
+
+def prepare_nar_sliding_pairs(ds, tokenizer, max_enc_len=256, num_queries=80, stride=None):
+    """Generate multiple enc/dec pairs per story using sliding windows.
+
+    For each story, produces pairs where enc = tokens[0:split] and
+    tgt = tokens[split:split+max_tgt]. Split points advance by `stride`.
+    max_tgt = num_queries // 2 for 2x CTC overprovisioning.
+    Every token appears as a target in at least one pair.
+    """
+    max_tgt = num_queries // 2  # 2x overprovisioning for CTC
+    if stride is None:
+        stride = max(1, max_tgt)
+
+    # Use /tmp for sliding window caches (large, regenerated easily)
+    tmp_cache_dir = "/tmp/needle_cache"
+    cache_id = _cache_key(len(ds), max_enc_len, num_queries) + f"_narsw{stride}"
+    cache_path = os.path.join(tmp_cache_dir, cache_id)
+    if os.path.exists(cache_path + "_enc.npy"):
+        print(f"Loading cached NAR sliding data ({cache_id})...")
+        return (
+            np.load(cache_path + "_enc.npy"),
+            np.load(cache_path + "_dec_tgt.npy"),
+        )
+
+    pad_id = tokenizer.pad_token_id
+    max_total = max_enc_len + max_tgt
+
+    texts = list(ds["text"])
+    num_workers = min(os.cpu_count() or 1, 8)
+    model_path = TOKENIZER_PREFIX + ".model"
+    chunk_size = max(1, len(texts) // (num_workers * 4))
+    chunks = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
+
+    print(f"Tokenizing NAR sliding ({num_workers} workers, max_tgt={max_tgt}, stride={stride})...")
+    with mp.Pool(num_workers, initializer=_init_worker,
+                 initargs=(model_path, max_total)) as pool:
+        results = pool.map(_tokenize_chunk, chunks)
+    all_tokens = [tok for chunk in results for tok in chunk]
+
+    # Generate sliding window pairs
+    enc_list = []
+    tgt_list = []
+    min_enc = 2
+
+    for tokens in all_tokens:
+        if len(tokens) < min_enc + 2:
+            continue
+        split_point = min_enc
+        while split_point < len(tokens):
+            enc_len = min(split_point, max_enc_len)
+            tgt_start = split_point
+            tgt_end = min(split_point + max_tgt, len(tokens))
+            tgt_len = tgt_end - tgt_start
+            if tgt_len < 2:
+                break
+
+            enc = np.full(max_enc_len, pad_id, dtype=np.int32)
+            enc[:enc_len] = tokens[split_point - enc_len:split_point][:max_enc_len]
+
+            tgt = np.full(num_queries, pad_id, dtype=np.int32)
+            tgt[:tgt_len] = tokens[tgt_start:tgt_end]
+
+            enc_list.append(enc)
+            tgt_list.append(tgt)
+
+            split_point += stride
+
+    enc_inputs = np.array(enc_list, dtype=np.int32)
+    dec_targets = np.array(tgt_list, dtype=np.int32)
+
+    os.makedirs(tmp_cache_dir, exist_ok=True)
+    np.save(cache_path + "_enc.npy", enc_inputs)
+    np.save(cache_path + "_dec_tgt.npy", dec_targets)
+    print(f"Cached {len(enc_inputs):,} NAR sliding pairs to /tmp ({cache_id}, "
+          f"stride={stride}, max_tgt={max_tgt}, from {len(all_tokens):,} stories)")
+
+    return enc_inputs, dec_targets
+
+
+def get_nar_batches(enc_inputs, dec_targets, batch_size, shuffle=True):
+    """Yield (enc, tgt) pairs for NAR training — no dec_inputs needed."""
+    n = len(enc_inputs)
+    if shuffle:
+        perm = np.random.permutation(n)
+        enc_inputs = enc_inputs[perm]
+        dec_targets = dec_targets[perm]
+
+    for i in range(0, n - batch_size + 1, batch_size):
+        yield enc_inputs[i : i + batch_size], dec_targets[i : i + batch_size]

@@ -13,7 +13,7 @@ from tqdm import tqdm
 from flax import jax_utils
 from flax.training import train_state
 
-from .data import get_batches, get_tokenizer, load_tinystories, prepare_encoder_decoder_pairs
+from .data import get_batches, get_nar_batches, get_tokenizer, load_tinystories, prepare_encoder_decoder_pairs, prepare_nar_pairs, prepare_nar_sliding_pairs
 from .model import (
     EncoderDecoderTransformer,
     TransformerConfig,
@@ -93,38 +93,53 @@ def _wsd_schedule(peak_value, total_steps, warmup_steps, decay_ratio=0.15):
     )
 
 
-def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_steps):
+def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_steps, adamw_only=False):
     model = EncoderDecoderTransformer(config)
 
     rng, init_rng = jax.random.split(rng)
     dummy_src = jnp.ones((1, 128), dtype=jnp.int32)
-    dummy_tgt = jnp.ones((1, 128), dtype=jnp.int32)
-    variables = model.init(
-        {"params": init_rng},
-        dummy_src,
-        dummy_tgt,
-    )
+    if config.num_queries > 0:
+        # NAR mode: init via forward_nar (no tgt needed)
+        variables = model.init(
+            {"params": init_rng},
+            dummy_src,
+            src_mask=None,
+            method="forward_nar",
+        )
+    else:
+        dummy_tgt = jnp.ones((1, 128), dtype=jnp.int32)
+        variables = model.init(
+            {"params": init_rng},
+            dummy_src,
+            dummy_tgt,
+        )
 
     adam_schedule = _wsd_schedule(learning_rate, total_steps, warmup_steps)
     muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
 
-    muon_opt = optax.chain(
-        scale_by_muon(momentum=0.95, ns_steps=5),
-        optax.add_decayed_weights(weight_decay=0.01),
-        optax.scale_by_schedule(muon_schedule),
-        optax.scale(-1.0),
-    )
-    adam_opt = optax.chain(
-        optax.adamw(adam_schedule, b2=0.95, weight_decay=0.0),
-    )
+    if adamw_only:
+        tx = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(adam_schedule, b2=0.95, weight_decay=0.01),
+        )
+    else:
+        muon_opt = optax.chain(
+            scale_by_muon(momentum=0.95, ns_steps=5),
+            optax.add_decayed_weights(weight_decay=0.01),
+            optax.scale_by_schedule(muon_schedule),
+            optax.scale(-1.0),
+        )
+        adam_opt = optax.chain(
+            optax.adamw(adam_schedule, b2=0.95, weight_decay=0.0),
+        )
 
-    tx = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.multi_transform(
-            {"muon": muon_opt, "adam": adam_opt},
-            _param_labels,
-        ),
-    )
+        tx = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.multi_transform(
+                {"muon": muon_opt, "adam": adam_opt},
+                _param_labels,
+            ),
+        )
     return train_state.TrainState.create(
         apply_fn=model.apply,
         params=variables["params"],
@@ -389,6 +404,69 @@ def _make_p_train_step():
     return jax.pmap(_train_step, axis_name="batch", donate_argnums=(0, 1))
 
 
+def ctc_loss(logits, targets, blank_id, pad_id):
+    """CTC loss between query logits and target tokens.
+
+    logits:  (B, N, V+1) — decoder output over queries
+    targets: (B, T)       — ground truth token IDs (padded)
+
+    Includes zero_infinity: samples where target_len > num_queries produce
+    infinite CTC loss — these are clamped to zero (matching PyTorch's
+    zero_infinity=True used by NARVL).
+    """
+    B, N = logits.shape[0], logits.shape[1]
+    # Logit paddings: all queries are valid (none padded)
+    logit_paddings = jnp.zeros((B, N), dtype=jnp.float32)
+    # Label paddings: pad tokens are padding
+    label_paddings = (targets == pad_id).astype(jnp.float32)
+
+    loss = optax.ctc_loss(logits, logit_paddings, targets, label_paddings,
+                          blank_id=blank_id)
+
+    # zero_infinity: clamp infeasible samples (target_len > num_queries)
+    # optax returns ~1e5 * seq_len for these; clamp anything above a threshold
+    loss = jnp.where(jnp.isfinite(loss), loss, 0.0)
+    loss = jnp.minimum(loss, 1e4)  # cap extreme values
+
+    # Only average over feasible samples
+    valid = loss > 0
+    num_valid = jnp.maximum(jnp.sum(valid), 1.0)
+    return jnp.sum(loss) / num_valid
+
+
+def _nar_train_step(state, ema_params, src, tgt_out):
+    """Single NAR training step — no tgt_in needed."""
+    pad_id = 0
+    blank_id = 8192  # config.blank_token_id
+    ema_decay = 0.999
+
+    def loss_fn(params):
+        src_mask = make_padding_mask(src, pad_id)
+        logits, _ = state.apply_fn(
+            {"params": params},
+            src, src_mask=src_mask,
+            method="forward_nar",
+        )
+        loss = ctc_loss(logits, tgt_out, blank_id, pad_id)
+        z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits, axis=-1) ** 2)
+        return loss + z_loss
+
+    loss, grads = jax.value_and_grad(loss_fn)(state.params)
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    loss = jax.lax.pmean(loss, axis_name="batch")
+    grad_norm = optax.global_norm(grads)
+    state = state.apply_gradients(grads=grads)
+    ema_params = jax.tree.map(
+        lambda e, p: ema_decay * e + (1 - ema_decay) * p,
+        ema_params, state.params,
+    )
+    return state, ema_params, loss, grad_norm
+
+
+def _make_p_nar_train_step():
+    return jax.pmap(_nar_train_step, axis_name="batch", donate_argnums=(0, 1))
+
+
 def _make_val_loss_fn(apply_fn):
     @jax.jit
     def val_loss_batch(params, src, tgt_in, tgt_out, causal_mask):
@@ -422,6 +500,29 @@ def _make_mrl_val_loss_fn(apply_fn, mrl_dim):
         loss = optax.softmax_cross_entropy_with_integer_labels(trunc_logits, tgt_out)
         mask = (tgt_out != pad_id).astype(jnp.float32)
         return jnp.sum(loss * mask), jnp.sum(mask)
+    return val_loss_batch
+
+
+def _make_nar_val_loss_fn(apply_fn, blank_id=8192):
+    """Val CTC loss for NAR model."""
+    @jax.jit
+    def val_loss_batch(params, src, tgt_out):
+        pad_id = 0
+        src_mask = make_padding_mask(src, pad_id)
+        logits, _ = apply_fn(
+            {"params": params}, src, src_mask=src_mask,
+            method="forward_nar",
+        )
+        B, N = logits.shape[0], logits.shape[1]
+        logit_paddings = jnp.zeros((B, N), dtype=jnp.float32)
+        label_paddings = (tgt_out == pad_id).astype(jnp.float32)
+        loss = optax.ctc_loss(logits, logit_paddings, tgt_out, label_paddings,
+                              blank_id=blank_id)
+        # zero_infinity: clamp infeasible samples
+        loss = jnp.where(jnp.isfinite(loss), loss, 0.0)
+        loss = jnp.minimum(loss, 1e4)
+        valid = loss > 0
+        return jnp.sum(loss), jnp.sum(valid).astype(jnp.float32)
     return val_loss_batch
 
 
@@ -463,6 +564,7 @@ def shard_batch(batch, num_devices):
 
 
 def train(args):
+    nar_mode = getattr(args, "nar", False)
     num_devices = jax.local_device_count()
 
     use_wandb = getattr(args, "wandb", False)
@@ -471,8 +573,9 @@ def train(args):
         if wandb.run is None:
             wandb.init(project="needle-v1", config=vars(args))
 
+    mode_str = "NAR (Query-CTC)" if nar_mode else "AR"
     print(f"\n[1/4] Detecting devices...")
-    print(f"      {num_devices} device(s) for data-parallel training")
+    print(f"      {num_devices} device(s) for data-parallel training ({mode_str})")
 
     print(f"\n[2/4] Loading tokenizer...")
     tokenizer = get_tokenizer(max_samples=args.max_samples)
@@ -482,16 +585,46 @@ def train(args):
     val_ds = load_tinystories("validation", max_samples=getattr(args, "max_eval_samples", None))
 
     print(f"\n[4/4] Preparing encoder-decoder pairs...")
-    enc_inputs, dec_inputs, dec_targets = prepare_encoder_decoder_pairs(
-        ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
-    )
-    val_enc, val_dec_in, val_dec_tgt = prepare_encoder_decoder_pairs(
-        val_ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
-    )
-    val_enc = np.array(val_enc)
-    val_dec_in = np.array(val_dec_in)
-    val_dec_tgt = np.array(val_dec_tgt)
-    print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val pairs")
+    if nar_mode:
+        num_queries = getattr(args, "num_queries", 0)
+        nar_sliding = getattr(args, "nar_sliding", False)
+        nar_stride = getattr(args, "nar_stride", None)
+        if nar_sliding:
+            enc_inputs, dec_targets = prepare_nar_sliding_pairs(
+                ds, tokenizer, max_enc_len=args.max_enc_len,
+                num_queries=num_queries, stride=nar_stride,
+            )
+            val_enc, val_dec_tgt = prepare_nar_sliding_pairs(
+                val_ds, tokenizer, max_enc_len=args.max_enc_len,
+                num_queries=num_queries, stride=nar_stride,
+            )
+        else:
+            max_tgt = num_queries // 2  # 2x overprovisioning for CTC blank/repetition slack
+            enc_inputs, dec_targets = prepare_nar_pairs(
+                ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len,
+                max_target_len=max_tgt,
+            )
+            val_enc, val_dec_tgt = prepare_nar_pairs(
+                val_ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len,
+                max_target_len=max_tgt,
+            )
+        val_enc = np.array(val_enc)
+        val_dec_tgt = np.array(val_dec_tgt)
+        # Placeholders for AR-only variables (not used in NAR path)
+        dec_inputs = None
+        val_dec_in = None
+        print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val pairs (NAR)")
+    else:
+        enc_inputs, dec_inputs, dec_targets = prepare_encoder_decoder_pairs(
+            ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
+        )
+        val_enc, val_dec_in, val_dec_tgt = prepare_encoder_decoder_pairs(
+            val_ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
+        )
+        val_enc = np.array(val_enc)
+        val_dec_in = np.array(val_dec_in)
+        val_dec_tgt = np.array(val_dec_tgt)
+        print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val pairs")
 
     effective_batch_size = args.batch_size * num_devices
 
@@ -504,6 +637,7 @@ def train(args):
         config = TransformerConfig(**ckpt_data["config"])
         print(f"  Config: d={config.d_model}, heads={config.num_heads}, layers={config.num_encoder_layers}/{config.num_decoder_layers}")
     else:
+        num_queries = getattr(args, "num_queries", 0) if nar_mode else 0
         config = TransformerConfig(
             d_model=args.d_model,
             num_heads=args.num_heads,
@@ -515,16 +649,22 @@ def train(args):
             dtype=args.dtype,
             activation=getattr(args, "activation", "drelu"),
             num_memory_slots=getattr(args, "num_memory_slots", 64),
+            num_queries=num_queries,
+            query_init=getattr(args, "query_init", "normal"),
         )
 
     global _GROUP_SIZE, _MRL_DIMS
     _GROUP_SIZE = getattr(args, "group_size", 32)
-    mrl_dims_raw = getattr(args, "mrl_dims", None)
-    if mrl_dims_raw:
-        _MRL_DIMS = tuple(d for d in mrl_dims_raw if d < config.d_model)
-    else:
+    if nar_mode:
         _MRL_DIMS = ()
-    p_train_step = _make_p_train_step()
+        p_train_step = _make_p_nar_train_step()
+    else:
+        mrl_dims_raw = getattr(args, "mrl_dims", None)
+        if mrl_dims_raw:
+            _MRL_DIMS = tuple(d for d in mrl_dims_raw if d < config.d_model)
+        else:
+            _MRL_DIMS = ()
+        p_train_step = _make_p_train_step()
 
     np.random.seed(args.seed)
     rng = jax.random.PRNGKey(args.seed)
@@ -532,16 +672,53 @@ def train(args):
 
     num_batches = len(enc_inputs) // effective_batch_size
     total_steps = num_batches * args.epochs
-    warmup_steps = max(1, int(total_steps * args.warmup_ratio))
+    warmup_ratio = 0.15 if nar_mode else args.warmup_ratio
+    warmup_steps = max(1, int(total_steps * warmup_ratio))
 
     scaled_lr = args.lr * num_devices
     muon_lr = getattr(args, "muon_lr", 0.02) * math.sqrt(num_devices)
-    state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps)
-    val_loss_fn = _make_val_loss_fn(state.apply_fn)
+    adamw_only = getattr(args, "adamw_only", False)
+    state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps, adamw_only=adamw_only)
+    if nar_mode:
+        val_loss_fn = _make_nar_val_loss_fn(state.apply_fn)
+    else:
+        val_loss_fn = _make_val_loss_fn(state.apply_fn)
 
     if resume_checkpoint:
         state = state.replace(params=ckpt_params)
         print(f"  Loaded checkpoint params into train state")
+
+    # NAR: initialize encoder+decoder from AR checkpoint (query_embed/blank_embed stay random)
+    nar_checkpoint = getattr(args, "nar_checkpoint", None)
+    if nar_mode and nar_checkpoint and not resume_checkpoint:
+        print(f"  Initializing NAR from AR checkpoint: {nar_checkpoint}")
+        with open(nar_checkpoint, "rb") as f:
+            ar_data = pickle.load(f)
+        ar_params = jax.tree.map(jnp.array, ar_data["params"])
+
+        # Copy all matching keys from AR params into NAR state.
+        # NAR-only params (query_embed, blank_embed) keep their random init.
+        def _merge_ar_into_nar(nar_tree, ar_tree):
+            ar_flat_dict = {}
+            for path, leaf in jax.tree_util.tree_leaves_with_path(ar_tree):
+                key = "/".join(str(p) for p in path)
+                ar_flat_dict[key] = leaf
+
+            def _pick(path, nar_leaf):
+                key = "/".join(str(p) for p in path)
+                if key in ar_flat_dict and ar_flat_dict[key].shape == nar_leaf.shape:
+                    return ar_flat_dict[key]
+                return nar_leaf  # keep random init (query_embed, blank_embed)
+
+            return jax.tree_util.tree_map_with_path(_pick, nar_tree)
+
+        merged_params = _merge_ar_into_nar(state.params, ar_params)
+        state = state.replace(params=merged_params)
+        del ar_params
+
+        total_p = sum(x.size for x in jax.tree.leaves(merged_params))
+        print(f"  Initialized NAR model from AR weights ({total_p:,} total params)")
+        print(f"  NAR-only params (randomly initialized): query_embed + blank_embed")
 
     ema_params = jax.tree.map(jnp.copy, state.params)
     state = jax_utils.replicate(state)
@@ -552,11 +729,14 @@ def train(args):
     stable_steps = total_steps - warmup_steps - decay_steps
 
     print(f"\n  ─────────────────────────────────────")
+    print(f"  Mode          {'NAR (Q-CTC)':>12}" if nar_mode else f"  Mode          {'AR':>12}")
     print(f"  Parameters    {param_count:>12,}")
     print(f"  d_model       {config.d_model:>12}")
     print(f"  Heads         {config.num_heads:>7} ({config.num_kv_heads} KV)")
     print(f"  Layers        {config.num_encoder_layers:>7} enc / {config.num_decoder_layers} dec")
     print(f"  Memory slots  {config.num_memory_slots:>12}")
+    if nar_mode:
+        print(f"  Queries       {config.num_queries:>12}")
     print(f"  Activation    {config.activation:>12}")
     print(f"  Dtype         {config.dtype:>12}")
     print(f"  ─────────────────────────────────────")
@@ -571,17 +751,19 @@ def train(args):
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     global_step = 0
-    causal_mask = jnp.broadcast_to(
-        make_causal_mask(args.max_dec_len),
-        (num_devices, 1, args.max_dec_len, args.max_dec_len),
-    )
+    if not nar_mode:
+        causal_mask = jnp.broadcast_to(
+            make_causal_mask(args.max_dec_len),
+            (num_devices, 1, args.max_dec_len, args.max_dec_len),
+        )
 
     adam_schedule = _wsd_schedule(scaled_lr, total_steps, warmup_steps)
     muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
     tokens_per_batch = effective_batch_size * (args.max_enc_len + args.max_dec_len)
 
     enc_inputs = np.array(enc_inputs)
-    dec_inputs = np.array(dec_inputs)
+    if not nar_mode:
+        dec_inputs = np.array(dec_inputs)
     dec_targets = np.array(dec_targets)
 
     last_val_ppl = None
@@ -638,20 +820,33 @@ def train(args):
             print(f"\nContinuing training with {config.num_encoder_layers}+{config.num_decoder_layers} layers...\n")
 
         losses = []
-        batches = get_batches(enc_inputs, dec_inputs, dec_targets, effective_batch_size)
+        if nar_mode:
+            batches = get_nar_batches(enc_inputs, dec_targets, effective_batch_size)
+        else:
+            batches = get_batches(enc_inputs, dec_inputs, dec_targets, effective_batch_size)
         pbar = tqdm(batches, total=num_batches, desc=f"Epoch {epoch + 1}/{args.epochs}")
 
-        for src, tgt_in, tgt_out in pbar:
+        for batch in pbar:
             t0 = time.perf_counter()
 
-            state, ema_params, loss, grad_norm = p_train_step(
-                state,
-                ema_params,
-                shard_batch(src, num_devices),
-                shard_batch(tgt_in, num_devices),
-                shard_batch(tgt_out, num_devices),
-                causal_mask,
-            )
+            if nar_mode:
+                src, tgt_out = batch
+                state, ema_params, loss, grad_norm = p_train_step(
+                    state,
+                    ema_params,
+                    shard_batch(src, num_devices),
+                    shard_batch(tgt_out, num_devices),
+                )
+            else:
+                src, tgt_in, tgt_out = batch
+                state, ema_params, loss, grad_norm = p_train_step(
+                    state,
+                    ema_params,
+                    shard_batch(src, num_devices),
+                    shard_batch(tgt_in, num_devices),
+                    shard_batch(tgt_out, num_devices),
+                    causal_mask,
+                )
 
             # --- Gradual magnitude pruning (epoch 1 only) ---
             if epoch == weight_prune_epoch and not gradual_pruning_done:
@@ -673,17 +868,32 @@ def train(args):
             eval_every = getattr(args, "eval_every", 100)
             if global_step % eval_every == 0 or global_step == total_steps:
                 _eval_params = jax_utils.unreplicate(ema_params)
-                val_causal = make_causal_mask(args.max_dec_len)
-                total_loss, total_toks = 0.0, 0.0
-                for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
-                    vl, vt = val_loss_fn(_eval_params, vb[0], vb[1], vb[2], val_causal)
-                    total_loss += float(vl)
-                    total_toks += float(vt)
+                if nar_mode:
+                    total_loss, total_toks = 0.0, 0.0
+                    for vb in get_nar_batches(val_enc, val_dec_tgt, args.batch_size, shuffle=False):
+                        vl, vt = val_loss_fn(_eval_params, vb[0], vb[1])
+                        total_loss += float(vl)
+                        total_toks += float(vt)
+                    # For NAR, CTC loss is not cross-entropy per token; report avg loss directly
+                    last_val_ppl = float(total_loss / max(total_toks, 1))
+                else:
+                    val_causal = make_causal_mask(args.max_dec_len)
+                    total_loss, total_toks = 0.0, 0.0
+                    for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
+                        vl, vt = val_loss_fn(_eval_params, vb[0], vb[1], vb[2], val_causal)
+                        total_loss += float(vl)
+                        total_toks += float(vt)
+                    last_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
                 del _eval_params
-                last_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
 
             # --- tqdm postfix with sparsity during epoch 1 ---
-            postfix = {"loss": f"{loss_val:.4f}", "val_ppl": f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?"}
+            if nar_mode:
+                val_label = "val_ctc"
+                val_str = f"{last_val_ppl:.4f}" if last_val_ppl is not None else "?"
+            else:
+                val_label = "val_ppl"
+                val_str = f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?"
+            postfix = {"loss": f"{loss_val:.4f}", val_label: val_str}
             if epoch == weight_prune_epoch and not gradual_pruning_done:
                 postfix["sparsity"] = f"{current_sparsity*100:.1f}%"
             pbar.set_postfix(**postfix)
@@ -700,7 +910,10 @@ def train(args):
                 if epoch == weight_prune_epoch and not gradual_pruning_done:
                     log_dict["train/scheduled_sparsity"] = current_sparsity
                 if global_step % eval_every == 0 or global_step == total_steps:
-                    log_dict["val/ppl"] = last_val_ppl
+                    if nar_mode:
+                        log_dict["val/ctc_loss"] = last_val_ppl
+                    else:
+                        log_dict["val/ppl"] = last_val_ppl
                 wandb.log(log_dict)
 
         # --- Lock mask after epoch 1 gradual pruning ---
@@ -722,42 +935,55 @@ def train(args):
 
         epoch_avg_loss = sum(losses) / len(losses) if losses else float("nan")
         final_loss = losses[-1] if losses else float("nan")
-        final_ppl = math.exp(final_loss) if not math.isnan(final_loss) else float("nan")
+        if nar_mode:
+            final_ppl = final_loss  # CTC loss, not cross-entropy — no exp()
+        else:
+            final_ppl = math.exp(final_loss) if not math.isnan(final_loss) else float("nan")
 
         eval_params = jax_utils.unreplicate(ema_params)
-        val_causal = make_causal_mask(args.max_dec_len)
-        total_loss, total_toks = 0.0, 0.0
-        for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
-            vl, vt = val_loss_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
-            total_loss += float(vl)
-            total_toks += float(vt)
-        last_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
+        if nar_mode:
+            total_loss, total_toks = 0.0, 0.0
+            for vb in get_nar_batches(val_enc, val_dec_tgt, args.batch_size, shuffle=False):
+                vl, vt = val_loss_fn(eval_params, vb[0], vb[1])
+                total_loss += float(vl)
+                total_toks += float(vt)
+            last_val_ppl = float(total_loss / max(total_toks, 1))
+            quant_val_ppl = last_val_ppl  # skip separate quant eval for NAR
+            mrl_results = {}
+        else:
+            val_causal = make_causal_mask(args.max_dec_len)
+            total_loss, total_toks = 0.0, 0.0
+            for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
+                vl, vt = val_loss_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
+                total_loss += float(vl)
+                total_toks += float(vt)
+            last_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
 
-        q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE)
-        q_total_loss, q_total_toks = 0.0, 0.0
-        for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
-            vl, vt = val_loss_fn(q_params, vb[0], vb[1], vb[2], val_causal)
-            q_total_loss += float(vl)
-            q_total_toks += float(vt)
-        quant_val_ppl = float(math.exp(q_total_loss / max(q_total_toks, 1)))
-        del q_params  # free device memory
+            q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE)
+            q_total_loss, q_total_toks = 0.0, 0.0
+            for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
+                vl, vt = val_loss_fn(q_params, vb[0], vb[1], vb[2], val_causal)
+                q_total_loss += float(vl)
+                q_total_toks += float(vt)
+            quant_val_ppl = float(math.exp(q_total_loss / max(q_total_toks, 1)))
+            del q_params  # free device memory
 
-        # MRL per-dimension evaluation (reuse val_loss_fn's apply_fn)
-        mrl_results = {}
-        if _MRL_DIMS:
-            apply_fn = jax_utils.unreplicate(state).apply_fn
-            for d_prime in _MRL_DIMS:
-                mrl_vl_fn = _make_mrl_val_loss_fn(apply_fn, d_prime)
-                mrl_total_loss, mrl_total_toks = 0.0, 0.0
-                for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
-                    vl, vt = mrl_vl_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
-                    mrl_total_loss += float(vl)
-                    mrl_total_toks += float(vt)
-                avg_loss = mrl_total_loss / max(mrl_total_toks, 1)
-                mrl_ppl = float(math.exp(min(avg_loss, 20)))
-                mrl_params = _estimate_mrl_params(config, d_prime)
-                mrl_results[d_prime] = (mrl_ppl, mrl_params)
-            del apply_fn
+            # MRL per-dimension evaluation (reuse val_loss_fn's apply_fn)
+            mrl_results = {}
+            if _MRL_DIMS:
+                apply_fn = jax_utils.unreplicate(state).apply_fn
+                for d_prime in _MRL_DIMS:
+                    mrl_vl_fn = _make_mrl_val_loss_fn(apply_fn, d_prime)
+                    mrl_total_loss, mrl_total_toks = 0.0, 0.0
+                    for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
+                        vl, vt = mrl_vl_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
+                        mrl_total_loss += float(vl)
+                        mrl_total_toks += float(vt)
+                    avg_loss = mrl_total_loss / max(mrl_total_toks, 1)
+                    mrl_ppl = float(math.exp(min(avg_loss, 20)))
+                    mrl_params = _estimate_mrl_params(config, d_prime)
+                    mrl_results[d_prime] = (mrl_ppl, mrl_params)
+                del apply_fn
 
         # Sparsity + checkpoint — move to CPU, reuse single copy
         params_np = jax.tree.map(np.array, eval_params)
@@ -772,23 +998,38 @@ def train(args):
         with open(ckpt_path, "wb") as f:
             pickle.dump({"params": params_np, "config": config.__dict__}, f)
 
-        from .test import measure_throughput, benchmark_generation_quality
+        from .test import (measure_throughput, benchmark_generation_quality,
+                          measure_nar_throughput, benchmark_nar_generation_quality,
+                          evaluate_bleu4)
         eval_params_jnp = jax.tree.map(jnp.array, params_np)
         del params_np  # free CPU memory
         model = EncoderDecoderTransformer(config)
-        tp = measure_throughput(model, eval_params_jnp, tokenizer, num_runs=5)
         prompts = ["Once upon a time", "The little dog", "She was very happy because"]
-        quality = benchmark_generation_quality(model, eval_params_jnp, tokenizer, prompts, max_gen_len=64, temperature=0.8)
+        if nar_mode:
+            tp = measure_nar_throughput(model, eval_params_jnp, tokenizer, num_runs=5)
+            quality = benchmark_nar_generation_quality(model, eval_params_jnp, tokenizer, prompts)
+            bleu_results = evaluate_bleu4(model, eval_params_jnp, tokenizer,
+                                          val_enc, val_dec_tgt, num_samples=200,
+                                          pad_id=config.pad_token_id, nar_mode=True)
+        else:
+            tp = measure_throughput(model, eval_params_jnp, tokenizer, num_runs=5)
+            quality = benchmark_generation_quality(model, eval_params_jnp, tokenizer, prompts, max_gen_len=64, temperature=0.8)
+            bleu_results = evaluate_bleu4(model, eval_params_jnp, tokenizer,
+                                          val_enc, val_dec_tgt, num_samples=200,
+                                          temperature=0.8, pad_id=config.pad_token_id, nar_mode=False)
         del eval_params_jnp  # free device memory
 
         print(f"\n  ─────────────────────────────────────")
-        print(f"  Epoch {epoch + 1}/{args.epochs}")
+        print(f"  Epoch {epoch + 1}/{args.epochs}  ({mode_str})")
         print(f"  ─────────────────────────────────────")
         print(f"  Avg loss       {epoch_avg_loss:>12.4f}")
         print(f"  Final loss     {final_loss:>12.4f}")
-        print(f"  Train ppl      {final_ppl:>12.2f}")
-        print(f"  Val ppl        {last_val_ppl:>12.2f}")
-        print(f"  Quant val ppl  {quant_val_ppl:>12.2f}  (INT4 g{_GROUP_SIZE})")
+        if nar_mode:
+            print(f"  Val CTC loss   {last_val_ppl:>12.4f}")
+        else:
+            print(f"  Train ppl      {final_ppl:>12.2f}")
+            print(f"  Val ppl        {last_val_ppl:>12.2f}")
+            print(f"  Quant val ppl  {quant_val_ppl:>12.2f}  (INT4 g{_GROUP_SIZE})")
         print(f"  Sparsity       {sparsity:>11.2f}%  ({near_zero:,}/{total_params:,})")
         if mrl_results:
             print(f"  ─────────────────────────────────────")
@@ -803,8 +1044,12 @@ def train(args):
         print(f"  ─────────────────────────────────────")
         print(f"  Throughput     {tp['tokens_per_second']:>10.1f} tok/s")
         print(f"  Latency        {tp['avg_latency_s']:>11.3f}s")
+        print(f"  BLEU-4         {bleu_results['bleu4']:>12.4f}  ({bleu_results['num_samples']} samples)")
+        print(f"  Length ratio   {bleu_results['mean_length_ratio']:>12.3f}  (ideal=1.0)")
         print(f"  Gen length     {quality['avg_generation_length']:>10.1f} tok")
         print(f"  Repetition     {quality['bigram_repetition_rate']:>12.3f}")
+        print(f"  Distinct-1     {quality['distinct_1']:>12.3f}")
+        print(f"  Distinct-2     {quality['distinct_2']:>12.3f}")
         print(f"  ─────────────────────────────────────")
         for prompt, gen in quality["generations"]:
             print(f"  [{prompt}]")
@@ -817,14 +1062,24 @@ def train(args):
             log_dict = {
                 "epoch/avg_loss": epoch_avg_loss,
                 "epoch/final_loss": final_loss,
-                "epoch/val_ppl": last_val_ppl,
-                "epoch/quant_val_ppl": quant_val_ppl,
                 "epoch/weight_sparsity": sparsity,
+                "epoch/bleu4": bleu_results["bleu4"],
+                "epoch/mean_length_ratio": bleu_results["mean_length_ratio"],
+                "epoch/distinct_1": quality["distinct_1"],
+                "epoch/distinct_2": quality["distinct_2"],
+                "epoch/bigram_repetition": quality["bigram_repetition_rate"],
+                "epoch/throughput_tok_s": tp["tokens_per_second"],
+                "epoch/latency_s": tp["avg_latency_s"],
                 "epoch": epoch + 1,
             }
-            for d_prime, (mrl_ppl, mrl_params) in mrl_results.items():
-                log_dict[f"epoch/mrl_ppl_d{d_prime}"] = mrl_ppl
-                log_dict[f"epoch/mrl_params_d{d_prime}"] = mrl_params
+            if nar_mode:
+                log_dict["epoch/val_ctc_loss"] = last_val_ppl
+            else:
+                log_dict["epoch/val_ppl"] = last_val_ppl
+                log_dict["epoch/quant_val_ppl"] = quant_val_ppl
+                for d_prime, (mrl_ppl, mrl_params) in mrl_results.items():
+                    log_dict[f"epoch/mrl_ppl_d{d_prime}"] = mrl_ppl
+                    log_dict[f"epoch/mrl_params_d{d_prime}"] = mrl_params
             wandb.log(log_dict)
 
     if use_wandb:
