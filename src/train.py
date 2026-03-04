@@ -588,10 +588,10 @@ def train(args):
                 del ema_unr
                 prune_mask = jax_utils.replicate(mask)
                 del mask
-                # Apply mask once via the fused step (reuses donated buffers)
-                state = state.replace(
-                    params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
-                ema_params = jax.tree.map(lambda w, m: w * m, ema_params, prune_mask)
+            # Apply final mask to both params and EMA (EMA lags due to slow decay)
+            state = state.replace(
+                params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
+            ema_params = jax.tree.map(lambda w, m: w * m, ema_params, prune_mask)
             final_pruned = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
             total_p = sum(x.size for x in jax.tree.leaves(final_pruned))
             zero_p = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(final_pruned))
