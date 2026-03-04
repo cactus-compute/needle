@@ -44,6 +44,7 @@ class TransformerConfig:
     dtype: str = "bfloat16"
     activation: str = "drelu"
     num_memory_slots: int = 64
+    n_mels: int = 80
 
     @property
     def jax_dtype(self):
@@ -303,6 +304,17 @@ class Decoder(nn.Module):
         return x
 
 
+class MelProjection(nn.Module):
+    """Project mel spectrogram features to model dimension."""
+    d_model: int
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, mel):
+        return nn.Dense(self.d_model, dtype=self.dtype, use_bias=True,
+                        kernel_init=default_init(), name="proj")(mel)
+
+
 class EncoderDecoderTransformer(nn.Module):
     """Encoder-decoder transformer with shared embeddings, tied output, RoPE, and bfloat16."""
     config: TransformerConfig
@@ -310,6 +322,7 @@ class EncoderDecoderTransformer(nn.Module):
     def setup(self):
         self.embedding = nn.Embed(self.config.vocab_size, self.config.d_model, embedding_init=jinit.normal(stddev=0.02))
         self.embed_scale = math.sqrt(self.config.d_model)
+        self.mel_proj = MelProjection(self.config.d_model, self.config.jax_dtype)
         self.encoder = MemoryMixerEncoder(self.config)
         self.decoder = Decoder(self.config)
 
@@ -317,9 +330,18 @@ class EncoderDecoderTransformer(nn.Module):
         head_dim = self.config.d_model // self.config.num_heads
         return precompute_rope_freqs(head_dim, seq_len, self.config.rope_theta)
 
-    def encode(self, src, src_mask=None):
+    def encode_text(self, src, src_mask=None):
         x = self.embedding(src) * self.embed_scale
         rope = self._rope(src.shape[1])
+        return self.encoder(x, mask=src_mask, rope=rope)
+
+    def encode(self, src, src_mask=None):
+        """Backward-compatible alias for encode_text."""
+        return self.encode_text(src, src_mask=src_mask)
+
+    def encode_speech(self, mel, src_mask=None):
+        x = self.mel_proj(mel) * self.embed_scale
+        rope = self._rope(mel.shape[1])
         return self.encoder(x, mask=src_mask, rope=rope)
 
     def decode(self, tgt, encoder_out, self_mask=None, cross_mask=None):
@@ -332,19 +354,19 @@ class EncoderDecoderTransformer(nn.Module):
         return logits
 
     def __call__(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None):
-        encoder_out = self.encode(src, src_mask=src_mask)
+        encoder_out = self.encode_text(src, src_mask=src_mask)
         logits = self.decode(
             tgt, encoder_out, self_mask=tgt_mask
         )
         return logits
 
-    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mrl_dims=None):
-        encoder_out = self.encode(src, src_mask=src_mask)
+    def _decode_with_aux(self, encoder_out, tgt, tgt_mask=None, mrl_dims=None):
+        """Shared decode logic returning logits, slot_div, mrl_logits."""
         x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
         x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=None, rope=rope)
         x_f32 = x.astype(jnp.float32)
-        emb = self.embedding.embedding 
+        emb = self.embedding.embedding
         logits = x_f32 @ emb.T
 
         mrl_logits = []
@@ -359,6 +381,25 @@ class EncoderDecoderTransformer(nn.Module):
         slot_div = (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
         return logits, slot_div, mrl_logits
 
+    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mrl_dims=None):
+        encoder_out = self.encode_text(src, src_mask=src_mask)
+        return self._decode_with_aux(encoder_out, tgt, tgt_mask=tgt_mask, mrl_dims=mrl_dims)
+
+    def forward_speech_with_aux(self, mel, tgt, src_mask=None, tgt_mask=None, mrl_dims=None):
+        encoder_out = self.encode_speech(mel, src_mask=src_mask)
+        return self._decode_with_aux(encoder_out, tgt, tgt_mask=tgt_mask, mrl_dims=mrl_dims)
+
+    def init_all(self, src, tgt, mel):
+        """Dummy forward through both text and speech pathways to initialize all params."""
+        src_mask = make_padding_mask(src, self.config.pad_token_id)
+        tgt_mask = make_causal_mask(tgt.shape[1]) & make_padding_mask(tgt, self.config.pad_token_id)
+        text_out = self.encode_text(src, src_mask=src_mask)
+        mel_mask = make_mel_padding_mask(mel)
+        speech_out = self.encode_speech(mel, src_mask=mel_mask)
+        _ = self._decode_with_aux(text_out, tgt, tgt_mask=tgt_mask)
+        _ = self._decode_with_aux(speech_out, tgt, tgt_mask=tgt_mask)
+        return jnp.zeros(())
+
 
 def make_causal_mask(seq_len):
     mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
@@ -368,3 +409,9 @@ def make_causal_mask(seq_len):
 def make_padding_mask(tokens, pad_token_id):
     mask = tokens != pad_token_id
     return mask[:, None, None, :]
+
+
+def make_mel_padding_mask(mel):
+    """Create padding mask from mel spectrogram: non-zero frames are valid."""
+    mask = jnp.any(mel != 0, axis=-1)  # (B, T)
+    return mask[:, None, None, :]  # (B, 1, 1, T)

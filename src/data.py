@@ -10,7 +10,7 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 import numpy as np
-from datasets import load_dataset
+from datasets import Audio, load_dataset
 from tqdm import tqdm
 import sentencepiece as spm
 
@@ -21,6 +21,9 @@ TOKENIZER_PREFIX = os.path.join(TOKENIZER_DIR, "needle")
 PAD_ID = 0
 EOS_ID = 1
 BOS_ID = 2
+UNK_ID = 3
+STORY_ID = 4
+TRANSCRIBE_ID = 5
 
 
 class NeedleTokenizer:
@@ -41,6 +44,14 @@ class NeedleTokenizer:
     @property
     def bos_token_id(self):
         return BOS_ID
+
+    @property
+    def story_token_id(self):
+        return STORY_ID
+
+    @property
+    def transcribe_token_id(self):
+        return TRANSCRIBE_ID
 
     @property
     def vocab_size(self):
@@ -111,7 +122,8 @@ def train_tokenizer(vocab_size=8192, max_samples=None):
         pad_id=PAD_ID,
         eos_id=EOS_ID,
         bos_id=BOS_ID,
-        unk_id=3,
+        unk_id=UNK_ID,
+        user_defined_symbols=["<story>", "<transcribe>"],
         byte_fallback=True,
         normalization_rule_name="identity",
         num_threads=os.cpu_count(),
@@ -147,18 +159,19 @@ def _tokenizer_hash():
     return "none"
 
 
-def _cache_key(n_samples, max_enc_len, max_dec_len):
+def _cache_key(prefix, n_samples, max_enc_len, max_dec_len):
     tok_hash = _tokenizer_hash()
-    key = f"tinystories_{tok_hash}_{n_samples}_{max_enc_len}_{max_dec_len}"
+    key = f"{prefix}_{tok_hash}_{n_samples}_{max_enc_len}_{max_dec_len}"
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
-def prepare_encoder_decoder_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=128, split_ratio=0.3):
+def prepare_text_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=128, split_ratio=0.3):
+    """Prepare text encoder-decoder pairs with <story> task token."""
 
-    cache_id = _cache_key(len(ds), max_enc_len, max_dec_len)
+    cache_id = _cache_key("text", len(ds), max_enc_len, max_dec_len)
     cache_path = os.path.join(CACHE_DIR, cache_id)
     if os.path.exists(cache_path + "_enc.npy"):
-        print(f"Loading cached data ({cache_id})...")
+        print(f"Loading cached text data ({cache_id})...")
         return (
             np.load(cache_path + "_enc.npy"),
             np.load(cache_path + "_dec_in.npy"),
@@ -167,6 +180,7 @@ def prepare_encoder_decoder_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=12
 
     pad_id = tokenizer.pad_token_id
     bos_id = tokenizer.eos_token_id
+    story_id = tokenizer.story_token_id
     max_total = max_enc_len + max_dec_len
 
     # --- Parallel tokenization ---
@@ -189,7 +203,8 @@ def prepare_encoder_decoder_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=12
 
     split_points = np.maximum(2, (lengths[valid_indices] * split_ratio).astype(np.int32))
     enc_lens = np.minimum(split_points, max_enc_len)
-    dec_lens = np.minimum(lengths[valid_indices] - split_points, max_dec_len)
+    # Account for <story> token taking one slot in decoder
+    dec_lens = np.minimum(lengths[valid_indices] - split_points, max_dec_len - 1)
     keep = dec_lens >= 2
 
     valid_indices = valid_indices[keep]
@@ -207,18 +222,27 @@ def prepare_encoder_decoder_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=12
     ):
         tokens = all_tokens[idx]
         enc_inputs[i, :el] = tokens[:sp][:max_enc_len]
+        # Decoder input: [BOS, <story>, tok1, tok2, ...]
         dec_inputs[i, 0] = bos_id
-        dec_inputs[i, 1:dl] = tokens[sp:][:dl - 1]
-        dec_targets[i, :dl] = tokens[sp:][:max_dec_len]
+        dec_inputs[i, 1] = story_id
+        dec_inputs[i, 2:dl + 1] = tokens[sp:][:dl - 1]
+        # Decoder target: [<story>, tok1, tok2, ..., EOS]
+        dec_targets[i, 0] = story_id
+        dec_targets[i, 1:dl + 1] = tokens[sp:][:dl]
 
     # Save cache
     os.makedirs(CACHE_DIR, exist_ok=True)
     np.save(cache_path + "_enc.npy", enc_inputs)
     np.save(cache_path + "_dec_in.npy", dec_inputs)
     np.save(cache_path + "_dec_tgt.npy", dec_targets)
-    print(f"Cached {n_keep:,} pairs to {CACHE_DIR}/{cache_id}")
+    print(f"Cached {n_keep:,} text pairs to {CACHE_DIR}/{cache_id}")
 
     return enc_inputs, dec_inputs, dec_targets
+
+
+# Backward compatibility alias
+def prepare_encoder_decoder_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=128, split_ratio=0.3):
+    return prepare_text_pairs(ds, tokenizer, max_enc_len, max_dec_len, split_ratio)
 
 
 def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True):
@@ -231,3 +255,194 @@ def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True):
 
     for i in range(0, n - batch_size + 1, batch_size):
         yield enc_inputs[i : i + batch_size], dec_inputs[i : i + batch_size], dec_targets[i : i + batch_size]
+
+
+get_text_batches = get_batches
+
+
+# ─── Speech pipeline ───────────────────────────────────────────────────────────
+
+def load_librispeech(split="train", max_samples=None):
+    """Load LibriSpeech-100 from HuggingFace (SPRINGLab/LibriSpeech-100).
+
+    The dataset has a single 'train' split, so we partition it:
+      - train / train.clean.100: first 90%
+      - validation.clean / test.clean / validation / test: last 10%
+
+    Audio decoding is disabled (to avoid torchcodec/torch dependency);
+    prepare_speech_pairs decodes audio bytes via soundfile instead.
+    """
+    ds = load_dataset("SPRINGLab/LibriSpeech-100", split="train")
+    ds = ds.cast_column("audio", Audio(decode=False))
+    n = len(ds)
+    if split in ("validation.clean", "validation", "test.clean", "test"):
+        ds = ds.select(range(int(n * 0.9), n))
+    elif split.startswith("train"):
+        ds = ds.select(range(int(n * 0.9)))
+    if max_samples:
+        ds = ds.select(range(min(max_samples, len(ds))))
+    return ds
+
+
+def _decode_audio(audio_data, target_sr=16000):
+    """Decode raw audio bytes from a datasets Audio(decode=False) field using soundfile."""
+    import io
+    import soundfile as sf
+
+    audio_bytes = audio_data["bytes"]
+    if audio_bytes is None:
+        path = audio_data["path"]
+        audio, sr = sf.read(path, dtype="float32")
+    else:
+        audio, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+
+    # Convert stereo to mono
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+
+    # Resample if needed
+    if sr != target_sr:
+        from scipy.signal import resample
+        num_samples = int(len(audio) * target_sr / sr)
+        audio = resample(audio, num_samples).astype(np.float32)
+        sr = target_sr
+
+    return audio.astype(np.float32), sr
+
+
+def compute_mel_spectrogram(audio, sr=16000, n_mels=80, n_fft=400, hop_length=160):
+    """Compute log-mel spectrogram using numpy/scipy. Returns (T_mel, n_mels) float32.
+
+    25ms window (n_fft=400 at 16kHz), 10ms hop (hop_length=160) → ~100 frames/sec.
+    """
+    from scipy.signal import windows as scipy_windows
+    from scipy.fft import rfft
+
+    # Pre-emphasis
+    audio = np.append(audio[0], audio[1:] - 0.97 * audio[:-1])
+
+    # STFT
+    window = scipy_windows.hann(n_fft, sym=False).astype(np.float32)
+    num_frames = 1 + (len(audio) - n_fft) // hop_length
+    if num_frames <= 0:
+        return np.zeros((1, n_mels), dtype=np.float32)
+
+    frames = np.lib.stride_tricks.as_strided(
+        audio,
+        shape=(num_frames, n_fft),
+        strides=(audio.strides[0] * hop_length, audio.strides[0]),
+    ).copy()
+    frames = frames * window
+    spectrum = np.abs(rfft(frames, n=n_fft, axis=-1)) ** 2
+
+    # Mel filterbank
+    fmin, fmax = 0.0, sr / 2.0
+    mel_low = 2595.0 * np.log10(1.0 + fmin / 700.0)
+    mel_high = 2595.0 * np.log10(1.0 + fmax / 700.0)
+    mel_points = np.linspace(mel_low, mel_high, n_mels + 2)
+    hz_points = 700.0 * (10.0 ** (mel_points / 2595.0) - 1.0)
+    bin_points = np.floor((n_fft + 1) * hz_points / sr).astype(np.int32)
+
+    filterbank = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float32)
+    for m in range(n_mels):
+        f_left, f_center, f_right = bin_points[m], bin_points[m + 1], bin_points[m + 2]
+        for k in range(f_left, f_center):
+            if f_center > f_left:
+                filterbank[m, k] = (k - f_left) / (f_center - f_left)
+        for k in range(f_center, f_right):
+            if f_right > f_center:
+                filterbank[m, k] = (f_right - k) / (f_right - f_center)
+
+    mel_spec = spectrum @ filterbank.T
+    log_mel = np.log(np.maximum(mel_spec, 1e-10))
+    return log_mel.astype(np.float32)
+
+
+def _speech_cache_key(n_samples, n_mels, max_mel_len, max_dec_len):
+    tok_hash = _tokenizer_hash()
+    key = f"speech_{tok_hash}_{n_samples}_{n_mels}_{max_mel_len}_{max_dec_len}"
+    return hashlib.md5(key.encode()).hexdigest()[:12]
+
+
+def prepare_speech_pairs(ds, tokenizer, n_mels=80, max_mel_len=1024, max_dec_len=128):
+    """Prepare speech encoder-decoder pairs with <transcribe> task token."""
+
+    cache_id = _speech_cache_key(len(ds), n_mels, max_mel_len, max_dec_len)
+    cache_path = os.path.join(CACHE_DIR, cache_id)
+    if os.path.exists(cache_path + "_mel.npy"):
+        print(f"Loading cached speech data ({cache_id})...")
+        return (
+            np.load(cache_path + "_mel.npy"),
+            np.load(cache_path + "_dec_in.npy"),
+            np.load(cache_path + "_dec_tgt.npy"),
+        )
+
+    pad_id = tokenizer.pad_token_id
+    bos_id = tokenizer.eos_token_id
+    eos_id = tokenizer.eos_token_id
+    transcribe_id = tokenizer.transcribe_token_id
+
+    mel_features = []
+    dec_inputs_list = []
+    dec_targets_list = []
+
+    for example in tqdm(ds, desc="Processing speech"):
+        audio, sr = _decode_audio(example["audio"])
+
+        mel = compute_mel_spectrogram(audio, sr=sr, n_mels=n_mels)
+
+        # Pad or truncate mel to max_mel_len
+        if mel.shape[0] > max_mel_len:
+            mel = mel[:max_mel_len]
+        elif mel.shape[0] < max_mel_len:
+            pad_len = max_mel_len - mel.shape[0]
+            mel = np.pad(mel, ((0, pad_len), (0, 0)))
+
+        # Tokenize transcript
+        text = example["text"].strip().lower()
+        tokens = tokenizer.encode(text)
+        # Leave room for <transcribe> prefix and EOS
+        tokens = tokens[:max_dec_len - 2]
+
+        # Decoder input: [BOS, <transcribe>, tok1, tok2, ...]
+        dec_in = np.full(max_dec_len, pad_id, dtype=np.int32)
+        dec_in[0] = bos_id
+        dec_in[1] = transcribe_id
+        n_tok = len(tokens)
+        if n_tok > 0:
+            dec_in[2:2 + n_tok] = tokens
+
+        # Decoder target: [<transcribe>, tok1, tok2, ..., EOS]
+        dec_tgt = np.full(max_dec_len, pad_id, dtype=np.int32)
+        dec_tgt[0] = transcribe_id
+        if n_tok > 0:
+            dec_tgt[1:1 + n_tok] = tokens
+        dec_tgt[1 + n_tok] = eos_id
+
+        mel_features.append(mel)
+        dec_inputs_list.append(dec_in)
+        dec_targets_list.append(dec_tgt)
+
+    mel_features = np.stack(mel_features).astype(np.float32)
+    dec_inputs = np.stack(dec_inputs_list)
+    dec_targets = np.stack(dec_targets_list)
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    np.save(cache_path + "_mel.npy", mel_features)
+    np.save(cache_path + "_dec_in.npy", dec_inputs)
+    np.save(cache_path + "_dec_tgt.npy", dec_targets)
+    print(f"Cached {len(mel_features):,} speech pairs to {CACHE_DIR}/{cache_id}")
+
+    return mel_features, dec_inputs, dec_targets
+
+
+def get_speech_batches(mel_features, dec_inputs, dec_targets, batch_size, shuffle=True):
+    n = len(mel_features)
+    if shuffle:
+        perm = np.random.permutation(n)
+        mel_features = mel_features[perm]
+        dec_inputs = dec_inputs[perm]
+        dec_targets = dec_targets[perm]
+
+    for i in range(0, n - batch_size + 1, batch_size):
+        yield mel_features[i : i + batch_size], dec_inputs[i : i + batch_size], dec_targets[i : i + batch_size]
