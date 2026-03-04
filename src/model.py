@@ -242,7 +242,7 @@ class MemoryMixerEncoder(nn.Module):
             mask = mask[..., :T_new]
 
         for i in range(cfg.num_encoder_layers):
-            x, s = MemoryMixerBlock(
+            x, s = nn.remat(MemoryMixerBlock)(
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
                 cfg.num_memory_slots, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
             )(x, s, mask=mask, rope=rope)
@@ -295,7 +295,7 @@ class Decoder(nn.Module):
         x = x.astype(dt)
 
         for i in range(cfg.num_decoder_layers):
-            x = DecoderBlock(
+            x = nn.remat(DecoderBlock)(
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
             )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope)
 
