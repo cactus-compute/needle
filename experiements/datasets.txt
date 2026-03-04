@@ -18,6 +18,7 @@ Note:
 1. LEAP makes sense as we wish the dataset to preprocess and pretokenize the inputs before injesting into the model. 
 2. We are training a cutom sentencepiece tokenizer with a small vocab size, given how constrained the decode is.
 3. Requires solid cloud infra experience, latency in injestion will slow down training. 
+4. Can text to tools translate to voice to tools.
 4. Record all obersvations, they will go into the paper!
 5. Design the batching (mix of speech and text and tools) experimantally.
 6. We should have a <transcribe> and <tools> tag for the two tasks we train on.
