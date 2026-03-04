@@ -10,30 +10,32 @@ HELP = """
   │      ...the tiny model to rule them all...                        │
   │                                                                   │
   │   train                                                           │
-  │     --epochs INT            Training epochs (default: 1)          │
-  │     --batch-size INT        Batch size (default: 32)              │
-  │     --lr FLOAT              AdamW learning rate (default: 3e-4)   │
-  │     --muon-lr FLOAT         Muon learning rate (default: 0.02)    │
-  │     --d-model INT           Model dim (default: max of mrl-dims)  │
-  │     --num-heads INT         Attention heads (default: 4)          │
-  │     --num-layers INT        Encoder layers (default: 4)           │
-  │     --num-dec-layers INT    Decoder layers (default: 2)           │
-  │     --max-enc-len INT       Max encoder seq length (default: 256) │
-  │     --max-dec-len INT       Max decoder seq length (default: 256) │
-  │     --max-samples INT       Training samples (default: all)       │
-  │     --mrl-dims INT [...]    MRL dim targets (default: 1024 512..) │
-  │     --sparsity-ratio FLOAT  Block prune ratio (default: 0.5)      │
-  │     --group-size INT        Quant/prune group size (default: 32)  │
-  │     --prune-interval INT    Steps between mask updates (def: 100) │
-  │     --prune-start-frac FL   Start pruning at this frac (def: 0.33)│
-  │     --prune-end-frac FL     Lock mask at this frac (def: 0.67)    │
-  │     --activation STR        drelu|swiglu|geglu (default: drelu)   │
-  │     --warmup-ratio FLOAT    LR warmup ratio (default: 0.05)       │
-  │     --eval-every INT        Val eval interval (default: 1000)     │
-  │     --wandb                 Enable W&B logging                    │
-  │     --checkpoint PATH       Resume from checkpoint                │
-  │     --checkpoint-dir DIR    Checkpoint directory                  │
-  │     --seed INT              Random seed (default: 42)             │
+  │     --full                   Use full 1B config (~1.17B params)   │
+  │     --epochs INT             Training epochs (default: 1)         │
+  │     --batch-size INT         Batch size (default: 32)             │
+  │     --lr FLOAT               AdamW learning rate (default: 3e-4)  │
+  │     --muon-lr FLOAT          Muon learning rate (default: 0.02)   │
+  │     --d-model INT            Model dim (default: 512)             │
+  │     --num-heads INT          Attention heads (default: 8)         │
+  │     --num-kv-heads INT       KV heads for GQA (default: num-heads)│
+  │     --num-layers INT         Encoder layers (default: 8)          │
+  │     --num-dec-layers INT     Decoder layers (default: 4)          │
+  │     --max-enc-len INT        Max encoder seq length (default: 256)│
+  │     --max-dec-len INT        Max decoder seq length (default: 256)│
+  │     --max-samples INT        Training samples (default: all)      │
+  │     --mrl-dims INT [...]     MRL dim targets (default: 256 128 64)│
+  │     --sparsity-ratio FLOAT   Block prune ratio (default: 0.5)    │
+  │     --group-size INT         Quant/prune group size (default: 32) │
+  │     --prune-interval INT     Steps between mask updates (def: 100)│
+  │     --prune-start-frac FL    Start pruning at frac (def: 0.33)   │
+  │     --prune-end-frac FL      Lock mask at this frac (def: 0.67)  │
+  │     --activation STR         drelu|swiglu|geglu (default: drelu)  │
+  │     --warmup-ratio FLOAT     LR warmup ratio (default: 0.05)     │
+  │     --eval-every INT         Val eval interval (default: 1000)    │
+  │     --wandb                  Enable W&B logging                   │
+  │     --checkpoint PATH        Resume from checkpoint               │
+  │     --checkpoint-dir DIR     Checkpoint directory                 │
+  │     --seed INT               Random seed (default: 42)            │
   │                                                                   │
   │   run                                                             │
   │     --checkpoint PATH       Path to model checkpoint (required)   │
@@ -79,15 +81,17 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     p = sub.add_parser("train", add_help=False)
+    p.add_argument("--full", action="store_true")
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
-    p.add_argument("--d-model", type=int, default=None)
-    p.add_argument("--num-heads", type=int, default=4)
-    p.add_argument("--num-layers", type=int, default=4)
-    p.add_argument("--num-dec-layers", type=int, default=2)
+    p.add_argument("--d-model", type=int, default=512)
+    p.add_argument("--num-heads", type=int, default=8)
+    p.add_argument("--num-kv-heads", type=int, default=None)
+    p.add_argument("--num-layers", type=int, default=8)
+    p.add_argument("--num-dec-layers", type=int, default=4)
     p.add_argument("--max-enc-len", type=int, default=256)
     p.add_argument("--max-dec-len", type=int, default=256)
     p.add_argument("--max-samples", type=int, default=None)
@@ -108,8 +112,8 @@ def main():
                    help="Fraction of epoch at which pruning finishes and mask locks (default: 0.67)")
     p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu"])
     p.add_argument("--num-memory-slots", type=int, default=64)
-    p.add_argument("--mrl-dims", type=int, nargs="*", default=[1024, 512, 256, 128, 64],
-                   help="MRL dimension pruning targets (default: 1024 512 256 128 64)")
+    p.add_argument("--mrl-dims", type=int, nargs="*", default=[256, 128, 64],
+                   help="MRL dimension targets (default: 256 128 64)")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
@@ -172,8 +176,14 @@ def main():
         sys.exit(0)
 
     if args.command == "train":
-        if args.d_model is None:
-            args.d_model = max(args.mrl_dims)
+        if getattr(args, "full", False):
+            args.d_model = 1536
+            args.num_heads = 24
+            args.num_kv_heads = 8
+            args.num_layers = 12
+            args.num_dec_layers = 4
+            args.num_memory_slots = 128
+            args.mrl_dims = [1024, 768, 512, 256, 128]
         from .train import train
         train(args)
     elif args.command == "run":

@@ -218,7 +218,7 @@ def _cubic_sparsity_schedule(step, t_start, t_end, s_final):
 def _make_prune_mask(params, sparsity, group_size):
     """Compute block-prune mask entirely on-device (no numpy round-trips).
 
-    Returns (pruned_params, binary_mask).
+    Returns binary mask tree matching param shapes and dtypes.
     """
     # Pass 1: collect block L1 scores as JAX arrays
     all_scores = []
@@ -233,12 +233,11 @@ def _make_prune_mask(params, sparsity, group_size):
         all_scores.append(scores)
 
     if not all_scores:
-        ones = jax.tree.map(jnp.ones_like, params)
-        return params, ones
+        return jax.tree.map(jnp.ones_like, params)
 
     threshold = jnp.percentile(jnp.concatenate(all_scores), sparsity * 100)
 
-    # Pass 2: build per-leaf binary mask
+    # Pass 2: build per-leaf binary mask (in param dtype to save memory)
     def _leaf_mask(path, leaf):
         if leaf.ndim != 2:
             return jnp.ones_like(leaf)
@@ -248,11 +247,9 @@ def _make_prune_mask(params, sparsity, group_size):
         w = jnp.pad(leaf, ((0, pad), (0, 0))) if pad else leaf
         w_grouped = w.reshape(-1, gs, out_feat)
         block_keep = (jnp.sum(jnp.abs(w_grouped), axis=1, keepdims=True) > threshold)
-        return jnp.broadcast_to(block_keep, w_grouped.shape).reshape(-1, out_feat)[:in_feat].astype(jnp.float32)
+        return jnp.broadcast_to(block_keep, w_grouped.shape).reshape(-1, out_feat)[:in_feat].astype(leaf.dtype)
 
-    mask = jax.tree_util.tree_map_with_path(_leaf_mask, params)
-    pruned = jax.tree.map(lambda w, m: w * m, params, mask)
-    return pruned, mask
+    return jax.tree_util.tree_map_with_path(_leaf_mask, params)
 
 
 def _quantize_params(params, group_size=32):
@@ -559,8 +556,10 @@ def train(args):
                 current_sparsity = _cubic_sparsity_schedule(epoch_step, t_start, t_end, sparsity_ratio)
                 if epoch_step >= t_start and epoch_step % prune_interval == 0 and current_sparsity > 0:
                     ema_unr = jax_utils.unreplicate(ema_params)
-                    _, mask = _make_prune_mask(ema_unr, current_sparsity, _GROUP_SIZE)
+                    mask = _make_prune_mask(ema_unr, current_sparsity, _GROUP_SIZE)
+                    del ema_unr
                     prune_mask = jax_utils.replicate(mask)
+                    del mask
 
             if prune_mask is not None:
                 state = state.replace(params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
@@ -609,8 +608,10 @@ def train(args):
             if prune_mask is None:
                 # Edge case: epoch had fewer steps than t_start
                 ema_unr = jax_utils.unreplicate(ema_params)
-                _, mask = _make_prune_mask(ema_unr, sparsity_ratio, _GROUP_SIZE)
+                mask = _make_prune_mask(ema_unr, sparsity_ratio, _GROUP_SIZE)
+                del ema_unr
                 prune_mask = jax_utils.replicate(mask)
+                del mask
                 state = state.replace(params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
                 ema_params = jax.tree.map(lambda w, m: w * m, ema_params, prune_mask)
             final_pruned = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
