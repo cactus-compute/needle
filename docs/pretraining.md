@@ -3,8 +3,7 @@
 ```mermaid
 graph LR
     %% Inputs
-    A_in[Audio] --> A_denoise[Audio Denoise]
-    A_denoise --> A_emb[Audio Embedding]
+    A_in[Audio] --> A_emb[Audio Embedding]
     T_in[Text] --> T_emb[Text Embedding]
 
     %% Embeddings to Encoder
