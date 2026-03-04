@@ -159,52 +159,6 @@ def _fake_quantize_int4(w, group_size=32):
     return w + jax.lax.stop_gradient(w_q - w)
 
 
-def _block_prune_params(params, prune_ratio=0.25, group_size=32):
-    """Block magnitude pruning aligned to quantization groups.
-
-    All 2D weight matrices (Dense kernels + embeddings) are divided into
-    (group_size, 1) blocks along axis 0. Blocks are scored by L1 norm,
-    and the bottom `prune_ratio` fraction (globally) are zeroed out.
-    """
-    all_scores = []
-    for path, leaf in jax.tree_util.tree_leaves_with_path(params):
-        name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
-        if leaf.ndim != 2:
-            continue
-        w = np.array(leaf)
-        in_feat, out_feat = w.shape
-        gs = min(group_size, in_feat)
-        pad = (gs - in_feat % gs) % gs
-        if pad:
-            w = np.pad(w, ((0, pad), (0, 0)))
-        w_grouped = w.reshape(-1, gs, out_feat)
-        scores = np.sum(np.abs(w_grouped), axis=1).ravel()
-        all_scores.append(scores)
-
-    if not all_scores:
-        return params
-
-    threshold = np.percentile(np.concatenate(all_scores), prune_ratio * 100)
-
-    def _prune_weight(path, leaf):
-        name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
-        if leaf.ndim != 2:
-            return leaf
-        w = np.array(leaf)
-        in_feat, out_feat = w.shape
-        gs = min(group_size, in_feat)
-        pad = (gs - in_feat % gs) % gs
-        if pad:
-            w = np.pad(w, ((0, pad), (0, 0)))
-        w_grouped = w.reshape(-1, gs, out_feat)
-        scores = np.sum(np.abs(w_grouped), axis=1, keepdims=True)
-        mask = (scores > threshold).astype(np.float32)
-        w_pruned = (w_grouped * mask).reshape(-1, out_feat)[:in_feat]
-        return jnp.array(w_pruned)
-
-    return jax.tree_util.tree_map_with_path(_prune_weight, params)
-
-
 def _cubic_sparsity_schedule(step, t_start, t_end, s_final):
     """Cubic sparsity ramp (Zhu & Gupta 2017). Returns target sparsity at *step*."""
     if step < t_start:
@@ -266,48 +220,50 @@ _GROUP_SIZE = 32
 _MRL_DIMS = ()
 
 
-def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
+def _loss_fn(state, params, src, tgt_in, tgt_out, causal_mask):
     pad_id = 0
-    ema_decay = 0.999
+    src_mask = make_padding_mask(src, pad_id)
+    tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+    cross_mask = src_mask
 
-    def loss_fn(params):
-        src_mask = make_padding_mask(src, pad_id)
-        tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
-        cross_mask = src_mask
+    logits, slot_div, mrl_logits = state.apply_fn(
+        {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
+        src,
+        tgt_in,
+        src_mask=src_mask,
+        tgt_mask=tgt_mask,
+        cross_mask=cross_mask,
+        mrl_dims=_MRL_DIMS if _MRL_DIMS else None,
+        method="forward_with_aux",
+    )
 
-        logits, slot_div, mrl_logits = state.apply_fn(
-            {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
-            src,
-            tgt_in,
-            src_mask=src_mask,
-            tgt_mask=tgt_mask,
-            cross_mask=cross_mask,
-            mrl_dims=_MRL_DIMS if _MRL_DIMS else None,
-            method="forward_with_aux",
-        )
+    logits_f32 = logits.astype(jnp.float32)
+    mask = (tgt_out != pad_id).astype(jnp.float32)
+    ce_loss = jnp.sum(
+        optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
+    ) / jnp.maximum(jnp.sum(mask), 1.0)
 
-        logits_f32 = logits.astype(jnp.float32)
-        mask = (tgt_out != pad_id).astype(jnp.float32)
-        ce_loss = jnp.sum(
-            optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
+    total_loss = ce_loss
+    num_scales = 1
+    for mrl_log in mrl_logits:
+        mrl_log_f32 = mrl_log.astype(jnp.float32)
+        aux_loss = jnp.sum(
+            optax.softmax_cross_entropy_with_integer_labels(mrl_log_f32, tgt_out) * mask
         ) / jnp.maximum(jnp.sum(mask), 1.0)
+        total_loss = total_loss + aux_loss
+        num_scales = num_scales + 1
+    total_loss = total_loss / num_scales
 
-        total_loss = ce_loss
-        num_scales = 1
-        for mrl_log in mrl_logits:
-            mrl_log_f32 = mrl_log.astype(jnp.float32)
-            aux_loss = jnp.sum(
-                optax.softmax_cross_entropy_with_integer_labels(mrl_log_f32, tgt_out) * mask
-            ) / jnp.maximum(jnp.sum(mask), 1.0)
-            total_loss = total_loss + aux_loss
-            num_scales = num_scales + 1
-        total_loss = total_loss / num_scales
+    z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
+    div_loss = 1e-4 * slot_div
+    return total_loss + z_loss + div_loss
 
-        z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
-        div_loss = 1e-4 * slot_div
-        return total_loss + z_loss + div_loss
 
-    loss, grads = jax.value_and_grad(loss_fn)(state.params)
+def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
+    ema_decay = 0.999
+    loss, grads = jax.value_and_grad(
+        lambda p: _loss_fn(state, p, src, tgt_in, tgt_out, causal_mask)
+    )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
     grad_norm = optax.global_norm(grads)
@@ -316,8 +272,28 @@ def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
     return state, ema_params, loss, grad_norm
 
 
+def _train_step_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask):
+    """Training step with fused mask application — avoids post-pmap copies."""
+    ema_decay = 0.999
+    loss, grads = jax.value_and_grad(
+        lambda p: _loss_fn(state, p, src, tgt_in, tgt_out, causal_mask)
+    )(state.params)
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    loss = jax.lax.pmean(loss, axis_name="batch")
+    grad_norm = optax.global_norm(grads)
+    state = state.apply_gradients(grads=grads)
+    masked_params = jax.tree.map(lambda w, m: w * m, state.params, prune_mask)
+    state = state.replace(params=masked_params)
+    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, masked_params)
+    return state, ema_params, loss, grad_norm
+
+
 def _make_p_train_step():
     return jax.pmap(_train_step, axis_name="batch", donate_argnums=(0, 1))
+
+
+def _make_p_train_step_masked():
+    return jax.pmap(_train_step_masked, axis_name="batch", donate_argnums=(0, 1))
 
 
 def _make_val_loss_fn(apply_fn):
@@ -456,6 +432,7 @@ def train(args):
     else:
         _MRL_DIMS = ()
     p_train_step = _make_p_train_step()
+    p_train_step_masked = _make_p_train_step_masked()
 
     np.random.seed(args.seed)
     rng = jax.random.PRNGKey(args.seed)
@@ -540,15 +517,18 @@ def train(args):
 
         for src, tgt_in, tgt_out in pbar:
             t0 = time.perf_counter()
+            src_b = shard_batch(src, num_devices)
+            tgt_in_b = shard_batch(tgt_in, num_devices)
+            tgt_out_b = shard_batch(tgt_out, num_devices)
 
-            state, ema_params, loss, grad_norm = p_train_step(
-                state,
-                ema_params,
-                shard_batch(src, num_devices),
-                shard_batch(tgt_in, num_devices),
-                shard_batch(tgt_out, num_devices),
-                causal_mask,
-            )
+            if prune_mask is not None:
+                state, ema_params, loss, grad_norm = p_train_step_masked(
+                    state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask,
+                )
+            else:
+                state, ema_params, loss, grad_norm = p_train_step(
+                    state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask,
+                )
 
             # --- Gradual magnitude sparsification (epoch 1 only) ---
             if epoch == weight_prune_epoch and not gradual_sparsify_done:
@@ -560,10 +540,6 @@ def train(args):
                     del ema_unr
                     prune_mask = jax_utils.replicate(mask)
                     del mask
-
-            if prune_mask is not None:
-                state = state.replace(params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
-                ema_params = jax.tree.map(lambda w, m: w * m, ema_params, prune_mask)
 
             loss_val = float(loss[0])
             losses.append(loss_val)
@@ -612,7 +588,9 @@ def train(args):
                 del ema_unr
                 prune_mask = jax_utils.replicate(mask)
                 del mask
-                state = state.replace(params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
+                # Apply mask once via the fused step (reuses donated buffers)
+                state = state.replace(
+                    params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
                 ema_params = jax.tree.map(lambda w, m: w * m, ema_params, prune_mask)
             final_pruned = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
             total_p = sum(x.size for x in jax.tree.leaves(final_pruned))
