@@ -129,16 +129,32 @@ class FeedForward(nn.Module):
     activation: str = "drelu"
 
     @nn.compact
-    def __call__(self, x):
-        gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="gate_proj")(x)
-        up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="up_proj")(x)
+    def __call__(self, x, d_ff_slice=None):
+        sliced = d_ff_slice is not None and d_ff_slice < self.d_ff
+
+        if sliced:
+            # Sliced path: access existing kernels and slice for efficiency.
+            # Params must already exist from a prior full-width call (e.g. the
+            # non-MRL forward in forward_with_aux).
+            gk = self.variables['params']['gate_proj']['kernel'][:, :d_ff_slice]
+            uk = self.variables['params']['up_proj']['kernel'][:, :d_ff_slice]
+            gate = x.astype(self.dtype) @ gk.astype(self.dtype)
+            up = x.astype(self.dtype) @ uk.astype(self.dtype)
+        else:
+            gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="gate_proj")(x)
+            up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="up_proj")(x)
+
         if self.activation == "swiglu":
-            x = nn.silu(gate) * up
+            h = nn.silu(gate) * up
         elif self.activation == "geglu":
-            x = nn.gelu(gate) * up
+            h = nn.gelu(gate) * up
         else:  # drelu
-            x = nn.relu(gate) * nn.relu(up)
-        return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="down_proj")(x)
+            h = nn.relu(gate) * nn.relu(up)
+
+        if sliced:
+            dk = self.variables['params']['down_proj']['kernel'][:d_ff_slice]
+            return (h @ dk.astype(self.dtype))
+        return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="down_proj")(h)
 
 
 class MLPMixer(nn.Module):
@@ -194,7 +210,7 @@ class MemoryMixerBlock(nn.Module):
     activation: str = "drelu"
 
     @nn.compact
-    def __call__(self, x, s, mask=None, rope=None):
+    def __call__(self, x, s, mask=None, rope=None, d_ff_slice=None):
         s_norm = ZCRMSNorm(dtype=self.dtype, name="pack_s_norm")(s)
         x_norm = ZCRMSNorm(dtype=self.dtype, name="pack_x_norm")(x)
         s = s + MultiHeadAttention(
@@ -208,7 +224,7 @@ class MemoryMixerBlock(nn.Module):
 
         residual = x
         x = ZCRMSNorm(dtype=self.dtype, name="local_norm")(x)
-        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation, name="local_ffn")(x)
+        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation, name="local_ffn")(x, d_ff_slice=d_ff_slice)
         x = x + residual
 
         return x, s
@@ -219,7 +235,7 @@ class MemoryMixerEncoder(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, x, mask=None, rope=None):
+    def __call__(self, x, mask=None, rope=None, d_ff_slice=None):
         cfg = self.config
         dt = cfg.jax_dtype
         x = x.astype(dt)
@@ -246,7 +262,7 @@ class MemoryMixerEncoder(nn.Module):
             x, s = nn.remat(MemoryMixerBlock)(
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
                 cfg.num_memory_slots, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
-            )(x, s, mask=mask, rope=rope)
+            )(x, s, mask=mask, rope=rope, d_ff_slice=d_ff_slice)
 
         s = ZCRMSNorm(dtype=dt, name="final_norm")(s)
         return s
@@ -262,7 +278,7 @@ class DecoderBlock(nn.Module):
     activation: str = "drelu"
 
     @nn.compact
-    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None):
+    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, d_ff_slice=None):
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
         x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
@@ -279,7 +295,7 @@ class DecoderBlock(nn.Module):
 
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x)
+        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x, d_ff_slice=d_ff_slice)
         x = x + residual
 
         return x
@@ -290,7 +306,7 @@ class Decoder(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None):
+    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, d_ff_slice=None):
         cfg = self.config
         dt = cfg.jax_dtype
         x = x.astype(dt)
@@ -298,7 +314,7 @@ class Decoder(nn.Module):
         for i in range(cfg.num_decoder_layers):
             x = nn.remat(DecoderBlock)(
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
-            )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope)
+            )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, d_ff_slice=d_ff_slice)
 
         x = ZCRMSNorm(dtype=dt)(x)
         return x
@@ -330,19 +346,19 @@ class EncoderDecoderTransformer(nn.Module):
         head_dim = self.config.d_model // self.config.num_heads
         return precompute_rope_freqs(head_dim, seq_len, self.config.rope_theta)
 
-    def encode_text(self, src, src_mask=None):
+    def encode_text(self, src, src_mask=None, d_ff_slice=None):
         x = self.embedding(src) * self.embed_scale
         rope = self._rope(src.shape[1])
-        return self.encoder(x, mask=src_mask, rope=rope)
+        return self.encoder(x, mask=src_mask, rope=rope, d_ff_slice=d_ff_slice)
 
     def encode(self, src, src_mask=None):
         """Backward-compatible alias for encode_text."""
         return self.encode_text(src, src_mask=src_mask)
 
-    def encode_speech(self, mel, src_mask=None):
+    def encode_speech(self, mel, src_mask=None, d_ff_slice=None):
         x = self.mel_proj(mel) * self.embed_scale
         rope = self._rope(mel.shape[1])
-        return self.encoder(x, mask=src_mask, rope=rope)
+        return self.encoder(x, mask=src_mask, rope=rope, d_ff_slice=d_ff_slice)
 
     def decode(self, tgt, encoder_out, self_mask=None, cross_mask=None):
         x = self.embedding(tgt) * self.embed_scale
@@ -360,34 +376,59 @@ class EncoderDecoderTransformer(nn.Module):
         )
         return logits
 
-    def _decode_with_aux(self, encoder_out, tgt, tgt_mask=None, mrl_dims=None):
-        """Shared decode logic returning logits, slot_div, mrl_logits."""
+    def _run_decoder(self, encoder_out, tgt, tgt_mask=None, d_ff_slice=None):
+        """Run decoder and return float32 hidden states."""
         x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
-        x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=None, rope=rope)
-        x_f32 = x.astype(jnp.float32)
+        x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=None, rope=rope, d_ff_slice=d_ff_slice)
+        return x.astype(jnp.float32)
+
+    def _slot_diversity(self, encoder_out):
+        s = encoder_out.astype(jnp.float32)
+        gram = jnp.matmul(s, s.transpose(0, 2, 1))
+        diag_sq = jnp.sum(jnp.diagonal(gram, axis1=1, axis2=2) ** 2)
+        return (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
+
+    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mrl_dims=None):
         emb = self.embedding.embedding
+
+        # Full forward (no FFN slicing)
+        encoder_out = self.encode_text(src, src_mask=src_mask)
+        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask)
         logits = x_f32 @ emb.T
+        slot_div = self._slot_diversity(encoder_out)
 
         mrl_logits = []
         if mrl_dims is not None:
             for d in mrl_dims:
                 if d < self.config.d_model:
-                    mrl_logits.append(x_f32[..., :d] @ emb[:, :d].T)
+                    d_ff_slice = self.config.d_ff * d // self.config.d_model
+                    enc_m = self.encode_text(src, src_mask=src_mask, d_ff_slice=d_ff_slice)
+                    x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, d_ff_slice=d_ff_slice)
+                    mrl_logits.append(x_m @ emb.T)
 
-        s = encoder_out.astype(jnp.float32)
-        gram = jnp.matmul(s, s.transpose(0, 2, 1))
-        diag_sq = jnp.sum(jnp.diagonal(gram, axis1=1, axis2=2) ** 2)
-        slot_div = (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
         return logits, slot_div, mrl_logits
 
-    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mrl_dims=None):
-        encoder_out = self.encode_text(src, src_mask=src_mask)
-        return self._decode_with_aux(encoder_out, tgt, tgt_mask=tgt_mask, mrl_dims=mrl_dims)
-
     def forward_speech_with_aux(self, mel, tgt, src_mask=None, tgt_mask=None, mrl_dims=None):
+        emb = self.embedding.embedding
+
+        # Full forward (no FFN slicing)
         encoder_out = self.encode_speech(mel, src_mask=src_mask)
-        return self._decode_with_aux(encoder_out, tgt, tgt_mask=tgt_mask, mrl_dims=mrl_dims)
+        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask)
+        logits = x_f32 @ emb.T
+        slot_div = self._slot_diversity(encoder_out)
+
+        # MRL sub-model forwards with sliced FFN
+        mrl_logits = []
+        if mrl_dims is not None:
+            for d in mrl_dims:
+                if d < self.config.d_model:
+                    d_ff_slice = self.config.d_ff * d // self.config.d_model
+                    enc_m = self.encode_speech(mel, src_mask=src_mask, d_ff_slice=d_ff_slice)
+                    x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, d_ff_slice=d_ff_slice)
+                    mrl_logits.append(x_m @ emb.T)
+
+        return logits, slot_div, mrl_logits
 
     def init_all(self, src, tgt, mel):
         """Dummy forward through both text and speech pathways to initialize all params."""
@@ -396,8 +437,8 @@ class EncoderDecoderTransformer(nn.Module):
         text_out = self.encode_text(src, src_mask=src_mask)
         mel_mask = make_mel_padding_mask(mel)
         speech_out = self.encode_speech(mel, src_mask=mel_mask)
-        _ = self._decode_with_aux(text_out, tgt, tgt_mask=tgt_mask)
-        _ = self._decode_with_aux(speech_out, tgt, tgt_mask=tgt_mask)
+        _ = self._run_decoder(text_out, tgt, tgt_mask=tgt_mask)
+        _ = self._run_decoder(speech_out, tgt, tgt_mask=tgt_mask)
         return jnp.zeros(())
 
 

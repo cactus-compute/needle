@@ -378,7 +378,7 @@ def _make_val_loss_fn(apply_fn):
 
 
 def _make_mrl_val_loss_fn(apply_fn, mrl_dim):
-    """Val loss using truncated decoder hidden states and embedding at dimension mrl_dim."""
+    """Val loss for MRL sub-model at dimension mrl_dim (FFN interior slicing)."""
     @jax.jit
     def val_loss_batch(params, src, tgt_in, tgt_out, causal_mask):
         pad_id = 0
@@ -415,31 +415,28 @@ def _make_speech_val_loss_fn(apply_fn):
 
 
 def _estimate_mrl_params(config, d_prime):
-    """Estimate parameter count of an exported sub-model at dimension d_prime.
+    """Estimate parameter count of an exported sub-model at MRL dimension d_prime.
 
-    Slicing rules (matching what an actual MRL export would produce):
-      - Embedding:  [vocab, d_prime]  (first d_prime cols)
-      - Heads:      same head_dim, fewer heads → n_h = d_prime // head_dim
-      - KV heads:   min(original, n_h)
-      - FFN:        proportional  → d_ff' = d_ff * d_prime // d_model
-      - Memory:     slots unchanged, but projections shrink with d / d_ff
+    FFN interior slicing: only FFN d_ff is reduced proportionally.
+    d_model, attention, embedding, and mixer are all unchanged.
+      - Embedding:  [vocab, d_model]  (unchanged)
+      - Attention:  full d_model heads/projections (unchanged)
+      - FFN:        d_ff' = d_ff * d_prime // d_model (sliced)
+      - Mixer:      full d_ff (unchanged, not masked)
     """
-    d = d_prime
+    d = config.d_model
     v = config.vocab_size
     n_enc = config.num_encoder_layers
     n_dec = config.num_decoder_layers
-    head_dim = config.d_model // config.num_heads
-    n_h = max(1, d // head_dim)
-    n_kv = min(config.num_kv_heads, n_h)
-    d_ff = config.d_ff * d // config.d_model
+    kv_dim = config.num_kv_heads * (d // config.num_heads)
+    d_ff_prime = config.d_ff * d_prime // d
     m = config.num_memory_slots
 
     emb = v * d
-    kv_dim = n_kv * head_dim
     attn = d * d + d * kv_dim * 2 + d * d
-    ffn = d * d_ff * 3
-    mixer_token = d * d_ff * 2 + d_ff * m
-    mixer_channel = d * d_ff * 3
+    ffn = d * d_ff_prime * 3
+    mixer_token = d * config.d_ff * 2 + config.d_ff * m
+    mixer_channel = d * config.d_ff * 3
     enc_block = attn + ffn + mixer_token + mixer_channel
     dec_block = attn * 2 + ffn
     total = emb + n_enc * enc_block + n_dec * dec_block
@@ -881,14 +878,13 @@ def train(args):
         print(f"  Sparsity       {sparsity:>11.2f}%  ({near_zero:,}/{total_params:,})")
         if mrl_results:
             print(f"  ─────────────────────────────────────")
-            print(f"  MRL exportable sub-models:")
-            print(f"  {'dim':>6}  {'val ppl':>10}  {'params':>12}  {'heads':>5}")
-            head_dim = config.d_model // config.num_heads
-            print(f"  {config.d_model:>6}  {last_val_ppl:>10.2f}  {total_params:>12,}  {config.num_heads:>5}  (full)")
+            print(f"  MRL exportable sub-models (FFN interior slicing):")
+            print(f"  {'dim':>6}  {'d_ff':>6}  {'val ppl':>10}  {'params':>12}")
+            print(f"  {config.d_model:>6}  {config.d_ff:>6}  {last_val_ppl:>10.2f}  {total_params:>12,}  (full)")
             for d_prime in sorted(mrl_results.keys(), reverse=True):
                 mrl_ppl, mrl_params = mrl_results[d_prime]
-                n_h = max(1, d_prime // head_dim)
-                print(f"  {d_prime:>6}  {mrl_ppl:>10.2f}  {mrl_params:>12,}  {n_h:>5}")
+                d_ff_prime = config.d_ff * d_prime // config.d_model
+                print(f"  {d_prime:>6}  {d_ff_prime:>6}  {mrl_ppl:>10.2f}  {mrl_params:>12,}")
         print(f"  ─────────────────────────────────────")
         print(f"  Throughput     {tp['tokens_per_second']:>10.1f} tok/s")
         print(f"  Latency        {tp['avg_latency_s']:>11.3f}s")
