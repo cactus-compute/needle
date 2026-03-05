@@ -124,7 +124,7 @@ def main():
                    help="MRL method: 'slice' (prefix), 'topk' (learned masks)")
     p.add_argument("--mrl-tau-start", type=float, default=0.5)
     p.add_argument("--mrl-tau-end", type=float, default=0.1)
-    p.add_argument("--mrl-init-mode", choices=["prefix", "normal", "zeros"], default="normal")
+    p.add_argument("--mrl-init-mode", choices=["prefix", "shuffled_prefix", "normal", "zeros"], default="normal")
     p.add_argument("--mrl-init-value", type=float, default=0.5)
     p.add_argument("--mrl-spread-lambda", type=float, default=0.01)
     p.add_argument("--mrl-warmup-frac", type=float, default=0.15,

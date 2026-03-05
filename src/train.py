@@ -790,6 +790,17 @@ def train(args):
             positions = jnp.arange(config.d_model, dtype=jnp.float32)
             ramp = init_value * (1.0 - 2.0 * positions / max(1, config.d_model - 1))
             mask_logits = jnp.broadcast_to(ramp[None, :], (n_mrl, config.d_model)).copy()
+        elif init_mode == "shuffled_prefix":
+            # Same ramp distribution as prefix, but randomly permuted per MRL dim
+            # Theoretically equivalent to prefix if implementation is correct
+            positions = jnp.arange(config.d_model, dtype=jnp.float32)
+            ramp = init_value * (1.0 - 2.0 * positions / max(1, config.d_model - 1))
+            rows = []
+            for i in range(n_mrl):
+                rng, perm_rng = jax.random.split(rng)
+                perm = jax.random.permutation(perm_rng, config.d_model)
+                rows.append(ramp[perm])
+            mask_logits = jnp.stack(rows)
         elif init_mode == "normal":
             mask_logits = jax.random.normal(mask_rng, (n_mrl, config.d_model)) * init_value
         else:

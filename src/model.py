@@ -194,7 +194,7 @@ class MemoryMixerBlock(nn.Module):
     activation: str = "drelu"
 
     @nn.compact
-    def __call__(self, x, s, mask=None, rope=None):
+    def __call__(self, x, s, mask=None, rope=None, dim_mask=None):
         s_norm = ZCRMSNorm(dtype=self.dtype, name="pack_s_norm")(s)
         x_norm = ZCRMSNorm(dtype=self.dtype, name="pack_x_norm")(x)
         s = s + MultiHeadAttention(
@@ -211,6 +211,11 @@ class MemoryMixerBlock(nn.Module):
         x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation, name="local_ffn")(x)
         x = x + residual
 
+        if dim_mask is not None:
+            dm = dim_mask[None, None, :]
+            x = x * dm
+            s = s * dm
+
         return x, s
 
 
@@ -219,7 +224,7 @@ class MemoryMixerEncoder(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, x, mask=None, rope=None):
+    def __call__(self, x, mask=None, rope=None, dim_mask=None):
         cfg = self.config
         dt = cfg.jax_dtype
         x = x.astype(dt)
@@ -235,6 +240,11 @@ class MemoryMixerEncoder(nn.Module):
         x = nn.Dense(cfg.d_model, dtype=dt, use_bias=False,
                      kernel_init=default_init(), name="downsample_pw")(x)
 
+        if dim_mask is not None:
+            dm = dim_mask[None, None, :].astype(dt)
+            x = x * dm
+            s = s * dm
+
         if mask is not None:
             T_new = x.shape[1]
             if mask.shape[-1] % 2:
@@ -246,9 +256,11 @@ class MemoryMixerEncoder(nn.Module):
             x, s = nn.remat(MemoryMixerBlock)(
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
                 cfg.num_memory_slots, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
-            )(x, s, mask=mask, rope=rope)
+            )(x, s, mask=mask, rope=rope, dim_mask=dim_mask)
 
         s = ZCRMSNorm(dtype=dt, name="final_norm")(s)
+        if dim_mask is not None:
+            s = s * dim_mask[None, None, :].astype(dt)
         return s
 
 
@@ -262,7 +274,7 @@ class DecoderBlock(nn.Module):
     activation: str = "drelu"
 
     @nn.compact
-    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None):
+    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, dim_mask=None):
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
         x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
@@ -282,6 +294,9 @@ class DecoderBlock(nn.Module):
         x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x)
         x = x + residual
 
+        if dim_mask is not None:
+            x = x * dim_mask[None, None, :]
+
         return x
 
 
@@ -290,7 +305,7 @@ class Decoder(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None):
+    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, dim_mask=None):
         cfg = self.config
         dt = cfg.jax_dtype
         x = x.astype(dt)
@@ -298,9 +313,11 @@ class Decoder(nn.Module):
         for i in range(cfg.num_decoder_layers):
             x = nn.remat(DecoderBlock)(
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
-            )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope)
+            )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, dim_mask=dim_mask)
 
         x = ZCRMSNorm(dtype=dt)(x)
+        if dim_mask is not None:
+            x = x * dim_mask[None, None, :]
         return x
 
 
@@ -330,19 +347,23 @@ class EncoderDecoderTransformer(nn.Module):
         head_dim = self.config.d_model // self.config.num_heads
         return precompute_rope_freqs(head_dim, seq_len, self.config.rope_theta)
 
-    def encode_text(self, src, src_mask=None):
+    def encode_text(self, src, src_mask=None, dim_mask=None):
         x = self.embedding(src) * self.embed_scale
+        if dim_mask is not None:
+            x = x * dim_mask[None, None, :]
         rope = self._rope(src.shape[1])
-        return self.encoder(x, mask=src_mask, rope=rope)
+        return self.encoder(x, mask=src_mask, rope=rope, dim_mask=dim_mask)
 
     def encode(self, src, src_mask=None):
         """Backward-compatible alias for encode_text."""
         return self.encode_text(src, src_mask=src_mask)
 
-    def encode_speech(self, mel, src_mask=None):
+    def encode_speech(self, mel, src_mask=None, dim_mask=None):
         x = self.mel_proj(mel) * self.embed_scale
+        if dim_mask is not None:
+            x = x * dim_mask[None, None, :]
         rope = self._rope(mel.shape[1])
-        return self.encoder(x, mask=src_mask, rope=rope)
+        return self.encoder(x, mask=src_mask, rope=rope, dim_mask=dim_mask)
 
     def decode(self, tgt, encoder_out, self_mask=None, cross_mask=None):
         x = self.embedding(tgt) * self.embed_scale
@@ -360,39 +381,70 @@ class EncoderDecoderTransformer(nn.Module):
         )
         return logits
 
-    def _decode_with_aux(self, encoder_out, tgt, tgt_mask=None, mrl_dims=None, mrl_masks=None):
-        """Shared decode logic returning logits, slot_div, mrl_logits."""
+    def _run_decoder(self, encoder_out, tgt, tgt_mask=None, dim_mask=None):
+        """Run decoder and return float32 hidden states."""
         x = self.embedding(tgt) * self.embed_scale
+        if dim_mask is not None:
+            x = x * dim_mask[None, None, :]
         rope = self._rope(tgt.shape[1])
-        x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=None, rope=rope)
-        x_f32 = x.astype(jnp.float32)
-        emb = self.embedding.embedding
-        logits = x_f32 @ emb.T
+        x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=None, rope=rope, dim_mask=dim_mask)
+        return x.astype(jnp.float32)
 
+    def _slot_diversity(self, encoder_out):
+        s = encoder_out.astype(jnp.float32)
+        gram = jnp.matmul(s, s.transpose(0, 2, 1))
+        diag_sq = jnp.sum(jnp.diagonal(gram, axis1=1, axis2=2) ** 2)
+        return (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
+
+    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mrl_dims=None, mrl_masks=None):
+        emb = self.embedding.embedding
+
+        # Full forward (no masking)
+        encoder_out = self.encode_text(src, src_mask=src_mask)
+        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask)
+        logits = x_f32 @ emb.T
+        slot_div = self._slot_diversity(encoder_out)
+
+        # MRL sub-model forwards
         mrl_logits = []
         if mrl_dims is not None:
             for i, d in enumerate(mrl_dims):
                 if d < self.config.d_model:
                     if mrl_masks is not None:
-                        mask = mrl_masks[i]
-                        masked_x = x_f32 * mask[None, None, :]
-                        mrl_logits.append(masked_x @ emb.T)
+                        # Interior masking: full re-encode + re-decode with mask
+                        dm = mrl_masks[i]
+                        enc_m = self.encode_text(src, src_mask=src_mask, dim_mask=dm)
+                        x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, dim_mask=dm)
+                        mrl_logits.append(x_m @ emb.T)
+                    else:
+                        # Slice mode: output-only prefix slicing
+                        mrl_logits.append(x_f32[..., :d] @ emb[:, :d].T)
+
+        return logits, slot_div, mrl_logits
+
+    def forward_speech_with_aux(self, mel, tgt, src_mask=None, tgt_mask=None, mrl_dims=None, mrl_masks=None):
+        emb = self.embedding.embedding
+
+        # Full forward (no masking)
+        encoder_out = self.encode_speech(mel, src_mask=src_mask)
+        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask)
+        logits = x_f32 @ emb.T
+        slot_div = self._slot_diversity(encoder_out)
+
+        # MRL sub-model forwards
+        mrl_logits = []
+        if mrl_dims is not None:
+            for i, d in enumerate(mrl_dims):
+                if d < self.config.d_model:
+                    if mrl_masks is not None:
+                        dm = mrl_masks[i]
+                        enc_m = self.encode_speech(mel, src_mask=src_mask, dim_mask=dm)
+                        x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, dim_mask=dm)
+                        mrl_logits.append(x_m @ emb.T)
                     else:
                         mrl_logits.append(x_f32[..., :d] @ emb[:, :d].T)
 
-        s = encoder_out.astype(jnp.float32)
-        gram = jnp.matmul(s, s.transpose(0, 2, 1))
-        diag_sq = jnp.sum(jnp.diagonal(gram, axis1=1, axis2=2) ** 2)
-        slot_div = (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
         return logits, slot_div, mrl_logits
-
-    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mrl_dims=None, mrl_masks=None):
-        encoder_out = self.encode_text(src, src_mask=src_mask)
-        return self._decode_with_aux(encoder_out, tgt, tgt_mask=tgt_mask, mrl_dims=mrl_dims, mrl_masks=mrl_masks)
-
-    def forward_speech_with_aux(self, mel, tgt, src_mask=None, tgt_mask=None, mrl_dims=None, mrl_masks=None):
-        encoder_out = self.encode_speech(mel, src_mask=src_mask)
-        return self._decode_with_aux(encoder_out, tgt, tgt_mask=tgt_mask, mrl_dims=mrl_dims, mrl_masks=mrl_masks)
 
     def init_all(self, src, tgt, mel):
         """Dummy forward through both text and speech pathways to initialize all params."""
@@ -401,8 +453,8 @@ class EncoderDecoderTransformer(nn.Module):
         text_out = self.encode_text(src, src_mask=src_mask)
         mel_mask = make_mel_padding_mask(mel)
         speech_out = self.encode_speech(mel, src_mask=mel_mask)
-        _ = self._decode_with_aux(text_out, tgt, tgt_mask=tgt_mask)
-        _ = self._decode_with_aux(speech_out, tgt, tgt_mask=tgt_mask)
+        _ = self._run_decoder(text_out, tgt, tgt_mask=tgt_mask)
+        _ = self._run_decoder(speech_out, tgt, tgt_mask=tgt_mask)
         return jnp.zeros(())
 
 
