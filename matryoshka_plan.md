@@ -32,84 +32,55 @@ Replace the current static MRL weight-slicing approach with **learned per-dimens
 
 ---
 
-## Experiment Log
+## Experiment Config
 
-### Baseline Config
+### Shared Config (all experiments)
 - d_model=512, heads=8, kv=2, enc=6, dec=6, 75.6M params
-- batch=48×8=384, ~7358 total steps, 1 epoch
+- batch=48×8=384, ~7358 total steps, 1 epoch (unless noted)
 - MRL dims: 256, 128, 64
 - Speech enabled (every 3 text steps)
-- Seed 42
+- Seed 42 (unless noted)
 
-### Experiment 1: Slice vs TopK (Random Init)
-
-**Config:** Default hyperparams (tau 0.5→0.1, warmup 15%, freeze 20%, spread λ=0.01, init normal σ=0.5)
-
-| Dim | Slice PPL | TopK PPL | Δ |
-|-----|-----------|----------|---|
-| 512 | 4.49 | **4.44** | -1.1% |
-| 256 | **4.50** | 4.58 | +1.8% |
-| 128 | **4.57** | 4.96 | +8.5% |
-| 64 | **4.82** | 5.52 | +14.5% |
-
-**Analysis:** Full model better with topk (warmup has no MRL penalty). Sub-models significantly worse, gap grows with compression ratio. Hypothesis: with only ~4800 learning steps (65% of 7358), the soft masks create a moving target that the model can't fully adapt to. The slice approach has a fixed selection from step 0.
+### TopK Baseline Defaults
+- init: normal (σ=0.5), warmup: 15%, tau: 0.5→0.1, freeze: 20%, mask_lr: 1e-3, spread λ: 0.01
 
 ---
 
-## Hypotheses & Experiment Queue
+## Experiment Results
 
-### H1: Reduce warmup, extend learning phase
-**Rationale:** 15% warmup (1104 steps) wastes training budget on no-MRL. The model doesn't need 1k+ steps to stabilize before masks start. Reducing to 5% gives masks ~700 more learning steps.
-**Config:** `--mrl-warmup-frac 0.05`
+### Full Table (seed 42, 1 epoch, val PPL)
 
-### H2: Slower tau annealing (wider soft regime)
-**Rationale:** Aggressive tau annealing (0.5→0.1) forces hard decisions too early. Higher tau_end keeps masks softer longer, allowing more exploration.
-**Config:** `--mrl-tau-start 1.0 --mrl-tau-end 0.3`
+Each experiment changes **only the listed variable** from the topk baseline, except where noted.
 
-### H3: Prefix initialization
-**Rationale:** Initialize mask logits so initial top-k matches prefix dims. Smooth transition from warmup (no MRL) → learning (masks start at prefix, can deviate). Avoids random-init exploration cost.
-**Config:** `--mrl-init-mode prefix`
+| Dim | Slice | TopK baseline | H1 | H2 | H3 | H4 | H6 | H7 | H8 | H9 | **H10** | H11 | H12 |
+|-----|-------|---------------|------|------|------|------|------|------|------|------|---------|------|------|
+| 512 | 4.49 | 4.44 | 4.45 | 4.48 | **4.39** | 4.44 | 4.50 | 4.43 | 4.41 | 4.42 | **4.42** | 4.52 | 4.58 |
+| 256 | **4.50** | 4.58 | 4.57 | 4.61 | 4.51 | 4.56 | 4.61 | 4.55 | 4.60 | 4.58 | **4.45** | 4.54 | 4.61 |
+| 128 | **4.57** | 4.96 | 4.92 | 5.05 | 4.72 | 4.93 | 4.91 | 4.77 | 4.87 | 4.81 | **4.55** | 4.64 | 4.72 |
+| 64 | **4.82** | 5.52 | 5.42 | 5.67 | 5.34 | 5.49 | 5.38 | 5.28 | 5.35 | 5.36 | **4.83** | 4.90 | 4.99 |
 
-### H4: Higher mask learning rate
-**Rationale:** Mask logits use Adam at 1e-3. The model params use much higher LR (2.4e-3 Adam, 0.057 Muon). Masks may not adapt fast enough to keep up with model changes.
-**Config:** Increase mask_tx LR to 3e-3 or 1e-2.
+### Experiment Key
 
-### H5: Saliency-initialized masks (from plan)
-**Rationale:** During warmup, accumulate per-dimension gradient importance on the embedding. At warmup→learning transition, initialize mask logits from saliency ranking. Gives masks informed starting point.
-**Config:** `--mrl-init-mode saliency` (requires implementation)
+**Isolated single-variable experiments (one change from topk baseline):**
 
-### H6: No warmup — topk from step 0
-**Rationale:** Slice trains MRL from step 0. TopK's warmup gives fewer MRL training steps. What if we skip warmup entirely and use soft topk masks from the start?
-**Config:** `--mrl-warmup-frac 0.0`
+| ID | Changed variable | Value | Notes |
+|----|-----------------|-------|-------|
+| H1 | warmup | 5% (from 15%) | Modest improvement at sub-models |
+| H2 | tau | 1.0→0.3 (from 0.5→0.1) | Worse — softer masks hurt |
+| H3 | init | prefix (from normal) | **Biggest single-variable win** |
+| H4 | mask_lr | 3e-3 (from 1e-3) | Negligible effect |
+| H6 | warmup | 0% (from 15%) | Modest improvement, similar to H1 |
 
-### H7: Combined: prefix init + no warmup + slow tau
-**Rationale:** Start with prefix-matching masks (smooth), no wasted warmup steps, slow annealing for gradual deviation. Maximizes both MRL training steps and exploration time.
-**Config:** `--mrl-init-mode prefix --mrl-warmup-frac 0.0 --mrl-tau-start 1.0 --mrl-tau-end 0.2`
-
----
-
-## Experiment Results (Full Scale: 75.6M params, 7358 steps)
-
-### Summary Table (seed 42)
-
-| Dim | Slice | TopK Exp1 | H7 | H8 | H9 | **H10** | H11 | H12 |
-|-----|-------|-----------|------|------|------|---------|------|------|
-| 512 | 4.49 | 4.44 | 4.43 | 4.41 | 4.42 | **4.42** | 4.52 | 4.58 |
-| 256 | 4.50 | 4.58 | 4.55 | 4.60 | 4.58 | **4.45** | 4.54 | 4.61 |
-| 128 | 4.57 | 4.96 | 4.77 | 4.87 | 4.81 | **4.55** | 4.64 | 4.72 |
-| 64 | 4.82 | 5.52 | 5.28 | 5.35 | 5.36 | **4.83** | 4.90 | 4.99 |
-
-### Experiment Details
+**Combined experiments (multiple changes from topk baseline):**
 
 | ID | Warmup | Init | tau | freeze | mask_lr | spread | Notes |
 |----|--------|------|-----|--------|---------|--------|-------|
-| Exp1 | 15% | normal | 0.5→0.1 | 20% | 1e-3 | 0.01 | First attempt, all defaults |
-| H7 | 0% | prefix | 1.0→0.2 | 20% | 3e-3 | 0.01 | No warmup + prefix init |
-| H8 | 0% | prefix | 2.0→0.1 | 10% | 1e-2 | 0.01 | Too aggressive LR, negative loss |
+| H7 | 0% | prefix | 1.0→0.2 | 20% | 3e-3 | 0.01 | Combines H3+H6+H2+H4 |
+| H8 | 0% | prefix | 2.0→0.1 | 10% | 1e-2 | 0.01 | Too aggressive, negative loss |
 | H9 | 0% | prefix | 1.0→0.2 | 15% | 5e-3 | 0.005 | Slightly worse than H7 |
 | **H10** | **0%** | **prefix** | **1.0→0.2** | **60%** | **3e-3** | **0.01** | **Best: matches slice** |
 | H11 | 0% | prefix | 1.0→0.2 | 70% | 3e-3 | 0.01 | Too little learning time |
-| H12 | 0% | normal | 1.0→0.2 | 60% | 3e-3 | 0.01 | Random init worse than prefix |
+| H12 | 0% | normal | 1.0→0.2 | 60% | 3e-3 | 0.01 | H10 ablation: random init worse |
 
 ### Cross-Seed Validation (H10 config)
 
@@ -120,20 +91,36 @@ Replace the current static MRL weight-slicing approach with **learned per-dimens
 | 128 | 4.57 | **4.55** | **4.56** | 4.58 |
 | 64 | **4.82** | 4.83 | **4.81** | 4.86 |
 
-**Conclusion:** TopK H10 achieves **parity with slice** on average. The key hyperparameter is `--mrl-freeze-frac 0.6` — a long freeze phase gives the model time to fully adapt to the locked hard masks, mimicking slice's stability advantage. Prefix init provides a smooth starting point. Slow tau annealing (1.0→0.2) allows gradual exploration before freezing.
+### 2-Epoch Comparison (14,716 total steps, H10 config)
 
-### 2-Epoch Comparison (14,716 total steps)
-
-| Dim | Slice 2ep | TopK H10 2ep |
-|-----|-----------|-------------|
+| Dim | Slice 2ep | TopK 2ep |
+|-----|-----------|----------|
 | 512 | 4.11 | **4.09** |
 | 256 | 4.11 | 4.11 |
 | 128 | **4.17** | 4.18 |
 | 64 | **4.38** | 4.39 |
 
-With 2 epochs, topk fully converges to match slice (within 0.01 PPL at every dim). The full model is consistently better with topk due to no MRL penalty during mask learning. The theoretical advantage of non-contiguous dimension selection may require even longer training or larger models to manifest.
+### Training Overhead
+TopK H10: 8.65 it/s vs Slice: 8.91 it/s → **~3% slower**
 
-### Best TopK Config (H10)
+---
+
+## Analysis
+
+**Isolated variable impact (ranked by d=128 improvement over topk baseline 4.96):**
+1. **H3 (prefix init):** 4.72 (−0.24) — by far the most impactful single change
+2. **H6 (no warmup):** 4.91 (−0.05)
+3. **H1 (warmup 5%):** 4.92 (−0.04)
+4. **H4 (mask lr 3e-3):** 4.93 (−0.03) — negligible
+5. **H2 (slow tau):** 5.05 (+0.09) — actually hurts
+
+**Combined config H10** achieves parity with slice by combining prefix init (biggest win) with no warmup and a long 60% freeze phase. The freeze phase is critical — it gives the model 4400+ steps of stable hard-mask MRL training, equivalent to slice's fixed selection.
+
+**2-epoch results** show full convergence: topk matches slice within 0.01 PPL at every dim.
+
+---
+
+## Best TopK Config (H10)
 ```bash
 needle train --mrl-method topk \
     --mrl-init-mode prefix \
@@ -143,3 +130,21 @@ needle train --mrl-method topk \
     --mrl-mask-lr 0.003 \
     --mrl-spread-lambda 0.01
 ```
+
+- **`--mrl-init-mode prefix`** — Initialize mask logits as a linear ramp: dim 0 gets the highest value, dim d_model-1 gets the lowest. So the initial top-k selection exactly matches prefix slicing (dims 0..k-1). This was the single most impactful change (H3 isolated experiment).
+- **`--mrl-warmup-frac 0.0`** — No warmup phase. TopK mask learning starts from step 0. There is NO period of full-model-only training — MRL sub-model losses are active from the very first step. (When warmup > 0, the model trains with no MRL loss at all during warmup — just full-model CE.)
+- **`--mrl-tau-start 1.0`** — Initial sigmoid temperature. Higher tau = softer masks. At tau=1.0, the sigmoid `σ((logit - threshold) / tau)` has a gentle slope, so many dimensions get intermediate mask values (0.3-0.7). This allows gradients to flow to all dimensions near the boundary.
+- **`--mrl-tau-end 0.2`** — Final sigmoid temperature before freeze. At tau=0.2, the sigmoid is much steeper — mask values are pushed closer to 0 or 1. The annealing from 1.0→0.2 happens exponentially over the learning phase.
+- **`--mrl-freeze-frac 0.6`** — The last 60% of training uses hard binary masks (STE: straight-through estimator). Mask logit optimizer is frozen — no more mask updates. This was the key finding: the model needs a long period of stable, fixed dimension selection to fully adapt, just like slice has fixed selection from the start.
+- **`--mrl-mask-lr 0.003`** — Adam learning rate for the mask logit optimizer (separate from the model's Muon/AdamW optimizers). The mask logits are a small `(n_mrl_dims, d_model)` array updated host-side after each step.
+- **`--mrl-spread-lambda 0.01`** — Weight of the spread penalty: `−λ · mean(var(logits))`. Maximizes variance of mask logits per MRL dim, encouraging clear on/off decisions rather than ambiguous middle values. Matches matformer-olmo's best config (R6).
+
+---
+
+## Untested Hypotheses for Future Work
+
+### Saliency-initialized masks (H5)
+During a warmup phase, accumulate per-dimension gradient importance on the embedding. At the warmup→learning transition, initialize mask logits from saliency ranking instead of prefix ramp. Requires implementation of gradient accumulation during warmup.
+
+### Interior masking (not just logit stage)
+Current masks only zero hidden dims at the logit projection. matformer-olmo applies masks inside MLP layers, forcing the model to route information through selected neurons during computation. This is a deeper architectural change but could unlock the true benefit of learned selection over prefix slicing.
