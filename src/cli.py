@@ -120,6 +120,19 @@ def main():
     p.add_argument("--num-memory-slots", type=int, default=64)
     p.add_argument("--mrl-dims", type=int, nargs="*", default=[256, 128, 64],
                    help="MRL dimension targets (default: 256 128 64)")
+    p.add_argument("--mrl-method", choices=["slice", "topk"], default="slice",
+                   help="MRL method: 'slice' (prefix), 'topk' (learned masks)")
+    p.add_argument("--mrl-tau-start", type=float, default=0.5)
+    p.add_argument("--mrl-tau-end", type=float, default=0.1)
+    p.add_argument("--mrl-init-mode", choices=["prefix", "normal", "zeros"], default="normal")
+    p.add_argument("--mrl-init-value", type=float, default=0.5)
+    p.add_argument("--mrl-spread-lambda", type=float, default=0.01)
+    p.add_argument("--mrl-warmup-frac", type=float, default=0.15,
+                   help="Fraction of total steps for vanilla warmup (no masks)")
+    p.add_argument("--mrl-freeze-frac", type=float, default=0.2,
+                   help="Fraction of total steps at end to freeze masks (hard only)")
+    p.add_argument("--mrl-mask-lr", type=float, default=3e-3,
+                   help="Mask logit optimizer learning rate (default: 3e-3)")
     p.add_argument("--no-speech", action="store_true", help="Disable speech training (text-only)")
     p.add_argument("--speech-every", type=int, default=3,
                    help="Do one speech step every N text steps (default: 3)")

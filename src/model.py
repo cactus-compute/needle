@@ -360,7 +360,7 @@ class EncoderDecoderTransformer(nn.Module):
         )
         return logits
 
-    def _decode_with_aux(self, encoder_out, tgt, tgt_mask=None, mrl_dims=None):
+    def _decode_with_aux(self, encoder_out, tgt, tgt_mask=None, mrl_dims=None, mrl_masks=None):
         """Shared decode logic returning logits, slot_div, mrl_logits."""
         x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
@@ -371,9 +371,14 @@ class EncoderDecoderTransformer(nn.Module):
 
         mrl_logits = []
         if mrl_dims is not None:
-            for d in mrl_dims:
+            for i, d in enumerate(mrl_dims):
                 if d < self.config.d_model:
-                    mrl_logits.append(x_f32[..., :d] @ emb[:, :d].T)
+                    if mrl_masks is not None:
+                        mask = mrl_masks[i]
+                        masked_x = x_f32 * mask[None, None, :]
+                        mrl_logits.append(masked_x @ emb.T)
+                    else:
+                        mrl_logits.append(x_f32[..., :d] @ emb[:, :d].T)
 
         s = encoder_out.astype(jnp.float32)
         gram = jnp.matmul(s, s.transpose(0, 2, 1))
@@ -381,13 +386,13 @@ class EncoderDecoderTransformer(nn.Module):
         slot_div = (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
         return logits, slot_div, mrl_logits
 
-    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mrl_dims=None):
+    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mrl_dims=None, mrl_masks=None):
         encoder_out = self.encode_text(src, src_mask=src_mask)
-        return self._decode_with_aux(encoder_out, tgt, tgt_mask=tgt_mask, mrl_dims=mrl_dims)
+        return self._decode_with_aux(encoder_out, tgt, tgt_mask=tgt_mask, mrl_dims=mrl_dims, mrl_masks=mrl_masks)
 
-    def forward_speech_with_aux(self, mel, tgt, src_mask=None, tgt_mask=None, mrl_dims=None):
+    def forward_speech_with_aux(self, mel, tgt, src_mask=None, tgt_mask=None, mrl_dims=None, mrl_masks=None):
         encoder_out = self.encode_speech(mel, src_mask=src_mask)
-        return self._decode_with_aux(encoder_out, tgt, tgt_mask=tgt_mask, mrl_dims=mrl_dims)
+        return self._decode_with_aux(encoder_out, tgt, tgt_mask=tgt_mask, mrl_dims=mrl_dims, mrl_masks=mrl_masks)
 
     def init_all(self, src, tgt, mel):
         """Dummy forward through both text and speech pathways to initialize all params."""
