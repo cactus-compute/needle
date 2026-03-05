@@ -254,11 +254,42 @@ def tpu_stop(args):
     print(f"[tpu] Stopped '{args.name}'")
 
 
+def _update_ssh_config_for(args):
+    """Fetch the current external IP and update ~/.ssh/config."""
+    zone = args.zone
+    result = _run(
+        ["gcloud", "compute", "tpus", "tpu-vm", "describe", args.name,
+         "--zone", zone, "--project", PROJECT,
+         "--format", "get(networkEndpoints[0].accessConfig.externalIp)"],
+        capture=True,
+    )
+    ip = result.stdout.strip()
+    if not ip:
+        print("[tpu] WARNING: could not get external IP, SSH config not updated.",
+              file=sys.stderr)
+        return
+    print(f"[tpu] New IP: {ip}")
+    ssh_config_path = os.path.expanduser("~/.ssh/config")
+    user = getpass.getuser()
+    block = (
+        f"\nHost {args.name}\n"
+        f"    HostName {ip}\n"
+        f"    User {user}\n"
+        f"    IdentityFile ~/.ssh/google_compute_engine\n"
+        f"    CheckHostIP no\n"
+        f"    StrictHostKeyChecking no\n"
+    )
+    _update_ssh_config(ssh_config_path, args.name, block)
+    print(f"[tpu] Updated SSH config for '{args.name}'")
+
+
 def tpu_start(args):
     zone = args.zone or _detect_zone(args.name)
     _run(["gcloud", "compute", "tpus", "tpu-vm", "start", args.name,
           "--zone", zone, "--project", PROJECT])
     print(f"[tpu] Started '{args.name}'")
+    args.zone = zone
+    _update_ssh_config_for(args)
 
 
 def tpu_delete(args):
