@@ -136,15 +136,58 @@ needle train --mrl-method topk \
 - **`--mrl-tau-start 1.0`** — Initial sigmoid temperature. Higher tau = softer masks. At tau=1.0, the sigmoid `σ((logit - threshold) / tau)` has a gentle slope, so many dimensions get intermediate mask values (0.3-0.7). This allows gradients to flow to all dimensions near the boundary.
 - **`--mrl-tau-end 0.2`** — Final sigmoid temperature before freeze. At tau=0.2, the sigmoid is much steeper — mask values are pushed closer to 0 or 1. The annealing from 1.0→0.2 happens exponentially over the learning phase.
 - **`--mrl-freeze-frac 0.6`** — The last 60% of training uses hard binary masks (STE: straight-through estimator). Mask logit optimizer is frozen — no more mask updates. This was the key finding: the model needs a long period of stable, fixed dimension selection to fully adapt, just like slice has fixed selection from the start.
-- **`--mrl-mask-lr 0.003`** — Adam learning rate for the mask logit optimizer (separate from the model's Muon/AdamW optimizers). The mask logits are a small `(n_mrl_dims, d_model)` array updated host-side after each step.
+- **`--mrl-mask-lr 0.003`** — Adam learning rate for the mask logit optimizer (separate from the model's Muon/AdamW optimizers). The mask logits are a small `(n_mrl_dims, d_ff)` array updated host-side after each step.
 - **`--mrl-spread-lambda 0.01`** — Weight of the spread penalty: `−λ · mean(var(logits))`. Maximizes variance of mask logits per MRL dim, encouraging clear on/off decisions rather than ambiguous middle values. Matches matformer-olmo's best config (R6).
+
+---
+
+## PROPER Learned Matryoshka (FFN Interior Masking)
+
+All experiments above used **output-only masking**: the mask was applied to the final hidden state at the logit projection (`x * mask @ emb.T`). The decoder and encoder ran at full width — the mask only selected which output dimensions contributed to classification. This is fundamentally wrong: the sub-models aren't truly independent, they share all internal computation and just differ in which output dims are read.
+
+Evidence: a **shuffled_prefix** experiment (same logit distribution as prefix, but randomly permuted dims) performed worse than prefix (d=128: 4.63 vs 4.55). If the implementation were correct, these should be identical since all dimensions are symmetric. The gap proves the model was exploiting contiguous prefix structure in the output projection, not learning genuine sub-networks.
+
+### What Changed
+
+**The mask now operates on the FFN intermediate activations (d_ff), not d_model.** This is exactly what matformer-olmo does:
+
+```python
+# Inside FeedForward.__call__:
+gate = gate_proj(x)     # (B, T, d_ff)
+up = up_proj(x)         # (B, T, d_ff)
+h = activation(gate) * up
+if ffn_mask is not None:
+    h = h * ffn_mask[None, None, :]  # mask d_ff neurons
+return down_proj(h)      # (B, T, d_model) — d_model unchanged
+```
+
+Key differences from the output-only approach:
+
+1. **d_model is constant** — attention heads, embeddings, residual stream all stay full-width. No head structure issues.
+2. **Only FFN parameters are reduced** — for a sub-model at MRL dim d, the active FFN neurons are `k = d_ff * d // d_model` (proportional reduction). Only gate_proj, up_proj, and down_proj weights for the active neurons participate.
+3. **Mask shape is `(n_mrl, d_ff)`** not `(n_mrl, d_model)` — the learnable logits select which FFN neurons to keep, not which hidden dimensions.
+4. **Separate forward passes per MRL dim** — each sub-model runs a full encoder + decoder pass with its FFN mask applied at every FeedForward layer (both encoder local FFN and decoder FFN). The full-model forward runs without any mask.
+5. **All FeedForward layers masked** — encoder's local FFN in each MemoryMixerBlock and decoder's FFN in each DecoderBlock. The MLP-Mixer's token/channel mixing is NOT masked (different structure/dimensions).
+
+### Training Cost
+
+With 3 MRL dims, each step runs 4 forward passes (1 full + 3 masked). Observed ~2x slower than output-only masking (~4 it/s vs ~8.6 it/s). The extra cost comes from re-running the full encoder and decoder per MRL dim.
+
+### Why This Should Work
+
+With FFN masking, shuffled_prefix and prefix init should now give **identical results**, because:
+- The FFN treats all intermediate neurons symmetrically (each is an independent gate+up → activation → down pathway)
+- The mask selects which neurons are active — their index doesn't matter, only which set
+- d_model is unchanged, so attention heads are unaffected
+- The model is forced to route information through fewer FFN neurons for sub-models, creating genuinely different computational paths
+
+### Files Modified
+- `src/model.py`: Added `ffn_mask` parameter to `FeedForward`, `DecoderBlock`, `Decoder`, `MemoryMixerBlock`, `MemoryMixerEncoder`, and all encode/decode methods. `forward_with_aux` and `forward_speech_with_aux` now run separate encoder+decoder passes per MRL dim with FFN masks.
+- `src/train.py`: Mask logits shape changed from `(n_mrl, d_model)` to `(n_mrl, d_ff)`. `_compute_mrl_masks` computes `k = d_ff * d // d_model` per MRL dim. Eval topk_mask uses `k_ff` not `d`.
 
 ---
 
 ## Untested Hypotheses for Future Work
 
 ### Saliency-initialized masks (H5)
-During a warmup phase, accumulate per-dimension gradient importance on the embedding. At the warmup→learning transition, initialize mask logits from saliency ranking instead of prefix ramp. Requires implementation of gradient accumulation during warmup.
-
-### Interior masking (not just logit stage)
-Current masks only zero hidden dims at the logit projection. matformer-olmo applies masks inside MLP layers, forcing the model to route information through selected neurons during computation. This is a deeper architectural change but could unlock the true benefit of learned selection over prefix slicing.
+During a warmup phase, accumulate per-dimension gradient importance on the FFN intermediate activations. At the warmup→learning transition, initialize mask logits from saliency ranking instead of prefix ramp. Requires implementation of gradient accumulation during warmup.
