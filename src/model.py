@@ -58,7 +58,12 @@ class TransformerConfig:
 
 
 class AltUp(nn.Module):
-    """Alternating Updates: maintain N parallel predictions through decoder layers."""
+    """Alternating Updates: maintain N parallel predictions through decoder layers.
+
+    Uses Gemma 3n-style input-dependent routing with paper-style replication
+    expand and mean collapse. Zero-init on predict/correct coefs ensures
+    exact identity at initialization.
+    """
     num_inputs: int
     d_model: int
     active_idx: int = 0
@@ -79,13 +84,13 @@ class AltUp(nn.Module):
         self.correct_output_scale = self.param("correct_output_scale", jinit.zeros, (self.d_model,))
 
     def predict(self, hidden_states):
-        """Generate predicted outputs for all copies. Returns (predictions, active)."""
+        """Generate predicted outputs for all copies."""
         N = self.num_inputs
         modalities = self._compute_modalities(hidden_states[self.active_idx])
         all_coefs = self.prediction_coefs_proj(modalities)
         all_coefs = jnp.clip(all_coefs, -self.coef_clip, self.coef_clip)
         all_coefs = all_coefs.reshape(*modalities.shape[:-1], N, N)
-        all_coefs = jnp.swapaxes(all_coefs, -2, -1)  # transpose NxN coef matrix
+        all_coefs = jnp.swapaxes(all_coefs, -2, -1)
         hs_perm = jnp.transpose(hidden_states, (1, 2, 3, 0))
         predictions = jnp.matmul(hs_perm, all_coefs)
         predictions = jnp.transpose(predictions, (3, 0, 1, 2))
@@ -372,7 +377,6 @@ class Decoder(nn.Module):
             )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope)
 
         if cfg.altup_num_inputs > 0:
-            # Apply final norm to all predictions
             for i in range(cfg.altup_num_inputs):
                 x = x.at[i].set(ZCRMSNorm(dtype=dt, name=f"final_norm_{i}")(x[i]))
         else:
@@ -403,43 +407,24 @@ class EncoderDecoderTransformer(nn.Module):
         self.mel_proj = MelProjection(cfg.d_model, dt)
         self.encoder = MemoryMixerEncoder(cfg)
         self.decoder = Decoder(cfg)
-        if cfg.altup_num_inputs > 0:
-            # Residual expand: x[i] = x + proj_i(x), tiny init → near-identity + symmetry breaking
-            self.altup_expand_projs = [
-                nn.Dense(cfg.d_model, dtype=dt, use_bias=False,
-                         kernel_init=jinit.normal(stddev=0.001), name=f"altup_expand_{i}")
-                for i in range(1, cfg.altup_num_inputs)
-            ]
-            # Residual collapse: out = x[0] + Σ proj_i(x[i]), tiny init → mostly x[0] + small learned contribution
-            self.altup_collapse_projs = [
-                nn.Dense(cfg.d_model, dtype=dt, use_bias=False,
-                         kernel_init=jinit.normal(stddev=0.001), name=f"altup_collapse_{i}")
-                for i in range(1, cfg.altup_num_inputs)
-            ]
 
     def _rope(self, seq_len):
         head_dim = self.config.d_model // self.config.num_heads
         return precompute_rope_freqs(head_dim, seq_len, self.config.rope_theta)
 
     def _altup_expand(self, x):
-        """Expand: x[0]=x, x[i]=x+proj_i(x). Zero-init proj → replication at start."""
+        """Expand: replicate embedding N times (Recycled-AltUp, paper Section 4.1)."""
         cfg = self.config
         if cfg.altup_num_inputs <= 0:
             return x
-        copies = [x]
-        for proj in self.altup_expand_projs:
-            copies.append(x + proj(x))
-        return jnp.stack(copies, axis=0)  # (N, B, T, d)
+        return jnp.broadcast_to(x[None], (cfg.altup_num_inputs, *x.shape))
 
     def _altup_collapse(self, x):
-        """Collapse: x[0] + Σ proj_i(x[i]). Zero-init proj → just x[0] at start."""
+        """Collapse: mean of all sub-blocks."""
         cfg = self.config
         if cfg.altup_num_inputs <= 0:
             return x
-        out = x[0]
-        for i, proj in enumerate(self.altup_collapse_projs):
-            out = out + proj(x[i + 1])
-        return out  # (B, T, d)
+        return jnp.mean(x, axis=0)
 
     def encode_text(self, src, src_mask=None):
         x = self.embedding(src) * self.embed_scale
