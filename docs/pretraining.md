@@ -62,5 +62,3 @@ where $\lambda_{\mathrm{adv}}\ge 0$ controls the strength of adversarial alignme
 
 6. **Audio Projector**: The audio projector will be a simple linear multiplication on the latent multiplying across the hidden dimension.
 
-7. **Audio Denoise**: The denoiser will be pretrained according to [denoising.md](denoising.md) and then frozen during pretraining.
-
