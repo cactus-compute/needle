@@ -226,6 +226,8 @@ def _quantize_params(params, group_size=32):
 _GROUP_SIZE = 32
 _MRL_DIMS = ()
 _MRL_METHOD = "slice"
+_D_MODEL = 512
+_D_FF = 2048
 _MRL_TAU_START = 0.5
 _MRL_TAU_END = 0.1
 _MRL_WARMUP_FRAC = 0.15
@@ -245,11 +247,12 @@ def topk_mask(logits, k, tau, hard):
     return jnp.where(hard, ste, y_soft)
 
 
-def _compute_mrl_masks(mask_logits, mrl_dims, tau, hard):
-    """Compute masks for all MRL dims from mask logits. tau/hard are JAX scalars."""
+def _compute_mrl_masks(mask_logits, mrl_dims, d_model, d_ff, tau, hard):
+    """Compute FFN masks for all MRL dims. mask_logits: (n_mrl, d_ff). tau/hard: JAX scalars."""
     masks = []
     for i, d in enumerate(mrl_dims):
-        masks.append(topk_mask(mask_logits[i], k=d, tau=tau, hard=hard))
+        k = d_ff * d // d_model  # proportional FFN reduction
+        masks.append(topk_mask(mask_logits[i], k=k, tau=tau, hard=hard))
     return masks
 
 
@@ -291,7 +294,7 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, mask_logits=
     mrl_masks = None
     ml_for_loss = None
     if _MRL_METHOD == "topk" and mask_logits is not None and _MRL_DIMS:
-        mrl_masks = _compute_mrl_masks(mask_logits, _MRL_DIMS, tau, hard)
+        mrl_masks = _compute_mrl_masks(mask_logits, _MRL_DIMS, _D_MODEL, _D_FF, tau, hard)
         ml_for_loss = mask_logits
 
     logits, slot_div, mrl_logits = state.apply_fn(
@@ -316,7 +319,7 @@ def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, mask_logit
     mrl_masks = None
     ml_for_loss = None
     if _MRL_METHOD == "topk" and mask_logits is not None and _MRL_DIMS:
-        mrl_masks = _compute_mrl_masks(mask_logits, _MRL_DIMS, tau, hard)
+        mrl_masks = _compute_mrl_masks(mask_logits, _MRL_DIMS, _D_MODEL, _D_FF, tau, hard)
         ml_for_loss = mask_logits
 
     logits, slot_div, mrl_logits = state.apply_fn(
@@ -723,7 +726,7 @@ def train(args):
         )
 
     global _GROUP_SIZE, _MRL_DIMS, _MRL_METHOD, _MRL_TAU_START, _MRL_TAU_END
-    global _MRL_WARMUP_FRAC, _MRL_FREEZE_FRAC, _MRL_SPREAD_LAMBDA
+    global _MRL_WARMUP_FRAC, _MRL_FREEZE_FRAC, _MRL_SPREAD_LAMBDA, _D_MODEL, _D_FF
     _GROUP_SIZE = getattr(args, "group_size", 32)
     mrl_dims_raw = getattr(args, "mrl_dims", None)
     if mrl_dims_raw:
@@ -736,6 +739,8 @@ def train(args):
     _MRL_WARMUP_FRAC = getattr(args, "mrl_warmup_frac", 0.15)
     _MRL_FREEZE_FRAC = getattr(args, "mrl_freeze_frac", 0.2)
     _MRL_SPREAD_LAMBDA = getattr(args, "mrl_spread_lambda", 0.01)
+    _D_MODEL = config.d_model
+    _D_FF = config.d_ff
 
     use_topk = _MRL_METHOD == "topk" and _MRL_DIMS
     if use_topk:
@@ -784,27 +789,27 @@ def train(args):
         init_mode = getattr(args, "mrl_init_mode", "normal")
         init_value = getattr(args, "mrl_init_value", 0.5)
         rng, mask_rng = jax.random.split(rng)
+        d_ff = config.d_ff
         if init_mode == "prefix":
-            # Linear ramp: dim 0 gets +init_value, dim d_model-1 gets -init_value
-            # Initial top-k exactly matches prefix slicing for a smooth warmup→learning transition
-            positions = jnp.arange(config.d_model, dtype=jnp.float32)
-            ramp = init_value * (1.0 - 2.0 * positions / max(1, config.d_model - 1))
-            mask_logits = jnp.broadcast_to(ramp[None, :], (n_mrl, config.d_model)).copy()
+            # Linear ramp over d_ff: neuron 0 gets highest, neuron d_ff-1 gets lowest
+            # Initial top-k selects the first k FFN neurons (prefix pattern)
+            positions = jnp.arange(d_ff, dtype=jnp.float32)
+            ramp = init_value * (1.0 - 2.0 * positions / max(1, d_ff - 1))
+            mask_logits = jnp.broadcast_to(ramp[None, :], (n_mrl, d_ff)).copy()
         elif init_mode == "shuffled_prefix":
             # Same ramp distribution as prefix, but randomly permuted per MRL dim
-            # Theoretically equivalent to prefix if implementation is correct
-            positions = jnp.arange(config.d_model, dtype=jnp.float32)
-            ramp = init_value * (1.0 - 2.0 * positions / max(1, config.d_model - 1))
+            positions = jnp.arange(d_ff, dtype=jnp.float32)
+            ramp = init_value * (1.0 - 2.0 * positions / max(1, d_ff - 1))
             rows = []
             for i in range(n_mrl):
                 rng, perm_rng = jax.random.split(rng)
-                perm = jax.random.permutation(perm_rng, config.d_model)
+                perm = jax.random.permutation(perm_rng, d_ff)
                 rows.append(ramp[perm])
             mask_logits = jnp.stack(rows)
         elif init_mode == "normal":
-            mask_logits = jax.random.normal(mask_rng, (n_mrl, config.d_model)) * init_value
+            mask_logits = jax.random.normal(mask_rng, (n_mrl, d_ff)) * init_value
         else:
-            mask_logits = jnp.zeros((n_mrl, config.d_model))
+            mask_logits = jnp.zeros((n_mrl, d_ff))
         mask_lr = getattr(args, "mrl_mask_lr", 3e-3)
         mask_tx = optax.adam(learning_rate=mask_lr)
         # Init opt state from numpy to keep it host-side (not on any TPU device)
@@ -1130,7 +1135,8 @@ def train(args):
             if use_topk:
                 ml_unr = jax_utils.unreplicate(mask_logits)
                 for i, d in enumerate(_MRL_DIMS):
-                    topk_hard_masks[d] = topk_mask(ml_unr[i], k=d, tau=0.001, hard=True)
+                    k_ff = config.d_ff * d // config.d_model
+                    topk_hard_masks[d] = topk_mask(ml_unr[i], k=k_ff, tau=0.001, hard=True)
             for d_prime in _MRL_DIMS:
                 mrl_mask = topk_hard_masks.get(d_prime, None)
                 mrl_vl_fn = _make_mrl_val_loss_fn(apply_fn, d_prime)
