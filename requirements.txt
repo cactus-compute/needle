@@ -7,3 +7,4 @@ transformers
 wandb
 pyyaml
 sentencepiece
+google-cloud-storage
