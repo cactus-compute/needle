@@ -7,3 +7,6 @@ transformers
 wandb
 pyyaml
 sentencepiece
+scipy
+google-cloud-storage
+datasets
