@@ -122,6 +122,17 @@ Replace the current static MRL weight-slicing approach with **learned per-dimens
 
 **Conclusion:** TopK H10 achieves **parity with slice** on average. The key hyperparameter is `--mrl-freeze-frac 0.6` — a long freeze phase gives the model time to fully adapt to the locked hard masks, mimicking slice's stability advantage. Prefix init provides a smooth starting point. Slow tau annealing (1.0→0.2) allows gradual exploration before freezing.
 
+### 2-Epoch Comparison (14,716 total steps)
+
+| Dim | Slice 2ep | TopK H10 2ep |
+|-----|-----------|-------------|
+| 512 | 4.11 | **4.09** |
+| 256 | 4.11 | 4.11 |
+| 128 | **4.17** | 4.18 |
+| 64 | **4.38** | 4.39 |
+
+With 2 epochs, topk fully converges to match slice (within 0.01 PPL at every dim). The full model is consistently better with topk due to no MRL penalty during mask learning. The theoretical advantage of non-contiguous dimension selection may require even longer training or larger models to manifest.
+
 ### Best TopK Config (H10)
 ```bash
 needle train --mrl-method topk \
