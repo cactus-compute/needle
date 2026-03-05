@@ -1,0 +1,28 @@
+# Needle pretraining ablations — 30-minute runs, full model (d_model=512)
+# Fields: status TAB name TAB extra_args
+# Status: pending | running | finished | failed
+#
+# Ablation matrix covers: adv weight, mask ratio, audio decoder depth, text-only baseline
+# All use: --full (d_model=512, 8 enc + 4 dec), TinyStories + Libri Light small,
+#          --max-steps 315 (~30 min at ~0.18 steps/sec on v6e-8), --wandb, bfloat16
+
+# --- Adversarial weight ablations (A1, A2, A3) ---
+failed	A1_recon_only	--lambda-adv 0.0 --run-name A1_recon_only
+failed	A2_adv_01	--lambda-adv 0.1 --run-name A2_adv_01
+failed	A3_adv_05	--lambda-adv 0.5 --run-name A3_adv_05
+
+# --- Mask ratio ablations (A4, A5, A6) ---
+pending	A4_mask_30	--lambda-adv 0.1 --mask-ratio 0.30 --run-name A4_mask_30
+pending	A5_mask_50	--lambda-adv 0.1 --mask-ratio 0.50 --run-name A5_mask_50
+pending	A6_mask_70	--lambda-adv 0.1 --mask-ratio 0.70 --run-name A6_mask_70
+
+# --- Audio decoder depth (A8, A9) ---
+pending	A8_audio_dec1	--lambda-adv 0.1 --num-dec-layers 1 --run-name A8_audio_dec1
+pending	A9_audio_dec4	--lambda-adv 0.1 --num-dec-layers 4 --run-name A9_audio_dec4
+
+# --- Text-only MAE baseline (A11) ---
+finished	A11_text_only	--lambda-adv 0.0 --no-speech --run-name A11_text_only
+
+# --- Speech-every frequency (bonus) ---
+pending	B1_speech_every1	--lambda-adv 0.1 --speech-every 1 --run-name B1_speech_every1
+pending	B2_speech_every5	--lambda-adv 0.1 --speech-every 5 --run-name B2_speech_every5

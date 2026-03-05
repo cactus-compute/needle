@@ -44,6 +44,7 @@ class TransformerConfig:
     dtype: str = "bfloat16"
     activation: str = "drelu"
     num_memory_slots: int = 64
+    n_mels: int = 80
 
     @property
     def jax_dtype(self):
@@ -368,3 +369,175 @@ def make_causal_mask(seq_len):
 def make_padding_mask(tokens, pad_token_id):
     mask = tokens != pad_token_id
     return mask[:, None, None, :]
+
+
+def make_mel_padding_mask(mel):
+    """True where at least one mel bin is non-zero."""
+    mask = jnp.any(mel != 0, axis=-1)
+    return mask[:, None, None, :]
+
+
+class WhisperConvFrontend(nn.Module):
+    """Two Conv1D layers (stride-1 then stride-2) to project mel → d_model tokens."""
+    d_model: int
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, x):
+        # x: (B, T_mel, n_mels) — time as spatial dim, n_mels as input channels
+        x = x.astype(self.dtype)
+        x = nn.Conv(features=self.d_model, kernel_size=(3,), strides=(1,),
+                    padding='SAME', dtype=self.dtype, use_bias=False, name="conv1")(x)
+        x = nn.gelu(x)
+        x = nn.Conv(features=self.d_model, kernel_size=(3,), strides=(2,),
+                    padding='SAME', dtype=self.dtype, use_bias=False, name="conv2")(x)
+        x = nn.gelu(x)
+        return x  # (B, T_mel//2, d_model)
+
+
+class AudioDecoderBlock(nn.Module):
+    num_heads: int
+    num_kv_heads: int
+    d_model: int
+    d_ff: int
+    num_layers: int
+    dtype: jnp.dtype = jnp.bfloat16
+    activation: str = "drelu"
+
+    @nn.compact
+    def __call__(self, x, encoder_slots):
+        residual = x
+        x = ZCRMSNorm(dtype=self.dtype, name="cross_norm")(x)
+        x = MultiHeadAttention(
+            self.num_heads, self.num_kv_heads, self.d_model, self.num_layers,
+            self.dtype, name="cross_attn"
+        )(x, encoder_slots)
+        x = x + residual
+
+        residual = x
+        x = ZCRMSNorm(dtype=self.dtype, name="ffn_norm")(x)
+        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype,
+                        self.activation, name="ffn")(x)
+        x = x + residual
+        return x
+
+
+class AudioDecoder(nn.Module):
+    """Non-causal cross-attention decoder: learned queries → cross-attend slots → mel."""
+    config: TransformerConfig
+    num_layers: int = 2
+    num_output_frames: int = 1000
+
+    @nn.compact
+    def __call__(self, encoder_slots):
+        cfg = self.config
+        dt = cfg.jax_dtype
+        B = encoder_slots.shape[0]
+
+        queries = self.param("queries", jinit.normal(stddev=0.02),
+                             (1, self.num_output_frames, cfg.d_model))
+        x = jnp.broadcast_to(queries.astype(dt), (B, self.num_output_frames, cfg.d_model))
+        encoder_slots = encoder_slots.astype(dt)
+
+        for i in range(self.num_layers):
+            x = nn.remat(AudioDecoderBlock)(
+                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
+                self.num_layers, dt, cfg.activation, name=f"block_{i}"
+            )(x, encoder_slots)
+
+        x = ZCRMSNorm(dtype=dt, name="final_norm")(x)
+        x = nn.Dense(cfg.n_mels, dtype=jnp.float32, use_bias=True,
+                     kernel_init=jinit.zeros, name="output_proj")(x.astype(jnp.float32))
+        return x  # (B, num_output_frames, n_mels)
+
+
+class AudioProjector(nn.Module):
+    """Linear projection to strip speaker/acoustic content before adversarial alignment."""
+    d_model: int
+    dtype: jnp.dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, z):
+        # z: (B, M, d_model) → (B, M, d_model)
+        return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False,
+                        kernel_init=default_init(), name="proj")(z.astype(self.dtype))
+
+
+class Discriminator(nn.Module):
+    """Pool + MLP binary classifier: text (label 0) vs projected audio (label 1)."""
+    d_model: int
+
+    @nn.compact
+    def __call__(self, x):
+        # x: (B, M, d_model)
+        x = x.astype(jnp.float32)
+        x = jnp.mean(x, axis=1)  # (B, d_model)
+        x = nn.Dense(self.d_model, dtype=jnp.float32, use_bias=True,
+                     kernel_init=default_init(), name="mlp1")(x)
+        x = nn.gelu(x)
+        x = nn.Dense(1, dtype=jnp.float32, use_bias=True,
+                     kernel_init=default_init(), name="mlp2")(x)
+        return x  # (B, 1)
+
+
+class PretrainingModel(nn.Module):
+    """Wraps encoder, text decoder, audio frontend/decoder, and audio projector."""
+    config: TransformerConfig
+    num_audio_dec_layers: int = 2
+    clip_frames: int = 1000
+
+    def setup(self):
+        cfg = self.config
+        self.embedding = nn.Embed(cfg.vocab_size, cfg.d_model,
+                                  embedding_init=jinit.normal(stddev=0.02))
+        self.embed_scale = math.sqrt(cfg.d_model)
+        self.encoder = MemoryMixerEncoder(cfg)
+        self.text_decoder = Decoder(cfg)
+        self.audio_frontend = WhisperConvFrontend(cfg.d_model, cfg.jax_dtype)
+        self.audio_decoder = AudioDecoder(cfg, num_layers=self.num_audio_dec_layers,
+                                          num_output_frames=self.clip_frames)
+        self.audio_projector = AudioProjector(cfg.d_model)
+
+    def _rope(self, seq_len):
+        head_dim = self.config.d_model // self.config.num_heads
+        return precompute_rope_freqs(head_dim, seq_len, self.config.rope_theta)
+
+    def encode_text(self, masked_src):
+        x = self.embedding(masked_src) * self.embed_scale
+        rope = self._rope(masked_src.shape[1])
+        return self.encoder(x, rope=rope)  # (B, M, d_model)
+
+    def encode_audio(self, masked_mel):
+        x = self.audio_frontend(masked_mel)  # (B, T//2, d_model)
+        return self.encoder(x)  # (B, M, d_model)
+
+    def forward_text(self, masked_src, dec_in):
+        z = self.encode_text(masked_src)
+        x = self.embedding(dec_in) * self.embed_scale
+        rope = self._rope(dec_in.shape[1])
+        causal_mask = make_causal_mask(dec_in.shape[1])
+        x = self.text_decoder(x, z, self_mask=causal_mask, rope=rope)
+        logits = x.astype(jnp.float32) @ self.embedding.embedding.T
+
+        s = z.astype(jnp.float32)
+        gram = jnp.matmul(s, s.transpose(0, 2, 1))
+        diag_sq = jnp.sum(jnp.diagonal(gram, axis1=1, axis2=2) ** 2)
+        slot_div = (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
+        return logits, slot_div
+
+    def forward_audio(self, masked_mel):
+        z = self.encode_audio(masked_mel)
+        mel_pred = self.audio_decoder(z)
+        u_audio = self.audio_projector(z)
+
+        s = z.astype(jnp.float32)
+        gram = jnp.matmul(s, s.transpose(0, 2, 1))
+        diag_sq = jnp.sum(jnp.diagonal(gram, axis1=1, axis2=2) ** 2)
+        slot_div = (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
+        return mel_pred, z, u_audio, slot_div
+
+    def __call__(self, masked_src, dec_in, masked_mel):
+        """Dummy forward through both pathways for parameter initialization."""
+        logits, _ = self.forward_text(masked_src, dec_in)
+        mel_pred, _, _, _ = self.forward_audio(masked_mel)
+        return logits, mel_pred

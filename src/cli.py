@@ -9,6 +9,24 @@ HELP = """
   │      └─┘┴ ┴└─┘ ┴ └─┘└─┘  ┘└┘└─┘└─┘─┴┘┴─┘└─┘                       │
   │      ...the tiny model to rule them all...                        │
   │                                                                   │
+  │   pretrain                                                        │
+  │     --epochs INT             Training epochs (default: 3)         │
+  │     --batch-size INT         Batch size per device (default: 32)  │
+  │     --lr FLOAT               AdamW LR (default: 3e-4)             │
+  │     --muon-lr FLOAT          Muon LR (default: 0.02)              │
+  │     --d-model INT            Model dim (default: 128)             │
+  │     --num-layers INT         Encoder layers (default: 2)          │
+  │     --num-dec-layers INT     Decoder layers (default: 2)          │
+  │     --speech-every INT       Audio step every N text steps (def:3)│
+  │     --mask-ratio FLOAT       Fraction masked (default: 0.50)      │
+  │     --lambda-adv FLOAT       Final adv weight (default: 0.10)     │
+  │     --disc-lr FLOAT          Discriminator LR (default: 1e-4)     │
+  │     --no-speech              Text-only MAE baseline               │
+  │     --wandb                  Enable W&B logging                   │
+  │     --checkpoint-dir DIR     Checkpoint dir (default: checkpoints/pretrain) │
+  │     --max-samples INT        Max text samples                     │
+  │     --max-speech-samples INT Max audio samples                    │
+  │                                                                   │
   │   train                                                           │
   │     --full                   Use full 1B config (~1.17B params)   │
   │     --epochs INT             Training epochs (default: 1)         │
@@ -79,6 +97,43 @@ def main():
 
     parser = argparse.ArgumentParser(prog="needle", add_help=False)
     sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("pretrain", add_help=False)
+    p.add_argument("--epochs",              type=int,   default=3)
+    p.add_argument("--batch-size",          type=int,   default=32)
+    p.add_argument("--lr",                  type=float, default=3e-4)
+    p.add_argument("--muon-lr",             type=float, default=0.02)
+    p.add_argument("--d-model",             type=int,   default=128)
+    p.add_argument("--num-heads",           type=int,   default=4)
+    p.add_argument("--num-kv-heads",        type=int,   default=None)
+    p.add_argument("--num-layers",          type=int,   default=2)
+    p.add_argument("--num-dec-layers",      type=int,   default=2)
+    p.add_argument("--d-ff",                type=int,   default=None)
+    p.add_argument("--max-enc-len",         type=int,   default=128)
+    p.add_argument("--max-dec-len",         type=int,   default=128)
+    p.add_argument("--n-mels",              type=int,   default=80)
+    p.add_argument("--speech-every",        type=int,   default=3)
+    p.add_argument("--mask-ratio",          type=float, default=0.50)
+    p.add_argument("--lambda-adv",          type=float, default=0.10)
+    p.add_argument("--disc-lr",             type=float, default=1e-4)
+    p.add_argument("--no-speech",           action="store_true")
+    p.add_argument("--wandb",               action="store_true")
+    p.add_argument("--checkpoint-dir",      type=str,   default="checkpoints/pretrain")
+    p.add_argument("--max-samples",         type=int,   default=None)
+    p.add_argument("--max-speech-samples",  type=int,   default=None)
+    p.add_argument("--warmup-ratio",        type=float, default=0.05)
+    p.add_argument("--activation",          type=str,   default="drelu",
+                   choices=["drelu", "swiglu", "geglu"])
+    p.add_argument("--seed",                type=int,   default=42)
+    p.add_argument("--max-steps",           type=int,   default=None,
+                   help="Stop after this many steps (overrides epochs for timed runs)")
+    p.add_argument("--run-name",            type=str,   default=None,
+                   help="W&B run name and checkpoint tag")
+    p.add_argument("--num-memory-slots",    type=int,   default=64)
+    p.add_argument("--librilight-subset",   type=str,   default="small",
+                   choices=["small", "medium", "large"])
+    p.add_argument("--full",                action="store_true",
+                   help="Use full-size model config (d_model=512, 8 enc + 4 dec layers)")
 
     p = sub.add_parser("train", add_help=False)
     p.add_argument("--full", action="store_true")
@@ -175,7 +230,18 @@ def main():
         print(HELP)
         sys.exit(0)
 
-    if args.command == "train":
+    if args.command == "pretrain":
+        if getattr(args, "full", False):
+            args.d_model          = 512
+            args.num_heads        = 8
+            args.num_kv_heads     = 4
+            args.num_layers       = 8
+            args.num_dec_layers   = 4
+            args.num_memory_slots = 64
+            args.d_ff             = None  # auto 4× d_model = 2048
+        from .pretrain import pretrain
+        pretrain(args)
+    elif args.command == "train":
         if getattr(args, "full", False):
             args.d_model = 1536
             args.num_heads = 24
@@ -198,3 +264,7 @@ def main():
     elif args.command == "tpu":
         from .tpu import tpu_dispatch
         tpu_dispatch(args)
+
+
+if __name__ == "__main__":
+    main()

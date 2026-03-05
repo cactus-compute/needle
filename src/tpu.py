@@ -288,36 +288,75 @@ def tpu_claude(args):
     )
 
 
-def tpu_list(args):
-    found = False
-    for zone in ZONES:
-        result = _run(
-            ["gcloud", "compute", "tpus", "tpu-vm", "list",
-             "--zone", zone, "--project", PROJECT],
-            check=False, capture=True, quiet=True,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            if not found:
-                header = result.stdout.strip().splitlines()[0]
-                print(f"{header}  ZONE")
-                found = True
-            for line in result.stdout.strip().splitlines()[1:]:
-                print(f"{line}  {zone}")
-    if not found:
-        print("[tpu] No instances found.")
+def tpu_disk(args):
+    """Create a persistent SSD, attach it to the TPU VM, format + mount at /mnt/data,
+    and configure HF_HOME / cache dirs to use the new disk."""
+    zone = args.zone or _detect_zone(args.name)
+    disk_name = f"{args.name}-data"
+    size_gb   = getattr(args, "size", 200)
+    mount     = "/mnt/data"
 
+    # 1. Create the disk (idempotent — skip if already exists)
+    print(f"[tpu] Creating {size_gb}GB SSD '{disk_name}' in {zone}...")
+    result = _run(
+        ["gcloud", "compute", "disks", "create", disk_name,
+         "--size", f"{size_gb}GB", "--type", "pd-ssd",
+         "--zone", zone, "--project", PROJECT],
+        check=False, capture=True,
+    )
+    if result.returncode != 0:
+        if "already exists" in result.stderr:
+            print(f"[tpu] Disk '{disk_name}' already exists, reusing.")
+        else:
+            print(result.stderr.strip(), file=sys.stderr)
+            sys.exit(result.returncode)
 
-def tpu_dispatch(args):
-    actions = {
-        "create": tpu_create,
-        "connect": tpu_connect,
-        "claude": tpu_claude,
-        "stop": tpu_stop,
-        "start": tpu_start,
-        "delete": tpu_delete,
-        "list": tpu_list,
-    }
-    if not args.tpu_action or args.tpu_action not in actions:
-        print(TPU_HELP)
-        sys.exit(0 if not args.tpu_action else 1)
-    actions[args.tpu_action](args)
+    # 2. Attach the disk to the TPU VM
+    print(f"[tpu] Attaching '{disk_name}' to '{args.name}'...")
+    result = _run(
+        ["gcloud", "alpha", "compute", "tpus", "tpu-vm", "attach-disk", args.name,
+         "--zone", zone, "--project", PROJECT,
+         "--disk", disk_name, "--mode", "read-write"],
+        check=False, capture=True,
+    )
+    if result.returncode != 0:
+        if "already attached" in result.stderr.lower():
+            print(f"[tpu] Disk already attached.")
+        else:
+            print(result.stderr.strip(), file=sys.stderr)
+            sys.exit(result.returncode)
+
+    # 3. Format, mount, set ownership, wire cache dirs
+    setup = f"""
+set -euo pipefail
+DISK=$(ls /dev/disk/by-id/google-{disk_name} 2>/dev/null || ls /dev/sdb 2>/dev/null || echo "")
+if [ -z "$DISK" ]; then
+  echo "ERROR: could not find disk device" >&2; exit 1
+fi
+if ! blkid "$DISK" &>/dev/null; then
+  echo "Formatting $DISK as ext4..."
+  sudo mkfs.ext4 -F "$DISK"
+fi
+sudo mkdir -p {mount}
+if ! mountpoint -q {mount}; then
+  sudo mount "$DISK" {mount}
+fi
+# fstab entry so it survives reboot
+UUID=$(sudo blkid -s UUID -o value "$DISK")
+if ! grep -q "$UUID" /etc/fstab; then
+  echo "UUID=$UUID {mount} ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab
+fi
+sudo chown -R $USER:$USER {mount}
+# Create cache dirs on the disk
+mkdir -p {mount}/hf_cache {mount}/data_cache {mount}/tmp
+chmod 1777 {mount}/tmp
+# Symlink /tmp → disk tmp so JAX lockfile + XLA cache land on disk
+sudo rm -rf /tmp || true
+sudo ln -sfn {mount}/tmp /tmp
+# Symlink the data cache
+rm -rf ~/.data_cache 2>/dev/null || true
+ln -sfn {mount}/data_cache ~/.data_cache
+# Update ~/.bashrc with HF_HOME
+grep -q "HF_HOME" ~/.bashrc || echo 'export HF_HOME={mount}/hf_cache' >> ~/.bashrc
+grep -q "HF_HOME" ~/needle/hf_token.sh 2>/dev/null || echo 'export HF_HOME={mount}/hf_cache' >> ~/needle/hf_token.sh
+echo "Done. Disk mounted at {mount}. HF 
