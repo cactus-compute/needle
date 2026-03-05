@@ -403,27 +403,43 @@ class EncoderDecoderTransformer(nn.Module):
         self.mel_proj = MelProjection(cfg.d_model, dt)
         self.encoder = MemoryMixerEncoder(cfg)
         self.decoder = Decoder(cfg)
-        # No expand/collapse projections needed — Recycled-AltUp uses
-        # replication for expand and sum for collapse (paper Section 4.1)
+        if cfg.altup_num_inputs > 0:
+            # Residual expand: x[i] = x + proj_i(x), tiny init → near-identity + symmetry breaking
+            self.altup_expand_projs = [
+                nn.Dense(cfg.d_model, dtype=dt, use_bias=False,
+                         kernel_init=jinit.normal(stddev=0.001), name=f"altup_expand_{i}")
+                for i in range(1, cfg.altup_num_inputs)
+            ]
+            # Residual collapse: out = x[0] + Σ proj_i(x[i]), tiny init → mostly x[0] + small learned contribution
+            self.altup_collapse_projs = [
+                nn.Dense(cfg.d_model, dtype=dt, use_bias=False,
+                         kernel_init=jinit.normal(stddev=0.001), name=f"altup_collapse_{i}")
+                for i in range(1, cfg.altup_num_inputs)
+            ]
 
     def _rope(self, seq_len):
         head_dim = self.config.d_model // self.config.num_heads
         return precompute_rope_freqs(head_dim, seq_len, self.config.rope_theta)
 
     def _altup_expand(self, x):
-        """Expand: replicate embedding N times (Recycled-AltUp, paper Section 4.1)."""
+        """Expand: x[0]=x, x[i]=x+proj_i(x). Zero-init proj → replication at start."""
         cfg = self.config
         if cfg.altup_num_inputs <= 0:
             return x
-        return jnp.broadcast_to(x[None], (cfg.altup_num_inputs, *x.shape))  # (N, B, T, d)
+        copies = [x]
+        for proj in self.altup_expand_projs:
+            copies.append(x + proj(x))
+        return jnp.stack(copies, axis=0)  # (N, B, T, d)
 
     def _altup_collapse(self, x):
-        """Collapse N altup predictions back to single hidden state (element-wise sum, paper-style)."""
+        """Collapse: x[0] + Σ proj_i(x[i]). Zero-init proj → just x[0] at start."""
         cfg = self.config
         if cfg.altup_num_inputs <= 0:
             return x
-        # Recycled-AltUp narrowing: sum all sub-blocks
-        return jnp.sum(x, axis=0) / cfg.altup_num_inputs  # (B, T, d)
+        out = x[0]
+        for i, proj in enumerate(self.altup_collapse_projs):
+            out = out + proj(x[i + 1])
+        return out  # (B, T, d)
 
     def encode_text(self, src, src_mask=None):
         x = self.embedding(src) * self.embed_scale
