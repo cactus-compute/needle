@@ -544,6 +544,7 @@ def train(args):
             activation=getattr(args, "activation", "drelu"),
             num_memory_slots=getattr(args, "num_memory_slots", 64),
             n_mels=n_mels,
+            altup_num_inputs=getattr(args, "altup_num_inputs", 0),
         )
 
     global _GROUP_SIZE, _MRL_DIMS
@@ -593,6 +594,8 @@ def train(args):
     print(f"  Layers        {config.num_encoder_layers:>7} enc / {config.num_decoder_layers} dec")
     print(f"  Memory slots  {config.num_memory_slots:>12}")
     print(f"  Activation    {config.activation:>12}")
+    if config.altup_num_inputs > 0:
+        print(f"  AltUp inputs  {config.altup_num_inputs:>12}")
     print(f"  Dtype         {config.dtype:>12}")
     if not no_speech:
         print(f"  Speech        every {speech_every} text steps")

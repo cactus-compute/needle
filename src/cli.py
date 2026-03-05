@@ -129,6 +129,8 @@ def main():
                    help="Number of mel frequency bins (default: 80)")
     p.add_argument("--max-speech-samples", type=int, default=None,
                    help="Max LibriSpeech training samples (default: all)")
+    p.add_argument("--altup-num-inputs", type=int, default=0,
+                   help="AltUp parallel predictions (0=disabled, 2=recommended)")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
@@ -200,6 +202,8 @@ def main():
             args.num_dec_layers = 4
             args.num_memory_slots = 128
             args.mrl_dims = [1024, 768, 512, 256, 128]
+            if not args.altup_num_inputs:
+                args.altup_num_inputs = 0
         from .train import train
         train(args)
     elif args.command == "run":

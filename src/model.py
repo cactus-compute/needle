@@ -45,6 +45,8 @@ class TransformerConfig:
     activation: str = "drelu"
     num_memory_slots: int = 64
     n_mels: int = 80
+    altup_num_inputs: int = 0
+    altup_active_idx: int = 0
 
     @property
     def jax_dtype(self):
@@ -53,6 +55,61 @@ class TransformerConfig:
     @property
     def total_layers(self):
         return self.num_encoder_layers + self.num_decoder_layers
+
+
+class AltUp(nn.Module):
+    """Alternating Updates: maintain N parallel predictions through decoder layers."""
+    num_inputs: int
+    d_model: int
+    active_idx: int = 0
+    dtype: jnp.dtype = jnp.bfloat16
+    coef_clip: float = 120.0
+
+    def setup(self):
+        N = self.num_inputs
+        self.router_norm = ZCRMSNorm(dtype=self.dtype)
+        self.modality_router = nn.Dense(N, dtype=jnp.float32, use_bias=False,
+                                        kernel_init=jinit.normal(stddev=0.02))
+        self.prediction_coefs_proj = nn.Dense(N * N, dtype=self.dtype, use_bias=False,
+                                               kernel_init=jinit.zeros)
+        self.correction_coefs_proj = nn.Dense(N, dtype=self.dtype, use_bias=False,
+                                               kernel_init=jinit.zeros)
+        self.router_input_scale = self.param("router_input_scale",
+                                              lambda _, s: jnp.full(s, self.d_model ** -1.0), ())
+        self.correct_output_scale = self.param("correct_output_scale", jinit.zeros, (self.d_model,))
+
+    def predict(self, hidden_states):
+        """Generate predicted outputs for all copies. Returns (predictions, active)."""
+        N = self.num_inputs
+        modalities = self._compute_modalities(hidden_states[self.active_idx])
+        all_coefs = self.prediction_coefs_proj(modalities)
+        all_coefs = jnp.clip(all_coefs, -self.coef_clip, self.coef_clip)
+        all_coefs = all_coefs.reshape(*modalities.shape[:-1], N, N)
+        all_coefs = jnp.swapaxes(all_coefs, -2, -1)  # transpose NxN coef matrix
+        hs_perm = jnp.transpose(hidden_states, (1, 2, 3, 0))
+        predictions = jnp.matmul(hs_perm, all_coefs)
+        predictions = jnp.transpose(predictions, (3, 0, 1, 2))
+        predictions = predictions + hidden_states
+        return predictions
+
+    def correct(self, predictions, activated):
+        """Update all predictions based on actual output."""
+        modalities = self._compute_modalities(activated)
+        innovation = activated - predictions[self.active_idx]
+        all_coefs = self.correction_coefs_proj(modalities) + 1.0
+        all_coefs = jnp.clip(all_coefs, -self.coef_clip, self.coef_clip)
+        corrected = innovation[..., None] * all_coefs[:, :, None, :]
+        corrected = jnp.transpose(corrected, (3, 0, 1, 2))
+        corrected = corrected + predictions
+        scale = (1.0 + self.correct_output_scale).astype(corrected.dtype)
+        corrected = corrected.at[self.active_idx].multiply(scale)
+        return corrected
+
+    def _compute_modalities(self, x):
+        normed = self.router_norm(x)
+        scaled = normed * self.router_input_scale
+        routed = self.modality_router(scaled.astype(jnp.float32))
+        return jnp.tanh(routed).astype(self.dtype)
 
 
 def precompute_rope_freqs(head_dim, seq_len, theta=10000.0):
@@ -260,29 +317,42 @@ class DecoderBlock(nn.Module):
     num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
+    altup_num_inputs: int = 0
+    altup_active_idx: int = 0
 
     @nn.compact
     def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None):
-        residual = x
-        x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
-            x, x, mask=self_mask, rope=rope
+        use_altup = self.altup_num_inputs > 0
+
+        if use_altup:
+            altup = AltUp(self.altup_num_inputs, self.d_model, self.altup_active_idx, self.dtype, name="altup")
+            predictions = altup.predict(x)
+            x_active = predictions[self.altup_active_idx]
+        else:
+            x_active = x
+
+        residual = x_active
+        x_active = ZCRMSNorm(dtype=self.dtype)(x_active)
+        x_active = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
+            x_active, x_active, mask=self_mask, rope=rope
         )
-        x = x + residual
+        x_active = x_active + residual
 
-        residual = x
-        x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="cross_attn")(
-            x, encoder_out, mask=cross_mask
+        residual = x_active
+        x_active = ZCRMSNorm(dtype=self.dtype)(x_active)
+        x_active = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="cross_attn")(
+            x_active, encoder_out, mask=cross_mask
         )
-        x = x + residual
+        x_active = x_active + residual
 
-        residual = x
-        x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x)
-        x = x + residual
+        residual = x_active
+        x_active = ZCRMSNorm(dtype=self.dtype)(x_active)
+        x_active = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x_active)
+        x_active = x_active + residual
 
-        return x
+        if use_altup:
+            return altup.correct(predictions, x_active)
+        return x_active
 
 
 
@@ -297,10 +367,16 @@ class Decoder(nn.Module):
 
         for i in range(cfg.num_decoder_layers):
             x = nn.remat(DecoderBlock)(
-                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
+                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation,
+                cfg.altup_num_inputs, cfg.altup_active_idx, name=f"block_{i}"
             )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope)
 
-        x = ZCRMSNorm(dtype=dt)(x)
+        if cfg.altup_num_inputs > 0:
+            # Apply final norm to all predictions
+            for i in range(cfg.altup_num_inputs):
+                x = x.at[i].set(ZCRMSNorm(dtype=dt, name=f"final_norm_{i}")(x[i]))
+        else:
+            x = ZCRMSNorm(dtype=dt)(x)
         return x
 
 
@@ -320,15 +396,34 @@ class EncoderDecoderTransformer(nn.Module):
     config: TransformerConfig
 
     def setup(self):
-        self.embedding = nn.Embed(self.config.vocab_size, self.config.d_model, embedding_init=jinit.normal(stddev=0.02))
-        self.embed_scale = math.sqrt(self.config.d_model)
-        self.mel_proj = MelProjection(self.config.d_model, self.config.jax_dtype)
-        self.encoder = MemoryMixerEncoder(self.config)
-        self.decoder = Decoder(self.config)
+        cfg = self.config
+        dt = cfg.jax_dtype
+        self.embedding = nn.Embed(cfg.vocab_size, cfg.d_model, embedding_init=jinit.normal(stddev=0.02))
+        self.embed_scale = math.sqrt(cfg.d_model)
+        self.mel_proj = MelProjection(cfg.d_model, dt)
+        self.encoder = MemoryMixerEncoder(cfg)
+        self.decoder = Decoder(cfg)
+        # No expand/collapse projections needed — Recycled-AltUp uses
+        # replication for expand and sum for collapse (paper Section 4.1)
 
     def _rope(self, seq_len):
         head_dim = self.config.d_model // self.config.num_heads
         return precompute_rope_freqs(head_dim, seq_len, self.config.rope_theta)
+
+    def _altup_expand(self, x):
+        """Expand: replicate embedding N times (Recycled-AltUp, paper Section 4.1)."""
+        cfg = self.config
+        if cfg.altup_num_inputs <= 0:
+            return x
+        return jnp.broadcast_to(x[None], (cfg.altup_num_inputs, *x.shape))  # (N, B, T, d)
+
+    def _altup_collapse(self, x):
+        """Collapse N altup predictions back to single hidden state (element-wise sum, paper-style)."""
+        cfg = self.config
+        if cfg.altup_num_inputs <= 0:
+            return x
+        # Recycled-AltUp narrowing: sum all sub-blocks
+        return jnp.sum(x, axis=0) / cfg.altup_num_inputs  # (B, T, d)
 
     def encode_text(self, src, src_mask=None):
         x = self.embedding(src) * self.embed_scale
@@ -347,9 +442,11 @@ class EncoderDecoderTransformer(nn.Module):
     def decode(self, tgt, encoder_out, self_mask=None, cross_mask=None):
         x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
+        x = self._altup_expand(x)
         x = self.decoder(
             x, encoder_out, self_mask=self_mask, cross_mask=None, rope=rope
         )
+        x = self._altup_collapse(x)
         logits = x.astype(jnp.float32) @ self.embedding.embedding.T
         return logits
 
@@ -364,7 +461,9 @@ class EncoderDecoderTransformer(nn.Module):
         """Shared decode logic returning logits, slot_div, mrl_logits."""
         x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
+        x = self._altup_expand(x)
         x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=None, rope=rope)
+        x = self._altup_collapse(x)
         x_f32 = x.astype(jnp.float32)
         emb = self.embedding.embedding
         logits = x_f32 @ emb.T
