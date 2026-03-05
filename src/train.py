@@ -419,29 +419,35 @@ def _estimate_mrl_params(config, d_prime):
 
     Slicing rules (matching what an actual MRL export would produce):
       - Embedding:  [vocab, d_prime]  (first d_prime cols)
-      - Heads:      same head_dim, fewer heads → n_h = d_prime // head_dim
+      - Heads:      same d_head, fewer heads → n_h = d_prime // d_head
       - KV heads:   min(original, n_h)
       - FFN:        proportional  → d_ff' = d_ff * d_prime // d_model
       - Memory:     slots unchanged, but projections shrink with d / d_ff
+      - Laurel:     rank scales proportionally → r' = laurel_rank * d_prime // d_model
     """
     d = d_prime
     v = config.vocab_size
     n_enc = config.num_encoder_layers
     n_dec = config.num_decoder_layers
-    head_dim = config.d_model // config.num_heads
+    head_dim = config.d_head
     n_h = max(1, d // head_dim)
     n_kv = min(config.num_kv_heads, n_h)
     d_ff = config.d_ff * d // config.d_model
     m = config.num_memory_slots
 
     emb = v * d
+    d_attn = n_h * head_dim
     kv_dim = n_kv * head_dim
-    attn = d * d + d * kv_dim * 2 + d * d
+    attn = d * d_attn + d * kv_dim * 2 + d_attn * d
     ffn = d * d_ff * 3
     mixer_token = d * d_ff * 2 + d_ff * m
     mixer_channel = d * d_ff * 3
     enc_block = attn + ffn + mixer_token + mixer_channel
-    dec_block = attn * 2 + ffn
+    laurel_params = 0
+    if config.laurel_rank > 0:
+        r_prime = config.laurel_rank * d // config.d_model
+        laurel_params = 2 * d * r_prime
+    dec_block = attn * 2 + ffn + laurel_params
     total = emb + n_enc * enc_block + n_dec * dec_block
     return int(total)
 
@@ -544,6 +550,7 @@ def train(args):
             activation=getattr(args, "activation", "drelu"),
             num_memory_slots=getattr(args, "num_memory_slots", 64),
             n_mels=n_mels,
+            laurel_rank=getattr(args, "laurel_rank", 0),
         )
 
     global _GROUP_SIZE, _MRL_DIMS
@@ -593,6 +600,8 @@ def train(args):
     print(f"  Layers        {config.num_encoder_layers:>7} enc / {config.num_decoder_layers} dec")
     print(f"  Memory slots  {config.num_memory_slots:>12}")
     print(f"  Activation    {config.activation:>12}")
+    if config.laurel_rank > 0:
+        print(f"  Laurel rank   {config.laurel_rank:>12}")
     print(f"  Dtype         {config.dtype:>12}")
     if not no_speech:
         print(f"  Speech        every {speech_every} text steps")
@@ -883,7 +892,7 @@ def train(args):
             print(f"  ─────────────────────────────────────")
             print(f"  MRL exportable sub-models:")
             print(f"  {'dim':>6}  {'val ppl':>10}  {'params':>12}  {'heads':>5}")
-            head_dim = config.d_model // config.num_heads
+            head_dim = config.d_head
             print(f"  {config.d_model:>6}  {last_val_ppl:>10.2f}  {total_params:>12,}  {config.num_heads:>5}  (full)")
             for d_prime in sorted(mrl_results.keys(), reverse=True):
                 mrl_ppl, mrl_params = mrl_results[d_prime]

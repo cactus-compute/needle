@@ -45,6 +45,7 @@ class TransformerConfig:
     activation: str = "drelu"
     num_memory_slots: int = 64
     n_mels: int = 80
+    laurel_rank: int = 0
 
     @property
     def jax_dtype(self):
@@ -53,6 +54,14 @@ class TransformerConfig:
     @property
     def total_layers(self):
         return self.num_encoder_layers + self.num_decoder_layers
+
+    @property
+    def d_head(self):
+        return self.d_model // self.num_heads
+
+    @property
+    def d_attn(self):
+        return self.d_model
 
 
 def precompute_rope_freqs(head_dim, seq_len, theta=10000.0):
@@ -77,16 +86,18 @@ class MultiHeadAttention(nn.Module):
     num_kv_heads: int
     d_model: int
     num_layers: int
+    d_head: int = 0  # 0 = auto (d_model // num_heads)
     dtype: jnp.dtype = jnp.bfloat16
     rope_keys_only: bool = False
 
     @nn.compact
     def __call__(self, q_input, kv_input, mask=None, rope=None):
-        head_dim = self.d_model // self.num_heads
+        head_dim = self.d_head if self.d_head > 0 else self.d_model // self.num_heads
+        d_attn = self.num_heads * head_dim
         kv_dim = self.num_kv_heads * head_dim
         B = q_input.shape[0]
 
-        q = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="q_proj")(q_input)
+        q = nn.Dense(d_attn, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="q_proj")(q_input)
         k = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="k_proj")(kv_input)
         v = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="v_proj")(kv_input)
 
@@ -117,7 +128,7 @@ class MultiHeadAttention(nn.Module):
         attn_weights = nn.softmax(attn_weights, axis=-1)
 
         out = jnp.matmul(attn_weights, v)
-        out = out.transpose(0, 2, 1, 3).reshape(B, -1, self.d_model)
+        out = out.transpose(0, 2, 1, 3).reshape(B, -1, d_attn)
         return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="out_proj")(out)
 
 
@@ -139,6 +150,22 @@ class FeedForward(nn.Module):
         else:  # drelu
             x = nn.relu(gate) * nn.relu(up)
         return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="down_proj")(x)
+
+
+class LaurelBlock(nn.Module):
+    """Learned Augmented Residual Layer: low-rank bottleneck parallel to attention."""
+    d_model: int
+    rank: int
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, x):
+        h = nn.Dense(self.rank, dtype=self.dtype, use_bias=False,
+                     kernel_init=default_init(), name="down")(x)
+        h = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False,
+                     kernel_init=jinit.zeros, name="up")(h)
+        h = ZCRMSNorm(dtype=self.dtype, name="norm")(h)
+        return h
 
 
 class MLPMixer(nn.Module):
@@ -190,6 +217,8 @@ class MemoryMixerBlock(nn.Module):
     d_ff: int
     num_slots: int
     num_layers: int
+    d_head: int = 0
+    laurel_rank: int = 0
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
 
@@ -197,10 +226,15 @@ class MemoryMixerBlock(nn.Module):
     def __call__(self, x, s, mask=None, rope=None):
         s_norm = ZCRMSNorm(dtype=self.dtype, name="pack_s_norm")(s)
         x_norm = ZCRMSNorm(dtype=self.dtype, name="pack_x_norm")(x)
-        s = s + MultiHeadAttention(
-            self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype,
+        attn_out = MultiHeadAttention(
+            self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.d_head, self.dtype,
             rope_keys_only=True, name="pack_attn"
         )(s_norm, x_norm, mask=mask, rope=rope)
+        if self.laurel_rank > 0:
+            laurel_out = LaurelBlock(self.d_model, self.laurel_rank, self.dtype, name="laurel")(s_norm)
+            s = s + (attn_out + laurel_out) * (1.0 / math.sqrt(2))
+        else:
+            s = s + attn_out
 
         s = s + MLPMixer(self.num_slots, self.d_model, self.d_ff, self.dtype, self.activation, name="mixer")(
             ZCRMSNorm(dtype=self.dtype, name="mix_norm")(s)
@@ -245,7 +279,7 @@ class MemoryMixerEncoder(nn.Module):
         for i in range(cfg.num_encoder_layers):
             x, s = nn.remat(MemoryMixerBlock)(
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
-                cfg.num_memory_slots, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
+                cfg.num_memory_slots, cfg.total_layers, cfg.d_head, cfg.laurel_rank, dt, cfg.activation, name=f"block_{i}"
             )(x, s, mask=mask, rope=rope)
 
         s = ZCRMSNorm(dtype=dt, name="final_norm")(s)
@@ -258,23 +292,29 @@ class DecoderBlock(nn.Module):
     d_model: int
     d_ff: int
     num_layers: int
+    d_head: int = 0
+    laurel_rank: int = 0
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
 
     @nn.compact
     def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None):
         residual = x
-        x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
-            x, x, mask=self_mask, rope=rope
-        )
-        x = x + residual
+        x_norm = ZCRMSNorm(dtype=self.dtype)(x)
+        attn_out = MultiHeadAttention(
+            self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.d_head, self.dtype, name="self_attn"
+        )(x_norm, x_norm, mask=self_mask, rope=rope)
+        if self.laurel_rank > 0:
+            laurel_out = LaurelBlock(self.d_model, self.laurel_rank, self.dtype, name="laurel")(x_norm)
+            x = residual + (attn_out + laurel_out) * (1.0 / math.sqrt(2))
+        else:
+            x = residual + attn_out
 
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="cross_attn")(
-            x, encoder_out, mask=cross_mask
-        )
+        x = MultiHeadAttention(
+            self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.d_head, self.dtype, name="cross_attn"
+        )(x, encoder_out, mask=cross_mask)
         x = x + residual
 
         residual = x
@@ -297,7 +337,8 @@ class Decoder(nn.Module):
 
         for i in range(cfg.num_decoder_layers):
             x = nn.remat(DecoderBlock)(
-                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
+                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers,
+                cfg.d_head, cfg.laurel_rank, dt, cfg.activation, name=f"block_{i}"
             )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope)
 
         x = ZCRMSNorm(dtype=dt)(x)
@@ -327,8 +368,7 @@ class EncoderDecoderTransformer(nn.Module):
         self.decoder = Decoder(self.config)
 
     def _rope(self, seq_len):
-        head_dim = self.config.d_model // self.config.num_heads
-        return precompute_rope_freqs(head_dim, seq_len, self.config.rope_theta)
+        return precompute_rope_freqs(self.config.d_head, seq_len, self.config.rope_theta)
 
     def encode_text(self, src, src_mask=None):
         x = self.embedding(src) * self.embed_scale

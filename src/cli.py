@@ -41,6 +41,7 @@ HELP = """
   │     --max-mel-len INT       Max mel frames (default: 1024)        │
   │     --n-mels INT            Mel frequency bins (default: 80)      │
   │     --max-speech-samples INT  Max LibriSpeech samples             │
+  │     --laurel-rank INT       Laurel low-rank dim (0=off, def: 0)  │
   │                                                                   │
   │   run                                                             │
   │     --checkpoint PATH       Path to model checkpoint (required)   │
@@ -129,6 +130,8 @@ def main():
                    help="Number of mel frequency bins (default: 80)")
     p.add_argument("--max-speech-samples", type=int, default=None,
                    help="Max LibriSpeech training samples (default: all)")
+    p.add_argument("--laurel-rank", type=int, default=0,
+                   help="Laurel low-rank bottleneck dim (0=disabled, default: 0)")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)

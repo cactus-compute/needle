@@ -34,16 +34,29 @@ def export_submodel(checkpoint_path, d_prime, output_path):
     d_ff_prime = config.d_ff * d_prime // config.d_model
     kv_dim = config.num_kv_heads * head_dim
     kv_dim_prime = n_kv * head_dim
+    laurel_rank = config.laurel_rank
+    laurel_rank_prime = laurel_rank * d_prime // config.d_model if laurel_rank > 0 else 0
 
     d_model = config.d_model
     d_ff = config.d_ff
+    d_attn = config.d_attn
+    d_attn_prime = n_h * head_dim
 
     def slice_leaf(key_path, leaf):
         arr = np.asarray(leaf)
 
         if arr.ndim == 1:
-            # Norm scales: shape (d_model,)
-            return arr[:d_prime]
+            # Norm scales: shape (d_model,) or (d_attn,) or (laurel_rank,)
+            size = arr.shape[0]
+            def _target_1d(s):
+                if s == d_model:
+                    return d_prime
+                if s == d_attn:
+                    return d_attn_prime
+                if s == laurel_rank and laurel_rank > 0:
+                    return laurel_rank_prime
+                return s
+            return arr[:_target_1d(size)]
 
         if arr.ndim == 3:
             # Memory slots: shape (1, M, d_model)
@@ -55,10 +68,14 @@ def export_submodel(checkpoint_path, d_prime, output_path):
             def _target(size):
                 if size == d_model:
                     return d_prime
+                if size == d_attn:
+                    return d_attn_prime
                 if size == d_ff:
                     return d_ff_prime
                 if size == kv_dim:
                     return kv_dim_prime
+                if size == laurel_rank and laurel_rank > 0:
+                    return laurel_rank_prime
                 return size  # vocab, num_memory_slots, etc.
 
             r = _target(rows)
@@ -76,6 +93,7 @@ def export_submodel(checkpoint_path, d_prime, output_path):
         d_ff=d_ff_prime,
         num_heads=n_h,
         num_kv_heads=n_kv,
+        laurel_rank=laurel_rank_prime,
     )
 
     # Convert any JAX arrays to numpy for pickling
