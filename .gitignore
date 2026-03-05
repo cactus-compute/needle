@@ -89,3 +89,6 @@ checkpoints/
 wandb/
 .data_cache/
 tokenizer/
+hf_gemma3n/
+NARVL/
+*.sh

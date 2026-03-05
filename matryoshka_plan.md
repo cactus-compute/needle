@@ -85,3 +85,50 @@ Replace the current static MRL weight-slicing approach with **learned per-dimens
 ### H7: Combined: prefix init + no warmup + slow tau
 **Rationale:** Start with prefix-matching masks (smooth), no wasted warmup steps, slow annealing for gradual deviation. Maximizes both MRL training steps and exploration time.
 **Config:** `--mrl-init-mode prefix --mrl-warmup-frac 0.0 --mrl-tau-start 1.0 --mrl-tau-end 0.2`
+
+---
+
+## Experiment Results (Full Scale: 75.6M params, 7358 steps)
+
+### Summary Table (seed 42)
+
+| Dim | Slice | TopK Exp1 | H7 | H8 | H9 | **H10** | H11 | H12 |
+|-----|-------|-----------|------|------|------|---------|------|------|
+| 512 | 4.49 | 4.44 | 4.43 | 4.41 | 4.42 | **4.42** | 4.52 | 4.58 |
+| 256 | 4.50 | 4.58 | 4.55 | 4.60 | 4.58 | **4.45** | 4.54 | 4.61 |
+| 128 | 4.57 | 4.96 | 4.77 | 4.87 | 4.81 | **4.55** | 4.64 | 4.72 |
+| 64 | 4.82 | 5.52 | 5.28 | 5.35 | 5.36 | **4.83** | 4.90 | 4.99 |
+
+### Experiment Details
+
+| ID | Warmup | Init | tau | freeze | mask_lr | spread | Notes |
+|----|--------|------|-----|--------|---------|--------|-------|
+| Exp1 | 15% | normal | 0.5→0.1 | 20% | 1e-3 | 0.01 | First attempt, all defaults |
+| H7 | 0% | prefix | 1.0→0.2 | 20% | 3e-3 | 0.01 | No warmup + prefix init |
+| H8 | 0% | prefix | 2.0→0.1 | 10% | 1e-2 | 0.01 | Too aggressive LR, negative loss |
+| H9 | 0% | prefix | 1.0→0.2 | 15% | 5e-3 | 0.005 | Slightly worse than H7 |
+| **H10** | **0%** | **prefix** | **1.0→0.2** | **60%** | **3e-3** | **0.01** | **Best: matches slice** |
+| H11 | 0% | prefix | 1.0→0.2 | 70% | 3e-3 | 0.01 | Too little learning time |
+| H12 | 0% | normal | 1.0→0.2 | 60% | 3e-3 | 0.01 | Random init worse than prefix |
+
+### Cross-Seed Validation (H10 config)
+
+| Dim | Slice s42 | TopK s42 | Slice s123 | TopK s123 |
+|-----|-----------|----------|------------|-----------|
+| 512 | 4.49 | **4.42** | 4.48 | **4.45** |
+| 256 | 4.50 | **4.45** | **4.49** | **4.49** |
+| 128 | 4.57 | **4.55** | **4.56** | 4.58 |
+| 64 | **4.82** | 4.83 | **4.81** | 4.86 |
+
+**Conclusion:** TopK H10 achieves **parity with slice** on average. The key hyperparameter is `--mrl-freeze-frac 0.6` — a long freeze phase gives the model time to fully adapt to the locked hard masks, mimicking slice's stability advantage. Prefix init provides a smooth starting point. Slow tau annealing (1.0→0.2) allows gradual exploration before freezing.
+
+### Best TopK Config (H10)
+```bash
+needle train --mrl-method topk \
+    --mrl-init-mode prefix \
+    --mrl-warmup-frac 0.0 \
+    --mrl-tau-start 1.0 --mrl-tau-end 0.2 \
+    --mrl-freeze-frac 0.6 \
+    --mrl-mask-lr 0.003 \
+    --mrl-spread-lambda 0.01
+```
