@@ -572,6 +572,7 @@ def train(args):
     muon_lr = getattr(args, "muon_lr", 0.02) * math.sqrt(num_devices)
     state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps)
     val_loss_fn = _make_val_loss_fn(state.apply_fn)
+    speech_vl_fn = _make_speech_val_loss_fn(state.apply_fn) if not no_speech else None
 
     if resume_checkpoint:
         state = state.replace(params=ckpt_params)
@@ -785,6 +786,16 @@ def train(args):
             total_toks += float(vt)
         last_val_ppl = float(math.exp(total_loss / max(total_toks, 1)))
 
+        speech_val_ppl = None
+        if speech_vl_fn is not None and val_speech_mel is not None:
+            sp_total_loss, sp_total_toks = 0.0, 0.0
+            for sp_batch in get_speech_batches(val_speech_mel, val_speech_dec_in, val_speech_dec_tgt, args.batch_size, shuffle=False):
+                vl, vt = speech_vl_fn(eval_params, sp_batch[0], sp_batch[1], sp_batch[2], val_causal)
+                sp_total_loss += float(vl)
+                sp_total_toks += float(vt)
+            speech_val_loss = sp_total_loss / max(sp_total_toks, 1)
+            speech_val_ppl = float(math.exp(min(speech_val_loss, 20)))
+
         q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE)
         q_total_loss, q_total_toks = 0.0, 0.0
         for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
@@ -864,6 +875,8 @@ def train(args):
             print(f"  Speech WER     {speech_wer:>12.4f}")
             epoch_avg_speech = sum(speech_losses) / len(speech_losses) if speech_losses else float("nan")
             print(f"  Avg speech loss{epoch_avg_speech:>12.4f}")
+        if speech_val_ppl is not None:
+            print(f"  Speech val ppl {speech_val_ppl:>12.2f}")
         print(f"  Quant val ppl  {quant_val_ppl:>12.2f}  (INT4 g{_GROUP_SIZE})")
         print(f"  Sparsity       {sparsity:>11.2f}%  ({near_zero:,}/{total_params:,})")
         if mrl_results:
@@ -908,6 +921,8 @@ def train(args):
                 log_dict["epoch/speech_wer"] = speech_wer
             if speech_losses:
                 log_dict["epoch/avg_speech_loss"] = sum(speech_losses) / len(speech_losses)
+            if speech_val_ppl is not None:
+                log_dict["epoch/speech_val_ppl"] = speech_val_ppl
             for d_prime, (mrl_ppl, mrl_params) in mrl_results.items():
                 log_dict[f"epoch/mrl_ppl_d{d_prime}"] = mrl_ppl
                 log_dict[f"epoch/mrl_params_d{d_prime}"] = mrl_params
