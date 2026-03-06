@@ -20,7 +20,9 @@ audio + metadata manifests to a Google Cloud Storage bucket.
     - transcript
     - language
     - duration
-    - timestamps (`start_s`, `end_s`, optional `segments`)
+    - timestamps (`start_s`, `end_s`, `segments`)
+      - if source segments are missing, collector writes approximate transcript chunks
+        distributed across clip duration
     - `gcs_audio_uri`
     - `gcs_mel_uri` (if mel storage enabled)
     - `gcs_metadata_csv_uri` (one CSV file per audio sample)

@@ -417,11 +417,75 @@ def _extract_timestamps(normalized: dict[str, Any]) -> dict[str, Any]:
             raw, ("segments", "timestamps", "word_timestamps", "words")
         )
 
+    if segments is None and start is not None and end is not None:
+        segments = _fallback_transcript_segments(
+            transcript=normalized.get("transcript"),
+            start_s=float(start),
+            end_s=float(end),
+        )
+
     return {
         "start_s": start,
         "end_s": end,
         "segments": _json_safe(segments),
     }
+
+
+def _fallback_transcript_segments(
+    transcript: str | None, start_s: float, end_s: float
+) -> list[dict[str, Any]]:
+    """Create approximate segment timestamps from transcript text.
+
+    This is only used when source datasets don't provide segment-level timing.
+    """
+    text = (transcript or "").strip()
+    if not text:
+        return [{"start_s": start_s, "end_s": end_s, "text": None}]
+
+    # Split by punctuation first.
+    chunks = [c.strip() for c in re.split(r"(?<=[\.\!\?;,:])\s+", text) if c.strip()]
+    if not chunks:
+        chunks = [text]
+
+    # Further split very long chunks into smaller word groups.
+    refined: list[str] = []
+    for chunk in chunks:
+        words = chunk.split()
+        if len(words) > 18:
+            step = 8
+            for i in range(0, len(words), step):
+                piece = " ".join(words[i : i + step]).strip()
+                if piece:
+                    refined.append(piece)
+        else:
+            refined.append(chunk)
+    chunks = refined or [text]
+
+    total_dur = max(0.0, float(end_s) - float(start_s))
+    if total_dur <= 0 or len(chunks) == 1:
+        return [{"start_s": start_s, "end_s": end_s, "text": " ".join(chunks)}]
+
+    weights = [max(1, len(c)) for c in chunks]
+    total_w = float(sum(weights))
+    current = float(start_s)
+    out: list[dict[str, Any]] = []
+
+    for i, (chunk, w) in enumerate(zip(chunks, weights)):
+        if i == len(chunks) - 1:
+            nxt = float(end_s)
+        else:
+            nxt = current + total_dur * (float(w) / total_w)
+        out.append(
+            {
+                "start_s": round(current, 3),
+                "end_s": round(nxt, 3),
+                "text": chunk,
+            }
+        )
+        current = nxt
+
+    out[-1]["end_s"] = round(float(end_s), 3)
+    return out
 
 
 def _record_to_csv_row(record: dict[str, Any]) -> dict[str, Any]:
@@ -812,6 +876,27 @@ def _iter_dataset_to_gcs(
 
             bytes_uploaded += int(audio_info.get("num_bytes", 0))
             duration_s = normalized.get("duration_s")
+            decoded_audio = None
+            decoded_sr = None
+            if duration_s is None or mel_cfg.enabled:
+                try:
+                    decoded_audio, decoded_sr = _decode_audio_for_mel(
+                        normalized["audio_field"], mel_cfg.sample_rate
+                    )
+                except Exception as exc:
+                    if duration_s is None:
+                        LOGGER.warning(
+                            "Failed audio decode for duration idx=%s (%s/%s): %s",
+                            idx,
+                            dataset_split.logical_name,
+                            dataset_split.split,
+                            exc,
+                        )
+
+            if duration_s is None and decoded_audio is not None and decoded_sr:
+                duration_s = float(len(decoded_audio)) / float(decoded_sr)
+                normalized["duration_s"] = duration_s
+
             if duration_s is not None:
                 durations_found += 1
                 duration_total += float(duration_s)
@@ -821,10 +906,11 @@ def _iter_dataset_to_gcs(
             mel_info = None
             if mel_cfg.enabled:
                 try:
-                    audio_arr, _ = _decode_audio_for_mel(
-                        normalized["audio_field"], mel_cfg.sample_rate
-                    )
-                    mel = _compute_mel_spectrogram(audio_arr, mel_cfg)
+                    if decoded_audio is None:
+                        decoded_audio, _ = _decode_audio_for_mel(
+                            normalized["audio_field"], mel_cfg.sample_rate
+                        )
+                    mel = _compute_mel_spectrogram(decoded_audio, mel_cfg)
                     mel_ext = "npz" if mel_cfg.file_format == "npz" else "npy"
                     mel_blob_path = (
                         f"{prefix}/{dataset_split.logical_name}/{dataset_split.split}/mel/{item_id}.{mel_ext}"
