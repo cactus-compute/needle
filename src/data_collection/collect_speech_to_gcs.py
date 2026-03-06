@@ -123,12 +123,14 @@ class ManifestWriter:
         dataset_name: str,
         split: str,
         shard_size: int,
+        shard_namespace: str | None = None,
     ) -> None:
         self.bucket = bucket
         self.bucket_prefix = bucket_prefix.strip("/")
         self.dataset_name = dataset_name
         self.split = split
         self.shard_size = max(1, shard_size)
+        self.shard_namespace = shard_namespace.strip("/") if shard_namespace else None
 
         self._tmp_dir = tempfile.TemporaryDirectory(prefix="manifest_")
         self._file = None
@@ -153,9 +155,11 @@ class ManifestWriter:
             return
         self._file.close()
         filename = os.path.basename(self._path)
-        blob_path = (
-            f"{self.bucket_prefix}/{self.dataset_name}/{self.split}/manifests/{filename}"
-        )
+        base_path = f"{self.bucket_prefix}/{self.dataset_name}/{self.split}/manifests"
+        if self.shard_namespace:
+            blob_path = f"{base_path}/{self.shard_namespace}/{filename}"
+        else:
+            blob_path = f"{base_path}/{filename}"
         self.bucket.blob(blob_path).upload_from_filename(
             self._path, content_type="application/gzip"
         )
@@ -803,6 +807,73 @@ def _load_split(dataset_split: DatasetSplit, hf_token: str | None):
     return ds
 
 
+def _shard_namespace(shard_index: int, shard_count: int) -> str:
+    return f"shard-{shard_index:05d}-of-{shard_count:05d}"
+
+
+def _maybe_apply_worker_shard(
+    ds: Any,
+    dataset_split: DatasetSplit,
+    shard_count: int,
+    shard_index: int,
+    shard_contiguous: bool,
+) -> tuple[Any | None, int]:
+    """Apply deterministic worker sharding to iterable datasets.
+
+    Returns:
+        tuple[dataset_or_none, effective_shard_count]
+        - dataset_or_none is None when this worker has no shards for this split.
+    """
+    if shard_count <= 1:
+        return ds, 1
+
+    dataset_shards = getattr(ds, "num_shards", None)
+    if not isinstance(dataset_shards, int) or dataset_shards < 1:
+        if not hasattr(ds, "shard"):
+            raise ValueError(
+                f"Cannot shard dataset {dataset_split.logical_name}/{dataset_split.split}: "
+                "dataset does not expose shard() or num_shards."
+            )
+        return (
+            ds.shard(
+                num_shards=shard_count,
+                index=shard_index,
+                contiguous=shard_contiguous,
+            ),
+            shard_count,
+        )
+
+    effective_count = min(int(shard_count), int(dataset_shards))
+    if effective_count != shard_count:
+        LOGGER.warning(
+            "Requested --shard-count=%s for %s/%s but source has %s shards; clamping to %s.",
+            shard_count,
+            dataset_split.logical_name,
+            dataset_split.split,
+            dataset_shards,
+            effective_count,
+        )
+
+    if shard_index >= effective_count:
+        LOGGER.info(
+            "No work for worker shard-index=%s on %s/%s (effective shard count=%s).",
+            shard_index,
+            dataset_split.logical_name,
+            dataset_split.split,
+            effective_count,
+        )
+        return None, effective_count
+
+    return (
+        ds.shard(
+            num_shards=effective_count,
+            index=shard_index,
+            contiguous=shard_contiguous,
+        ),
+        effective_count,
+    )
+
+
 def _iter_dataset_to_gcs(
     bucket: storage.Bucket,
     dataset_split: DatasetSplit,
@@ -812,9 +883,77 @@ def _iter_dataset_to_gcs(
     log_every: int,
     hf_token: str | None,
     mel_cfg: MelConfig,
+    worker_shard_count: int,
+    worker_shard_index: int,
+    worker_shard_contiguous: bool,
 ) -> dict[str, Any]:
     start = time.time()
     ds = _load_split(dataset_split, hf_token=hf_token)
+    ds, effective_shard_count = _maybe_apply_worker_shard(
+        ds=ds,
+        dataset_split=dataset_split,
+        shard_count=worker_shard_count,
+        shard_index=worker_shard_index,
+        shard_contiguous=worker_shard_contiguous,
+    )
+    shard_namespace = (
+        _shard_namespace(worker_shard_index, effective_shard_count)
+        if effective_shard_count > 1
+        else None
+    )
+
+    if ds is None:
+        elapsed_s = max(0.001, time.time() - start)
+        summary = {
+            "dataset": dataset_split.logical_name,
+            "hf_dataset": dataset_split.hf_dataset,
+            "hf_config": dataset_split.hf_config,
+            "split": dataset_split.split,
+            "streaming": dataset_split.streaming,
+            "worker_shard_count_requested": worker_shard_count,
+            "worker_shard_count_effective": effective_shard_count,
+            "worker_shard_index": worker_shard_index,
+            "worker_shard_contiguous": worker_shard_contiguous,
+            "worker_shard_namespace": shard_namespace,
+            "num_uploaded": 0,
+            "num_failed": 0,
+            "bytes_uploaded": 0,
+            "bytes_uploaded_gb": 0.0,
+            "duration_s_total": 0.0,
+            "duration_h_total": 0.0,
+            "duration_s_counted_items": 0,
+            "mel_enabled": mel_cfg.enabled,
+            "mel_preset": mel_cfg.preset,
+            "mel_bins": mel_cfg.n_mels,
+            "mel_uploaded": 0,
+            "mel_failed": 0,
+            "mel_bytes": 0,
+            "mel_bytes_gb": 0.0,
+            "metadata_csv_prefix": (
+                f"gs://{bucket.name}/{prefix}/{dataset_split.logical_name}/{dataset_split.split}/metadata_csv/"
+            ),
+            "metadata_csv_uploaded": 0,
+            "metadata_csv_failed": 0,
+            "metadata_csv_bytes": 0,
+            "metadata_csv_bytes_gb": 0.0,
+            "elapsed_s": round(elapsed_s, 3),
+            "items_per_s": 0.0,
+            "manifest_uris": [],
+            "bucket": bucket.name,
+            "prefix": prefix,
+            "worker_has_data": False,
+        }
+        if shard_namespace:
+            summary_blob = (
+                f"{prefix}/{dataset_split.logical_name}/{dataset_split.split}/summary/{shard_namespace}.json"
+            )
+        else:
+            summary_blob = (
+                f"{prefix}/{dataset_split.logical_name}/{dataset_split.split}/summary.json"
+            )
+        summary_uri = _upload_json(bucket, summary_blob, summary)
+        summary["summary_uri"] = summary_uri
+        return summary
 
     writer = ManifestWriter(
         bucket=bucket,
@@ -822,6 +961,7 @@ def _iter_dataset_to_gcs(
         dataset_name=dataset_split.logical_name,
         split=dataset_split.split,
         shard_size=manifest_shard_size,
+        shard_namespace=shard_namespace,
     )
 
     uploaded = 0
@@ -851,7 +991,10 @@ def _iter_dataset_to_gcs(
                 f"{normalized.get('transcript') or ''}"
             )
             source_id = _sanitize_id(normalized["source_id"], fallback_seed=fallback_seed)
-            item_id = f"{source_id}-{idx:09d}"
+            if effective_shard_count > 1:
+                item_id = f"{source_id}-w{worker_shard_index:05d}-{idx:09d}"
+            else:
+                item_id = f"{source_id}-{idx:09d}"
             audio_ext = _audio_field_ext_hint(
                 normalized["audio_field"], normalized["preferred_ext"]
             )
@@ -1005,6 +1148,11 @@ def _iter_dataset_to_gcs(
         "hf_config": dataset_split.hf_config,
         "split": dataset_split.split,
         "streaming": dataset_split.streaming,
+        "worker_shard_count_requested": worker_shard_count,
+        "worker_shard_count_effective": effective_shard_count,
+        "worker_shard_index": worker_shard_index,
+        "worker_shard_contiguous": worker_shard_contiguous,
+        "worker_shard_namespace": shard_namespace,
         "num_uploaded": uploaded,
         "num_failed": failed,
         "bytes_uploaded": bytes_uploaded,
@@ -1029,11 +1177,17 @@ def _iter_dataset_to_gcs(
         "manifest_uris": writer.manifest_uris,
         "bucket": bucket.name,
         "prefix": prefix,
+        "worker_has_data": True,
     }
 
-    summary_blob = (
-        f"{prefix}/{dataset_split.logical_name}/{dataset_split.split}/summary.json"
-    )
+    if shard_namespace:
+        summary_blob = (
+            f"{prefix}/{dataset_split.logical_name}/{dataset_split.split}/summary/{shard_namespace}.json"
+        )
+    else:
+        summary_blob = (
+            f"{prefix}/{dataset_split.logical_name}/{dataset_split.split}/summary.json"
+        )
     summary_uri = _upload_json(bucket, summary_blob, summary)
     summary["summary_uri"] = summary_uri
     return summary
@@ -1236,6 +1390,30 @@ def parse_args() -> argparse.Namespace:
         choices=["float16", "float32"],
         help="Stored dtype for mel arrays",
     )
+    parser.add_argument(
+        "--shard-count",
+        type=int,
+        default=1,
+        help=(
+            "Total number of workers for split-level sharding. "
+            "Each worker should use the same value."
+        ),
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="Zero-based worker index in [0, shard-count).",
+    )
+    parser.add_argument(
+        "--shard-contiguous",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use contiguous shard assignment (default: true). "
+            "Set --no-shard-contiguous for round-robin assignment."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1245,6 +1423,12 @@ def main() -> None:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if args.shard_count < 1:
+        raise SystemExit("--shard-count must be >= 1")
+    if args.shard_index < 0:
+        raise SystemExit("--shard-index must be >= 0")
+    if args.shard_index >= args.shard_count:
+        raise SystemExit("--shard-index must be < --shard-count")
 
     client = storage.Client(project=args.project) if args.project else storage.Client()
     bucket = client.bucket(args.bucket)
@@ -1259,6 +1443,12 @@ def main() -> None:
         len(work_items),
         args.bucket,
         args.prefix.strip("/"),
+    )
+    LOGGER.info(
+        "Worker shard config: shard_count=%s shard_index=%s contiguous=%s",
+        args.shard_count,
+        args.shard_index,
+        args.shard_contiguous,
     )
     LOGGER.info(
         "Mel config: enabled=%s preset=%s n_mels=%s sample_rate=%s n_fft=%s hop=%s win=%s format=%s dtype=%s",
@@ -1291,6 +1481,9 @@ def main() -> None:
             log_every=max(1, args.log_every),
             hf_token=args.hf_token,
             mel_cfg=mel_cfg,
+            worker_shard_count=args.shard_count,
+            worker_shard_index=args.shard_index,
+            worker_shard_contiguous=args.shard_contiguous,
         )
         summaries.append(summary)
         LOGGER.info(
@@ -1307,6 +1500,11 @@ def main() -> None:
         "bucket": args.bucket,
         "prefix": args.prefix.strip("/"),
         "completed_items": len(summaries),
+        "worker_shard_config": {
+            "shard_count": args.shard_count,
+            "shard_index": args.shard_index,
+            "shard_contiguous": args.shard_contiguous,
+        },
         "mel_config": {
             "enabled": mel_cfg.enabled,
             "preset": mel_cfg.preset,
