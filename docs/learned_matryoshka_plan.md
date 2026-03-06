@@ -126,15 +126,39 @@ Based on the ablations, the optimal single-variable changes from default are:
 
 A combined run with tau 2.0→0.3 + lr 1e-3 could potentially close the gap to prefix baseline further.
 
+### C1-C5: Hyperparameter Combinations
+
+All use combined best base: tau 2.0→0.3 + lr 1e-3 + freeze 0.6 + shuffled_prefix init.
+
+| Width | d_ff | C1 (base) | C2 (f=0.7) | C3 (f=0.5) | **C4 (λ=0)** | C5 (λ=0.005) |
+|-------|------|-----------|------------|------------|--------------|--------------|
+| Full | 2048 | 5.03 | 5.10 | 4.99 | **4.82** | 5.03 |
+| 256 | 1024 | 5.10 | 5.13 | 5.03 | **4.84** | 5.06 |
+| 128 | 512 | 5.23 | 5.24 | 5.14 | **4.96** | 5.19 |
+| 64 | 256 | 5.40 | 5.42 | 5.32 | **5.12** | 5.35 |
+
+**Key finding: Removing the spread penalty (C4, λ=0) is the single biggest improvement.** C4 achieves 4.82 full / 5.12 d=64, beating all previous single-epoch topk runs and approaching the prefix baseline (4.66 / 4.80). The spread penalty was actively hurting — it pushes logits apart but interferes with the tau annealing schedule.
+
+C1 (combined best with default spread) underperforms the individual E3/E4 ablations — the combination doesn't stack. This is because the spread penalty (λ=0.01) interacts poorly with tau 2.0→0.3.
+
+Freeze=0.5 (C3) beats 0.6 (C1) and 0.7 (C2) when combined with slow tau, suggesting the softer tau schedule benefits from more learning time.
+
+### Summary: Best Overall Single-Epoch TopK Config
+
+| Width | d_ff | Prefix Baseline | Best TopK (C4) | Gap |
+|-------|------|-----------------|----------------|-----|
+| Full | 2048 | **4.66** | 4.82 | +0.16 |
+| 256 | 1024 | **4.66** | 4.84 | +0.18 |
+| 128 | 512 | **4.68** | 4.96 | +0.28 |
+| 64 | 256 | **4.80** | 5.12 | +0.32 |
+
+Best topk config: `--mrl-tau-start 2.0 --mrl-tau-end 0.3 --mrl-freeze-frac 0.6 --mrl-mask-lr 0.001 --mrl-spread-lambda 0.0`
+
+TopK is still ~0.16-0.32 behind prefix at 1 epoch, but 2-epoch topk (E5: 4.55 d=64) already beats 1-epoch prefix (4.80 d=64).
+
+---
+
 ## Experiments Still Needed
-
-### Hyperparameter Combinations (1 epoch each)
-
-1. **Combined best**: tau 2.0→0.3 + lr 1e-3 + freeze 0.6 — stack the two best single-variable winners
-2. **Combined best + freeze 0.7**: tau 2.0→0.3 shifts more learning into early steps, so longer freeze may now work
-3. **Combined best + freeze 0.5**: test the other direction
-4. **No spread penalty**: combined best config but λ=0 — spread penalty may hurt with softer tau
-5. **Lower spread**: combined best but λ=0.005 — half the current penalty
 
 ### Saliency Initialization
 
@@ -145,21 +169,26 @@ Saliency init uses a **10% warmup phase** (full-model-only, no MRL) to accumulat
 - Low scale (e.g., 0.5): weak prior — all neurons start near the sigmoid boundary, optimizer has full freedom. Saliency just provides a slight bias.
 - The conversion: `logits[j] = scale * (1 - 2 * rank[j] / (d_ff - 1))` where `rank[j]` is the saliency rank (0 = most important).
 
-6. **Saliency init (scale=1.0)**: 10% warmup, 50% freeze, tau 2.0→0.3, lr 1e-3, saliency-scale 1.0. Baseline saliency config.
-7. **Saliency init (scale=0.5)**: Same but weaker prior — more optimizer freedom.
-8. **Saliency init (scale=2.0)**: Same but stronger prior — trust the saliency ranking more.
-9. **Saliency init + no freeze**: Saliency scale=1.0 but freeze=0.0 — test if saliency-initialized masks are good enough to stay soft throughout.
-10. **Saliency init + 60% freeze**: Saliency scale=1.0 but freeze=0.6 — compare against the 50% default.
-11. **Saliency vs shuffled at 2 epochs**: Both with combined best config. Does the saliency advantage persist or wash out?
+1. **Saliency init (scale=1.0)**: 10% warmup, 50% freeze, tau 2.0→0.3, lr 1e-3, λ=0, saliency-scale 1.0
+2. **Saliency init (scale=0.5)**: Same but weaker prior
+3. **Saliency init (scale=2.0)**: Same but stronger prior
+4. **Saliency init + no freeze**: Saliency scale=1.0 but freeze=0.0
+5. **Saliency init + 60% freeze**: Saliency scale=1.0 but freeze=0.6
+6. **Saliency vs shuffled at 2 epochs**: Both with C4 config. Does the saliency advantage persist?
+
+### Additional Experiments
+
+7. **C4 config at 2 epochs**: The best single-epoch config (tau 2.0→0.3, lr 1e-3, λ=0) may close the gap further
+8. **C4 config + freeze=0.5**: Since C3 suggested f=0.5 helps with slow tau, try it without spread penalty too
 
 ### Export Verification
 
-12. **Export correctness**: For a topk-trained checkpoint, extract the learned hard masks, gather the active FFN neuron indices, and slice gate_proj/up_proj/down_proj to produce a smaller model. Verify:
+9. **Export correctness**: For a topk-trained checkpoint, extract the learned hard masks, gather the active FFN neuron indices, and slice gate_proj/up_proj/down_proj to produce a smaller model. Verify:
     - Exported model loads and runs inference without errors
     - Exported model's PPL matches the eval-time masked PPL (should be identical)
     - Exported model size matches `_estimate_mrl_params` predictions
     - Export works for all 3 MRL dims (256, 128, 64)
-13. **Export + quantization**: Verify INT4 quantization works on exported sub-models (smaller d_ff may interact with group_size=32 alignment)
+10. **Export + quantization**: Verify INT4 quantization works on exported sub-models (smaller d_ff may interact with group_size=32 alignment)
 
 ## Historical Notes
 
