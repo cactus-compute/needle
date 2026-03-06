@@ -114,7 +114,7 @@ def transcribe(model, params, tokenizer, audio_array, sr=16000, max_gen_len=128,
 
     src_mask = make_mel_padding_mask(mel_input)
     encoder_out = model.apply(
-        {"params": params}, mel_input, src_mask=src_mask, method="encode_speech"
+        {"params": params}, mel_input, src_mask=src_mask, deterministic=True, method="encode_speech"
     )
 
     tgt_mask = make_causal_mask(max_gen_len)
