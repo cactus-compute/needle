@@ -120,6 +120,8 @@ def main():
     p.add_argument("--num-memory-slots", type=int, default=64)
     p.add_argument("--mrl-dims", type=int, nargs="*", default=[256, 128, 64],
                    help="MRL dimension targets (default: 256 128 64)")
+    p.add_argument("--mrl-shared-input", action="store_true",
+                   help="Each unique input is repeated across all MRL widths (default: unique input per width)")
     p.add_argument("--no-speech", action="store_true", help="Disable speech training (text-only)")
     p.add_argument("--speech-every", type=int, default=3,
                    help="Do one speech step every N text steps (default: 3)")
