@@ -138,22 +138,28 @@ A combined run with tau 2.0→0.3 + lr 1e-3 could potentially close the gap to p
 
 ### Saliency Initialization
 
-6. **Saliency init (basic)**: During a short warmup phase (5-10%), accumulate per-FFN-neuron gradient importance via `||grad(down_proj)[:, j]||²` EMA. At warmup→learning transition, initialize mask logits from saliency ranking instead of shuffled ramp. Neurons with higher saliency get higher logits → more likely selected. Requires:
-   - Implement gradient accumulation hook during warmup
-   - Convert accumulated scores to logit values (quantile normalization to ±init_value)
-   - Compare against shuffled_prefix init with same total training budget
-7. **Saliency init + no freeze**: Test whether saliency-initialized masks are good enough to skip the freeze phase entirely (masks already point at the right neurons)
-8. **Saliency init + combined best**: Saliency init with tau 2.0→0.3 + lr 1e-3 + freeze 0.6
-9. **Saliency vs shuffled at 2 epochs**: Does the init advantage persist or wash out with more training?
+Saliency init uses a **10% warmup phase** (full-model-only, no MRL) to accumulate per-FFN-neuron gradient importance via `||grad(down_proj)[:, j]||²` EMA across all layers. At the warmup→learning transition, these scores are converted to mask logits via quantile normalization. The **freeze phase is 50%** (shorter than the 60% default for shuffled, since saliency gives a better starting point and we want more learning time to refine).
+
+**Saliency logit conversion** requires a temperature/scale parameter (`--mrl-saliency-scale`) to control how strongly the initial ranking influences mask selection:
+- High scale (e.g., 2.0): strong prior — top-saliency neurons are almost certainly selected, bottom ones almost certainly pruned. Less room for the optimizer to override.
+- Low scale (e.g., 0.5): weak prior — all neurons start near the sigmoid boundary, optimizer has full freedom. Saliency just provides a slight bias.
+- The conversion: `logits[j] = scale * (1 - 2 * rank[j] / (d_ff - 1))` where `rank[j]` is the saliency rank (0 = most important).
+
+6. **Saliency init (scale=1.0)**: 10% warmup, 50% freeze, tau 2.0→0.3, lr 1e-3, saliency-scale 1.0. Baseline saliency config.
+7. **Saliency init (scale=0.5)**: Same but weaker prior — more optimizer freedom.
+8. **Saliency init (scale=2.0)**: Same but stronger prior — trust the saliency ranking more.
+9. **Saliency init + no freeze**: Saliency scale=1.0 but freeze=0.0 — test if saliency-initialized masks are good enough to stay soft throughout.
+10. **Saliency init + 60% freeze**: Saliency scale=1.0 but freeze=0.6 — compare against the 50% default.
+11. **Saliency vs shuffled at 2 epochs**: Both with combined best config. Does the saliency advantage persist or wash out?
 
 ### Export Verification
 
-10. **Export correctness**: For a topk-trained checkpoint, extract the learned hard masks, gather the active FFN neuron indices, and slice gate_proj/up_proj/down_proj to produce a smaller model. Verify:
+12. **Export correctness**: For a topk-trained checkpoint, extract the learned hard masks, gather the active FFN neuron indices, and slice gate_proj/up_proj/down_proj to produce a smaller model. Verify:
     - Exported model loads and runs inference without errors
     - Exported model's PPL matches the eval-time masked PPL (should be identical)
     - Exported model size matches `_estimate_mrl_params` predictions
     - Export works for all 3 MRL dims (256, 128, 64)
-11. **Export + quantization**: Verify INT4 quantization works on exported sub-models (smaller d_ff may interact with group_size=32 alignment)
+13. **Export + quantization**: Verify INT4 quantization works on exported sub-models (smaller d_ff may interact with group_size=32 alignment)
 
 ## Historical Notes
 
