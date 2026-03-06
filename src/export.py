@@ -38,29 +38,32 @@ def export_submodel(checkpoint_path, d_prime, output_path):
     d_model = config.d_model
     d_ff = config.d_ff
 
+    def _target(size):
+        """Map original dimension to sliced dimension."""
+        if size == d_model:
+            return d_prime
+        if size == d_ff:
+            return d_ff_prime
+        if size == kv_dim:
+            return kv_dim_prime
+        return size  
+
     def slice_leaf(key_path, leaf):
         arr = np.asarray(leaf)
 
         if arr.ndim == 1:
-            # Norm scales: shape (d_model,)
-            return arr[:d_prime]
+            return arr[:_target(arr.shape[0])]
 
         if arr.ndim == 3:
-            # Memory slots: shape (1, M, d_model)
+            if arr.shape[0] > 1:
+                _, in_ch, out_ch = arr.shape
+                r_in = in_ch if in_ch == config.n_mels else _target(in_ch)
+                r_out = _target(out_ch)
+                return arr[:, :r_in, :r_out]
             return arr[:, :, :d_prime]
 
         if arr.ndim == 2:
             rows, cols = arr.shape
-            # Determine slice for each axis based on original size
-            def _target(size):
-                if size == d_model:
-                    return d_prime
-                if size == d_ff:
-                    return d_ff_prime
-                if size == kv_dim:
-                    return kv_dim_prime
-                return size  # vocab, num_memory_slots, etc.
-
             r = _target(rows)
             c = _target(cols)
             return arr[:r, :c]

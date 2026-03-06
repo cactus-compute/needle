@@ -270,7 +270,7 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask):
     return _compute_loss(logits, slot_div, mrl_logits, tgt_out)
 
 
-def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask):
+def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, rng):
     pad_id = 0
     src_mask = make_mel_padding_mask(mel)
     tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
@@ -282,7 +282,9 @@ def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask):
         src_mask=src_mask,
         tgt_mask=tgt_mask,
         mrl_dims=_MRL_DIMS if _MRL_DIMS else None,
+        deterministic=False,
         method="forward_speech_with_aux",
+        rngs={"specaugment": rng},
     )
     return _compute_loss(logits, slot_div, mrl_logits, tgt_out)
 
@@ -316,10 +318,10 @@ def _train_step_text_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask
     return state, ema_params, loss, grad_norm
 
 
-def _train_step_speech(state, ema_params, mel, tgt_in, tgt_out, causal_mask):
+def _train_step_speech(state, ema_params, mel, tgt_in, tgt_out, causal_mask, rng):
     ema_decay = 0.999
     loss, grads = jax.value_and_grad(
-        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask)
+        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, rng)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -329,11 +331,11 @@ def _train_step_speech(state, ema_params, mel, tgt_in, tgt_out, causal_mask):
     return state, ema_params, loss, grad_norm
 
 
-def _train_step_speech_masked(state, ema_params, mel, tgt_in, tgt_out, causal_mask, prune_mask):
+def _train_step_speech_masked(state, ema_params, mel, tgt_in, tgt_out, causal_mask, prune_mask, rng):
     """Speech training step with fused mask application."""
     ema_decay = 0.999
     loss, grads = jax.value_and_grad(
-        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask)
+        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, rng)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -406,6 +408,7 @@ def _make_speech_val_loss_fn(apply_fn):
         logits, _, _ = apply_fn(
             {"params": params}, mel, tgt_in,
             src_mask=src_mask, tgt_mask=tgt_mask,
+            deterministic=True,
             method="forward_speech_with_aux",
         )
         loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tgt_out)
@@ -434,6 +437,10 @@ def _estimate_mrl_params(config, d_prime):
     d_ff = config.d_ff * d // config.d_model
     m = config.num_memory_slots
 
+    n_mels = config.n_mels
+    # ConvSubsampling: conv1 (3*n_mels*d + d) + conv2 (3*d*d + d)
+    conv_sub = 3 * n_mels * d + d + 3 * d * d + d
+
     emb = v * d
     kv_dim = n_kv * head_dim
     attn = d * d + d * kv_dim * 2 + d * d
@@ -442,7 +449,7 @@ def _estimate_mrl_params(config, d_prime):
     mixer_channel = d * d_ff * 3
     enc_block = attn + ffn + mixer_token + mixer_channel
     dec_block = attn * 2 + ffn
-    total = emb + n_enc * enc_block + n_dec * dec_block
+    total = emb + conv_sub + n_enc * enc_block + n_dec * dec_block
     return int(total)
 
 
@@ -456,7 +463,7 @@ def train(args):
 
     num_devices = jax.local_device_count()
     no_speech = getattr(args, "no_speech", False)
-    speech_every = getattr(args, "speech_every", 3)
+    speech_every_override = getattr(args, "speech_every", None)
     n_mels = getattr(args, "n_mels", 80)
     max_mel_len = getattr(args, "max_mel_len", 1024)
 
@@ -563,6 +570,13 @@ def train(args):
     rng, init_rng = jax.random.split(rng)
 
     text_batches_per_epoch = len(enc_inputs) // effective_batch_size
+    if speech_every_override is not None:
+        speech_every = speech_every_override
+    elif not no_speech and speech_mel is not None:
+        speech_batches_available = len(speech_mel) // effective_batch_size
+        speech_every = max(1, text_batches_per_epoch // max(1, speech_batches_available))
+    else:
+        speech_every = 1
     speech_batches_per_epoch = text_batches_per_epoch // speech_every if (not no_speech and speech_mel is not None) else 0
     num_batches = text_batches_per_epoch + speech_batches_per_epoch
     total_steps = num_batches * args.epochs
@@ -687,13 +701,16 @@ def train(args):
                 sp_tgt_in_b = shard_batch(sp_tgt_in, num_devices)
                 sp_tgt_out_b = shard_batch(sp_tgt_out, num_devices)
 
+                rng, spec_rng = jax.random.split(rng)
+                spec_rngs = jax.random.split(spec_rng, num_devices)
+
                 if prune_mask is not None:
                     state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech_masked(
-                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, prune_mask,
+                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, prune_mask, spec_rngs,
                     )
                 else:
                     state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech(
-                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask,
+                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, spec_rngs,
                     )
                 speech_loss_val = float(sp_loss[0])
                 speech_losses.append(speech_loss_val)
@@ -732,7 +749,7 @@ def train(args):
             if speech_loss_val is not None:
                 postfix["speech_loss"] = f"{speech_loss_val:.4f}"
             if epoch == weight_prune_epoch and not gradual_sparsify_done:
-                postfix["prune"] = f"{current_sparsity*100:.1f}%"
+                postfix["sparsity"] = f"{current_sparsity*100:.1f}%"
             pbar.set_postfix(**postfix)
 
             if use_wandb:
