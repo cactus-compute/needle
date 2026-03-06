@@ -61,6 +61,8 @@ python src/data_collection/collect_speech_to_gcs.py \
 ## Notes
 
 - The default mode uses Hugging Face streaming to avoid local dataset materialization.
+- Script disables HF Xet transport (`HF_HUB_DISABLE_XET=1`) by default to avoid
+  occasional process hang after completion in some local environments.
 - If you want SPGISpeech eval slices, use a different `--spgi-config` (for example
   `dev` or `test`) and select its available split names via `--spgi-splits`.
 - Mel options:

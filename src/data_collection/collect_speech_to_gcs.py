@@ -24,6 +24,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# Avoid hanging on shutdown due to hf-xet background transport in some environments.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
 try:
     from datasets import Audio, load_dataset
 except ImportError as exc:  # pragma: no cover - import guard
