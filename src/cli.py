@@ -122,6 +122,20 @@ def main():
                    help="MRL dimension targets (default: 256 128 64)")
     p.add_argument("--mrl-shared-input", action="store_true",
                    help="Each unique input is repeated across all MRL widths (default: unique input per width)")
+    p.add_argument("--mrl-method", choices=["prefix", "topk"], default="prefix",
+                   help="MRL FFN masking: 'prefix' (fixed first-k neurons) or 'topk' (learned selection)")
+    p.add_argument("--mrl-tau-start", type=float, default=1.0,
+                   help="TopK: initial sigmoid temperature (default: 1.0)")
+    p.add_argument("--mrl-tau-end", type=float, default=0.2,
+                   help="TopK: final sigmoid temperature before freeze (default: 0.2)")
+    p.add_argument("--mrl-freeze-frac", type=float, default=0.6,
+                   help="TopK: fraction of training with hard frozen masks (default: 0.6)")
+    p.add_argument("--mrl-mask-lr", type=float, default=3e-3,
+                   help="TopK: mask logit optimizer learning rate (default: 3e-3)")
+    p.add_argument("--mrl-spread-lambda", type=float, default=0.01,
+                   help="TopK: spread penalty weight (default: 0.01)")
+    p.add_argument("--mrl-init-mode", choices=["prefix", "shuffled_prefix", "normal"], default="prefix",
+                   help="TopK: mask logit initialization (default: prefix)")
     p.add_argument("--no-speech", action="store_true", help="Disable speech training (text-only)")
     p.add_argument("--speech-every", type=int, default=3,
                    help="Do one speech step every N text steps (default: 3)")
