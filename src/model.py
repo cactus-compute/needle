@@ -230,10 +230,11 @@ class MemoryMixerEncoder(nn.Module):
             mask = mask[..., :T_new]
 
         for i in range(cfg.num_encoder_layers):
+            block_mask = ffn_mask[i] if (ffn_mask is not None and ffn_mask.ndim == 3) else ffn_mask
             x, s = nn.remat(MemoryMixerBlock)(
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
                 cfg.num_memory_slots, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
-            )(x, s, mask=mask, rope=rope, ffn_mask=ffn_mask)
+            )(x, s, mask=mask, rope=rope, ffn_mask=block_mask)
 
         s = ZCRMSNorm(dtype=dt, name="final_norm")(s)
         return s
@@ -283,9 +284,10 @@ class Decoder(nn.Module):
         x = x.astype(dt)
 
         for i in range(cfg.num_decoder_layers):
+            block_mask = ffn_mask[i] if (ffn_mask is not None and ffn_mask.ndim == 3) else ffn_mask
             x = nn.remat(DecoderBlock)(
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
-            )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, ffn_mask=ffn_mask)
+            )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, ffn_mask=block_mask)
 
         x = ZCRMSNorm(dtype=dt)(x)
         return x
@@ -360,18 +362,27 @@ class EncoderDecoderTransformer(nn.Module):
         diag_sq = jnp.sum(jnp.diagonal(gram, axis1=1, axis2=2) ** 2)
         return (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
 
+    def _split_ffn_mask(self, ffn_mask):
+        """Split a (n_blocks, batch, d_ff) mask into encoder and decoder portions."""
+        if ffn_mask is not None and ffn_mask.ndim == 3:
+            n_enc = self.config.num_encoder_layers
+            return ffn_mask[:n_enc], ffn_mask[n_enc:]
+        return ffn_mask, ffn_mask
+
     def forward_masked(self, src, tgt, src_mask=None, tgt_mask=None, ffn_mask=None):
         """Single forward with per-batch-item FFN masking. Returns (logits, slot_div)."""
-        encoder_out = self.encode_text(src, src_mask=src_mask, ffn_mask=ffn_mask)
-        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, ffn_mask=ffn_mask)
+        enc_mask, dec_mask = self._split_ffn_mask(ffn_mask)
+        encoder_out = self.encode_text(src, src_mask=src_mask, ffn_mask=enc_mask)
+        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, ffn_mask=dec_mask)
         logits = x_f32 @ self.embedding.embedding.T
         slot_div = self._slot_diversity(encoder_out)
         return logits, slot_div
 
     def forward_speech_masked(self, mel, tgt, src_mask=None, tgt_mask=None, ffn_mask=None):
         """Single speech forward with per-batch-item FFN masking. Returns (logits, slot_div)."""
-        encoder_out = self.encode_speech(mel, src_mask=src_mask, ffn_mask=ffn_mask)
-        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, ffn_mask=ffn_mask)
+        enc_mask, dec_mask = self._split_ffn_mask(ffn_mask)
+        encoder_out = self.encode_speech(mel, src_mask=src_mask, ffn_mask=enc_mask)
+        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, ffn_mask=dec_mask)
         logits = x_f32 @ self.embedding.embedding.T
         slot_div = self._slot_diversity(encoder_out)
         return logits, slot_div
@@ -381,10 +392,11 @@ class EncoderDecoderTransformer(nn.Module):
         mask = (jnp.arange(self.config.d_ff) < ff_width).astype(dtype)
         return jnp.broadcast_to(mask[None, :], (B, self.config.d_ff))
 
-    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mat_ff_widths=None):
+    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mat_ff_widths=None, mat_ffn_masks=None):
         """Eval-only: separate per-width forwards for reporting per-width PPL.
 
         mat_ff_widths: list of FFN widths to evaluate (e.g. [1024, 512, 256]).
+        mat_ffn_masks: optional list of (d_ff,) masks for topk eval (overrides prefix masks).
         """
         emb = self.embedding.embedding
         B = src.shape[0]
@@ -395,7 +407,21 @@ class EncoderDecoderTransformer(nn.Module):
         slot_div = self._slot_diversity(encoder_out)
 
         mat_logits = []
-        if mat_ff_widths is not None:
+        if mat_ffn_masks is not None:
+            n_enc = self.config.num_encoder_layers
+            for m in mat_ffn_masks:
+                if m.ndim == 2:
+                    # Per-layer: (n_blocks, d_ff) → (n_blocks, B, d_ff)
+                    mask = jnp.broadcast_to(m[:, None, :], (m.shape[0], B, self.config.d_ff))
+                    enc_m = self.encode_text(src, src_mask=src_mask, ffn_mask=mask[:n_enc])
+                    x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, ffn_mask=mask[n_enc:])
+                else:
+                    # Shared: (d_ff,) → (B, d_ff)
+                    mask = jnp.broadcast_to(m[None, :], (B, self.config.d_ff))
+                    enc_m = self.encode_text(src, src_mask=src_mask, ffn_mask=mask)
+                    x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, ffn_mask=mask)
+                mat_logits.append(x_m @ emb.T)
+        elif mat_ff_widths is not None:
             for ff_w in mat_ff_widths:
                 mask = self._make_eval_ffn_mask(ff_w, B, x_f32.dtype)
                 enc_m = self.encode_text(src, src_mask=src_mask, ffn_mask=mask)
@@ -404,7 +430,7 @@ class EncoderDecoderTransformer(nn.Module):
 
         return logits, slot_div, mat_logits
 
-    def forward_speech_with_aux(self, mel, tgt, src_mask=None, tgt_mask=None, mat_ff_widths=None):
+    def forward_speech_with_aux(self, mel, tgt, src_mask=None, tgt_mask=None, mat_ff_widths=None, mat_ffn_masks=None):
         """Eval-only: separate per-width speech forwards for reporting per-width PPL."""
         emb = self.embedding.embedding
         B = mel.shape[0]
@@ -415,7 +441,19 @@ class EncoderDecoderTransformer(nn.Module):
         slot_div = self._slot_diversity(encoder_out)
 
         mat_logits = []
-        if mat_ff_widths is not None:
+        if mat_ffn_masks is not None:
+            n_enc = self.config.num_encoder_layers
+            for m in mat_ffn_masks:
+                if m.ndim == 2:
+                    mask = jnp.broadcast_to(m[:, None, :], (m.shape[0], B, self.config.d_ff))
+                    enc_m = self.encode_speech(mel, src_mask=src_mask, ffn_mask=mask[:n_enc])
+                    x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, ffn_mask=mask[n_enc:])
+                else:
+                    mask = jnp.broadcast_to(m[None, :], (B, self.config.d_ff))
+                    enc_m = self.encode_speech(mel, src_mask=src_mask, ffn_mask=mask)
+                    x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, ffn_mask=mask)
+                mat_logits.append(x_m @ emb.T)
+        elif mat_ff_widths is not None:
             for ff_w in mat_ff_widths:
                 mask = self._make_eval_ffn_mask(ff_w, B, x_f32.dtype)
                 enc_m = self.encode_speech(mel, src_mask=src_mask, ffn_mask=mask)

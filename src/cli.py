@@ -24,6 +24,13 @@ HELP = """
   │     --max-dec-len INT        Max decoder seq length (default: 256)│
   │     --max-samples INT        Training samples (default: all)      │
   │     --mat-factors INT [...]   FFN shrink factors (default: 2 4 8)  │
+  │     --mat-method STR         static-prefix|topk (def: static-..) │
+  │     --mat-tau-start FLOAT    TopK tau start (default: 0.5)       │
+  │     --mat-tau-end FLOAT      TopK tau end (default: 0.1)         │
+  │     --mat-init-mode STR      prefix|shuffled_prefix|saliency|... │
+  │     --mat-warmup-frac FL     TopK warmup fraction (def: 0.15)    │
+  │     --mat-freeze-frac FL     TopK freeze fraction (def: 0.2)     │
+  │     --mat-mask-lr FLOAT      Mask logit LR (default: 3e-3)       │
   │     --sparsity-ratio FLOAT   Block prune ratio (default: 0.5)    │
   │     --group-size INT         Quant/prune group size (default: 32) │
   │     --prune-interval INT     Steps between mask updates (def: 100)│
@@ -122,6 +129,22 @@ def main():
                    help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4 8)")
     p.add_argument("--mat-shared-input", action="store_true",
                    help="Each unique input is repeated across all mat widths (default: unique input per width)")
+    p.add_argument("--mat-method", choices=["static-prefix", "topk"], default="static-prefix",
+                   help="Matryoshka method: 'static-prefix' (fixed first-N masks), 'topk' (learned masks)")
+    p.add_argument("--mat-tau-start", type=float, default=0.5)
+    p.add_argument("--mat-tau-end", type=float, default=0.1)
+    p.add_argument("--mat-init-mode", choices=["prefix", "shuffled_prefix", "saliency", "normal", "zeros"], default="normal")
+    p.add_argument("--mat-init-value", type=float, default=0.5)
+    p.add_argument("--mat-spread-lambda", type=float, default=0.01)
+    p.add_argument("--mat-warmup-frac", type=float, default=0.15,
+                   help="Fraction of total steps for vanilla warmup (no masks)")
+    p.add_argument("--mat-freeze-frac", type=float, default=0.2,
+                   help="Fraction of total steps at end to freeze masks (hard only)")
+    p.add_argument("--mat-mask-lr", type=float, default=3e-3,
+                   help="Mask logit optimizer learning rate (default: 3e-3)")
+    p.add_argument("--mat-saliency-scale", type=float, default=1.0)
+    p.add_argument("--mat-gumbel", action="store_true",
+                   help="Use Gumbel noise for per-item mask diversity during topk learning")
     p.add_argument("--no-speech", action="store_true", help="Disable speech training (text-only)")
     p.add_argument("--speech-every", type=int, default=3,
                    help="Do one speech step every N text steps (default: 3)")
