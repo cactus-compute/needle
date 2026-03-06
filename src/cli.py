@@ -23,7 +23,7 @@ HELP = """
   │     --max-enc-len INT        Max encoder seq length (default: 256)│
   │     --max-dec-len INT        Max decoder seq length (default: 256)│
   │     --max-samples INT        Training samples (default: all)      │
-  │     --mrl-dims INT [...]     MRL dim targets (default: 256 128 64)│
+  │     --mat-factors INT [...]   FFN shrink factors (default: 2 4 8)  │
   │     --sparsity-ratio FLOAT   Block prune ratio (default: 0.5)    │
   │     --group-size INT         Quant/prune group size (default: 32) │
   │     --prune-interval INT     Steps between mask updates (def: 100)│
@@ -118,10 +118,10 @@ def main():
                    help="Fraction of epoch at which pruning finishes and mask locks (default: 0.67)")
     p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu"])
     p.add_argument("--num-memory-slots", type=int, default=64)
-    p.add_argument("--mrl-dims", type=int, nargs="*", default=[256, 128, 64],
-                   help="MRL dimension targets (default: 256 128 64)")
-    p.add_argument("--mrl-shared-input", action="store_true",
-                   help="Each unique input is repeated across all MRL widths (default: unique input per width)")
+    p.add_argument("--mat-factors", type=int, nargs="*", default=[2, 4, 8],
+                   help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4 8)")
+    p.add_argument("--mat-shared-input", action="store_true",
+                   help="Each unique input is repeated across all mat widths (default: unique input per width)")
     p.add_argument("--no-speech", action="store_true", help="Disable speech training (text-only)")
     p.add_argument("--speech-every", type=int, default=3,
                    help="Do one speech step every N text steps (default: 3)")
@@ -201,7 +201,7 @@ def main():
             args.num_layers = 12
             args.num_dec_layers = 4
             args.num_memory_slots = 128
-            args.mrl_dims = [1024, 768, 512, 256, 128]
+            args.mat_factors = [2, 3, 4, 8, 16]
         from .train import train
         train(args)
     elif args.command == "run":
