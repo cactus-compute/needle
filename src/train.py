@@ -503,14 +503,16 @@ def _make_val_loss_fn(apply_fn):
 def _make_mrl_val_loss_fn(apply_fn, mrl_dim):
     """Val loss for MRL sub-model at dimension mrl_dim (FFN interior slicing)."""
     @jax.jit
-    def val_loss_batch(params, src, tgt_in, tgt_out, causal_mask):
+    def val_loss_batch(params, src, tgt_in, tgt_out, causal_mask, ffn_mask=None):
         pad_id = 0
         src_mask = make_padding_mask(src, pad_id)
         tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+        mrl_ffn_masks = [ffn_mask] if ffn_mask is not None else None
         logits, _, mrl_logits = apply_fn(
             {"params": params}, src, tgt_in,
             src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=src_mask,
             mrl_dims=(mrl_dim,),
+            mrl_ffn_masks=mrl_ffn_masks,
             method="forward_with_aux",
         )
         trunc_logits = mrl_logits[0].astype(jnp.float32)
@@ -1048,11 +1050,19 @@ def train(args):
         mrl_results = {}
         if _MRL_DIMS:
             apply_fn = jax_utils.unreplicate(state).apply_fn
+            # For topk: compute hard masks from learned logits for eval
+            topk_eval_masks = {}
+            if use_topk:
+                ml_unr = jax_utils.unreplicate(mask_logits)
+                for i, d in enumerate(_MRL_DIMS):
+                    k_ff = config.d_ff * d // config.d_model
+                    topk_eval_masks[d] = topk_mask(ml_unr[i], k=k_ff, tau=0.001, hard=True)
             for d_prime in _MRL_DIMS:
                 mrl_vl_fn = _make_mrl_val_loss_fn(apply_fn, d_prime)
+                eval_ffn_mask = topk_eval_masks.get(d_prime, None)
                 mrl_total_loss, mrl_total_toks = 0.0, 0.0
                 for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
-                    vl, vt = mrl_vl_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
+                    vl, vt = mrl_vl_fn(eval_params, vb[0], vb[1], vb[2], val_causal, eval_ffn_mask)
                     mrl_total_loss += float(vl)
                     mrl_total_toks += float(vt)
                 avg_loss = mrl_total_loss / max(mrl_total_toks, 1)

@@ -391,10 +391,19 @@ class EncoderDecoderTransformer(nn.Module):
         slot_div = self._slot_diversity(encoder_out)
         return logits, slot_div
 
-    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mrl_dims=None):
-        """Eval-only: separate per-width forwards for reporting per-width PPL."""
+    def _make_eval_ffn_mask(self, d, B, dtype):
+        """Default prefix FFN mask for eval: first k neurons active."""
+        k = self.config.d_ff * d // self.config.d_model
+        mask = (jnp.arange(self.config.d_ff) < k).astype(dtype)
+        return jnp.broadcast_to(mask[None, :], (B, self.config.d_ff))
+
+    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mrl_dims=None, mrl_ffn_masks=None):
+        """Eval-only: separate per-width forwards for reporting per-width PPL.
+
+        mrl_ffn_masks: optional list of (d_ff,) masks, one per mrl_dim. If provided,
+        uses these instead of default prefix masks (for topk-trained models).
+        """
         emb = self.embedding.embedding
-        d_ff = self.config.d_ff
         d_model = self.config.d_model
         B = src.shape[0]
 
@@ -405,21 +414,22 @@ class EncoderDecoderTransformer(nn.Module):
 
         mrl_logits = []
         if mrl_dims is not None:
-            for d in mrl_dims:
+            for i, d in enumerate(mrl_dims):
                 if d < d_model:
-                    k = d_ff * d // d_model
-                    mask = (jnp.arange(d_ff) < k).astype(x_f32.dtype)
-                    mask = jnp.broadcast_to(mask[None, :], (B, d_ff))
+                    if mrl_ffn_masks is not None:
+                        mask_1d = mrl_ffn_masks[i]
+                        mask = jnp.broadcast_to(mask_1d[None, :].astype(x_f32.dtype), (B, self.config.d_ff))
+                    else:
+                        mask = self._make_eval_ffn_mask(d, B, x_f32.dtype)
                     enc_m = self.encode_text(src, src_mask=src_mask, ffn_mask=mask)
                     x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, ffn_mask=mask)
                     mrl_logits.append(x_m @ emb.T)
 
         return logits, slot_div, mrl_logits
 
-    def forward_speech_with_aux(self, mel, tgt, src_mask=None, tgt_mask=None, mrl_dims=None):
+    def forward_speech_with_aux(self, mel, tgt, src_mask=None, tgt_mask=None, mrl_dims=None, mrl_ffn_masks=None):
         """Eval-only: separate per-width speech forwards for reporting per-width PPL."""
         emb = self.embedding.embedding
-        d_ff = self.config.d_ff
         d_model = self.config.d_model
         B = mel.shape[0]
 
@@ -430,11 +440,13 @@ class EncoderDecoderTransformer(nn.Module):
 
         mrl_logits = []
         if mrl_dims is not None:
-            for d in mrl_dims:
+            for i, d in enumerate(mrl_dims):
                 if d < d_model:
-                    k = d_ff * d // d_model
-                    mask = (jnp.arange(d_ff) < k).astype(x_f32.dtype)
-                    mask = jnp.broadcast_to(mask[None, :], (B, d_ff))
+                    if mrl_ffn_masks is not None:
+                        mask_1d = mrl_ffn_masks[i]
+                        mask = jnp.broadcast_to(mask_1d[None, :].astype(x_f32.dtype), (B, self.config.d_ff))
+                    else:
+                        mask = self._make_eval_ffn_mask(d, B, x_f32.dtype)
                     enc_m = self.encode_speech(mel, src_mask=src_mask, ffn_mask=mask)
                     x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, ffn_mask=mask)
                     mrl_logits.append(x_m @ emb.T)
