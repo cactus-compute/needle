@@ -134,8 +134,8 @@ def main():
                    help="TopK: mask logit optimizer learning rate (default: 3e-3)")
     p.add_argument("--mrl-spread-lambda", type=float, default=0.01,
                    help="TopK: spread penalty weight (default: 0.01)")
-    p.add_argument("--mrl-init-mode", choices=["prefix", "shuffled_prefix", "normal"], default="prefix",
-                   help="TopK: mask logit initialization (default: prefix)")
+    p.add_argument("--mrl-init-mode", choices=["shuffled_prefix", "normal"], default="shuffled_prefix",
+                   help="TopK: mask logit initialization (default: shuffled_prefix)")
     p.add_argument("--no-speech", action="store_true", help="Disable speech training (text-only)")
     p.add_argument("--speech-every", type=int, default=3,
                    help="Do one speech step every N text steps (default: 3)")

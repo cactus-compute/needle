@@ -726,11 +726,7 @@ def train(args):
         init_value = 0.5
         rng, mask_rng = jax.random.split(rng)
         d_ff = config.d_ff
-        if init_mode == "prefix":
-            positions = jnp.arange(d_ff, dtype=jnp.float32)
-            ramp = init_value * (1.0 - 2.0 * positions / max(1, d_ff - 1))
-            mask_logits = jnp.broadcast_to(ramp[None, :], (n_mrl, d_ff)).copy()
-        elif init_mode == "shuffled_prefix":
+        if init_mode == "shuffled_prefix":
             positions = jnp.arange(d_ff, dtype=jnp.float32)
             ramp = init_value * (1.0 - 2.0 * positions / max(1, d_ff - 1))
             rows = []
