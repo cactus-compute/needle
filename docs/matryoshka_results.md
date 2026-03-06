@@ -96,6 +96,27 @@ Use **unique input** (default, no flag) for best quality. The +0.14 PPL cost ove
 <story>[She was very happy because] but where if you ever see her again i know she has a very special thing i'm go
 ```
 
+## Ablation: Shared Input at 4x Batch Size
+
+**Question**: Does training every sample at all widths help, if we control for gradient quality?
+
+With `--mrl-shared-input --batch-size 128`, each step has 32 unique samples repeated 4x (one per width) — same unique samples per step as the default unique-input run at batch=32. The only difference is that every sample trains every width, at the cost of 4x compute per step.
+
+| Model | FFN unique (bs=32) | FFN shared (bs=128) |
+|---|---|---|
+| Full (d_ff=2048) | **4.66** | 4.67 |
+| MRL 256 (d_ff=1024) | **4.66** | 4.67 |
+| MRL 128 (d_ff=512) | **4.68** | 4.69 |
+| MRL 64 (d_ff=256) | **4.80** | 4.81 |
+| Quant (INT4 g32) | **4.75** | 4.77 |
+| Speed | 11.8 it/s | 5.6 it/s |
+| Wall time | ~16 min | ~35 min |
+| Sparsity | 50.01% | 50.01% |
+
+**Result**: Essentially identical PPL (4.66 vs 4.67). Repeating inputs across widths provides no benefit when gradient quality (unique samples per step) is controlled. Random width assignment per item is sufficient — the model doesn't need every sample to train every width simultaneously.
+
+This confirms **unique input at batch=32 is optimal**: same quality, 2x faster.
+
 ## Notes
 
 - All runs are 1-epoch on TinyStories + LibriSpeech. Multi-epoch runs would improve all metrics.
