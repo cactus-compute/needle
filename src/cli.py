@@ -124,7 +124,7 @@ def main():
                    help="MRL method: 'slice' (prefix), 'topk' (learned masks)")
     p.add_argument("--mrl-tau-start", type=float, default=0.5)
     p.add_argument("--mrl-tau-end", type=float, default=0.1)
-    p.add_argument("--mrl-init-mode", choices=["prefix", "shuffled_prefix", "normal", "zeros"], default="normal")
+    p.add_argument("--mrl-init-mode", choices=["prefix", "shuffled_prefix", "saliency", "normal", "zeros"], default="normal")
     p.add_argument("--mrl-init-value", type=float, default=0.5)
     p.add_argument("--mrl-spread-lambda", type=float, default=0.01)
     p.add_argument("--mrl-warmup-frac", type=float, default=0.15,
@@ -133,6 +133,8 @@ def main():
                    help="Fraction of total steps at end to freeze masks (hard only)")
     p.add_argument("--mrl-mask-lr", type=float, default=3e-3,
                    help="Mask logit optimizer learning rate (default: 3e-3)")
+    p.add_argument("--mrl-saliency-scale", type=float, default=1.0,
+                   help="Saliency init: logit scale for rank conversion (default: 1.0)")
     p.add_argument("--no-speech", action="store_true", help="Disable speech training (text-only)")
     p.add_argument("--speech-every", type=int, default=3,
                    help="Do one speech step every N text steps (default: 3)")

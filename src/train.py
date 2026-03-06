@@ -367,7 +367,7 @@ def _train_step_text_warmup(state, ema_params, src, tgt_in, tgt_out, causal_mask
     grad_norm = optax.global_norm(grads)
     state = state.apply_gradients(grads=grads)
     ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
-    return state, ema_params, loss, grad_norm
+    return state, ema_params, loss, grad_norm, grads
 
 
 def _train_step_speech_warmup(state, ema_params, mel, tgt_in, tgt_out, causal_mask):
@@ -381,7 +381,27 @@ def _train_step_speech_warmup(state, ema_params, mel, tgt_in, tgt_out, causal_ma
     grad_norm = optax.global_norm(grads)
     state = state.apply_gradients(grads=grads)
     ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
-    return state, ema_params, loss, grad_norm
+    return state, ema_params, loss, grad_norm, grads
+
+
+def _extract_ffn_saliency(grads, d_ff):
+    """Extract per-FFN-neuron saliency from param gradients.
+
+    Sums ||grad(down_proj)[:, j]||^2 across all down_proj layers.
+    Returns (d_ff,) array of neuron importance scores.
+    """
+    saliency = np.zeros(d_ff, dtype=np.float32)
+    for _, leaf in jax.tree_util.tree_leaves_with_path(grads):
+        pass  # just counting
+    # Walk the gradient tree, find down_proj kernels
+    for path, leaf in jax.tree_util.tree_leaves_with_path(grads):
+        path_str = "/".join(p.key if hasattr(p, "key") else str(p) for p in path)
+        if "down_proj" in path_str and "kernel" in path_str and leaf.ndim == 2:
+            # down_proj kernel: (d_ff, d_model), sum squared grads along d_model axis
+            g = np.array(leaf)
+            if g.shape[0] == d_ff:
+                saliency += np.sum(g ** 2, axis=1)
+    return saliency
 
 
 def _train_step_text(state, ema_params, src, tgt_in, tgt_out, causal_mask):
@@ -784,20 +804,22 @@ def train(args):
     mask_logits = None
     mask_opt_state = None
     mask_tx = None
+    use_saliency = False
+    saliency_accum = None
+    saliency_steps = 0
     if use_topk:
         n_mrl = len(_MRL_DIMS)
         init_mode = getattr(args, "mrl_init_mode", "normal")
         init_value = getattr(args, "mrl_init_value", 0.5)
+        saliency_scale = getattr(args, "mrl_saliency_scale", 1.0)
         rng, mask_rng = jax.random.split(rng)
         d_ff = config.d_ff
+        use_saliency = init_mode == "saliency"
         if init_mode == "prefix":
-            # Linear ramp over d_ff: neuron 0 gets highest, neuron d_ff-1 gets lowest
-            # Initial top-k selects the first k FFN neurons (prefix pattern)
             positions = jnp.arange(d_ff, dtype=jnp.float32)
             ramp = init_value * (1.0 - 2.0 * positions / max(1, d_ff - 1))
             mask_logits = jnp.broadcast_to(ramp[None, :], (n_mrl, d_ff)).copy()
         elif init_mode == "shuffled_prefix":
-            # Same ramp distribution as prefix, but randomly permuted per MRL dim
             positions = jnp.arange(d_ff, dtype=jnp.float32)
             ramp = init_value * (1.0 - 2.0 * positions / max(1, d_ff - 1))
             rows = []
@@ -806,17 +828,20 @@ def train(args):
                 perm = jax.random.permutation(perm_rng, d_ff)
                 rows.append(ramp[perm])
             mask_logits = jnp.stack(rows)
+        elif init_mode == "saliency":
+            # Placeholder — will be replaced after warmup using accumulated saliency
+            mask_logits = jnp.zeros((n_mrl, d_ff))
+            saliency_accum = np.zeros(d_ff, dtype=np.float32)
         elif init_mode == "normal":
             mask_logits = jax.random.normal(mask_rng, (n_mrl, d_ff)) * init_value
         else:
             mask_logits = jnp.zeros((n_mrl, d_ff))
         mask_lr = getattr(args, "mrl_mask_lr", 3e-3)
         mask_tx = optax.adam(learning_rate=mask_lr)
-        # Init opt state from numpy to keep it host-side (not on any TPU device)
         mask_opt_state = mask_tx.init(np.array(mask_logits))
-        # Resume mask logits from checkpoint if available
         if resume_checkpoint and "mask_logits" in ckpt_data:
             mask_logits = jnp.array(ckpt_data["mask_logits"])
+            use_saliency = False
             print(f"  Loaded mask logits from checkpoint")
 
     state = jax_utils.replicate(state)
@@ -954,9 +979,32 @@ def train(args):
                     mask_logits = jax_utils.replicate(jnp.array(ml_np))
             elif use_topk and not topk_active:
                 # TopK warmup: full-model-only, no MRL
-                state, ema_params, loss, grad_norm = p_train_step_warmup(
+                state, ema_params, loss, grad_norm, warmup_grads = p_train_step_warmup(
                     state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask,
                 )
+                # Accumulate saliency from gradients during warmup
+                if use_saliency and saliency_accum is not None:
+                    grads_unr = jax_utils.unreplicate(warmup_grads)
+                    step_saliency = _extract_ffn_saliency(grads_unr, config.d_ff)
+                    saliency_steps += 1
+                    # EMA accumulation
+                    beta = 0.99
+                    saliency_accum = beta * saliency_accum + (1 - beta) * step_saliency
+                    del grads_unr
+                    # Check if this is the last warmup step — convert saliency to logits
+                    if global_step + 1 >= int(total_steps * _MRL_WARMUP_FRAC):
+                        print(f"\n  Saliency init: {saliency_steps} warmup steps accumulated")
+                        # Rank-based conversion: highest saliency → highest logit
+                        ranks = np.argsort(np.argsort(-saliency_accum)).astype(np.float32)
+                        logits_np = saliency_scale * (1.0 - 2.0 * ranks / max(1, config.d_ff - 1))
+                        # Same logits for all MRL dims (all share the saliency ranking)
+                        mask_logits_np = np.broadcast_to(logits_np[None, :], (n_mrl, config.d_ff)).copy()
+                        mask_logits = jax_utils.replicate(jnp.array(mask_logits_np))
+                        # Re-init optimizer for the new logits
+                        mask_opt_state = mask_tx.init(mask_logits_np)
+                        saliency_accum = None  # done accumulating
+                        print(f"  Saliency top-5 neurons: {np.argsort(-logits_np)[:5]}")
+                        print(f"  Saliency logit range: [{logits_np.min():.3f}, {logits_np.max():.3f}]")
             else:
                 if prune_mask is not None:
                     state, ema_params, loss, grad_norm = p_train_step_masked(
