@@ -310,7 +310,7 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask):
     return _compute_ce(logits, tgt_out, slot_div)
 
 
-def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, ffn_mask):
+def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng):
     pad_id = 0
     src_mask = make_mel_padding_mask(mel)
     tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
@@ -318,7 +318,9 @@ def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, ffn_mask):
         {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
         mel, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask,
         ffn_mask=ffn_mask,
+        deterministic=False,
         method="forward_speech_masked",
+        rngs={"specaugment": rng},
     )
     return _compute_ce(logits, tgt_out, slot_div)
 
@@ -343,7 +345,7 @@ def _text_loss_fn_topk(state, params, mask_logits, src, tgt_in, tgt_out, causal_
     return loss
 
 
-def _speech_loss_fn_topk(state, params, mask_logits, mel, tgt_in, tgt_out, causal_mask, tau, hard, step_rng):
+def _speech_loss_fn_topk(state, params, mask_logits, mel, tgt_in, tgt_out, causal_mask, tau, hard, step_rng, spec_rng):
     """Speech loss with topk masks constructed inside for gradient flow."""
     pad_id = 0
     batch_size = mel.shape[0]
@@ -354,7 +356,9 @@ def _speech_loss_fn_topk(state, params, mask_logits, mel, tgt_in, tgt_out, causa
         {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
         mel, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask,
         ffn_mask=ffn_mask,
+        deterministic=False,
         method="forward_speech_masked",
+        rngs={"specaugment": spec_rng},
     )
     loss = _compute_ce(logits, tgt_out, slot_div)
     if _MAT_SPREAD_LAMBDA > 0:
@@ -363,7 +367,7 @@ def _speech_loss_fn_topk(state, params, mask_logits, mel, tgt_in, tgt_out, causa
     return loss
 
 
-def _no_mat_loss(state, params, src, tgt_in, tgt_out, causal_mask, is_speech=False):
+def _no_mat_loss(state, params, src, tgt_in, tgt_out, causal_mask, is_speech=False, spec_rng=None):
     """Full-model-only loss with no matryoshka (for topk warmup)."""
     pad_id = 0
     batch_size = src.shape[0]
@@ -374,11 +378,16 @@ def _no_mat_loss(state, params, src, tgt_in, tgt_out, causal_mask, is_speech=Fal
         src_mask = make_padding_mask(src, pad_id)
     tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
     method = "forward_speech_masked" if is_speech else "forward_masked"
+    kwargs = {}
+    if is_speech and spec_rng is not None:
+        kwargs["deterministic"] = False
+        kwargs["rngs"] = {"specaugment": spec_rng}
     logits, slot_div = state.apply_fn(
         {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
         src, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask,
         ffn_mask=ffn_mask,
         method=method,
+        **kwargs,
     )
     return _compute_ce(logits, tgt_out, slot_div)
 
@@ -386,8 +395,7 @@ def _no_mat_loss(state, params, src, tgt_in, tgt_out, causal_mask, is_speech=Fal
 def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
     """Build (batch, d_ff) prefix mask: batch split equally across widths.
 
-    First quarter = full width (all ones), remaining quarters = mat widths.
-    Each unique input is repeated once per width.
+    First 1/N = full width (all ones), remaining 1/N sections = mat widths.
     """
     n_widths = 1 + len(mat_ff_widths)  # full + mat widths
     per_width = batch_size // n_widths
@@ -400,13 +408,6 @@ def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
     if remainder > 0:
         rows.append(jnp.ones((remainder, d_ff), dtype=jnp.bfloat16))
     return jnp.concatenate(rows, axis=0)
-
-
-def _repeat_for_mat(arr, n_widths):
-    """Repeat first batch/n_widths items n_widths times to fill batch."""
-    per_width = arr.shape[0] // n_widths
-    unique = arr[:per_width]
-    return jnp.tile(unique, (n_widths,) + (1,) * (arr.ndim - 1))
 
 
 def _train_step_text(state, ema_params, src, tgt_in, tgt_out, causal_mask, ffn_mask):
@@ -438,10 +439,10 @@ def _train_step_text_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask
     return state, ema_params, loss, grad_norm
 
 
-def _train_step_speech(state, ema_params, mel, tgt_in, tgt_out, causal_mask, ffn_mask):
+def _train_step_speech(state, ema_params, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng):
     ema_decay = 0.999
     loss, grads = jax.value_and_grad(
-        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, ffn_mask)
+        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -451,11 +452,11 @@ def _train_step_speech(state, ema_params, mel, tgt_in, tgt_out, causal_mask, ffn
     return state, ema_params, loss, grad_norm
 
 
-def _train_step_speech_masked(state, ema_params, mel, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask):
+def _train_step_speech_masked(state, ema_params, mel, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask, rng):
     """Speech training step with fused prune mask application."""
     ema_decay = 0.999
     loss, grads = jax.value_and_grad(
-        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, ffn_mask)
+        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -481,11 +482,11 @@ def _train_step_text_warmup(state, ema_params, src, tgt_in, tgt_out, causal_mask
     return state, ema_params, loss, grad_norm, grads
 
 
-def _train_step_speech_warmup(state, ema_params, mel, tgt_in, tgt_out, causal_mask):
+def _train_step_speech_warmup(state, ema_params, mel, tgt_in, tgt_out, causal_mask, spec_rng):
     """Speech training step with no matryoshka (for topk warmup phase)."""
     ema_decay = 0.999
     loss, grads = jax.value_and_grad(
-        lambda p: _no_mat_loss(state, p, mel, tgt_in, tgt_out, causal_mask, is_speech=True)
+        lambda p: _no_mat_loss(state, p, mel, tgt_in, tgt_out, causal_mask, is_speech=True, spec_rng=spec_rng)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -527,11 +528,11 @@ def _train_step_text_topk_masked(state, ema_params, mask_logits, src, tgt_in, tg
     return state, ema_params, ml_grads, loss, grad_norm
 
 
-def _train_step_speech_topk(state, ema_params, mask_logits, mel, tgt_in, tgt_out, causal_mask, tau, hard, step_rng):
-    """Speech training step with learned topk masks. tau/hard/step_rng are JAX args."""
+def _train_step_speech_topk(state, ema_params, mask_logits, mel, tgt_in, tgt_out, causal_mask, tau, hard, step_rng, spec_rng):
+    """Speech training step with learned topk masks. tau/hard/step_rng/spec_rng are JAX args."""
     ema_decay = 0.999
     def joint_loss(params, ml):
-        return _speech_loss_fn_topk(state, params, ml, mel, tgt_in, tgt_out, causal_mask, tau, hard, step_rng)
+        return _speech_loss_fn_topk(state, params, ml, mel, tgt_in, tgt_out, causal_mask, tau, hard, step_rng, spec_rng)
     (loss, (p_grads, ml_grads)) = jax.value_and_grad(joint_loss, argnums=(0, 1))(state.params, mask_logits)
     p_grads = jax.lax.pmean(p_grads, axis_name="batch")
     ml_grads = jax.lax.pmean(ml_grads, axis_name="batch")
@@ -542,11 +543,11 @@ def _train_step_speech_topk(state, ema_params, mask_logits, mel, tgt_in, tgt_out
     return state, ema_params, ml_grads, loss, grad_norm
 
 
-def _train_step_speech_topk_masked(state, ema_params, mask_logits, mel, tgt_in, tgt_out, causal_mask, prune_mask, tau, hard, step_rng):
+def _train_step_speech_topk_masked(state, ema_params, mask_logits, mel, tgt_in, tgt_out, causal_mask, prune_mask, tau, hard, step_rng, spec_rng):
     """Speech training step with learned topk masks + prune mask."""
     ema_decay = 0.999
     def joint_loss(params, ml):
-        return _speech_loss_fn_topk(state, params, ml, mel, tgt_in, tgt_out, causal_mask, tau, hard, step_rng)
+        return _speech_loss_fn_topk(state, params, ml, mel, tgt_in, tgt_out, causal_mask, tau, hard, step_rng, spec_rng)
     (loss, (p_grads, ml_grads)) = jax.value_and_grad(joint_loss, argnums=(0, 1))(state.params, mask_logits)
     p_grads = jax.lax.pmean(p_grads, axis_name="batch")
     ml_grads = jax.lax.pmean(ml_grads, axis_name="batch")
@@ -668,6 +669,7 @@ def _make_speech_val_loss_fn(apply_fn):
         logits, _, _ = apply_fn(
             {"params": params}, mel, tgt_in,
             src_mask=src_mask, tgt_mask=tgt_mask,
+            deterministic=True,
             method="forward_speech_with_aux",
         )
         loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tgt_out)
@@ -711,7 +713,7 @@ def train(args):
 
     num_devices = jax.local_device_count()
     no_speech = getattr(args, "no_speech", False)
-    speech_every = getattr(args, "speech_every", 3)
+    speech_every_override = getattr(args, "speech_every", None)
     n_mels = getattr(args, "n_mels", 80)
     max_mel_len = getattr(args, "max_mel_len", 1024)
 
@@ -840,10 +842,19 @@ def train(args):
     rng, init_rng = jax.random.split(rng)
 
     mat_shared_input = getattr(args, "mat_shared_input", False)
+    if use_topk and mat_shared_input:
+        raise ValueError("--mat-shared-input is incompatible with --mat-method topk")
     # With shared input, each unique sample is repeated n_widths times,
     # so we fetch smaller batches but take more steps per epoch.
     unique_batch_size = effective_batch_size // n_widths if (mat_shared_input and n_widths > 1) else effective_batch_size
     text_batches_per_epoch = len(enc_inputs) // unique_batch_size
+    if speech_every_override is not None:
+        speech_every = speech_every_override
+    elif not no_speech and speech_mel is not None:
+        speech_batches_available = len(speech_mel) // effective_batch_size
+        speech_every = max(1, text_batches_per_epoch // max(1, speech_batches_available))
+    else:
+        speech_every = 1
     speech_batches_per_epoch = text_batches_per_epoch // speech_every if (not no_speech and speech_mel is not None) else 0
     num_batches = text_batches_per_epoch + speech_batches_per_epoch
     total_steps = num_batches * args.epochs
@@ -1032,13 +1043,18 @@ def train(args):
             t0 = time.perf_counter()
 
             if not use_topk and n_widths > 1 and mat_shared_input:
-                src = np.tile(src, (n_widths, 1))
-                tgt_in = np.tile(tgt_in, (n_widths, 1))
-                tgt_out = np.tile(tgt_out, (n_widths, 1))
-
-            src_b = shard_batch(src, num_devices)
-            tgt_in_b = shard_batch(tgt_in, num_devices)
-            tgt_out_b = shard_batch(tgt_out, num_devices)
+                per_width = args.batch_size // n_widths
+                def _tile_for_mat(arr):
+                    s = arr.reshape(num_devices, per_width, *arr.shape[1:])
+                    s = np.tile(s, (1, n_widths) + (1,) * (arr.ndim - 1))
+                    return s
+                src_b = _tile_for_mat(src)
+                tgt_in_b = _tile_for_mat(tgt_in)
+                tgt_out_b = _tile_for_mat(tgt_out)
+            else:
+                src_b = shard_batch(src, num_devices)
+                tgt_in_b = shard_batch(tgt_in, num_devices)
+                tgt_out_b = shard_batch(tgt_out, num_devices)
 
             if topk_active:
                 tau_arr = jax_utils.replicate(jnp.float32(cur_tau))
@@ -1104,26 +1120,31 @@ def train(args):
                 mel_batch, sp_tgt_in, sp_tgt_out = next(speech_iter)
 
                 if not use_topk and n_widths > 1 and mat_shared_input:
-                    mel_batch = np.tile(mel_batch, (n_widths, 1, 1))
-                    sp_tgt_in = np.tile(sp_tgt_in, (n_widths, 1))
-                    sp_tgt_out = np.tile(sp_tgt_out, (n_widths, 1))
-
-                mel_b = shard_batch(mel_batch, num_devices)
-                sp_tgt_in_b = shard_batch(sp_tgt_in, num_devices)
-                sp_tgt_out_b = shard_batch(sp_tgt_out, num_devices)
+                    per_width = args.batch_size // n_widths
+                    def _tile_sp(arr):
+                        s = arr.reshape(num_devices, per_width, *arr.shape[1:])
+                        return np.tile(s, (1, n_widths) + (1,) * (arr.ndim - 1))
+                    mel_b = _tile_sp(mel_batch)
+                    sp_tgt_in_b = _tile_sp(sp_tgt_in)
+                    sp_tgt_out_b = _tile_sp(sp_tgt_out)
+                else:
+                    mel_b = shard_batch(mel_batch, num_devices)
+                    sp_tgt_in_b = shard_batch(sp_tgt_in, num_devices)
+                    sp_tgt_out_b = shard_batch(sp_tgt_out, num_devices)
 
                 if topk_active:
                     tau_arr = jax_utils.replicate(jnp.float32(cur_tau))
                     hard_arr = jax_utils.replicate(jnp.bool_(cur_hard))
-                    rng, step_rng = jax.random.split(rng)
+                    rng, step_rng, spec_rng = jax.random.split(rng, 3)
                     step_rngs = jax.random.split(step_rng, num_devices)
+                    spec_rngs = jax.random.split(spec_rng, num_devices)
                     if prune_mask is not None:
                         state, ema_params, ml_grads, sp_loss, sp_grad_norm = p_train_step_speech_topk_masked(
-                            state, ema_params, mask_logits, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, prune_mask, tau_arr, hard_arr, step_rngs,
+                            state, ema_params, mask_logits, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, prune_mask, tau_arr, hard_arr, step_rngs, spec_rngs,
                         )
                     else:
                         state, ema_params, ml_grads, sp_loss, sp_grad_norm = p_train_step_speech_topk(
-                            state, ema_params, mask_logits, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, tau_arr, hard_arr, step_rngs,
+                            state, ema_params, mask_logits, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, tau_arr, hard_arr, step_rngs, spec_rngs,
                         )
                     if not cur_hard:
                         ml_grads_np = np.array(jax_utils.unreplicate(ml_grads))
@@ -1132,18 +1153,22 @@ def train(args):
                         ml_np = optax.apply_updates(ml_np, updates)
                         mask_logits = jax_utils.replicate(jnp.array(ml_np))
                 elif use_topk and not topk_active:
+                    rng, spec_rng = jax.random.split(rng)
+                    spec_rngs = jax.random.split(spec_rng, num_devices)
                     state, ema_params, sp_loss, sp_grad_norm, _ = p_train_step_warmup_speech(
-                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask,
+                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, spec_rngs,
                     )
                 else:
                     speech_ffn_mask = text_ffn_mask
+                    rng, spec_rng = jax.random.split(rng)
+                    spec_rngs = jax.random.split(spec_rng, num_devices)
                     if prune_mask is not None:
                         state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech_masked(
-                            state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, prune_mask, speech_ffn_mask,
+                            state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, prune_mask, speech_ffn_mask, spec_rngs,
                         )
                     else:
                         state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech(
-                            state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, speech_ffn_mask,
+                            state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, speech_ffn_mask, spec_rngs,
                         )
                 speech_loss_val = float(sp_loss[0])
                 speech_losses.append(speech_loss_val)
