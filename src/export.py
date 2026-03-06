@@ -1,7 +1,7 @@
-"""Export MRL sub-models by slicing FFN weights to a target dimension.
+"""Export matryoshka sub-models by slicing FFN weights by a shrink factor.
 
 With FFN interior matryoshka, d_model stays constant — only FFN intermediate
-dimensions (gate_proj, up_proj, down_proj) are sliced proportionally.
+dimensions (gate_proj, up_proj, down_proj) are sliced.
 """
 
 import os
@@ -19,11 +19,11 @@ from .model import TransformerConfig
 _FFN_KERNEL_NAMES = {"gate_proj", "up_proj", "down_proj"}
 
 
-def export_submodel(checkpoint_path, d_prime, output_path):
-    """Slice a full MRL checkpoint to a sub-model at MRL dimension d_prime.
+def export_submodel(checkpoint_path, factor, output_path):
+    """Slice a full matryoshka checkpoint to a sub-model at given shrink factor.
 
-    Only FFN weights are reduced: d_ff' = d_ff * d_prime // d_model.
-    Attention, embeddings, norms, and mixer weights are unchanged.
+    factor: how many times smaller the FFN width (e.g. 2 = half, 4 = quarter).
+    Attention, embeddings, and norms are unchanged.
     """
 
     with open(checkpoint_path, "rb") as f:
@@ -31,9 +31,9 @@ def export_submodel(checkpoint_path, d_prime, output_path):
     params = data["params"]
     config = TransformerConfig(**data["config"])
 
-    d_ff_prime = config.d_ff * d_prime // config.d_model
-    if d_ff_prime == 0:
-        raise ValueError(f"d_prime={d_prime} too small: would give d_ff=0")
+    d_ff_new = config.d_ff // factor
+    if d_ff_new == 0:
+        raise ValueError(f"factor={factor} too large: would give d_ff=0")
 
     d_ff = config.d_ff
 
@@ -53,28 +53,23 @@ def export_submodel(checkpoint_path, d_prime, output_path):
         if parent_name is None:
             return arr
 
-        # Also skip mixer FFN kernels (token_mix_*, channel_mix_*)
-        path_str = "/".join(
-            p.key if hasattr(p, "key") else str(p) for p in key_path
-        )
-        if "mixer" in path_str:
-            return arr
+        # Both token_mix and channel_mix are sliced via ffn_mask
 
         rows, cols = arr.shape
         if parent_name in ("gate_proj", "up_proj"):
-            # (d_model, d_ff) → (d_model, d_ff')
+            # (d_in, d_ff) → (d_in, d_ff_new)
             if cols == d_ff:
-                return arr[:, :d_ff_prime]
+                return arr[:, :d_ff_new]
         elif parent_name == "down_proj":
-            # (d_ff, d_model) → (d_ff', d_model)
+            # (d_ff, d_out) → (d_ff_new, d_out)
             if rows == d_ff:
-                return arr[:d_ff_prime, :]
+                return arr[:d_ff_new, :]
 
         return arr
 
     sliced = jax.tree_util.tree_map_with_path(slice_leaf, params)
 
-    new_config = replace(config, d_ff=d_ff_prime)
+    new_config = replace(config, d_ff=d_ff_new)
 
     sliced_np = jax.tree.map(
         lambda x: np.asarray(x) if isinstance(x, jnp.ndarray) else x, sliced
@@ -93,7 +88,8 @@ def export_submodel(checkpoint_path, d_prime, output_path):
     print(f"  ─────────────────────────────────────")
     print(f"  {'':>20s} {'Original':>12s} {'Exported':>12s}")
     print(f"  {'d_model':>20s} {config.d_model:>12d} {config.d_model:>12d}")
-    print(f"  {'d_ff':>20s} {config.d_ff:>12d} {d_ff_prime:>12d}")
+    print(f"  {'d_ff':>20s} {config.d_ff:>12d} {d_ff_new:>12d}")
+    print(f"  {'factor':>20s} {'1x':>12s} {str(factor)+'x':>12s}")
     print(f"  {'num_heads':>20s} {config.num_heads:>12d} {config.num_heads:>12d}")
     print(f"  {'num_kv_heads':>20s} {config.num_kv_heads:>12d} {config.num_kv_heads:>12d}")
     print(f"  {'params':>20s} {orig_count:>12,d} {new_count:>12,d}")
@@ -103,12 +99,12 @@ def export_submodel(checkpoint_path, d_prime, output_path):
 
 def main(args):
     checkpoint = args.checkpoint
-    d_prime = args.dim
+    factor = args.factor
     output = args.output
 
     if output is None:
         stem = Path(checkpoint).stem
         parent = Path(checkpoint).parent
-        output = str(parent / f"{stem}_d{d_prime}.pkl")
+        output = str(parent / f"{stem}_{factor}x.pkl")
 
-    export_submodel(checkpoint, d_prime, output)
+    export_submodel(checkpoint, factor, output)

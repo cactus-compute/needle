@@ -148,37 +148,22 @@ class MLPMixer(nn.Module):
     num_slots: int
     d_model: int
     d_ff: int
+    num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
 
     @nn.compact
-    def __call__(self, s):
+    def __call__(self, s, ffn_mask=None):
         residual = s
         s = ZCRMSNorm(dtype=self.dtype, name="token_mix_norm")(s)
         s = s.transpose(0, 2, 1)
-        gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="token_mix_gate")(s)
-        up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="token_mix_up")(s)
-        if self.activation == "swiglu":
-            s = nn.silu(gate) * up
-        elif self.activation == "geglu":
-            s = nn.gelu(gate) * up
-        else:
-            s = nn.relu(gate) * nn.relu(up)
-        s = nn.Dense(self.num_slots, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="token_mix_down")(s)
+        s = FeedForward(self.num_slots, self.d_ff, self.num_layers, self.dtype, self.activation, name="token_mix")(s, ffn_mask=ffn_mask)
         s = s.transpose(0, 2, 1)
         s = s + residual
 
         residual = s
         s = ZCRMSNorm(dtype=self.dtype, name="channel_mix_norm")(s)
-        gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="channel_mix_gate")(s)
-        up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="channel_mix_up")(s)
-        if self.activation == "swiglu":
-            s = nn.silu(gate) * up
-        elif self.activation == "geglu":
-            s = nn.gelu(gate) * up
-        else:
-            s = nn.relu(gate) * nn.relu(up)
-        s = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="channel_mix_down")(s)
+        s = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation, name="channel_mix")(s, ffn_mask=ffn_mask)
         s = s + residual
 
         return s
@@ -204,8 +189,8 @@ class MemoryMixerBlock(nn.Module):
             rope_keys_only=True, name="pack_attn"
         )(s_norm, x_norm, mask=mask, rope=rope)
 
-        s = s + MLPMixer(self.num_slots, self.d_model, self.d_ff, self.dtype, self.activation, name="mixer")(
-            ZCRMSNorm(dtype=self.dtype, name="mix_norm")(s)
+        s = s + MLPMixer(self.num_slots, self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation, name="mixer")(
+            ZCRMSNorm(dtype=self.dtype, name="mix_norm")(s), ffn_mask=ffn_mask
         )
 
         residual = x
@@ -391,11 +376,17 @@ class EncoderDecoderTransformer(nn.Module):
         slot_div = self._slot_diversity(encoder_out)
         return logits, slot_div
 
-    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mrl_dims=None):
-        """Eval-only: separate per-width forwards for reporting per-width PPL."""
+    def _make_eval_ffn_mask(self, ff_width, B, dtype):
+        """Default prefix FFN mask for eval: first ff_width neurons active."""
+        mask = (jnp.arange(self.config.d_ff) < ff_width).astype(dtype)
+        return jnp.broadcast_to(mask[None, :], (B, self.config.d_ff))
+
+    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mat_ff_widths=None):
+        """Eval-only: separate per-width forwards for reporting per-width PPL.
+
+        mat_ff_widths: list of FFN widths to evaluate (e.g. [1024, 512, 256]).
+        """
         emb = self.embedding.embedding
-        d_ff = self.config.d_ff
-        d_model = self.config.d_model
         B = src.shape[0]
 
         encoder_out = self.encode_text(src, src_mask=src_mask)
@@ -403,24 +394,19 @@ class EncoderDecoderTransformer(nn.Module):
         logits = x_f32 @ emb.T
         slot_div = self._slot_diversity(encoder_out)
 
-        mrl_logits = []
-        if mrl_dims is not None:
-            for d in mrl_dims:
-                if d < d_model:
-                    k = d_ff * d // d_model
-                    mask = (jnp.arange(d_ff) < k).astype(x_f32.dtype)
-                    mask = jnp.broadcast_to(mask[None, :], (B, d_ff))
-                    enc_m = self.encode_text(src, src_mask=src_mask, ffn_mask=mask)
-                    x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, ffn_mask=mask)
-                    mrl_logits.append(x_m @ emb.T)
+        mat_logits = []
+        if mat_ff_widths is not None:
+            for ff_w in mat_ff_widths:
+                mask = self._make_eval_ffn_mask(ff_w, B, x_f32.dtype)
+                enc_m = self.encode_text(src, src_mask=src_mask, ffn_mask=mask)
+                x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, ffn_mask=mask)
+                mat_logits.append(x_m @ emb.T)
 
-        return logits, slot_div, mrl_logits
+        return logits, slot_div, mat_logits
 
-    def forward_speech_with_aux(self, mel, tgt, src_mask=None, tgt_mask=None, mrl_dims=None):
+    def forward_speech_with_aux(self, mel, tgt, src_mask=None, tgt_mask=None, mat_ff_widths=None):
         """Eval-only: separate per-width speech forwards for reporting per-width PPL."""
         emb = self.embedding.embedding
-        d_ff = self.config.d_ff
-        d_model = self.config.d_model
         B = mel.shape[0]
 
         encoder_out = self.encode_speech(mel, src_mask=src_mask)
@@ -428,18 +414,15 @@ class EncoderDecoderTransformer(nn.Module):
         logits = x_f32 @ emb.T
         slot_div = self._slot_diversity(encoder_out)
 
-        mrl_logits = []
-        if mrl_dims is not None:
-            for d in mrl_dims:
-                if d < d_model:
-                    k = d_ff * d // d_model
-                    mask = (jnp.arange(d_ff) < k).astype(x_f32.dtype)
-                    mask = jnp.broadcast_to(mask[None, :], (B, d_ff))
-                    enc_m = self.encode_speech(mel, src_mask=src_mask, ffn_mask=mask)
-                    x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, ffn_mask=mask)
-                    mrl_logits.append(x_m @ emb.T)
+        mat_logits = []
+        if mat_ff_widths is not None:
+            for ff_w in mat_ff_widths:
+                mask = self._make_eval_ffn_mask(ff_w, B, x_f32.dtype)
+                enc_m = self.encode_speech(mel, src_mask=src_mask, ffn_mask=mask)
+                x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, ffn_mask=mask)
+                mat_logits.append(x_m @ emb.T)
 
-        return logits, slot_div, mrl_logits
+        return logits, slot_div, mat_logits
 
     def init_all(self, src, tgt, mel):
         """Dummy forward through both text and speech pathways to initialize all params."""

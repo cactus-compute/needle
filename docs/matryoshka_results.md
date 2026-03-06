@@ -1,19 +1,21 @@
 # FFN Interior Matryoshka — Results
 
+> **Note**: These results predate the mixer refactor. At the time, matryoshka FFN masking was only applied to attention FFNs and the local FFN in encoder blocks — the MLP-Mixer token/channel mixing layers were **not** masked. Current code applies masking to all FFN layers including mixer.
+
 ## Approach
 
-Heterogeneous batch MRL: a per-batch-item prefix mask zeros out FFN neurons beyond the target width. Single forward-backward pass, single optimizer step. All MRL widths trained simultaneously.
+Heterogeneous batch matryoshka: a per-batch-item prefix mask zeros out FFN neurons beyond the target width. Single forward-backward pass, single optimizer step. All widths trained simultaneously.
 
 - **Full width**: d_ff = 2048 (all neurons active)
-- **MRL 256**: d_ff = 1024 (first 1024 neurons)
-- **MRL 128**: d_ff = 512 (first 512 neurons)
-- **MRL 64**: d_ff = 256 (first 256 neurons)
+- **2x**: d_ff = 1024 (first 1024 neurons)
+- **4x**: d_ff = 512 (first 512 neurons)
+- **8x**: d_ff = 256 (first 256 neurons)
 
 d_model, attention heads, embeddings, and mixer are unchanged across all widths.
 
 Two modes:
 - **Unique input** (default): each batch item is a unique sample, assigned a fixed width based on its position in the batch. Full data diversity per epoch.
-- **Shared input** (`--mrl-shared-input`): each unique sample is repeated across all widths. Smaller unique batch but every sample trains every width. Epoch = 4x more steps to see all data.
+- **Shared input** (`--mat-shared-input`): each unique sample is repeated across all widths. Smaller unique batch but every sample trains every width. Epoch = 4x more steps to see all data.
 
 ## Training Config
 
@@ -41,16 +43,16 @@ All runs use the same architecture and hyperparameters:
 | Model | Main (output-only slice) | FFN unique input | FFN shared input |
 |---|---|---|---|
 | Full (d_ff=2048) | **4.52** | 4.66 | 5.11 |
-| MRL 256 (d_ff=1024) | - | **4.66** | 5.11 |
-| MRL 128 (d_ff=512) | - | **4.68** | 5.11 |
-| MRL 64 (d_ff=256) | - | **4.80** | 5.20 |
+| 2x (d_ff=1024) | - | **4.66** | 5.11 |
+| 4x (d_ff=512) | - | **4.68** | 5.11 |
+| 8x (d_ff=256) | - | **4.80** | 5.20 |
 | Quant (INT4 g32) | **4.59** | 4.75 | 5.20 |
 
-> Main branch MRL PPLs omitted — output-only slice MRL does not constrain internal computation, so sub-model PPLs are misleading.
+> Main branch PPLs omitted — output-only slice does not constrain internal computation, so sub-model PPLs are misleading.
 
 | Metric | Main | FFN unique | FFN shared |
 |---|---|---|---|
-| MRL method | Output-only slice | FFN interior mask | FFN interior mask |
+| Mat method | Output-only slice | FFN interior mask | FFN interior mask |
 | Total steps | 11,038 | 11,038 | 44,156 |
 | Unique items/batch | 32/dev | 32/dev | 8/dev x 4 |
 | Speed | ~19.3 it/s | 11.8 it/s | 20.9 it/s |
@@ -72,7 +74,7 @@ All runs use the same architecture and hyperparameters:
 
 **Shared input over-prunes** (68% vs 50% target) because the pruning schedule fractions apply to 4x more total steps, creating a wider absolute pruning window.
 
-**FFN interior MRL sub-models are tight.** With unique input, the d_ff=256 sub-model (1/8 of FFN, 68.7M params) is only +0.14 PPL worse than full. This is a genuine sub-network — unlike main's output-only approach which shares all internal computation.
+**FFN interior matryoshka sub-models are tight.** With unique input, the d_ff=256 sub-model (8x, 68.7M params) is only +0.14 PPL worse than full. This is a genuine sub-network — unlike main's output-only approach which shares all internal computation.
 
 **Main is faster** (~19 it/s) because it runs one full forward + cheap logit slicing. FFN unique input (11.8 it/s) does one forward with heterogeneous masking but can't exploit XLA batch optimizations as well. FFN shared input (20.9 it/s) is fastest per-step due to repeated inputs.
 
@@ -100,14 +102,14 @@ Use **unique input** (default, no flag) for best quality. The +0.14 PPL cost ove
 
 **Question**: Does training every sample at all widths help, if we control for gradient quality?
 
-With `--mrl-shared-input --batch-size 128`, each step has 32 unique samples repeated 4x (one per width) — same unique samples per step as the default unique-input run at batch=32. The only difference is that every sample trains every width, at the cost of 4x compute per step.
+With `--mat-shared-input --batch-size 128`, each step has 32 unique samples repeated 4x (one per width) — same unique samples per step as the default unique-input run at batch=32. The only difference is that every sample trains every width, at the cost of 4x compute per step.
 
 | Model | FFN unique (bs=32) | FFN shared (bs=128) |
 |---|---|---|
 | Full (d_ff=2048) | **4.66** | 4.67 |
-| MRL 256 (d_ff=1024) | **4.66** | 4.67 |
-| MRL 128 (d_ff=512) | **4.68** | 4.69 |
-| MRL 64 (d_ff=256) | **4.80** | 4.81 |
+| 2x (d_ff=1024) | **4.66** | 4.67 |
+| 4x (d_ff=512) | **4.68** | 4.69 |
+| 8x (d_ff=256) | **4.80** | 4.81 |
 | Quant (INT4 g32) | **4.75** | 4.77 |
 | Speed | 11.8 it/s | 5.6 it/s |
 | Wall time | ~16 min | ~35 min |
@@ -121,4 +123,4 @@ This confirms **unique input at batch=32 is optimal**: same quality, 2x faster.
 
 - All runs are 1-epoch on TinyStories + LibriSpeech. Multi-epoch runs would improve all metrics.
 - Speech WER is poor across all methods — expected with interleaved training and limited speech data.
-- The heterogeneous batch approach uses the same memory as a single full-width forward (~1x). No overhead from MRL.
+- The heterogeneous batch approach uses the same memory as a single full-width forward (~1x). No overhead from matryoshka.

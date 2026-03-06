@@ -224,8 +224,8 @@ def _quantize_params(params, group_size=32):
 
 
 _GROUP_SIZE = 32
-_MRL_DIMS = ()
-_MRL_FF_SLICES = ()  # precomputed d_ff slices, set alongside _MRL_DIMS
+_MAT_FACTORS = ()
+_MAT_FF_WIDTHS = ()  # precomputed d_ff widths per factor
 _D_FF = 2048  # set in train()
 
 
@@ -269,17 +269,17 @@ def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, ffn_mask):
     return ce_loss + z_loss + div_loss
 
 
-def _make_ffn_mask(batch_size, d_ff, mrl_ff_slices):
+def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
     """Build (batch, d_ff) prefix mask: batch split equally across widths.
 
-    First quarter = full width (all ones), remaining quarters = MRL slices.
+    First quarter = full width (all ones), remaining quarters = mat widths.
     Each unique input is repeated once per width.
     """
-    n_widths = 1 + len(mrl_ff_slices)  # full + MRL dims
+    n_widths = 1 + len(mat_ff_widths)  # full + mat widths
     per_width = batch_size // n_widths
     arange = jnp.arange(d_ff)
     rows = [jnp.ones((per_width, d_ff), dtype=jnp.bfloat16)]  # full width
-    for k in mrl_ff_slices:
+    for k in mat_ff_widths:
         rows.append((arange[None, :] < k).astype(jnp.bfloat16).repeat(per_width, axis=0))
     # Handle remainder (assign to full width)
     remainder = batch_size - per_width * n_widths
@@ -288,7 +288,7 @@ def _make_ffn_mask(batch_size, d_ff, mrl_ff_slices):
     return jnp.concatenate(rows, axis=0)
 
 
-def _repeat_for_mrl(arr, n_widths):
+def _repeat_for_mat(arr, n_widths):
     """Repeat first batch/n_widths items n_widths times to fill batch."""
     per_width = arr.shape[0] // n_widths
     unique = arr[:per_width]
@@ -385,20 +385,20 @@ def _make_val_loss_fn(apply_fn):
     return val_loss_batch
 
 
-def _make_mrl_val_loss_fn(apply_fn, mrl_dim):
-    """Val loss for MRL sub-model at dimension mrl_dim (FFN interior slicing)."""
+def _make_mat_val_loss_fn(apply_fn, ff_width):
+    """Val loss for matryoshka sub-model at given FFN width."""
     @jax.jit
     def val_loss_batch(params, src, tgt_in, tgt_out, causal_mask):
         pad_id = 0
         src_mask = make_padding_mask(src, pad_id)
         tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
-        logits, _, mrl_logits = apply_fn(
+        logits, _, mat_logits = apply_fn(
             {"params": params}, src, tgt_in,
             src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=src_mask,
-            mrl_dims=(mrl_dim,),
+            mat_ff_widths=(ff_width,),
             method="forward_with_aux",
         )
-        trunc_logits = mrl_logits[0].astype(jnp.float32)
+        trunc_logits = mat_logits[0].astype(jnp.float32)
         loss = optax.softmax_cross_entropy_with_integer_labels(trunc_logits, tgt_out)
         mask = (tgt_out != pad_id).astype(jnp.float32)
         return jnp.sum(loss * mask), jnp.sum(mask)
@@ -422,29 +422,25 @@ def _make_speech_val_loss_fn(apply_fn):
     return val_loss_batch
 
 
-def _estimate_mrl_params(config, d_prime):
-    """Estimate parameter count of an exported sub-model at MRL dimension d_prime.
+def _estimate_mat_params(config, matryoshka_factor):
+    """Estimate parameter count of a sub-model at a given matryoshka factor.
 
-    FFN interior slicing: only FFN d_ff is reduced proportionally.
-    d_model, attention, embedding, and mixer are all unchanged.
-      - Embedding:  [vocab, d_model]  (unchanged)
-      - Attention:  full d_model heads/projections (unchanged)
-      - FFN:        d_ff' = d_ff * d_prime // d_model (sliced)
-      - Mixer:      full d_ff (unchanged, not masked)
+    matryoshka_factor: how many times smaller the FFN widths are (e.g. 2 = half width).
+    Embedding and attention weights are unchanged.
     """
     d = config.d_model
     v = config.vocab_size
     n_enc = config.num_encoder_layers
     n_dec = config.num_decoder_layers
     kv_dim = config.num_kv_heads * (d // config.num_heads)
-    d_ff_prime = config.d_ff * d_prime // d
     m = config.num_memory_slots
+    d_ff = config.d_ff // matryoshka_factor
 
     emb = v * d
     attn = d * d + d * kv_dim * 2 + d * d
-    ffn = d * d_ff_prime * 3
-    mixer_token = d * config.d_ff * 2 + config.d_ff * m
-    mixer_channel = d * config.d_ff * 3
+    ffn = d * d_ff * 3
+    mixer_token = m * d_ff * 3
+    mixer_channel = d * d_ff * 3
     enc_block = attn + ffn + mixer_token + mixer_channel
     dec_block = attn * 2 + ffn
     total = emb + n_enc * enc_block + n_dec * dec_block
@@ -551,17 +547,17 @@ def train(args):
             n_mels=n_mels,
         )
 
-    global _GROUP_SIZE, _MRL_DIMS, _MRL_FF_SLICES, _D_FF
+    global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF
     _GROUP_SIZE = getattr(args, "group_size", 32)
     _D_FF = config.d_ff
-    mrl_dims_raw = getattr(args, "mrl_dims", None)
-    if mrl_dims_raw:
-        _MRL_DIMS = tuple(d for d in mrl_dims_raw if d < config.d_model)
-        _MRL_FF_SLICES = tuple(config.d_ff * d // config.d_model for d in _MRL_DIMS)
+    mat_factors_raw = getattr(args, "mat_factors", None)
+    if mat_factors_raw:
+        _MAT_FACTORS = tuple(f for f in mat_factors_raw if f > 1)
+        _MAT_FF_WIDTHS = tuple(config.d_ff // f for f in _MAT_FACTORS)
     else:
-        _MRL_DIMS = ()
-        _MRL_FF_SLICES = ()
-    n_widths = 1 + len(_MRL_FF_SLICES) if _MRL_FF_SLICES else 1
+        _MAT_FACTORS = ()
+        _MAT_FF_WIDTHS = ()
+    n_widths = 1 + len(_MAT_FF_WIDTHS) if _MAT_FF_WIDTHS else 1
     p_train_step = _make_p_train_step()
     p_train_step_masked = _make_p_train_step_masked()
     p_train_step_speech = _make_p_train_step_speech()
@@ -571,10 +567,10 @@ def train(args):
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
 
-    mrl_shared_input = getattr(args, "mrl_shared_input", False)
+    mat_shared_input = getattr(args, "mat_shared_input", False)
     # With shared input, each unique sample is repeated n_widths times,
     # so we fetch smaller batches but take more steps per epoch.
-    unique_batch_size = effective_batch_size // n_widths if (mrl_shared_input and n_widths > 1) else effective_batch_size
+    unique_batch_size = effective_batch_size // n_widths if (mat_shared_input and n_widths > 1) else effective_batch_size
     text_batches_per_epoch = len(enc_inputs) // unique_batch_size
     speech_batches_per_epoch = text_batches_per_epoch // speech_every if (not no_speech and speech_mel is not None) else 0
     num_batches = text_batches_per_epoch + speech_batches_per_epoch
@@ -630,19 +626,19 @@ def train(args):
         (num_devices, 1, args.max_dec_len, args.max_dec_len),
     )
 
-    # Precompute FFN mask for heterogeneous MRL training.
-    # Batch is split: 1/N full-width + 1/N per MRL dim.
-    text_ffn_mask = _make_ffn_mask(args.batch_size, config.d_ff, _MRL_FF_SLICES)
+    # Precompute FFN mask for heterogeneous matryoshka training.
+    # Batch is split: 1/N full-width + 1/N per mat factor.
+    text_ffn_mask = _make_ffn_mask(args.batch_size, config.d_ff, _MAT_FF_WIDTHS)
     text_ffn_mask = jnp.broadcast_to(
         text_ffn_mask[None, :, :],
         (num_devices, args.batch_size, config.d_ff),
     )
     if n_widths > 1:
-        print(f"  MRL widths    {n_widths} (full + {', '.join(str(s) for s in _MRL_FF_SLICES)})")
-        if mrl_shared_input:
-            print(f"  MRL mode      shared input ({unique_batch_size // num_devices}/dev x {n_widths} repeats)")
+        print(f"  Mat factors   {n_widths} (full + {', '.join(str(f)+'x' for f in _MAT_FACTORS)})")
+        if mat_shared_input:
+            print(f"  Mat mode      shared input ({unique_batch_size // num_devices}/dev x {n_widths} repeats)")
         else:
-            print(f"  MRL mode      unique input ({args.batch_size}/dev, random width)")
+            print(f"  Mat mode      unique input ({args.batch_size}/dev, random width)")
 
     adam_schedule = _wsd_schedule(scaled_lr, total_steps, warmup_steps)
     muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
@@ -689,7 +685,7 @@ def train(args):
             # --- Text step ---
             t0 = time.perf_counter()
 
-            if n_widths > 1 and mrl_shared_input:
+            if n_widths > 1 and mat_shared_input:
                 # Shared: repeat each unique input across all widths
                 src = np.tile(src, (n_widths, 1))
                 tgt_in = np.tile(tgt_in, (n_widths, 1))
@@ -719,7 +715,7 @@ def train(args):
             if speech_iter is not None and text_step_in_epoch % speech_every == 0:
                 mel_batch, sp_tgt_in, sp_tgt_out = next(speech_iter)
 
-                if n_widths > 1 and mrl_shared_input:
+                if n_widths > 1 and mat_shared_input:
                     mel_batch = np.tile(mel_batch, (n_widths, 1, 1))
                     sp_tgt_in = np.tile(sp_tgt_in, (n_widths, 1))
                     sp_tgt_out = np.tile(sp_tgt_out, (n_widths, 1))
@@ -849,21 +845,21 @@ def train(args):
         quant_val_ppl = float(math.exp(q_total_loss / max(q_total_toks, 1)))
         del q_params  # free device memory
 
-        # MRL per-dimension evaluation (reuse val_loss_fn's apply_fn)
-        mrl_results = {}
-        if _MRL_DIMS:
+        # Matryoshka per-factor evaluation (reuse val_loss_fn's apply_fn)
+        mat_results = {}
+        if _MAT_FACTORS:
             apply_fn = jax_utils.unreplicate(state).apply_fn
-            for d_prime in _MRL_DIMS:
-                mrl_vl_fn = _make_mrl_val_loss_fn(apply_fn, d_prime)
-                mrl_total_loss, mrl_total_toks = 0.0, 0.0
+            for factor, ff_w in zip(_MAT_FACTORS, _MAT_FF_WIDTHS):
+                mat_vl_fn = _make_mat_val_loss_fn(apply_fn, ff_w)
+                mat_total_loss, mat_total_toks = 0.0, 0.0
                 for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
-                    vl, vt = mrl_vl_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
-                    mrl_total_loss += float(vl)
-                    mrl_total_toks += float(vt)
-                avg_loss = mrl_total_loss / max(mrl_total_toks, 1)
-                mrl_ppl = float(math.exp(min(avg_loss, 20)))
-                mrl_params = _estimate_mrl_params(config, d_prime)
-                mrl_results[d_prime] = (mrl_ppl, mrl_params)
+                    vl, vt = mat_vl_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
+                    mat_total_loss += float(vl)
+                    mat_total_toks += float(vt)
+                avg_loss = mat_total_loss / max(mat_total_toks, 1)
+                mat_ppl = float(math.exp(min(avg_loss, 20)))
+                mat_params = _estimate_mat_params(config, factor)
+                mat_results[factor] = (mat_ppl, mat_params, ff_w)
             del apply_fn
 
         # Sparsity + checkpoint — move to CPU, reuse single copy
@@ -923,15 +919,14 @@ def train(args):
             print(f"  Speech val ppl {speech_val_ppl:>12.2f}")
         print(f"  Quant val ppl  {quant_val_ppl:>12.2f}  (INT4 g{_GROUP_SIZE})")
         print(f"  Sparsity       {sparsity:>11.2f}%  ({near_zero:,}/{total_params:,})")
-        if mrl_results:
+        if mat_results:
             print(f"  ─────────────────────────────────────")
-            print(f"  MRL exportable sub-models (FFN interior slicing):")
-            print(f"  {'dim':>6}  {'d_ff':>6}  {'val ppl':>10}  {'params':>12}")
-            print(f"  {config.d_model:>6}  {config.d_ff:>6}  {last_val_ppl:>10.2f}  {total_params:>12,}  (full)")
-            for d_prime in sorted(mrl_results.keys(), reverse=True):
-                mrl_ppl, mrl_params = mrl_results[d_prime]
-                d_ff_prime = config.d_ff * d_prime // config.d_model
-                print(f"  {d_prime:>6}  {d_ff_prime:>6}  {mrl_ppl:>10.2f}  {mrl_params:>12,}")
+            print(f"  Matryoshka exportable sub-models (FFN interior slicing):")
+            print(f"  {'factor':>6}  {'d_ff':>6}  {'val ppl':>10}  {'params':>12}")
+            print(f"  {'1x':>6}  {config.d_ff:>6}  {last_val_ppl:>10.2f}  {total_params:>12,}  (full)")
+            for factor in sorted(mat_results.keys()):
+                mat_ppl, mat_params, ff_w = mat_results[factor]
+                print(f"  {str(factor)+'x':>6}  {ff_w:>6}  {mat_ppl:>10.2f}  {mat_params:>12,}")
         print(f"  ─────────────────────────────────────")
         print(f"  Throughput     {tp['tokens_per_second']:>10.1f} tok/s")
         print(f"  Latency        {tp['avg_latency_s']:>11.3f}s")
@@ -966,9 +961,9 @@ def train(args):
                 log_dict["epoch/avg_speech_loss"] = sum(speech_losses) / len(speech_losses)
             if speech_val_ppl is not None:
                 log_dict["epoch/speech_val_ppl"] = speech_val_ppl
-            for d_prime, (mrl_ppl, mrl_params) in mrl_results.items():
-                log_dict[f"epoch/mrl_ppl_d{d_prime}"] = mrl_ppl
-                log_dict[f"epoch/mrl_params_d{d_prime}"] = mrl_params
+            for factor, (mat_ppl, mat_params, _) in mat_results.items():
+                log_dict[f"epoch/mat_ppl_{factor}x"] = mat_ppl
+                log_dict[f"epoch/mat_params_{factor}x"] = mat_params
             wandb.log(log_dict)
 
     if use_wandb:
