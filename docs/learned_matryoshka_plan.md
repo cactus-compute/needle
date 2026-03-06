@@ -57,26 +57,80 @@ Two-phase (no warmup — MRL active from step 0):
 
 ## Results
 
-### TopK (shuffled init, this branch, 75.6M params, 1378 steps)
+All experiments use identical config matching the prefix baseline in `matryoshka_results.md`:
+- 87.7M params: d=512, d_ff=2048, heads=8 (kv=8), enc=8, dec=4, memory=64
+- batch=32×8=256, 11038 total steps, seed=42, sparsity=50%, speech every 3
+- TopK defaults: shuffled_prefix init, tau 1.0→0.2, freeze=0.6, mask_lr=3e-3, spread λ=0.01
 
-| Width | d_ff | TopK Shuffled |
-|-------|------|---------------|
-| Full | 2048 | 9.62 |
-| 256 | 1024 | 8.98 |
-| 128 | 512 | 8.43 |
-| 64 | 256 | 8.86 |
+### E1: TopK vs Prefix Baseline (1 epoch)
 
-> Note: Different config from baseline (75.6M vs 87.7M params, batch=256 vs 256, 1378 vs 11038 steps). Needs rerun with matching config for fair comparison.
+| Width | d_ff | Prefix Baseline | **TopK (E1)** |
+|-------|------|-----------------|---------------|
+| Full | 2048 | **4.66** | 4.93 |
+| 256 | 1024 | **4.66** | 4.95 |
+| 128 | 512 | **4.68** | 5.03 |
+| 64 | 256 | **4.80** | 5.19 |
+
+TopK is +0.27 worse at full, +0.39 worse at d=64. The learned mask has extra overhead vs fixed prefix.
+
+### E2: Freeze Fraction Ablation
+
+| Width | d_ff | freeze=0.4 | freeze=0.5 | **freeze=0.6** | freeze=0.7 |
+|-------|------|------------|------------|----------------|------------|
+| Full | 2048 | 5.08 | 4.98 | **4.93** | 4.94 |
+| 256 | 1024 | 5.14 | 5.01 | **4.95** | 4.96 |
+| 128 | 512 | 5.25 | 5.12 | **5.03** | 5.07 |
+| 64 | 256 | 5.43 | 5.29 | **5.19** | 5.24 |
+
+freeze=0.6 is best overall. Too little freeze (0.4) hurts most. 0.7 is slightly worse than 0.6 (less learning time).
+
+### E3: Tau Schedule Ablation
+
+| Width | d_ff | tau 0.5→0.1 | **tau 1.0→0.2 (default)** | tau 2.0→0.3 |
+|-------|------|-------------|---------------------------|-------------|
+| Full | 2048 | 4.79 | 4.93 | **4.76** |
+| 256 | 1024 | 4.82 | 4.95 | **4.78** |
+| 128 | 512 | 4.93 | 5.03 | **4.88** |
+| 64 | 256 | 5.09 | 5.19 | **5.02** |
+
+Both alternatives beat the default! tau 2.0→0.3 (softer start, softer end) is best. tau 0.5→0.1 (sharper) is also strong. The default 1.0→0.2 is the worst of the three.
+
+### E4: Mask LR Ablation
+
+| Width | d_ff | lr=1e-3 | **lr=3e-3 (default)** | lr=1e-2 |
+|-------|------|---------|-----------------------|---------|
+| Full | 2048 | **4.80** | 4.93 | 5.10 |
+| 256 | 1024 | **4.85** | 4.95 | 5.13 |
+| 128 | 512 | **4.97** | 5.03 | 5.26 |
+| 64 | 256 | **5.12** | 5.19 | 5.43 |
+
+Lower LR (1e-3) is best. Higher LR (1e-2) hurts significantly. Default 3e-3 is middle.
+
+### E5: Multi-Epoch (2 epochs)
+
+| Width | d_ff | TopK 1 epoch | **TopK 2 epochs** |
+|-------|------|--------------|--------------------|
+| Full | 2048 | 4.93 | **4.36** |
+| 256 | 1024 | 4.95 | **4.37** |
+| 128 | 512 | 5.03 | **4.44** |
+| 64 | 256 | 5.19 | **4.55** |
+
+2 epochs dramatically improves everything. The 2-epoch d=64 (4.55) beats the 1-epoch prefix baseline d=64 (4.80).
+
+### Summary: Best Single-Epoch Config
+
+Based on the ablations, the optimal single-variable changes from default are:
+- **tau 2.0→0.3** (E3): biggest win, −0.17 at d=64
+- **lr 1e-3** (E4): −0.07 at d=64
+- **freeze 0.6** (E2): already the default, confirmed best
+
+A combined run with tau 2.0→0.3 + lr 1e-3 could potentially close the gap to prefix baseline further.
 
 ## Experiments Still Needed
 
-1. **Apples-to-apples comparison**: TopK shuffled vs prefix baseline with identical config (87.7M params, 8 enc / 4 dec, batch 256, 1 epoch, same sparsity/speech settings)
-2. **Ablation: freeze fraction**: Test 0.4, 0.5, 0.6, 0.7
-3. **Ablation: tau schedule**: Test different start/end temperatures
-4. **Ablation: mask LR**: Test 1e-3, 3e-3, 1e-2
-5. **Multi-epoch**: Does topk improve relative to prefix with longer training?
-6. **Export**: Verify learned neuron selection exports correctly (gather active neurons from gate/up/down projections)
-7. **Saliency init**: Initialize mask logits from accumulated gradient importance during warmup phase
+1. **Combined best**: tau 2.0→0.3 + lr 1e-3 + freeze 0.6 (combine best ablation winners)
+2. **Export**: Verify learned neuron selection exports correctly
+3. **Saliency init**: Initialize mask logits from gradient importance
 
 ## Historical Notes
 
