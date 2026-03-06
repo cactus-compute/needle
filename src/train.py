@@ -225,72 +225,80 @@ def _quantize_params(params, group_size=32):
 
 _GROUP_SIZE = 32
 _MRL_DIMS = ()
+_MRL_FF_SLICES = ()  # precomputed d_ff slices, set alongside _MRL_DIMS
+_D_FF = 2048  # set in train()
 
 
-def _compute_loss(logits, slot_div, mrl_logits, tgt_out):
-    """Shared CE + MRL + z-loss + slot-div computation."""
+def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask):
     pad_id = 0
+    src_mask = make_padding_mask(src, pad_id)
+    tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+    logits, slot_div = state.apply_fn(
+        {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
+        src, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask,
+        ffn_mask=ffn_mask,
+        method="forward_masked",
+    )
     logits_f32 = logits.astype(jnp.float32)
     mask = (tgt_out != pad_id).astype(jnp.float32)
     ce_loss = jnp.sum(
         optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
     ) / jnp.maximum(jnp.sum(mask), 1.0)
-
-    total_loss = ce_loss
-    num_scales = 1
-    for mrl_log in mrl_logits:
-        mrl_log_f32 = mrl_log.astype(jnp.float32)
-        aux_loss = jnp.sum(
-            optax.softmax_cross_entropy_with_integer_labels(mrl_log_f32, tgt_out) * mask
-        ) / jnp.maximum(jnp.sum(mask), 1.0)
-        total_loss = total_loss + aux_loss
-        num_scales = num_scales + 1
-    total_loss = total_loss / num_scales
-
     z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
     div_loss = 1e-4 * slot_div
-    return total_loss + z_loss + div_loss
+    return ce_loss + z_loss + div_loss
 
 
-def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask):
-    pad_id = 0
-    src_mask = make_padding_mask(src, pad_id)
-    tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
-
-    logits, slot_div, mrl_logits = state.apply_fn(
-        {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
-        src,
-        tgt_in,
-        src_mask=src_mask,
-        tgt_mask=tgt_mask,
-        cross_mask=src_mask,
-        mrl_dims=_MRL_DIMS if _MRL_DIMS else None,
-        method="forward_with_aux",
-    )
-    return _compute_loss(logits, slot_div, mrl_logits, tgt_out)
-
-
-def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask):
+def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, ffn_mask):
     pad_id = 0
     src_mask = make_mel_padding_mask(mel)
     tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
-
-    logits, slot_div, mrl_logits = state.apply_fn(
+    logits, slot_div = state.apply_fn(
         {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
-        mel,
-        tgt_in,
-        src_mask=src_mask,
-        tgt_mask=tgt_mask,
-        mrl_dims=_MRL_DIMS if _MRL_DIMS else None,
-        method="forward_speech_with_aux",
+        mel, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask,
+        ffn_mask=ffn_mask,
+        method="forward_speech_masked",
     )
-    return _compute_loss(logits, slot_div, mrl_logits, tgt_out)
+    logits_f32 = logits.astype(jnp.float32)
+    mask = (tgt_out != pad_id).astype(jnp.float32)
+    ce_loss = jnp.sum(
+        optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
+    ) / jnp.maximum(jnp.sum(mask), 1.0)
+    z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
+    div_loss = 1e-4 * slot_div
+    return ce_loss + z_loss + div_loss
 
 
-def _train_step_text(state, ema_params, src, tgt_in, tgt_out, causal_mask):
+def _make_ffn_mask(batch_size, d_ff, mrl_ff_slices):
+    """Build (batch, d_ff) prefix mask: batch split equally across widths.
+
+    First quarter = full width (all ones), remaining quarters = MRL slices.
+    Each unique input is repeated once per width.
+    """
+    n_widths = 1 + len(mrl_ff_slices)  # full + MRL dims
+    per_width = batch_size // n_widths
+    arange = jnp.arange(d_ff)
+    rows = [jnp.ones((per_width, d_ff), dtype=jnp.bfloat16)]  # full width
+    for k in mrl_ff_slices:
+        rows.append((arange[None, :] < k).astype(jnp.bfloat16).repeat(per_width, axis=0))
+    # Handle remainder (assign to full width)
+    remainder = batch_size - per_width * n_widths
+    if remainder > 0:
+        rows.append(jnp.ones((remainder, d_ff), dtype=jnp.bfloat16))
+    return jnp.concatenate(rows, axis=0)
+
+
+def _repeat_for_mrl(arr, n_widths):
+    """Repeat first batch/n_widths items n_widths times to fill batch."""
+    per_width = arr.shape[0] // n_widths
+    unique = arr[:per_width]
+    return jnp.tile(unique, (n_widths,) + (1,) * (arr.ndim - 1))
+
+
+def _train_step_text(state, ema_params, src, tgt_in, tgt_out, causal_mask, ffn_mask):
     ema_decay = 0.999
     loss, grads = jax.value_and_grad(
-        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask)
+        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -300,11 +308,11 @@ def _train_step_text(state, ema_params, src, tgt_in, tgt_out, causal_mask):
     return state, ema_params, loss, grad_norm
 
 
-def _train_step_text_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask):
-    """Text training step with fused mask application."""
+def _train_step_text_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask):
+    """Text training step with fused prune mask application."""
     ema_decay = 0.999
     loss, grads = jax.value_and_grad(
-        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask)
+        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -316,10 +324,10 @@ def _train_step_text_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask
     return state, ema_params, loss, grad_norm
 
 
-def _train_step_speech(state, ema_params, mel, tgt_in, tgt_out, causal_mask):
+def _train_step_speech(state, ema_params, mel, tgt_in, tgt_out, causal_mask, ffn_mask):
     ema_decay = 0.999
     loss, grads = jax.value_and_grad(
-        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask)
+        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, ffn_mask)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -329,11 +337,11 @@ def _train_step_speech(state, ema_params, mel, tgt_in, tgt_out, causal_mask):
     return state, ema_params, loss, grad_norm
 
 
-def _train_step_speech_masked(state, ema_params, mel, tgt_in, tgt_out, causal_mask, prune_mask):
-    """Speech training step with fused mask application."""
+def _train_step_speech_masked(state, ema_params, mel, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask):
+    """Speech training step with fused prune mask application."""
     ema_decay = 0.999
     loss, grads = jax.value_and_grad(
-        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask)
+        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, ffn_mask)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -543,13 +551,17 @@ def train(args):
             n_mels=n_mels,
         )
 
-    global _GROUP_SIZE, _MRL_DIMS
+    global _GROUP_SIZE, _MRL_DIMS, _MRL_FF_SLICES, _D_FF
     _GROUP_SIZE = getattr(args, "group_size", 32)
+    _D_FF = config.d_ff
     mrl_dims_raw = getattr(args, "mrl_dims", None)
     if mrl_dims_raw:
         _MRL_DIMS = tuple(d for d in mrl_dims_raw if d < config.d_model)
+        _MRL_FF_SLICES = tuple(config.d_ff * d // config.d_model for d in _MRL_DIMS)
     else:
         _MRL_DIMS = ()
+        _MRL_FF_SLICES = ()
+    n_widths = 1 + len(_MRL_FF_SLICES) if _MRL_FF_SLICES else 1
     p_train_step = _make_p_train_step()
     p_train_step_masked = _make_p_train_step_masked()
     p_train_step_speech = _make_p_train_step_speech()
@@ -559,7 +571,11 @@ def train(args):
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
 
-    text_batches_per_epoch = len(enc_inputs) // effective_batch_size
+    mrl_shared_input = getattr(args, "mrl_shared_input", False)
+    # With shared input, each unique sample is repeated n_widths times,
+    # so we fetch smaller batches but take more steps per epoch.
+    unique_batch_size = effective_batch_size // n_widths if (mrl_shared_input and n_widths > 1) else effective_batch_size
+    text_batches_per_epoch = len(enc_inputs) // unique_batch_size
     speech_batches_per_epoch = text_batches_per_epoch // speech_every if (not no_speech and speech_mel is not None) else 0
     num_batches = text_batches_per_epoch + speech_batches_per_epoch
     total_steps = num_batches * args.epochs
@@ -614,6 +630,20 @@ def train(args):
         (num_devices, 1, args.max_dec_len, args.max_dec_len),
     )
 
+    # Precompute FFN mask for heterogeneous MRL training.
+    # Batch is split: 1/N full-width + 1/N per MRL dim.
+    text_ffn_mask = _make_ffn_mask(args.batch_size, config.d_ff, _MRL_FF_SLICES)
+    text_ffn_mask = jnp.broadcast_to(
+        text_ffn_mask[None, :, :],
+        (num_devices, args.batch_size, config.d_ff),
+    )
+    if n_widths > 1:
+        print(f"  MRL widths    {n_widths} (full + {', '.join(str(s) for s in _MRL_FF_SLICES)})")
+        if mrl_shared_input:
+            print(f"  MRL mode      shared input ({unique_batch_size // num_devices}/dev x {n_widths} repeats)")
+        else:
+            print(f"  MRL mode      unique input ({args.batch_size}/dev, random width)")
+
     adam_schedule = _wsd_schedule(scaled_lr, total_steps, warmup_steps)
     muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
     tokens_per_batch = effective_batch_size * (args.max_enc_len + args.max_dec_len)
@@ -643,13 +673,13 @@ def train(args):
 
         text_losses = []
         speech_losses = []
-        text_batches = get_batches(enc_inputs, dec_inputs, dec_targets, effective_batch_size)
+        text_batches = get_batches(enc_inputs, dec_inputs, dec_targets, unique_batch_size)
 
         # Speech batches cycle via itertools.cycle
         speech_iter = None
         if not no_speech and speech_mel is not None:
             speech_iter = iter(itertools.cycle(
-                get_speech_batches(speech_mel, speech_dec_in, speech_dec_tgt, effective_batch_size)
+                get_speech_batches(speech_mel, speech_dec_in, speech_dec_tgt, unique_batch_size)
             ))
 
         text_step_in_epoch = 0
@@ -658,17 +688,25 @@ def train(args):
         for src, tgt_in, tgt_out in pbar:
             # --- Text step ---
             t0 = time.perf_counter()
+
+            if n_widths > 1 and mrl_shared_input:
+                # Shared: repeat each unique input across all widths
+                src = np.tile(src, (n_widths, 1))
+                tgt_in = np.tile(tgt_in, (n_widths, 1))
+                tgt_out = np.tile(tgt_out, (n_widths, 1))
+            # else: unique input per batch item, random width via ffn_mask
+
             src_b = shard_batch(src, num_devices)
             tgt_in_b = shard_batch(tgt_in, num_devices)
             tgt_out_b = shard_batch(tgt_out, num_devices)
 
             if prune_mask is not None:
                 state, ema_params, loss, grad_norm = p_train_step_masked(
-                    state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask,
+                    state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask, text_ffn_mask,
                 )
             else:
                 state, ema_params, loss, grad_norm = p_train_step(
-                    state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask,
+                    state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_ffn_mask,
                 )
 
             text_loss_val = float(loss[0])
@@ -680,17 +718,26 @@ def train(args):
             speech_loss_val = None
             if speech_iter is not None and text_step_in_epoch % speech_every == 0:
                 mel_batch, sp_tgt_in, sp_tgt_out = next(speech_iter)
+
+                if n_widths > 1 and mrl_shared_input:
+                    mel_batch = np.tile(mel_batch, (n_widths, 1, 1))
+                    sp_tgt_in = np.tile(sp_tgt_in, (n_widths, 1))
+                    sp_tgt_out = np.tile(sp_tgt_out, (n_widths, 1))
+
                 mel_b = shard_batch(mel_batch, num_devices)
                 sp_tgt_in_b = shard_batch(sp_tgt_in, num_devices)
                 sp_tgt_out_b = shard_batch(sp_tgt_out, num_devices)
 
+                # Speech ffn_mask: same width structure, but mel has different seq dim
+                speech_ffn_mask = text_ffn_mask  # same (devices, batch, d_ff) mask
+
                 if prune_mask is not None:
                     state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech_masked(
-                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, prune_mask,
+                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, prune_mask, speech_ffn_mask,
                     )
                 else:
                     state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech(
-                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask,
+                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, speech_ffn_mask,
                     )
                 speech_loss_val = float(sp_loss[0])
                 speech_losses.append(speech_loss_val)
