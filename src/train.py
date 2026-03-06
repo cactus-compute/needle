@@ -274,8 +274,7 @@ def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, ffn_mask, 
 def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
     """Build (batch, d_ff) prefix mask: batch split equally across widths.
 
-    First quarter = full width (all ones), remaining quarters = mat widths.
-    Each unique input is repeated once per width.
+    First 1/N = full width (all ones), remaining 1/N sections = mat widths.
     """
     n_widths = 1 + len(mat_ff_widths)  # full + mat widths
     per_width = batch_size // n_widths
@@ -288,13 +287,6 @@ def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
     if remainder > 0:
         rows.append(jnp.ones((remainder, d_ff), dtype=jnp.bfloat16))
     return jnp.concatenate(rows, axis=0)
-
-
-def _repeat_for_mat(arr, n_widths):
-    """Repeat first batch/n_widths items n_widths times to fill batch."""
-    per_width = arr.shape[0] // n_widths
-    unique = arr[:per_width]
-    return jnp.tile(unique, (n_widths,) + (1,) * (arr.ndim - 1))
 
 
 def _train_step_text(state, ema_params, src, tgt_in, tgt_out, causal_mask, ffn_mask):
@@ -696,15 +688,22 @@ def train(args):
             t0 = time.perf_counter()
 
             if n_widths > 1 and mat_shared_input:
-                # Shared: repeat each unique input across all widths
-                src = np.tile(src, (n_widths, 1))
-                tgt_in = np.tile(tgt_in, (n_widths, 1))
-                tgt_out = np.tile(tgt_out, (n_widths, 1))
-            # else: unique input per batch item, random width via ffn_mask
-
-            src_b = shard_batch(src, num_devices)
-            tgt_in_b = shard_batch(tgt_in, num_devices)
-            tgt_out_b = shard_batch(tgt_out, num_devices)
+                # Shared: each unique input sees all widths. Shard unique samples
+                # across devices, then tile within each device's portion so the
+                # ffn_mask width sections each get the same unique inputs.
+                per_width = args.batch_size // n_widths
+                def _tile_for_mat(arr):
+                    # (unique_batch, ...) -> (devices, per_width, ...) -> tile -> (devices, batch, ...)
+                    s = arr.reshape(num_devices, per_width, *arr.shape[1:])
+                    s = np.tile(s, (1, n_widths) + (1,) * (arr.ndim - 1))
+                    return s
+                src_b = _tile_for_mat(src)
+                tgt_in_b = _tile_for_mat(tgt_in)
+                tgt_out_b = _tile_for_mat(tgt_out)
+            else:
+                src_b = shard_batch(src, num_devices)
+                tgt_in_b = shard_batch(tgt_in, num_devices)
+                tgt_out_b = shard_batch(tgt_out, num_devices)
 
             if prune_mask is not None:
                 state, ema_params, loss, grad_norm = p_train_step_masked(
@@ -726,13 +725,17 @@ def train(args):
                 mel_batch, sp_tgt_in, sp_tgt_out = next(speech_iter)
 
                 if n_widths > 1 and mat_shared_input:
-                    mel_batch = np.tile(mel_batch, (n_widths, 1, 1))
-                    sp_tgt_in = np.tile(sp_tgt_in, (n_widths, 1))
-                    sp_tgt_out = np.tile(sp_tgt_out, (n_widths, 1))
-
-                mel_b = shard_batch(mel_batch, num_devices)
-                sp_tgt_in_b = shard_batch(sp_tgt_in, num_devices)
-                sp_tgt_out_b = shard_batch(sp_tgt_out, num_devices)
+                    per_width = args.batch_size // n_widths
+                    def _tile_sp(arr):
+                        s = arr.reshape(num_devices, per_width, *arr.shape[1:])
+                        return np.tile(s, (1, n_widths) + (1,) * (arr.ndim - 1))
+                    mel_b = _tile_sp(mel_batch)
+                    sp_tgt_in_b = _tile_sp(sp_tgt_in)
+                    sp_tgt_out_b = _tile_sp(sp_tgt_out)
+                else:
+                    mel_b = shard_batch(mel_batch, num_devices)
+                    sp_tgt_in_b = shard_batch(sp_tgt_in, num_devices)
+                    sp_tgt_out_b = shard_batch(sp_tgt_out, num_devices)
 
                 speech_ffn_mask = text_ffn_mask
                 rng, spec_rng = jax.random.split(rng)
