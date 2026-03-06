@@ -60,5 +60,8 @@ where $\lambda_{\mathrm{adv}}\ge 0$ controls the strength of adversarial alignme
 
 5. **Encoder**: The encoder will be a memory mixer like what we have implemented already.
 
-6. **Audio Projector**: The audio projector will be a simple linear multiplication on the latent multiplying across the hidden dimension.
+6. **Audio Projector**: The audio projector strips non-linguistic information (prosody, speaker identity, noise) from the audio latent so that the projected output is distributionally aligned with the text latent. A full $d \times d$ linear map cannot reduce rank, so a bottleneck is preferred. Options:
+   - (a) Full linear: $W \in \mathbb{R}^{d \times d}$ — baseline
+   - (b) LoRA-style bottleneck: $W = AB$ where $A \in \mathbb{R}^{d \times a}$, $B \in \mathbb{R}^{a \times d}$, $a \ll d$ — forces rank-$a$ projection, acting as an information bottleneck. Sweep $a \in \{d/16, d/8, d/4, d/2\}$.
+   - (c) 2-layer MLP with bottleneck: $\text{GELU}(z_a W_1) W_2$ — adds nonlinearity if the split is not linearly separable
 
