@@ -129,8 +129,8 @@ def main():
                    help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4 8)")
     p.add_argument("--mat-shared-input", action="store_true",
                    help="Each unique input is repeated across all mat widths (default: unique input per width)")
-    p.add_argument("--mat-method", choices=["static-prefix", "topk"], default="static-prefix",
-                   help="Matryoshka method: 'static-prefix' (fixed first-N masks), 'topk' (learned masks)")
+    p.add_argument("--mat-method", choices=["static-prefix", "topk"], default="topk",
+                   help="Matryoshka method: 'static-prefix' (fixed first-N masks), 'topk' (saliency-based masks, default)")
     p.add_argument("--mat-tau-start", type=float, default=0.5)
     p.add_argument("--mat-tau-end", type=float, default=0.1)
     p.add_argument("--mat-init-mode", choices=["prefix", "shuffled_prefix", "saliency", "normal", "zeros"], default="saliency")
