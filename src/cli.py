@@ -133,13 +133,13 @@ def main():
                    help="Matryoshka method: 'static-prefix' (fixed first-N masks), 'topk' (learned masks)")
     p.add_argument("--mat-tau-start", type=float, default=0.5)
     p.add_argument("--mat-tau-end", type=float, default=0.1)
-    p.add_argument("--mat-init-mode", choices=["prefix", "shuffled_prefix", "saliency", "normal", "zeros"], default="normal")
+    p.add_argument("--mat-init-mode", choices=["prefix", "shuffled_prefix", "saliency", "normal", "zeros"], default="saliency")
     p.add_argument("--mat-init-value", type=float, default=0.5)
-    p.add_argument("--mat-spread-lambda", type=float, default=0.01)
-    p.add_argument("--mat-warmup-frac", type=float, default=0.15,
+    p.add_argument("--mat-spread-lambda", type=float, default=0.0)
+    p.add_argument("--mat-warmup-frac", type=float, default=0.4,
                    help="Fraction of total steps for vanilla warmup (no masks)")
-    p.add_argument("--mat-freeze-frac", type=float, default=0.2,
-                   help="Fraction of total steps at end to freeze masks (hard only)")
+    p.add_argument("--mat-freeze-frac", type=float, default=1.0,
+                   help="Fraction of post-warmup steps to freeze masks (hard only)")
     p.add_argument("--mat-mask-lr", type=float, default=3e-3,
                    help="Mask logit optimizer learning rate (default: 3e-3)")
     p.add_argument("--mat-saliency-scale", type=float, default=1.0)

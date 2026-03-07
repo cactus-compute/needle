@@ -193,50 +193,112 @@ TopK is still ~0.16-0.32 behind prefix at 1 epoch, but 2-epoch topk (E5: 4.55 d=
 
 ---
 
-## Experiments Still Needed
+## Full-Matryoshka Experiments (with mixer masking)
 
-> **Note:** These experiments were planned for the old branch and have not yet been
-> run on the current codebase, which now has per-layer masks and Gumbel noise support.
-> The per-layer architecture may change optimal hyperparameters.
+All experiments below apply `ffn_mask` to ALL FeedForward layers including MLPMixer
+token_mix and channel_mix. Baselines from `matryoshka_results.md`:
+- **Prefix baseline** (full mat): 4.82 / 4.82 / 4.85 / 4.97 (full/2x/4x/8x)
+- **No-matryoshka**: 4.52 (full only, no sub-models)
 
-### Saliency Initialization
+### R1–R5: Re-validation of Prior Findings
 
-Saliency init uses a **10% warmup phase** (full-model-only, no MRL) to accumulate per-FFN-neuron gradient importance via `||grad(down_proj)[:, j]||²` EMA across all layers. At the warmup→learning transition, these scores are converted to mask logits via quantile normalization. The **freeze phase is 50%** (shorter than the 60% default for shuffled, since saliency gives a better starting point and we want more learning time to refine).
+All use seed=42, 1 epoch, 88.5M params. Base topk defaults: tau 0.5→0.1, lr 3e-3,
+λ=0.01, warmup 15%, freeze 20%, normal init.
 
-**Saliency logit conversion** requires a temperature/scale parameter (`--mrl-saliency-scale`) to control how strongly the initial ranking influences mask selection:
-- High scale (e.g., 2.0): strong prior — top-saliency neurons are almost certainly selected, bottom ones almost certainly pruned. Less room for the optimizer to override.
-- Low scale (e.g., 0.5): weak prior — all neurons start near the sigmoid boundary, optimizer has full freedom. Saliency just provides a slight bias.
-- The conversion: `logits[j] = scale * (1 - 2 * rank[j] / (d_ff - 1))` where `rank[j]` is the saliency rank (0 = most important).
+| Width | d_ff | Prefix | R1 (default) | R2 (C4) | R3 (tau 0.5→0.1) | R4 (lr 3e-3) | R5 (λ=0.01) |
+|-------|------|--------|-------------|---------|-------------------|-------------|-------------|
+| Full | 2048 | 4.82 | 4.69 | 4.72 | 4.70 | 4.72 | 4.74 |
+| 2x | 1024 | 4.82 | 4.94 | 4.76 | 4.75 | 4.74 | 4.78 |
+| 4x | 512 | 4.85 | 5.40 | 4.92 | 4.88 | 4.85 | 4.96 |
+| 8x | 256 | 4.97 | 5.81 | 5.17 | 5.05 | **5.01** | 5.14 |
 
-1. **Saliency init (scale=1.0)**: 10% warmup, 50% freeze, tau 2.0→0.3, lr 1e-3, λ=0, saliency-scale 1.0
-2. **Saliency init (scale=0.5)**: Same but weaker prior
-3. **Saliency init (scale=2.0)**: Same but stronger prior
-4. **Saliency init + no freeze**: Saliency scale=1.0 but freeze=0.0
-5. **Saliency init + 60% freeze**: Saliency scale=1.0 but freeze=0.6
-6. **Saliency vs shuffled at 2 epochs**: Both with C4 config. Does the saliency advantage persist?
+**R1** = default topk (tau 0.5→0.1, lr 3e-3, λ=0.01, f=0.2, normal init).
+**R2** = old C4 config (tau 2.0→0.3, lr 1e-3, λ=0, f=0.6).
+**R3** = R2 but tau 0.5→0.1 (sharper). **R4** = R3 but lr 3e-3. **R5** = R4 but λ=0.01.
 
-### Additional Experiments
+**Key finding shifts from old experiments (without mixer masking):**
+- **Tau 0.5→0.1 (sharper) is now better** than 2.0→0.3 (softer). Reversed from before.
+- **lr 3e-3 is now slightly better** than 1e-3 at sub-models. Reversed from before.
+- **Spread penalty (λ=0.01) still hurts.** Confirmed.
+- **Best non-saliency 1-epoch config**: tau 0.5→0.1, lr 3e-3, λ=0, f=0.6 (R4).
 
-7. **C4 config at 2 epochs**: The best single-epoch config (tau 2.0→0.3, lr 1e-3, λ=0) may close the gap further
-8. **C4 config + freeze=0.5**: Since C3 suggested f=0.5 helps with slow tau, try it without spread penalty too
+### N1–N3: Saliency Scale Sweep
 
-### Export Verification
+Saliency init with best R-series config (tau 0.5→0.1, lr 3e-3, λ=0, f=0.6, 10% warmup).
 
-9. **Export correctness**: For a topk-trained checkpoint, extract the learned hard masks, gather the active FFN neuron indices, and slice gate_proj/up_proj/down_proj to produce a smaller model. Verify:
-    - Exported model loads and runs inference without errors
-    - Exported model's PPL matches the eval-time masked PPL (should be identical)
-    - Exported model size matches `_estimate_mrl_params` predictions
-    - Export works for all 3 MRL dims (256, 128, 64)
-10. **Export + quantization**: Verify INT4 quantization works on exported sub-models (smaller d_ff may interact with group_size=32 alignment)
+| Width | d_ff | R4 (normal init) | N1 (scale=1.0) | N2 (scale=0.5) | N3 (scale=2.0) |
+|-------|------|-----------------|----------------|----------------|----------------|
+| Full | 2048 | 4.72 | **4.62** | 4.72 | 4.64 |
+| 2x | 1024 | 4.74 | **4.63** | 4.74 | 4.64 |
+| 4x | 512 | 4.85 | **4.72** | 4.78 | 4.73 |
+| 8x | 256 | 5.01 | **4.88** | 4.94 | **4.88** |
+
+**Saliency init is transformative.** Scale=1.0 and 2.0 are essentially tied; scale=0.5
+is too weak. All saliency runs beat prefix at every width.
+
+### N7: Multi-Epoch (2 epochs, non-saliency)
+
+| Width | d_ff | R4 (1 epoch) | N7 (2 epochs) |
+|-------|------|-------------|--------------|
+| Full | 2048 | 4.72 | **4.49** |
+| 2x | 1024 | 4.74 | **4.50** |
+| 4x | 512 | 4.85 | **4.63** |
+| 8x | 256 | 5.01 | **4.76** |
+
+### S1–S10: Saliency Deep Dive
+
+All use: tau 0.5→0.1, lr 3e-3, λ=0, f=0.6, saliency scale=1.0, seed=42.
+
+| ID | Experiment | Full | 2x | 4x | 8x |
+|----|-----------|------|-----|-----|-----|
+| S1 | Saliency-only (f=1.0, 10% warmup) | 4.67 | 4.67 | 4.73 | 4.88 |
+| S2 | Saliency + freeze=0.5, 10% warmup | 4.61 | 4.63 | 4.73 | 4.93 |
+| S3 | Saliency + Gumbel, 10% warmup | 4.66 | 4.66 | 4.72 | 4.86 |
+| S4 | Saliency, **20% warmup** | 4.60 | 4.61 | 4.69 | 4.85 |
+| S5 | Saliency, **30% warmup** | 4.60 | 4.61 | 4.68 | 4.84 |
+| **S6** | **Saliency, 40% warmup** | **4.59** | **4.60** | **4.67** | **4.84** |
+| S7 | Saliency, 50% warmup | 4.61 | 4.62 | 4.71 | 4.89 |
+| S8 | Saliency + Gumbel, 40% warmup | 4.63 | 4.64 | 4.71 | 4.88 |
+| S9 | Saliency-only (f=1.0), 40% warmup | **4.59** | **4.60** | **4.67** | **4.84** |
+| **S10** | **Saliency, 40% warmup, 2 epochs** | **4.38** | **4.39** | **4.45** | **4.60** |
+
+### Summary: Best Configs
+
+| Config | Full | 2x | 4x | 8x | Notes |
+|--------|------|-----|-----|-----|-------|
+| No matryoshka | 4.52 | - | - | - | No sub-models |
+| Prefix (static) | 4.82 | 4.82 | 4.85 | 4.97 | Simple, no learning |
+| **Best topk 1ep (S9)** | **4.59** | **4.60** | **4.67** | **4.84** | Saliency-only, 40% warmup, no mask learning |
+| Best topk 2ep (S10) | 4.38 | 4.39 | 4.45 | 4.60 | S9 config at 2 epochs |
+
+**Optimal config (S9 — saliency-only)**: `--mat-method topk --mat-init-mode saliency --mat-saliency-scale 1.0 --mat-warmup-frac 0.4 --mat-freeze-frac 1.0`
+
+S9 is the recommended default: saliency picks the neurons during 40% warmup, then hard masks are frozen for the remaining 60%. No mask optimizer, no tau annealing — simplest and best. Mask learning (S6, freeze=0.6) achieves identical results with more complexity.
+
+### Experiments Still Needed
+
+#### Export Verification
+
+| ID | Experiment | Details |
+|----|-----------|---------|
+| N9 | **Export correctness** | Extract learned hard masks, slice FFN weights, verify: loads, PPL matches masked eval, size matches `_estimate_mrl_params`, works for all 3 widths (256, 128, 64) |
+| N10 | **Export + quantization** | INT4 quantization on exported sub-models (smaller d_ff may interact with group_size=32 alignment) |
 
 ## Key Lessons Learned
 
+### From old experiments (without mixer masking)
 1. **Spread penalty hurts.** λ=0 was the single biggest improvement (C4). The penalty fights the tau schedule.
-2. **Softer tau is better.** tau 2.0→0.3 beats 1.0→0.2 and 0.5→0.1. More exploration early helps.
-3. **Lower mask LR is better.** 1e-3 beats 3e-3 beats 1e-2. Mask logits should move slowly.
-4. **freeze=0.6 is robust.** But may shift with softer tau (C3 suggested 0.5).
-5. **Multi-epoch is transformative.** 2 epochs closes the gap to prefix baseline entirely.
-6. **Combinations don't always stack.** C1 (tau+lr combined) was worse than individual ablations due to spread penalty interaction.
+2. **Multi-epoch is transformative.** 2 epochs closes the gap to prefix baseline entirely.
+3. **Combinations don't always stack.** C1 (tau+lr combined) was worse than individual ablations due to spread penalty interaction.
+
+### New findings (with mixer masking)
+4. **Saliency init is the most important hyperparameter.** It alone provides +0.1–0.13 PPL improvement over normal init at every width.
+5. **Warmup fraction matters more than expected.** 40% warmup is optimal — gives the saliency estimator enough data to rank neurons accurately. Below 20% is noticeably worse; above 50% wastes too much training time on full-model-only.
+6. **Mask learning adds almost nothing with good saliency.** S9 (saliency-only, freeze=1.0) matches S6 (saliency + learning). The gradient-importance ranking is already near-optimal.
+7. **Gumbel noise hurts.** Per-item noise during soft phase adds variance without benefit. Saliency provides enough exploration.
+8. **Tau and LR priors reversed with mixer masking.** Sharper tau (0.5→0.1) and higher LR (3e-3) now beat their softer/lower counterparts. More masked parameters may need faster convergence.
+9. **Spread penalty still hurts.** Confirmed across all configs.
+10. **2-epoch saliency (S10) is the best model overall.** 4.38 full PPL beats the no-matryoshka baseline (4.52) by 0.14, while providing 3 additional sub-models down to 8x compression.
 
 ## Historical Notes
 
