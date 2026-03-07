@@ -778,15 +778,17 @@ def train(args):
 
                 del _eval_params
 
-            # --- tqdm postfix ---
+            # --- tqdm postfix (fixed keys to prevent bar flickering) ---
             postfix = {
+                "speech_loss": f"{speech_loss_val:.4f}" if speech_loss_val is not None else "-",
                 "text_loss": f"{text_loss_val:.4f}",
                 "text_ppl": f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?",
             }
-            if speech_loss_val is not None:
-                postfix["speech_loss"] = f"{speech_loss_val:.4f}"
-            if epoch == weight_prune_epoch and not gradual_sparsify_done:
-                postfix["prune"] = f"{current_sparsity*100:.1f}%"
+            if sparsity_ratio > 0:
+                if epoch == weight_prune_epoch and not gradual_sparsify_done:
+                    postfix["sparsification"] = f"{current_sparsity*100:.1f}%"
+                else:
+                    postfix["sparsification"] = "done"
             pbar.set_postfix(**postfix)
 
             if use_wandb:
