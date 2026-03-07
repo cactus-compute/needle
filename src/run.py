@@ -21,19 +21,35 @@ def load_checkpoint(path):
         data = pickle.load(f)
     params = jax.tree.map(jnp.array, data["params"])
     config = TransformerConfig(**data["config"])
-    return params, config
+    ffn_mask = _build_ffn_mask(data, config) if "mat_mask_indices" in data else None
+    return params, config, ffn_mask
 
 
-def generate(model, params, tokenizer, prompt, max_gen_len=128, temperature=0.8, seed=0, stream=True):
+def _build_ffn_mask(data, config):
+    """Build (n_blocks, 1, d_ff) binary FFN mask from exported topk mask indices."""
+    indices = data["mat_mask_indices"]
+    n_blocks = len(indices)
+    mask = np.zeros((n_blocks, 1, config.d_ff), dtype=np.float32)
+    for b, idx in enumerate(indices):
+        mask[b, 0, idx] = 1.0
+    enc_mask = jnp.array(mask[:config.num_encoder_layers])
+    dec_mask = jnp.array(mask[config.num_encoder_layers:])
+    return {"encoder": enc_mask, "decoder": dec_mask}
+
+
+def generate(model, params, tokenizer, prompt, max_gen_len=128, temperature=0.8, seed=0, stream=True, ffn_mask=None):
     enc_tokens = tokenizer.encode(prompt)
     enc_input = jnp.array([enc_tokens])
 
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
 
+    enc_ffn = ffn_mask["encoder"] if ffn_mask else None
+    dec_ffn = ffn_mask["decoder"] if ffn_mask else None
+
     src_mask = make_padding_mask(enc_input, pad_id)
     encoder_out = model.apply(
-        {"params": params}, enc_input, src_mask=src_mask, method="encode"
+        {"params": params}, enc_input, src_mask=src_mask, ffn_mask=enc_ffn, method="encode"
     )
 
     # Fixed-size buffer so JAX compiles once
@@ -49,7 +65,8 @@ def generate(model, params, tokenizer, prompt, max_gen_len=128, temperature=0.8,
             encoder_out,
             self_mask=tgt_mask,
             cross_mask=src_mask,
-                       method="decode",
+            ffn_mask=dec_ffn,
+            method="decode",
         )
         return logits
 
@@ -60,7 +77,6 @@ def generate(model, params, tokenizer, prompt, max_gen_len=128, temperature=0.8,
         sys.stdout.write(f"\n{prompt}")
         sys.stdout.flush()
 
-    # Compile once on first call
     logits = decode_step(dec_buffer, encoder_out, src_mask)
 
     for i in range(max_gen_len - 1):
@@ -102,7 +118,7 @@ def load_audio(path, target_sr=16000):
     return audio, sr
 
 
-def transcribe(model, params, tokenizer, audio_array, sr=16000, max_gen_len=128, temperature=0.8, seed=0, stream=True):
+def transcribe(model, params, tokenizer, audio_array, sr=16000, max_gen_len=128, temperature=0.8, seed=0, stream=True, ffn_mask=None):
     """Transcribe audio using the speech encoder pathway."""
     n_mels = model.config.n_mels
     mel = compute_mel_spectrogram(audio_array, sr=sr, n_mels=n_mels)
@@ -112,9 +128,12 @@ def transcribe(model, params, tokenizer, audio_array, sr=16000, max_gen_len=128,
     eos_id = tokenizer.eos_token_id
     transcribe_id = tokenizer.transcribe_token_id
 
+    enc_ffn = ffn_mask["encoder"] if ffn_mask else None
+    dec_ffn = ffn_mask["decoder"] if ffn_mask else None
+
     src_mask = make_mel_padding_mask(mel_input)
     encoder_out = model.apply(
-        {"params": params}, mel_input, src_mask=src_mask, deterministic=True, method="encode_speech"
+        {"params": params}, mel_input, src_mask=src_mask, ffn_mask=enc_ffn, deterministic=True, method="encode_speech"
     )
 
     tgt_mask = make_causal_mask(max_gen_len)
@@ -130,6 +149,7 @@ def transcribe(model, params, tokenizer, audio_array, sr=16000, max_gen_len=128,
             encoder_out,
             self_mask=tgt_mask,
             cross_mask=src_mask,
+            ffn_mask=dec_ffn,
             method="decode",
         )
         return logits
@@ -169,13 +189,15 @@ def transcribe(model, params, tokenizer, audio_array, sr=16000, max_gen_len=128,
 
 def main(args):
     print(f"Loading checkpoint: {args.checkpoint}")
-    params, config = load_checkpoint(args.checkpoint)
+    params, config, ffn_mask = load_checkpoint(args.checkpoint)
 
     model = EncoderDecoderTransformer(config)
     tokenizer = get_tokenizer()
 
     param_count = sum(x.size for x in jax.tree.leaves(params))
     print(f"Model parameters: {param_count:,}")
+    if ffn_mask:
+        print(f"TopK sub-model: per-layer FFN masking active")
 
     # --- Audio transcription mode ---
     audio_files = getattr(args, "audio", None)
@@ -184,15 +206,10 @@ def main(args):
             print(f"\nTranscribing: {audio_path}")
             audio, sr = load_audio(audio_path)
             transcribe(
-                model,
-                params,
-                tokenizer,
-                audio,
-                sr=sr,
-                max_gen_len=args.max_len,
-                temperature=args.temperature,
-                seed=args.seed + i,
-                stream=True,
+                model, params, tokenizer, audio,
+                sr=sr, max_gen_len=args.max_len,
+                temperature=args.temperature, seed=args.seed + i,
+                stream=True, ffn_mask=ffn_mask,
             )
         return
 
@@ -201,14 +218,9 @@ def main(args):
 
     for i, prompt in enumerate(prompts):
         generate(
-            model,
-            params,
-            tokenizer,
-            prompt,
-            max_gen_len=args.max_len,
-            temperature=args.temperature,
-            seed=args.seed + i,
-            stream=True,
+            model, params, tokenizer, prompt,
+            max_gen_len=args.max_len, temperature=args.temperature,
+            seed=args.seed + i, stream=True, ffn_mask=ffn_mask,
         )
 
 

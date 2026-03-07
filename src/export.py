@@ -44,21 +44,12 @@ def _export_topk(data, params, config, factor, output_path):
     """TopK export: full model + per-layer binary mask indices for FFN masking."""
     mask_logits = np.asarray(data["mask_logits"])  # (n_mat, n_blocks, d_ff)
     mat_factors = data.get("mat_factors", [])
-
-    found = False
-    for i, f in enumerate(mat_factors):
-        if f == factor:
-            factor_logits = mask_logits[i]  # (n_blocks, d_ff)
-            ff_w = config.d_ff // factor
-            # Per-layer indices
-            per_layer_indices = []
-            for b in range(factor_logits.shape[0]):
-                indices = np.sort(np.argsort(-factor_logits[b])[:ff_w])
-                per_layer_indices.append(indices)
-            found = True
-            break
-    if not found:
+    if factor not in mat_factors:
         raise ValueError(f"factor={factor} not found in mat_factors={mat_factors}")
+
+    factor_logits = mask_logits[mat_factors.index(factor)]  # (n_blocks, d_ff)
+    ff_w = config.d_ff // factor
+    per_layer_indices = [np.sort(np.argsort(-factor_logits[b])[:ff_w]) for b in range(factor_logits.shape[0])]
 
     params_np = jax.tree.map(
         lambda x: np.asarray(x) if isinstance(x, jnp.ndarray) else x, params

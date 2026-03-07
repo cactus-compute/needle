@@ -22,24 +22,33 @@ def load_checkpoint(path):
         data = pickle.load(f)
     params = jax.tree.map(jnp.array, data["params"])
     config = TransformerConfig(**data["config"])
-    return params, config
+    ffn_mask = None
+    if "mat_mask_indices" in data:
+        from .run import _build_ffn_mask
+        ffn_mask = _build_ffn_mask(data, config)
+    return params, config, ffn_mask
 
 
-def compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, batch_size, pad_id):
+def compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, batch_size, pad_id, ffn_mask=None):
     total_loss = 0.0
     total_tokens = 0
+
+    enc_ffn = ffn_mask["encoder"] if ffn_mask else None
+    dec_ffn = ffn_mask["decoder"] if ffn_mask else None
 
     for src, tgt_in, tgt_out in get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=False):
         src, tgt_in, tgt_out = jnp.array(src), jnp.array(tgt_in), jnp.array(tgt_out)
 
         src_mask = make_padding_mask(src, pad_id)
         tgt_mask = make_causal_mask(tgt_in.shape[1]) & make_padding_mask(tgt_in, pad_id)
-        cross_mask = make_padding_mask(src, pad_id)
 
+        encoder_out = model.apply(
+            {"params": params}, src, src_mask=src_mask, ffn_mask=enc_ffn, method="encode",
+        )
         logits = model.apply(
-            {"params": params}, src, tgt_in,
-            src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=cross_mask,
-                   )
+            {"params": params}, tgt_in, encoder_out,
+            self_mask=tgt_mask, ffn_mask=dec_ffn, method="decode",
+        )
 
         loss = optax.softmax_cross_entropy_with_integer_labels(logits, tgt_out)
         mask = (tgt_out != pad_id).astype(jnp.float32)
@@ -209,7 +218,7 @@ def benchmark_asr(model, params, tokenizer, num_samples=100):
 
 
 def main(args):
-    params, config = load_checkpoint(args.checkpoint)
+    params, config, ffn_mask = load_checkpoint(args.checkpoint)
     model = EncoderDecoderTransformer(config)
     tokenizer = get_tokenizer()
 
@@ -217,13 +226,15 @@ def main(args):
     print(f"\ncheckpoint:  {args.checkpoint}")
     print(f"parameters:  {param_count:,}")
     print(f"config:      d={config.d_model}, heads={config.num_heads}, layers={config.num_encoder_layers}/{config.num_decoder_layers}")
+    if ffn_mask:
+        print(f"sub-model:   topk FFN masking active")
 
     print(f"\nevaluating text perplexity ({args.max_eval_samples} samples)...")
     ds = load_tinystories("validation", max_samples=args.max_eval_samples)
     enc_inputs, dec_inputs, dec_targets = prepare_text_pairs(
         ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
-    ppl = compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, args.batch_size, config.pad_token_id)
+    ppl = compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, args.batch_size, config.pad_token_id, ffn_mask=ffn_mask)
     print(f"text ppl:    {ppl:.2f}")
 
     asr_samples = getattr(args, "asr_samples", 50)

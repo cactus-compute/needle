@@ -24,12 +24,12 @@ HELP = """
   │     --max-dec-len INT        Max decoder seq length (default: 256)│
   │     --max-samples INT        Training samples (default: all)      │
   │     --mat-factors INT [...]   FFN shrink factors (default: 2 4 8)  │
-  │     --mat-method STR         static-prefix|topk (def: static-..) │
+  │     --mat-method STR         static-prefix|topk (default: topk)  │
+  │     --mat-init-mode STR      saliency|prefix|normal (def: sal.)  │
+  │     --mat-warmup-frac FL     Saliency warmup fraction (def: 0.4) │
+  │     --mat-freeze-frac FL     Mask freeze fraction (default: 1.0) │
   │     --mat-tau-start FLOAT    TopK tau start (default: 0.5)       │
   │     --mat-tau-end FLOAT      TopK tau end (default: 0.1)         │
-  │     --mat-init-mode STR      prefix|shuffled_prefix|saliency|... │
-  │     --mat-warmup-frac FL     TopK warmup fraction (def: 0.15)    │
-  │     --mat-freeze-frac FL     TopK freeze fraction (def: 0.2)     │
   │     --mat-mask-lr FLOAT      Mask logit LR (default: 3e-3)       │
   │     --sparsity-ratio FLOAT   Block prune ratio (default: 0.5)    │
   │     --group-size INT         Quant/prune group size (default: 32) │
@@ -139,7 +139,7 @@ def main():
     p.add_argument("--mat-warmup-frac", type=float, default=0.4,
                    help="Fraction of total steps for vanilla warmup (no masks)")
     p.add_argument("--mat-freeze-frac", type=float, default=1.0,
-                   help="Fraction of post-warmup steps to freeze masks (hard only)")
+                   help="Fraction of total steps at end with frozen hard masks")
     p.add_argument("--mat-mask-lr", type=float, default=3e-3,
                    help="Mask logit optimizer learning rate (default: 3e-3)")
     p.add_argument("--mat-saliency-scale", type=float, default=1.0)
