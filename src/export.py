@@ -1,4 +1,8 @@
-"""Export MRL sub-models by slicing a full checkpoint to a target dimension."""
+"""Export matryoshka sub-models by slicing FFN weights by a shrink factor.
+
+With FFN interior matryoshka, d_model stays constant — only FFN intermediate
+dimensions (gate_proj, up_proj, down_proj) are sliced.
+"""
 
 import os
 import pickle
@@ -11,77 +15,62 @@ import numpy as np
 
 from .model import TransformerConfig
 
+# FFN kernel names that should be sliced in the d_ff dimension
+_FFN_KERNEL_NAMES = {"gate_proj", "up_proj", "down_proj"}
 
-def export_submodel(checkpoint_path, d_prime, output_path):
-    """Slice a full MRL checkpoint to a self-contained sub-model at dimension d_prime."""
 
-    # Load checkpoint
+def export_submodel(checkpoint_path, factor, output_path):
+    """Slice a full matryoshka checkpoint to a sub-model at given shrink factor.
+
+    factor: how many times smaller the FFN width (e.g. 2 = half, 4 = quarter).
+    Attention, embeddings, and norms are unchanged.
+    """
+
     with open(checkpoint_path, "rb") as f:
         data = pickle.load(f)
     params = data["params"]
     config = TransformerConfig(**data["config"])
 
-    head_dim = config.d_model // config.num_heads
-    if d_prime % head_dim != 0:
-        raise ValueError(
-            f"d_prime={d_prime} must be divisible by head_dim={head_dim} "
-            f"(d_model={config.d_model} // num_heads={config.num_heads})"
-        )
+    d_ff_new = config.d_ff // factor
+    if d_ff_new == 0:
+        raise ValueError(f"factor={factor} too large: would give d_ff=0")
 
-    # Derived dims
-    n_h = d_prime // head_dim
-    n_kv = min(config.num_kv_heads, n_h)
-    d_ff_prime = config.d_ff * d_prime // config.d_model
-    kv_dim = config.num_kv_heads * head_dim
-    kv_dim_prime = n_kv * head_dim
-
-    d_model = config.d_model
     d_ff = config.d_ff
-
-    def _target(size):
-        """Map original dimension to sliced dimension."""
-        if size == d_model:
-            return d_prime
-        if size == d_ff:
-            return d_ff_prime
-        if size == kv_dim:
-            return kv_dim_prime
-        return size  
 
     def slice_leaf(key_path, leaf):
         arr = np.asarray(leaf)
+        if arr.ndim != 2:
+            return arr
 
-        if arr.ndim == 1:
-            return arr[:_target(arr.shape[0])]
+        # Check if this is an FFN kernel by looking at parent module name
+        parent_name = None
+        for part in key_path:
+            name = part.key if hasattr(part, "key") else str(part)
+            if name in _FFN_KERNEL_NAMES:
+                parent_name = name
+                break
 
-        if arr.ndim == 3:
-            if arr.shape[0] > 1:
-                _, in_ch, out_ch = arr.shape
-                r_in = in_ch if in_ch == config.n_mels else _target(in_ch)
-                r_out = _target(out_ch)
-                return arr[:, :r_in, :r_out]
-            return arr[:, :, :d_prime]
+        if parent_name is None:
+            return arr
 
-        if arr.ndim == 2:
-            rows, cols = arr.shape
-            r = _target(rows)
-            c = _target(cols)
-            return arr[:r, :c]
+        # Both token_mix and channel_mix are sliced via ffn_mask
+
+        rows, cols = arr.shape
+        if parent_name in ("gate_proj", "up_proj"):
+            # (d_in, d_ff) → (d_in, d_ff_new)
+            if cols == d_ff:
+                return arr[:, :d_ff_new]
+        elif parent_name == "down_proj":
+            # (d_ff, d_out) → (d_ff_new, d_out)
+            if rows == d_ff:
+                return arr[:d_ff_new, :]
 
         return arr
 
     sliced = jax.tree_util.tree_map_with_path(slice_leaf, params)
 
-    # Build new config
-    new_config = replace(
-        config,
-        d_model=d_prime,
-        d_ff=d_ff_prime,
-        num_heads=n_h,
-        num_kv_heads=n_kv,
-    )
+    new_config = replace(config, d_ff=d_ff_new)
 
-    # Convert any JAX arrays to numpy for pickling
     sliced_np = jax.tree.map(
         lambda x: np.asarray(x) if isinstance(x, jnp.ndarray) else x, sliced
     )
@@ -90,7 +79,6 @@ def export_submodel(checkpoint_path, d_prime, output_path):
     with open(output_path, "wb") as f:
         pickle.dump({"params": sliced_np, "config": new_config.__dict__}, f)
 
-    # Print summary
     orig_count = sum(x.size for x in jax.tree.leaves(params))
     new_count = sum(x.size for x in jax.tree.leaves(sliced_np))
     orig_bytes = sum(x.nbytes for x in jax.tree.leaves(params))
@@ -99,10 +87,11 @@ def export_submodel(checkpoint_path, d_prime, output_path):
     print(f"\n  Export complete: {output_path}")
     print(f"  ─────────────────────────────────────")
     print(f"  {'':>20s} {'Original':>12s} {'Exported':>12s}")
-    print(f"  {'d_model':>20s} {config.d_model:>12d} {d_prime:>12d}")
-    print(f"  {'d_ff':>20s} {config.d_ff:>12d} {d_ff_prime:>12d}")
-    print(f"  {'num_heads':>20s} {config.num_heads:>12d} {n_h:>12d}")
-    print(f"  {'num_kv_heads':>20s} {config.num_kv_heads:>12d} {n_kv:>12d}")
+    print(f"  {'d_model':>20s} {config.d_model:>12d} {config.d_model:>12d}")
+    print(f"  {'d_ff':>20s} {config.d_ff:>12d} {d_ff_new:>12d}")
+    print(f"  {'factor':>20s} {'1x':>12s} {str(factor)+'x':>12s}")
+    print(f"  {'num_heads':>20s} {config.num_heads:>12d} {config.num_heads:>12d}")
+    print(f"  {'num_kv_heads':>20s} {config.num_kv_heads:>12d} {config.num_kv_heads:>12d}")
     print(f"  {'params':>20s} {orig_count:>12,d} {new_count:>12,d}")
     print(f"  {'size (MB)':>20s} {orig_bytes / 1e6:>12.1f} {new_bytes / 1e6:>12.1f}")
     print()
@@ -110,12 +99,12 @@ def export_submodel(checkpoint_path, d_prime, output_path):
 
 def main(args):
     checkpoint = args.checkpoint
-    d_prime = args.dim
+    factor = args.factor
     output = args.output
 
     if output is None:
         stem = Path(checkpoint).stem
         parent = Path(checkpoint).parent
-        output = str(parent / f"{stem}_d{d_prime}.pkl")
+        output = str(parent / f"{stem}_{factor}x.pkl")
 
-    export_submodel(checkpoint, d_prime, output)
+    export_submodel(checkpoint, factor, output)
