@@ -25,12 +25,19 @@ def load_checkpoint(path):
     return params, config
 
 
-def compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, batch_size, pad_id):
+def compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, batch_size, pad_id, loss_mask=None):
     total_loss = 0.0
     total_tokens = 0
 
-    for src, tgt_in, tgt_out in get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=False):
-        src, tgt_in, tgt_out = jnp.array(src), jnp.array(tgt_in), jnp.array(tgt_out)
+    for batch in get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=False, loss_mask=loss_mask):
+        if loss_mask is not None:
+            src, tgt_in, tgt_out, lm = batch
+            src, tgt_in, tgt_out, lm = jnp.array(src), jnp.array(tgt_in), jnp.array(tgt_out), jnp.array(lm)
+            mask = lm
+        else:
+            src, tgt_in, tgt_out = batch
+            src, tgt_in, tgt_out = jnp.array(src), jnp.array(tgt_in), jnp.array(tgt_out)
+            mask = (tgt_out != pad_id).astype(jnp.float32)
 
         src_mask = make_padding_mask(src, pad_id)
         tgt_mask = make_causal_mask(tgt_in.shape[1]) & make_padding_mask(tgt_in, pad_id)
@@ -39,10 +46,9 @@ def compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, batch
         logits = model.apply(
             {"params": params}, src, tgt_in,
             src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=cross_mask,
-                   )
+        )
 
         loss = optax.softmax_cross_entropy_with_integer_labels(logits, tgt_out)
-        mask = (tgt_out != pad_id).astype(jnp.float32)
         total_loss += float(jnp.sum(loss * mask))
         total_tokens += int(jnp.sum(mask))
 
@@ -50,7 +56,7 @@ def compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, batch
     return math.exp(avg_nll)
 
 
-def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is the weather? [{"name": "get_weather"}]', max_gen_len=64):
+def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is the weather?', max_gen_len=64):
     enc_tokens = tokenizer.encode(prompt)
     enc_input = jnp.array([enc_tokens])
     pad_id = tokenizer.pad_token_id
@@ -205,13 +211,11 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
     samples = []
 
     for i, ex in enumerate(ds):
-        prompt = ex["query"] + " " + ex["tools"]
         ref_text = ex["answers"]
 
         pred_text = generate(
-            model, params, tokenizer, prompt,
-            max_gen_len=max_gen_len, temperature=0.0, seed=i, stream=False,
-            task_token_id=tokenizer.tool_call_token_id,
+            model, params, tokenizer, ex["query"],
+            tools=ex["tools"], max_gen_len=max_gen_len, seed=i, stream=False,
         ).strip()
 
         # Parse reference
@@ -331,10 +335,10 @@ def main(args):
 
     print(f"\nevaluating tool-call perplexity ({args.max_eval_samples} samples)...")
     ds = load_tool_calls("validation", max_samples=args.max_eval_samples)
-    enc_inputs, dec_inputs, dec_targets = prepare_tool_call_pairs(
+    enc_inputs, dec_inputs, dec_targets, loss_mask_arr = prepare_tool_call_pairs(
         ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
-    ppl = compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, args.batch_size, config.pad_token_id)
+    ppl = compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, args.batch_size, config.pad_token_id, loss_mask=loss_mask_arr)
 
     tc_samples = getattr(args, "tool_call_samples", 200)
     tc = None
@@ -385,8 +389,8 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default="checkpoints/checkpoint_epoch3.pkl")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-eval-samples", type=int, default=1000)
-    parser.add_argument("--max-enc-len", type=int, default=1024)
-    parser.add_argument("--max-dec-len", type=int, default=512)
+    parser.add_argument("--max-enc-len", type=int, default=256)
+    parser.add_argument("--max-dec-len", type=int, default=1024)
     parser.add_argument("--max-gen-len", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--throughput-runs", type=int, default=10)

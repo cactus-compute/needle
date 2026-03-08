@@ -21,9 +21,8 @@ Datasets and their native formats:
 
 3. glaiveai/glaive-function-calling-v2
    Tool definitions embedded in the system prompt; chat is a flat string with
-   USER:/A: role markers and <functioncall> tags. ~50% of examples are
-   irrelevance cases (answers=[]) where the tools don't match the query — these
-   are kept intentionally so the model learns to decline rather than hallucinate.
+   USER:/A: role markers and <functioncall> tags. Examples with empty answers
+   (answers=[]) are filtered out in the final combine step.
 
 4. Team-ACE/ToolACE
    Tool definitions as a JSON array in the system prompt; function calls use a
@@ -253,8 +252,15 @@ def load_and_combine():
         parts.append(converted)
 
     combined = concatenate_datasets(parts)
+    pre_filter = len(combined)
+
+    # Filter out examples with empty answers
+    combined = combined.filter(
+        lambda ex: json.loads(ex["answers"]) != [],
+        desc="Filtering empty answers",
+    )
     print(f"\n{'='*60}")
-    print(f"Combined dataset: {len(combined)} examples")
+    print(f"Combined dataset: {len(combined)} examples (filtered {pre_filter - len(combined)} empty answers)")
     print(f"Columns: {combined.column_names}")
 
     counts = Counter(combined["source"])

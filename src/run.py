@@ -24,28 +24,37 @@ def load_checkpoint(path):
     return params, config
 
 
-def generate(model, params, tokenizer, prompt, max_gen_len=512, temperature=0.8, seed=0, stream=True, task_token_id=None):
-    enc_tokens = tokenizer.encode(prompt)
+def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=0, stream=True, task_token_id=None):
+    """Generate tool-call output.
+
+    Encoder: query only.
+    Decoder: prefilled with [BOS, <tool_call>, tools_tokens...], then greedy decode.
+    """
+    from .data import _compact_tools
+
+    enc_tokens = tokenizer.encode(query)
     enc_input = jnp.array([enc_tokens])
 
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
+    tool_call_id = task_token_id if task_token_id is not None else tokenizer.tool_call_token_id
 
     src_mask = make_padding_mask(enc_input, pad_id)
     encoder_out = model.apply(
         {"params": params}, enc_input, src_mask=src_mask, method="encode"
     )
 
+    # Build decoder prefix: [BOS, <tool_call>, compact_tools_tokens...]
+    tools_tokens = tokenizer.encode(_compact_tools(tools))
+    prefix = [eos_id, tool_call_id] + tools_tokens
+    prefix_len = len(prefix)
+
     # Fixed-size buffer so JAX compiles once
     tgt_mask = make_causal_mask(max_gen_len)
     dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
-    dec_buffer = dec_buffer.at[0, 0].set(eos_id)
-
-    # If task_token_id provided, set it at position 1 (matching transcribe() pattern)
-    start_pos = 0
-    if task_token_id is not None:
-        dec_buffer = dec_buffer.at[0, 1].set(task_token_id)
-        start_pos = 1
+    # Fill prefix
+    for j, tok in enumerate(prefix[:max_gen_len]):
+        dec_buffer = dec_buffer.at[0, j].set(tok)
 
     @jax.jit
     def decode_step(dec_buffer, encoder_out, src_mask):
@@ -55,11 +64,10 @@ def generate(model, params, tokenizer, prompt, max_gen_len=512, temperature=0.8,
             encoder_out,
             self_mask=tgt_mask,
             cross_mask=src_mask,
-                       method="decode",
+            method="decode",
         )
         return logits
 
-    rng = jax.random.PRNGKey(seed)
     generated_tokens = []
 
     if stream:
@@ -69,10 +77,10 @@ def generate(model, params, tokenizer, prompt, max_gen_len=512, temperature=0.8,
     # Compile once on first call
     logits = decode_step(dec_buffer, encoder_out, src_mask)
 
-    for i in range(start_pos, max_gen_len - 1):
-        next_logits = logits[0, i] / temperature
-        rng, sample_rng = jax.random.split(rng)
-        next_token = jax.random.categorical(sample_rng, next_logits).item()
+    # Greedy decoding from end of prefix
+    for i in range(prefix_len - 1, max_gen_len - 1):
+        next_logits = logits[0, i]
+        next_token = int(jnp.argmax(next_logits))
 
         if next_token == eos_id:
             break
@@ -204,42 +212,39 @@ def main(args):
 
     # --- Tool-call generation mode ---
     query = getattr(args, "query", None)
-    tools = getattr(args, "tools", None)
-    prompts = args.prompts
+    tools = getattr(args, "tools", None) or "[]"
 
     if query:
-        prompt = query + " " + (tools or "[]")
-        prompts = [prompt]
-    elif not prompts:
-        prompts = [
-            'What is the weather in San Francisco? [{"name": "get_weather", "parameters": {"location": "string"}}]',
-            'Send an email to john@example.com saying hello [{"name": "send_email", "parameters": {"to": "string", "body": "string"}}]',
-            'Get the current stock price of AAPL [{"name": "get_stock_price", "parameters": {"symbol": "string"}}]',
+        queries = [(query, tools)]
+    else:
+        queries = [
+            ('What is the weather in San Francisco?', '[{"name": "get_weather", "parameters": {"location": "string"}}]'),
+            ('Send an email to john@example.com saying hello', '[{"name": "send_email", "parameters": {"to": "string", "body": "string"}}]'),
+            ('Get the current stock price of AAPL', '[{"name": "get_stock_price", "parameters": {"symbol": "string"}}]'),
         ]
 
-    for i, prompt in enumerate(prompts):
+    for i, (q, t) in enumerate(queries):
+        print(f"\nQuery: {q}")
+        print(f"Tools: {t[:80]}{'...' if len(t) > 80 else ''}")
         generate(
             model,
             params,
             tokenizer,
-            prompt,
+            q,
+            tools=t,
             max_gen_len=args.max_len,
-            temperature=args.temperature,
             seed=args.seed + i,
             stream=True,
-            task_token_id=tokenizer.tool_call_token_id,
         )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate tool calls with trained transformer")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/checkpoint_epoch3.pkl")
-    parser.add_argument("--prompts", type=str, nargs="*", help="Raw prompts (query + tools combined)")
     parser.add_argument("--query", type=str, default=None, help="Query text for tool-call generation")
     parser.add_argument("--tools", type=str, default=None, help="Tools JSON for tool-call generation")
     parser.add_argument("--audio", type=str, nargs="*", help="Audio file paths to transcribe")
     parser.add_argument("--max-len", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 

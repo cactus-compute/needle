@@ -173,12 +173,36 @@ def _cache_key(prefix, n_samples, max_enc_len, max_dec_len):
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
-def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=1024, max_dec_len=512):
+def _compact_tools(tools_json):
+    """Strip verbose schema descriptions, keep only function name + param name/type."""
+    import json
+    try:
+        tools = json.loads(tools_json)
+    except (json.JSONDecodeError, TypeError):
+        return tools_json
+    compact = []
+    for t in tools:
+        params = {}
+        raw_params = t.get("parameters", {})
+        props = raw_params.get("properties", raw_params) if isinstance(raw_params, dict) else {}
+        for pname, pdef in props.items():
+            if isinstance(pdef, dict):
+                params[pname] = pdef.get("type", "string")
+            else:
+                params[pname] = str(pdef)
+        compact.append({"name": t["name"], "parameters": params})
+    return json.dumps(compact)
+
+
+def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=256, max_dec_len=1024):
     """Prepare tool-call encoder-decoder pairs with <tool_call> task token.
 
-    Encoder input: tokenize(query + " " + tools), truncated to max_enc_len.
-    Decoder input:  [BOS, <tool_call>, answer_tokens...]
-    Decoder target: [<tool_call>, answer_tokens..., EOS]
+    Encoder input: tokenize(query), truncated to max_enc_len.
+    Decoder input:  [BOS, <tool_call>, tools_tokens..., answer_tokens...]
+    Decoder target: [<tool_call>, tools_tokens..., answer_tokens..., EOS]
+    Loss mask: 1 only on answer + EOS positions (not tools prefix or padding).
+
+    Returns (enc_inputs, dec_inputs, dec_targets, loss_mask).
     """
 
     cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len)
@@ -189,6 +213,7 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=1024, max_dec_len=512):
             np.load(cache_path + "_enc.npy"),
             np.load(cache_path + "_dec_in.npy"),
             np.load(cache_path + "_dec_tgt.npy"),
+            np.load(cache_path + "_loss_mask.npy"),
         )
 
     pad_id = tokenizer.pad_token_id
@@ -196,79 +221,126 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=1024, max_dec_len=512):
     eos_id = tokenizer.eos_token_id
     tool_call_id = tokenizer.tool_call_token_id
 
-    # Build encoder texts (query + tools) and decoder texts (answers)
-    enc_texts = [ex["query"] + " " + ex["tools"] for ex in ds]
-    dec_texts = [ex["answers"] for ex in ds]
+    # Encoder: query only. Decoder prefix: compact tools. Decoder answer: answers.
+    enc_texts = [ex["query"] for ex in ds]
+    tools_texts = [_compact_tools(ex["tools"]) for ex in ds]
+    ans_texts = [ex["answers"] for ex in ds]
 
     num_workers = min(os.cpu_count() or 1, 8)
     model_path = TOKENIZER_PREFIX + ".model"
-
-    # Parallel tokenization for encoder inputs
     chunk_size = max(1, len(enc_texts) // (num_workers * 4))
-    enc_chunks = [enc_texts[i:i + chunk_size] for i in range(0, len(enc_texts), chunk_size)]
 
+    # Tokenize queries (encoder)
+    enc_chunks = [enc_texts[i:i + chunk_size] for i in range(0, len(enc_texts), chunk_size)]
     print(f"Tokenizing encoder inputs ({num_workers} workers)...")
     with mp.Pool(num_workers, initializer=_init_worker,
                  initargs=(model_path, max_enc_len)) as pool:
         enc_results = pool.map(_tokenize_chunk, enc_chunks)
     all_enc_tokens = [tok for chunk in enc_results for tok in chunk]
 
-    # Parallel tokenization for decoder inputs (max_dec_len - 2 for BOS + task token)
-    dec_chunks = [dec_texts[i:i + chunk_size] for i in range(0, len(dec_texts), chunk_size)]
-
-    print(f"Tokenizing decoder inputs ({num_workers} workers)...")
+    # Tokenize tools (decoder prefix) — reserve 2 for BOS + <tool_call>, rest for tools + answer
+    tools_chunks = [tools_texts[i:i + chunk_size] for i in range(0, len(tools_texts), chunk_size)]
+    print(f"Tokenizing tools ({num_workers} workers)...")
     with mp.Pool(num_workers, initializer=_init_worker,
                  initargs=(model_path, max_dec_len - 2)) as pool:
-        dec_results = pool.map(_tokenize_chunk, dec_chunks)
-    all_dec_tokens = [tok for chunk in dec_results for tok in chunk]
+        tools_results = pool.map(_tokenize_chunk, tools_chunks)
+    all_tools_tokens = [tok for chunk in tools_results for tok in chunk]
+
+    # Tokenize answers (decoder generation target)
+    ans_chunks = [ans_texts[i:i + chunk_size] for i in range(0, len(ans_texts), chunk_size)]
+    print(f"Tokenizing answers ({num_workers} workers)...")
+    with mp.Pool(num_workers, initializer=_init_worker,
+                 initargs=(model_path, max_dec_len)) as pool:
+        ans_results = pool.map(_tokenize_chunk, ans_chunks)
+    all_ans_tokens = [tok for chunk in ans_results for tok in chunk]
 
     n = len(ds)
     enc_inputs = np.full((n, max_enc_len), pad_id, dtype=np.int32)
     dec_inputs = np.full((n, max_dec_len), pad_id, dtype=np.int32)
     dec_targets = np.full((n, max_dec_len), pad_id, dtype=np.int32)
+    loss_mask = np.zeros((n, max_dec_len), dtype=np.float32)
 
+    skipped = 0
     for i in range(n):
-        # Encoder: truncated tokens
         e_tok = all_enc_tokens[i]
+        t_tok = all_tools_tokens[i]
+        a_tok = all_ans_tokens[i]
+
+        # Prefix length: BOS + <tool_call> + tools_tokens
+        prefix_len = 2 + len(t_tok)
+        # Total decoder length: prefix + answer + EOS
+        total_dec = prefix_len + len(a_tok) + 1
+
+        if total_dec > max_dec_len:
+            # Truncate tools to fit answer + EOS
+            available_for_tools = max_dec_len - 2 - len(a_tok) - 1
+            if available_for_tools < 1:
+                skipped += 1
+                continue
+            t_tok = t_tok[:available_for_tools]
+            prefix_len = 2 + len(t_tok)
+            total_dec = prefix_len + len(a_tok) + 1
+
+        # Encoder
         el = len(e_tok)
         enc_inputs[i, :el] = e_tok
 
-        # Decoder answer tokens
-        d_tok = all_dec_tokens[i]
-        dl = len(d_tok)
-
-        # Decoder input: [BOS, <tool_call>, answer_tokens...]
+        # Decoder input: [BOS, <tool_call>, tools..., answer...]
         dec_inputs[i, 0] = bos_id
         dec_inputs[i, 1] = tool_call_id
-        if dl > 0:
-            dec_inputs[i, 2:2 + dl] = d_tok
+        tl = len(t_tok)
+        if tl > 0:
+            dec_inputs[i, 2:2 + tl] = t_tok
+        al = len(a_tok)
+        if al > 0:
+            dec_inputs[i, prefix_len:prefix_len + al] = a_tok
 
-        # Decoder target: [<tool_call>, answer_tokens..., EOS]
+        # Decoder target: [<tool_call>, tools..., answer..., EOS]
         dec_targets[i, 0] = tool_call_id
-        if dl > 0:
-            dec_targets[i, 1:1 + dl] = d_tok
-        dec_targets[i, 1 + dl] = eos_id
+        if tl > 0:
+            dec_targets[i, 1:1 + tl] = t_tok
+        if al > 0:
+            dec_targets[i, prefix_len - 1:prefix_len - 1 + al] = a_tok
+        dec_targets[i, prefix_len - 1 + al] = eos_id
+
+        # Loss mask: 1 on answer positions + EOS only
+        loss_mask[i, prefix_len - 1:prefix_len - 1 + al + 1] = 1.0
+
+    if skipped > 0:
+        # Remove skipped rows (all-pad)
+        keep = enc_inputs[:, 0] != pad_id
+        enc_inputs = enc_inputs[keep]
+        dec_inputs = dec_inputs[keep]
+        dec_targets = dec_targets[keep]
+        loss_mask = loss_mask[keep]
+        print(f"  Skipped {skipped} examples (too long for max_dec_len={max_dec_len})")
 
     # Save cache
     os.makedirs(CACHE_DIR, exist_ok=True)
     np.save(cache_path + "_enc.npy", enc_inputs)
     np.save(cache_path + "_dec_in.npy", dec_inputs)
     np.save(cache_path + "_dec_tgt.npy", dec_targets)
-    print(f"Cached {n:,} tool-call pairs to {CACHE_DIR}/{cache_id}")
+    np.save(cache_path + "_loss_mask.npy", loss_mask)
+    print(f"Cached {len(enc_inputs):,} tool-call pairs to {CACHE_DIR}/{cache_id}")
 
-    return enc_inputs, dec_inputs, dec_targets
+    return enc_inputs, dec_inputs, dec_targets, loss_mask
 
 
-def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True):
+def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True, loss_mask=None):
     n = len(enc_inputs)
     if shuffle:
         perm = np.random.permutation(n)
         enc_inputs = enc_inputs[perm]
         dec_inputs = dec_inputs[perm]
         dec_targets = dec_targets[perm]
+        if loss_mask is not None:
+            loss_mask = loss_mask[perm]
 
     for i in range(0, n - batch_size + 1, batch_size):
-        yield enc_inputs[i : i + batch_size], dec_inputs[i : i + batch_size], dec_targets[i : i + batch_size]
+        batch = (enc_inputs[i : i + batch_size], dec_inputs[i : i + batch_size], dec_targets[i : i + batch_size])
+        if loss_mask is not None:
+            batch = batch + (loss_mask[i : i + batch_size],)
+        yield batch
 
 
 get_text_batches = get_batches

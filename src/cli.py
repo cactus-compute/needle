@@ -18,10 +18,10 @@ HELP = """
   │     --d-model INT            Model dim (default: 512)             │
   │     --num-heads INT          Attention heads (default: 8)         │
   │     --num-kv-heads INT       KV heads for GQA (default: num-heads)│
-  │     --num-layers INT         Encoder layers (default: 8)          │
+  │     --num-layers INT         Encoder layers (default: 4)          │
   │     --num-dec-layers INT     Decoder layers (default: 4)          │
-  │     --max-enc-len INT        Max encoder seq len (default: 1024)  │
-  │     --max-dec-len INT        Max decoder seq length (default: 512)│
+  │     --max-enc-len INT        Max encoder seq len (default: 256)  │
+  │     --max-dec-len INT        Max decoder seq len (default: 1024) │
   │     --max-samples INT        Training samples (default: all)      │
   │     --mat-factors INT [...]   FFN shrink factors (default: 2 4 8) │
   │     --sparsity-ratio FLOAT   Block prune ratio (default: 0.5)     │
@@ -56,8 +56,8 @@ HELP = """
   │     --checkpoint PATH       Path to model checkpoint (required)   │
   │     --batch-size INT        Batch size (default: 32)              │
   │     --max-eval-samples INT  Evaluation samples (default: 1000)    │
-  │     --max-enc-len INT       Max encoder length (default: 1024)    │
-  │     --max-dec-len INT       Max decoder length (default: 512)     │
+  │     --max-enc-len INT       Max encoder length (default: 256)    │
+  │     --max-dec-len INT       Max decoder length (default: 1024)    │
   │     --max-gen-len INT       Max generation length (default: 512)  │
   │     --temperature FLOAT     Sampling temperature (default: 0.8)   │
   │     --throughput-runs INT   Throughput runs (default: 10)         │
@@ -101,10 +101,10 @@ def main():
     p.add_argument("--d-model", type=int, default=512)
     p.add_argument("--num-heads", type=int, default=8)
     p.add_argument("--num-kv-heads", type=int, default=None)
-    p.add_argument("--num-layers", type=int, default=8)
+    p.add_argument("--num-layers", type=int, default=4)
     p.add_argument("--num-dec-layers", type=int, default=4)
-    p.add_argument("--max-enc-len", type=int, default=1024)
-    p.add_argument("--max-dec-len", type=int, default=512)
+    p.add_argument("--max-enc-len", type=int, default=256)
+    p.add_argument("--max-dec-len", type=int, default=1024)
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--wandb", action="store_true")
@@ -141,22 +141,19 @@ def main():
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--query", type=str, default=None, help="Query text for tool-call generation")
     p.add_argument("--tools", type=str, default=None, help="Tools JSON for tool-call generation")
-    p.add_argument("--prompts", type=str, nargs="*")
     p.add_argument("--audio", type=str, nargs="*", help="Audio file paths to transcribe")
     p.add_argument("--max-len", type=int, default=512)
-    p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--seed", type=int, default=0)
 
     p = sub.add_parser("test", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--max-eval-samples", type=int, default=1000)
-    p.add_argument("--max-enc-len", type=int, default=1024)
-    p.add_argument("--max-dec-len", type=int, default=512)
+    p.add_argument("--max-enc-len", type=int, default=256)
+    p.add_argument("--max-dec-len", type=int, default=1024)
     p.add_argument("--max-gen-len", type=int, default=512)
     p.add_argument("--tool-call-samples", type=int, default=200,
                    help="Samples for tool-call accuracy eval (default: 200)")
-    p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--throughput-runs", type=int, default=10)
 
     p = sub.add_parser("evaluate", add_help=False)
