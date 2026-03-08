@@ -3,8 +3,11 @@ jaxlib
 flax
 optax
 datasets
+gcsfs
 transformers
 wandb
 pyyaml
 sentencepiece
-google-cloud-storage
+google-cloud-texttospeech
+audiomentations
+gcsfsgoogle-cloud-storage

@@ -89,3 +89,4 @@ checkpoints/
 wandb/
 .data_cache/
 tokenizer/
+data/
