@@ -14,7 +14,7 @@ from flax import jax_utils
 from flax.training import train_state
 
 from .data import (
-    get_batches, get_tokenizer, load_tinystories, prepare_text_pairs,
+    get_batches, get_tokenizer, load_tool_calls, prepare_tool_call_pairs,
     load_librispeech, prepare_speech_pairs, get_speech_batches,
 )
 from .model import (
@@ -474,22 +474,22 @@ def train(args):
     tokenizer = get_tokenizer(max_samples=args.max_samples)
 
     step_idx += 1
-    print(f"\n[{step_idx}/{total_data_steps}] Loading TinyStories dataset...")
-    ds = load_tinystories("train", max_samples=args.max_samples)
-    val_ds = load_tinystories("validation", max_samples=getattr(args, "max_eval_samples", None))
+    print(f"\n[{step_idx}/{total_data_steps}] Loading tool-calling dataset...")
+    ds = load_tool_calls("train", max_samples=args.max_samples)
+    val_ds = load_tool_calls("validation", max_samples=getattr(args, "max_eval_samples", None))
 
     step_idx += 1
-    print(f"\n[{step_idx}/{total_data_steps}] Preparing text pairs...")
-    enc_inputs, dec_inputs, dec_targets = prepare_text_pairs(
+    print(f"\n[{step_idx}/{total_data_steps}] Preparing tool-call pairs...")
+    enc_inputs, dec_inputs, dec_targets = prepare_tool_call_pairs(
         ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
-    val_enc, val_dec_in, val_dec_tgt = prepare_text_pairs(
+    val_enc, val_dec_in, val_dec_tgt = prepare_tool_call_pairs(
         val_ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
     val_enc = np.array(val_enc)
     val_dec_in = np.array(val_dec_in)
     val_dec_tgt = np.array(val_dec_tgt)
-    print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val text pairs")
+    print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val tool-call pairs")
 
     # --- Speech data ---
     speech_mel = speech_dec_in = speech_dec_tgt = None
@@ -891,15 +891,14 @@ def train(args):
         with open(ckpt_path, "wb") as f:
             pickle.dump({"params": params_np, "config": config.__dict__}, f)
 
-        from .test import measure_throughput, benchmark_generation_quality, compute_wer
-        from .run import generate, transcribe
+        from .test import measure_throughput, benchmark_tool_calls, compute_wer
+        from .run import transcribe
         from .data import _decode_audio
         eval_params_jnp = jax.tree.map(jnp.array, params_np)
         del params_np  # free CPU memory
         model = EncoderDecoderTransformer(config)
         tp = measure_throughput(model, eval_params_jnp, tokenizer, num_runs=5)
-        prompts = ["Once upon a time", "The little dog", "She was very happy because"]
-        quality = benchmark_generation_quality(model, eval_params_jnp, tokenizer, prompts, max_gen_len=64, temperature=0.8)
+        tc_metrics = benchmark_tool_calls(model, eval_params_jnp, tokenizer, num_samples=20, max_gen_len=128)
 
         speech_wer = None
         transcribe_samples = []
@@ -926,7 +925,7 @@ def train(args):
         print(f"  Avg loss       {epoch_avg_loss:>12.4f}")
         print(f"  Final loss     {final_loss:>12.4f}")
         print(f"  Train ppl      {final_ppl:>12.2f}")
-        print(f"  Text val ppl   {last_val_ppl:>12.2f}")
+        print(f"  TC val ppl     {last_val_ppl:>12.2f}")
         if speech_wer is not None:
             print(f"  Speech WER     {speech_wer:>12.4f}")
             epoch_avg_speech = sum(speech_losses) / len(speech_losses) if speech_losses else float("nan")
@@ -946,12 +945,18 @@ def train(args):
         print(f"  ─────────────────────────────────────")
         print(f"  Throughput     {tp['tokens_per_second']:>10.1f} tok/s")
         print(f"  Latency        {tp['avg_latency_s']:>11.3f}s")
-        print(f"  Gen length     {quality['avg_generation_length']:>10.1f} tok")
-        print(f"  Repetition     {quality['bigram_repetition_rate']:>12.3f}")
-        print(f"  ─────────────────────────────────────")
-        for prompt, gen in quality["generations"]:
-            gen_clean = gen.replace("<story>", "").replace("<transcribe>", "").strip()
-            print(f"  <story>[{prompt}] {gen_clean[:80]}")
+        print(f"  ─── Tool-Call Metrics ───────────────")
+        print(f"  JSON parse     {tc_metrics['json_parse_rate']:>10.1%}")
+        print(f"  Exact match    {tc_metrics['exact_match']:>10.1%}")
+        print(f"  Name F1        {tc_metrics['name_f1']:>10.3f}  (P={tc_metrics['name_precision']:.3f} R={tc_metrics['name_recall']:.3f})")
+        print(f"  Call F1        {tc_metrics['call_f1']:>10.3f}  (P={tc_metrics['call_precision']:.3f} R={tc_metrics['call_recall']:.3f})")
+        if tc_metrics["samples"]:
+            print(f"  ─────────────────────────────────────")
+            for query, ref, pred in tc_metrics["samples"][:3]:
+                print(f"  Q: {query}")
+                print(f"  R: {ref}")
+                print(f"  P: {pred}")
+                print()
         if transcribe_samples:
             print(f"  ─────────────────────────────────────")
             print(f"  Transcribe (WER={speech_wer:.4f}):")
@@ -971,6 +976,10 @@ def train(args):
                 "epoch/weight_sparsity": sparsity,
                 "epoch": epoch + 1,
             }
+            log_dict["epoch/tc_exact_match"] = tc_metrics["exact_match"]
+            log_dict["epoch/tc_name_f1"] = tc_metrics["name_f1"]
+            log_dict["epoch/tc_call_f1"] = tc_metrics["call_f1"]
+            log_dict["epoch/tc_json_parse_rate"] = tc_metrics["json_parse_rate"]
             if speech_wer is not None:
                 log_dict["epoch/speech_wer"] = speech_wer
             if speech_losses:

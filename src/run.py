@@ -24,7 +24,7 @@ def load_checkpoint(path):
     return params, config
 
 
-def generate(model, params, tokenizer, prompt, max_gen_len=128, temperature=0.8, seed=0, stream=True):
+def generate(model, params, tokenizer, prompt, max_gen_len=512, temperature=0.8, seed=0, stream=True, task_token_id=None):
     enc_tokens = tokenizer.encode(prompt)
     enc_input = jnp.array([enc_tokens])
 
@@ -40,6 +40,12 @@ def generate(model, params, tokenizer, prompt, max_gen_len=128, temperature=0.8,
     tgt_mask = make_causal_mask(max_gen_len)
     dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
     dec_buffer = dec_buffer.at[0, 0].set(eos_id)
+
+    # If task_token_id provided, set it at position 1 (matching transcribe() pattern)
+    start_pos = 0
+    if task_token_id is not None:
+        dec_buffer = dec_buffer.at[0, 1].set(task_token_id)
+        start_pos = 1
 
     @jax.jit
     def decode_step(dec_buffer, encoder_out, src_mask):
@@ -57,13 +63,13 @@ def generate(model, params, tokenizer, prompt, max_gen_len=128, temperature=0.8,
     generated_tokens = []
 
     if stream:
-        sys.stdout.write(f"\n{prompt}")
+        sys.stdout.write(f"\n")
         sys.stdout.flush()
 
     # Compile once on first call
     logits = decode_step(dec_buffer, encoder_out, src_mask)
 
-    for i in range(max_gen_len - 1):
+    for i in range(start_pos, max_gen_len - 1):
         next_logits = logits[0, i] / temperature
         rng, sample_rng = jax.random.split(rng)
         next_token = jax.random.categorical(sample_rng, next_logits).item()
@@ -196,8 +202,20 @@ def main(args):
             )
         return
 
-    # --- Text generation mode ---
-    prompts = args.prompts or ["Once upon a time", "The little dog", "She was very happy because"]
+    # --- Tool-call generation mode ---
+    query = getattr(args, "query", None)
+    tools = getattr(args, "tools", None)
+    prompts = args.prompts
+
+    if query:
+        prompt = query + " " + (tools or "[]")
+        prompts = [prompt]
+    elif not prompts:
+        prompts = [
+            'What is the weather in San Francisco? [{"name": "get_weather", "parameters": {"location": "string"}}]',
+            'Send an email to john@example.com saying hello [{"name": "send_email", "parameters": {"to": "string", "body": "string"}}]',
+            'Get the current stock price of AAPL [{"name": "get_stock_price", "parameters": {"symbol": "string"}}]',
+        ]
 
     for i, prompt in enumerate(prompts):
         generate(
@@ -209,14 +227,18 @@ def main(args):
             temperature=args.temperature,
             seed=args.seed + i,
             stream=True,
+            task_token_id=tokenizer.tool_call_token_id,
         )
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate stories with trained transformer")
+    parser = argparse.ArgumentParser(description="Generate tool calls with trained transformer")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/checkpoint_epoch3.pkl")
-    parser.add_argument("--prompts", type=str, nargs="*", help="Prompts to continue")
-    parser.add_argument("--max-len", type=int, default=128)
+    parser.add_argument("--prompts", type=str, nargs="*", help="Raw prompts (query + tools combined)")
+    parser.add_argument("--query", type=str, default=None, help="Query text for tool-call generation")
+    parser.add_argument("--tools", type=str, default=None, help="Tools JSON for tool-call generation")
+    parser.add_argument("--audio", type=str, nargs="*", help="Audio file paths to transcribe")
+    parser.add_argument("--max-len", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()

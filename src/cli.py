@@ -4,10 +4,10 @@ import sys
 HELP = """
   ┌───────────────────────────────────────────────────────────────────┐
   │                                                                   │
-  │      ┌─┐┌─┐┌─┐┌┬┐┬ ┬┌─┐  ┌┐┌┌─┐┌─┐┌┬┐┬  ┌─┐                       │
-  │      │  ├─┤│   │ │ │└─┐  │││├┤ ├┤  │││  ├┤                        │
-  │      └─┘┴ ┴└─┘ ┴ └─┘└─┘  ┘└┘└─┘└─┘─┴┘┴─┘└─┘                       │
-  │      ...the tiny model to rule them all...                        │
+  │            ┌─┐┌─┐┌─┐┌┬┐┬ ┬┌─┐  ┌┐┌┌─┐┌─┐┌┬┐┬  ┌─┐                 │
+  │            │  ├─┤│   │ │ │└─┐  │││├┤ ├┤  │││  ├┤                  │
+  │            └─┘┴ ┴└─┘ ┴ └─┘└─┘  ┘└┘└─┘└─┘─┴┘┴─┘└─┘                 │
+  │            ...the tiny model to rule them all...                  │
   │                                                                   │
   │   train                                                           │
   │     --full                   Use full 1B config (~1.17B params)   │
@@ -20,17 +20,17 @@ HELP = """
   │     --num-kv-heads INT       KV heads for GQA (default: num-heads)│
   │     --num-layers INT         Encoder layers (default: 8)          │
   │     --num-dec-layers INT     Decoder layers (default: 4)          │
-  │     --max-enc-len INT        Max encoder seq length (default: 256)│
-  │     --max-dec-len INT        Max decoder seq length (default: 256)│
+  │     --max-enc-len INT        Max encoder seq len (default: 1024)  │
+  │     --max-dec-len INT        Max decoder seq length (default: 512)│
   │     --max-samples INT        Training samples (default: all)      │
-  │     --mat-factors INT [...]   FFN shrink factors (default: 2 4 8)  │
-  │     --sparsity-ratio FLOAT   Block prune ratio (default: 0.5)    │
+  │     --mat-factors INT [...]   FFN shrink factors (default: 2 4 8) │
+  │     --sparsity-ratio FLOAT   Block prune ratio (default: 0.5)     │
   │     --group-size INT         Quant/prune group size (default: 32) │
   │     --prune-interval INT     Steps between mask updates (def: 100)│
-  │     --prune-start-frac FL    Start pruning at frac (def: 0.33)   │
-  │     --prune-end-frac FL      Lock mask at this frac (def: 0.67)  │
+  │     --prune-start-frac FL    Start pruning at frac (def: 0.33)    │
+  │     --prune-end-frac FL      Lock mask at this frac (def: 0.67)   │
   │     --activation STR         drelu|swiglu|geglu (default: drelu)  │
-  │     --warmup-ratio FLOAT     LR warmup ratio (default: 0.05)     │
+  │     --warmup-ratio FLOAT     LR warmup ratio (default: 0.05)      │
   │     --eval-every INT         Val eval interval (default: 1000)    │
   │     --wandb                  Enable W&B logging                   │
   │     --checkpoint PATH        Resume from checkpoint               │
@@ -44,9 +44,11 @@ HELP = """
   │                                                                   │
   │   run                                                             │
   │     --checkpoint PATH       Path to model checkpoint (required)   │
-  │     --prompts STR [...]     One or more prompts to continue       │
+  │     --query STR             Query text for tool-call generation   │
+  │     --tools STR             Tools JSON for tool-call generation   │
+  │     --prompts STR [...]     Raw prompts (query+tools combined)    │
   │     --audio PATH [...]      Audio files to transcribe             │
-  │     --max-len INT           Max tokens to generate (default: 128) │
+  │     --max-len INT           Max tokens to generate (default: 512) │
   │     --temperature FLOAT     Sampling temperature (default: 0.8)   │
   │     --seed INT              Random seed (default: 0)              │
   │                                                                   │
@@ -54,9 +56,12 @@ HELP = """
   │     --checkpoint PATH       Path to model checkpoint (required)   │
   │     --batch-size INT        Batch size (default: 32)              │
   │     --max-eval-samples INT  Evaluation samples (default: 1000)    │
-  │     --max-gen-len INT       Max generation length (default: 128)  │
+  │     --max-enc-len INT       Max encoder length (default: 1024)    │
+  │     --max-dec-len INT       Max decoder length (default: 512)     │
+  │     --max-gen-len INT       Max generation length (default: 512)  │
   │     --temperature FLOAT     Sampling temperature (default: 0.8)   │
   │     --throughput-runs INT   Throughput runs (default: 10)         │
+  │     --tool-call-samples INT Tool-call eval samples (default: 200) │
   │                                                                   │
   │   evaluate                                                        │
   │     --checkpoint PATH       Path to model checkpoint (required)   │
@@ -98,8 +103,8 @@ def main():
     p.add_argument("--num-kv-heads", type=int, default=None)
     p.add_argument("--num-layers", type=int, default=8)
     p.add_argument("--num-dec-layers", type=int, default=4)
-    p.add_argument("--max-enc-len", type=int, default=256)
-    p.add_argument("--max-dec-len", type=int, default=256)
+    p.add_argument("--max-enc-len", type=int, default=1024)
+    p.add_argument("--max-dec-len", type=int, default=512)
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--wandb", action="store_true")
@@ -134,9 +139,11 @@ def main():
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--query", type=str, default=None, help="Query text for tool-call generation")
+    p.add_argument("--tools", type=str, default=None, help="Tools JSON for tool-call generation")
     p.add_argument("--prompts", type=str, nargs="*")
     p.add_argument("--audio", type=str, nargs="*", help="Audio file paths to transcribe")
-    p.add_argument("--max-len", type=int, default=128)
+    p.add_argument("--max-len", type=int, default=512)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--seed", type=int, default=0)
 
@@ -144,9 +151,11 @@ def main():
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--max-eval-samples", type=int, default=1000)
-    p.add_argument("--max-enc-len", type=int, default=128)
-    p.add_argument("--max-dec-len", type=int, default=128)
-    p.add_argument("--max-gen-len", type=int, default=128)
+    p.add_argument("--max-enc-len", type=int, default=1024)
+    p.add_argument("--max-dec-len", type=int, default=512)
+    p.add_argument("--max-gen-len", type=int, default=512)
+    p.add_argument("--tool-call-samples", type=int, default=200,
+                   help="Samples for tool-call accuracy eval (default: 200)")
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--throughput-runs", type=int, default=10)
 

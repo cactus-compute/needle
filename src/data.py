@@ -10,19 +10,20 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 import numpy as np
-from datasets import Audio, load_dataset
+from datasets import Audio, load_dataset, load_from_disk
 from tqdm import tqdm
 import sentencepiece as spm
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".data_cache")
 TOKENIZER_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tokenizer")
 TOKENIZER_PREFIX = os.path.join(TOKENIZER_DIR, "needle")
+TOOL_CALLS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "tool_calls")
 
 PAD_ID = 0
 EOS_ID = 1
 BOS_ID = 2
 UNK_ID = 3
-STORY_ID = 4
+TOOL_CALL_ID = 4
 TRANSCRIBE_ID = 5
 
 
@@ -46,8 +47,8 @@ class NeedleTokenizer:
         return BOS_ID
 
     @property
-    def story_token_id(self):
-        return STORY_ID
+    def tool_call_token_id(self):
+        return TOOL_CALL_ID
 
     @property
     def transcribe_token_id(self):
@@ -93,7 +94,7 @@ def _tokenize_chunk(texts):
 
 
 def train_tokenizer(vocab_size=8192, max_samples=None):
-    """Train a SentencePiece BPE tokenizer on TinyStories."""
+    """Train a SentencePiece BPE tokenizer on tool-calling corpus."""
     model_path = TOKENIZER_PREFIX + ".model"
     if os.path.exists(model_path):
         print(f"Tokenizer already exists at {model_path}")
@@ -101,7 +102,7 @@ def train_tokenizer(vocab_size=8192, max_samples=None):
 
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
 
-    ds = load_dataset("roneneldan/TinyStories", split="train")
+    ds = load_from_disk(TOOL_CALLS_DIR)
     if max_samples:
         ds = ds.select(range(min(max_samples, len(ds))))
 
@@ -110,9 +111,10 @@ def train_tokenizer(vocab_size=8192, max_samples=None):
     corpus_path = os.path.join(TOKENIZER_DIR, "corpus.txt")
     with open(corpus_path, "w") as f:
         for example in tqdm(ds, desc="Writing corpus"):
-            text = example["text"].strip()
-            if text:
-                f.write(text + "\n")
+            for field in ("query", "tools", "answers"):
+                text = example[field].strip()
+                if text:
+                    f.write(text + "\n")
 
     spm.SentencePieceTrainer.Train(
         input=corpus_path,
@@ -123,7 +125,7 @@ def train_tokenizer(vocab_size=8192, max_samples=None):
         eos_id=EOS_ID,
         bos_id=BOS_ID,
         unk_id=UNK_ID,
-        user_defined_symbols=["<story>", "<transcribe>"],
+        user_defined_symbols=["<tool_call>", "<transcribe>"],
         byte_fallback=True,
         normalization_rule_name="identity",
         num_threads=os.cpu_count(),
@@ -143,8 +145,14 @@ def get_tokenizer(max_samples=None):
     return NeedleTokenizer(model_path)
 
 
-def load_tinystories(split="train", max_samples=None):
-    ds = load_dataset("roneneldan/TinyStories", split=split)
+def load_tool_calls(split="train", max_samples=None):
+    """Load tool-calling dataset, splitting 90/10 for train/val."""
+    ds = load_from_disk(TOOL_CALLS_DIR)
+    n = len(ds)
+    if split in ("validation", "val", "test"):
+        ds = ds.select(range(int(n * 0.9), n))
+    elif split == "train":
+        ds = ds.select(range(int(n * 0.9)))
     if max_samples:
         ds = ds.select(range(min(max_samples, len(ds))))
     return ds
@@ -165,13 +173,18 @@ def _cache_key(prefix, n_samples, max_enc_len, max_dec_len):
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
-def prepare_text_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=128, split_ratio=0.3):
-    """Prepare text encoder-decoder pairs with <story> task token."""
+def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=1024, max_dec_len=512):
+    """Prepare tool-call encoder-decoder pairs with <tool_call> task token.
 
-    cache_id = _cache_key("text", len(ds), max_enc_len, max_dec_len)
+    Encoder input: tokenize(query + " " + tools), truncated to max_enc_len.
+    Decoder input:  [BOS, <tool_call>, answer_tokens...]
+    Decoder target: [<tool_call>, answer_tokens..., EOS]
+    """
+
+    cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len)
     cache_path = os.path.join(CACHE_DIR, cache_id)
     if os.path.exists(cache_path + "_enc.npy"):
-        print(f"Loading cached text data ({cache_id})...")
+        print(f"Loading cached tool-call data ({cache_id})...")
         return (
             np.load(cache_path + "_enc.npy"),
             np.load(cache_path + "_dec_in.npy"),
@@ -180,69 +193,70 @@ def prepare_text_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=128, split_ra
 
     pad_id = tokenizer.pad_token_id
     bos_id = tokenizer.eos_token_id
-    story_id = tokenizer.story_token_id
-    max_total = max_enc_len + max_dec_len
+    eos_id = tokenizer.eos_token_id
+    tool_call_id = tokenizer.tool_call_token_id
 
-    # --- Parallel tokenization ---
-    texts = list(ds["text"])
+    # Build encoder texts (query + tools) and decoder texts (answers)
+    enc_texts = [ex["query"] + " " + ex["tools"] for ex in ds]
+    dec_texts = [ex["answers"] for ex in ds]
+
     num_workers = min(os.cpu_count() or 1, 8)
     model_path = TOKENIZER_PREFIX + ".model"
-    chunk_size = max(1, len(texts) // (num_workers * 4))
-    chunks = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
 
-    print(f"Tokenizing ({num_workers} workers)...")
+    # Parallel tokenization for encoder inputs
+    chunk_size = max(1, len(enc_texts) // (num_workers * 4))
+    enc_chunks = [enc_texts[i:i + chunk_size] for i in range(0, len(enc_texts), chunk_size)]
+
+    print(f"Tokenizing encoder inputs ({num_workers} workers)...")
     with mp.Pool(num_workers, initializer=_init_worker,
-                 initargs=(model_path, max_total)) as pool:
-        results = pool.map(_tokenize_chunk, chunks)
-    all_tokens = [tok for chunk in results for tok in chunk]
+                 initargs=(model_path, max_enc_len)) as pool:
+        enc_results = pool.map(_tokenize_chunk, enc_chunks)
+    all_enc_tokens = [tok for chunk in enc_results for tok in chunk]
 
-    # --- Pre-filter by length to reduce loop iterations ---
-    lengths = np.array([len(t) for t in all_tokens])
-    valid_mask = lengths >= 6
-    valid_indices = np.where(valid_mask)[0]
+    # Parallel tokenization for decoder inputs (max_dec_len - 2 for BOS + task token)
+    dec_chunks = [dec_texts[i:i + chunk_size] for i in range(0, len(dec_texts), chunk_size)]
 
-    split_points = np.maximum(2, (lengths[valid_indices] * split_ratio).astype(np.int32))
-    enc_lens = np.minimum(split_points, max_enc_len)
-    # Account for <story> token taking one slot in decoder
-    dec_lens = np.minimum(lengths[valid_indices] - split_points, max_dec_len - 1)
-    keep = dec_lens >= 2
+    print(f"Tokenizing decoder inputs ({num_workers} workers)...")
+    with mp.Pool(num_workers, initializer=_init_worker,
+                 initargs=(model_path, max_dec_len - 2)) as pool:
+        dec_results = pool.map(_tokenize_chunk, dec_chunks)
+    all_dec_tokens = [tok for chunk in dec_results for tok in chunk]
 
-    valid_indices = valid_indices[keep]
-    split_points = split_points[keep]
-    enc_lens = enc_lens[keep]
-    dec_lens = dec_lens[keep]
+    n = len(ds)
+    enc_inputs = np.full((n, max_enc_len), pad_id, dtype=np.int32)
+    dec_inputs = np.full((n, max_dec_len), pad_id, dtype=np.int32)
+    dec_targets = np.full((n, max_dec_len), pad_id, dtype=np.int32)
 
-    n_keep = len(valid_indices)
-    enc_inputs = np.full((n_keep, max_enc_len), pad_id, dtype=np.int32)
-    dec_inputs = np.full((n_keep, max_dec_len), pad_id, dtype=np.int32)
-    dec_targets = np.full((n_keep, max_dec_len), pad_id, dtype=np.int32)
+    for i in range(n):
+        # Encoder: truncated tokens
+        e_tok = all_enc_tokens[i]
+        el = len(e_tok)
+        enc_inputs[i, :el] = e_tok
 
-    for i, (idx, sp, el, dl) in enumerate(
-        zip(valid_indices, split_points, enc_lens, dec_lens)
-    ):
-        tokens = all_tokens[idx]
-        enc_inputs[i, :el] = tokens[:sp][:max_enc_len]
-        # Decoder input: [BOS, <story>, tok1, tok2, ...]
+        # Decoder answer tokens
+        d_tok = all_dec_tokens[i]
+        dl = len(d_tok)
+
+        # Decoder input: [BOS, <tool_call>, answer_tokens...]
         dec_inputs[i, 0] = bos_id
-        dec_inputs[i, 1] = story_id
-        dec_inputs[i, 2:dl + 1] = tokens[sp:][:dl - 1]
-        # Decoder target: [<story>, tok1, tok2, ..., EOS]
-        dec_targets[i, 0] = story_id
-        dec_targets[i, 1:dl + 1] = tokens[sp:][:dl]
+        dec_inputs[i, 1] = tool_call_id
+        if dl > 0:
+            dec_inputs[i, 2:2 + dl] = d_tok
+
+        # Decoder target: [<tool_call>, answer_tokens..., EOS]
+        dec_targets[i, 0] = tool_call_id
+        if dl > 0:
+            dec_targets[i, 1:1 + dl] = d_tok
+        dec_targets[i, 1 + dl] = eos_id
 
     # Save cache
     os.makedirs(CACHE_DIR, exist_ok=True)
     np.save(cache_path + "_enc.npy", enc_inputs)
     np.save(cache_path + "_dec_in.npy", dec_inputs)
     np.save(cache_path + "_dec_tgt.npy", dec_targets)
-    print(f"Cached {n_keep:,} text pairs to {CACHE_DIR}/{cache_id}")
+    print(f"Cached {n:,} tool-call pairs to {CACHE_DIR}/{cache_id}")
 
     return enc_inputs, dec_inputs, dec_targets
-
-
-# Backward compatibility alias
-def prepare_encoder_decoder_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=128, split_ratio=0.3):
-    return prepare_text_pairs(ds, tokenizer, max_enc_len, max_dec_len, split_ratio)
 
 
 def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True):
