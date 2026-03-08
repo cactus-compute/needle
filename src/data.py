@@ -173,27 +173,6 @@ def _cache_key(prefix, n_samples, max_enc_len, max_dec_len):
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
-def _compact_tools(tools_json):
-    """Strip verbose schema descriptions, keep only function name + param name/type."""
-    import json
-    try:
-        tools = json.loads(tools_json)
-    except (json.JSONDecodeError, TypeError):
-        return tools_json
-    compact = []
-    for t in tools:
-        params = {}
-        raw_params = t.get("parameters", {})
-        props = raw_params.get("properties", raw_params) if isinstance(raw_params, dict) else {}
-        for pname, pdef in props.items():
-            if isinstance(pdef, dict):
-                params[pname] = pdef.get("type", "string")
-            else:
-                params[pname] = str(pdef)
-        compact.append({"name": t["name"], "parameters": params})
-    return json.dumps(compact)
-
-
 def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=256, max_dec_len=1024):
     """Prepare tool-call encoder-decoder pairs with <tool_call> task token.
 
@@ -221,9 +200,9 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=256, max_dec_len=1024):
     eos_id = tokenizer.eos_token_id
     tool_call_id = tokenizer.tool_call_token_id
 
-    # Encoder: query only. Decoder prefix: compact tools. Decoder answer: answers.
+    # Encoder: query only. 
     enc_texts = [ex["query"] for ex in ds]
-    tools_texts = [_compact_tools(ex["tools"]) for ex in ds]
+    tools_texts = [ex["tools"] for ex in ds]
     ans_texts = [ex["answers"] for ex in ds]
 
     num_workers = min(os.cpu_count() or 1, 8)

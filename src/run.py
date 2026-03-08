@@ -30,8 +30,6 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
     Encoder: query only.
     Decoder: prefilled with [BOS, <tool_call>, tools_tokens...], then greedy decode.
     """
-    from .data import _compact_tools
-
     enc_tokens = tokenizer.encode(query)
     enc_input = jnp.array([enc_tokens])
 
@@ -44,8 +42,8 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
         {"params": params}, enc_input, src_mask=src_mask, method="encode"
     )
 
-    # Build decoder prefix: [BOS, <tool_call>, compact_tools_tokens...]
-    tools_tokens = tokenizer.encode(_compact_tools(tools))
+    # Build decoder prefix: [BOS, <tool_call>, tools_tokens...]
+    tools_tokens = tokenizer.encode(tools)
     prefix = [eos_id, tool_call_id] + tools_tokens
     prefix_len = len(prefix)
 

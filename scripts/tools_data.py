@@ -22,7 +22,7 @@ Datasets and their native formats:
 3. glaiveai/glaive-function-calling-v2
    Tool definitions embedded in the system prompt; chat is a flat string with
    USER:/A: role markers and <functioncall> tags. Examples with empty answers
-   (answers=[]) are filtered out in the final combine step.
+   (answers=[]) are kept so the model learns when NOT to call functions.
 
 4. Team-ACE/ToolACE
    Tool definitions as a JSON array in the system prompt; function calls use a
@@ -227,6 +227,26 @@ def _parse_toolace_calls(text):
     return answers
 
 
+def compact_tools(tools_json):
+    """Strip verbose schema descriptions, keep only function name + param name/type."""
+    try:
+        tools = json.loads(tools_json)
+    except (json.JSONDecodeError, TypeError):
+        return tools_json
+    compact = []
+    for t in tools:
+        params = {}
+        raw_params = t.get("parameters", {})
+        props = raw_params.get("properties", raw_params) if isinstance(raw_params, dict) else {}
+        for pname, pdef in props.items():
+            if isinstance(pdef, dict):
+                params[pname] = pdef.get("type", "string")
+            else:
+                params[pname] = str(pdef)
+        compact.append({"name": t["name"], "parameters": params})
+    return json.dumps(compact)
+
+
 CONVERTERS = {
     "xlam-function-calling-60k": convert_xlam,
     "APIGen-MT-5k": convert_apigen_mt,
@@ -252,15 +272,17 @@ def load_and_combine():
         parts.append(converted)
 
     combined = concatenate_datasets(parts)
-    pre_filter = len(combined)
 
-    # Filter out examples with empty answers
-    combined = combined.filter(
-        lambda ex: json.loads(ex["answers"]) != [],
-        desc="Filtering empty answers",
+    # Compact tool schemas: strip descriptions, keep only name + param name/type
+    print(f"\nCompacting tool schemas...")
+    combined = combined.map(
+        lambda ex: {"tools": compact_tools(ex["tools"])},
+        desc="Compacting tools",
     )
+
+    empty_count = sum(1 for ex in combined if json.loads(ex["answers"]) == [])
     print(f"\n{'='*60}")
-    print(f"Combined dataset: {len(combined)} examples (filtered {pre_filter - len(combined)} empty answers)")
+    print(f"Combined dataset: {len(combined)} examples ({empty_count} with empty answers = no-call examples)")
     print(f"Columns: {combined.column_names}")
 
     counts = Counter(combined["source"])
