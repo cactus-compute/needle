@@ -1,87 +1,7 @@
 import argparse
 import sys
 
-HELP = """
-  ┌───────────────────────────────────────────────────────────────────┐
-  │                                                                   │
-  │            ┌─┐┌─┐┌─┐┌┬┐┬ ┬┌─┐  ┌┐┌┌─┐┌─┐┌┬┐┬  ┌─┐                 │
-  │            │  ├─┤│   │ │ │└─┐  │││├┤ ├┤  │││  ├┤                  │
-  │            └─┘┴ ┴└─┘ ┴ └─┘└─┘  ┘└┘└─┘└─┘─┴┘┴─┘└─┘                 │
-  │            ...the tiny model to rule them all...                  │
-  │                                                                   │
-  │   train                                                           │
-  │     --full                   Use full 1B config (~1.17B params)   │
-  │     --epochs INT             Training epochs (default: 1)         │
-  │     --batch-size INT         Batch size (default: 32)             │
-  │     --lr FLOAT               AdamW learning rate (default: 3e-4)  │
-  │     --muon-lr FLOAT          Muon learning rate (default: 0.02)   │
-  │     --d-model INT            Model dim (default: 512)             │
-  │     --num-heads INT          Attention heads (default: 8)         │
-  │     --num-kv-heads INT       KV heads for GQA (default: num-heads)│
-  │     --num-layers INT         Encoder layers (default: 4)          │
-  │     --num-dec-layers INT     Decoder layers (default: 4)          │
-  │     --max-enc-len INT        Max encoder seq len (default: 256)  │
-  │     --max-dec-len INT        Max decoder seq len (default: 1024) │
-  │     --max-samples INT        Training samples (default: all)      │
-  │     --mat-factors INT [...]   FFN shrink factors (default: 2 4 8) │
-  │     --sparsity-ratio FLOAT   Block prune ratio (default: 0.5)     │
-  │     --group-size INT         Quant/prune group size (default: 32) │
-  │     --prune-interval INT     Steps between mask updates (def: 100)│
-  │     --prune-start-frac FL    Start pruning at frac (def: 0.33)    │
-  │     --prune-end-frac FL      Lock mask at this frac (def: 0.67)   │
-  │     --activation STR         drelu|swiglu|geglu (default: drelu)  │
-  │     --warmup-ratio FLOAT     LR warmup ratio (default: 0.05)      │
-  │     --eval-every INT         Val eval interval (default: 1000)    │
-  │     --wandb                  Enable W&B logging                   │
-  │     --checkpoint PATH        Resume from checkpoint               │
-  │     --checkpoint-dir DIR     Checkpoint directory                 │
-  │     --seed INT               Random seed (default: 42)            │
-  │     --no-speech             Disable speech (text-only training)   │
-  │     --speech-every INT      Speech step every N text (default: 3) │
-  │     --max-mel-len INT       Max mel frames (default: 1024)        │
-  │     --n-mels INT            Mel frequency bins (default: 80)      │
-  │     --max-speech-samples INT  Max LibriSpeech samples             │
-  │                                                                   │
-  │   run                                                             │
-  │     --checkpoint PATH       Path to model checkpoint (required)   │
-  │     --query STR             Query text for tool-call generation   │
-  │     --tools STR             Tools JSON for tool-call generation   │
-  │     --prompts STR [...]     Raw prompts (query+tools combined)    │
-  │     --audio PATH [...]      Audio files to transcribe             │
-  │     --max-len INT           Max tokens to generate (default: 512) │
-  │     --temperature FLOAT     Sampling temperature (default: 0.8)   │
-  │     --seed INT              Random seed (default: 0)              │
-  │                                                                   │
-  │   test                                                            │
-  │     --checkpoint PATH       Path to model checkpoint (required)   │
-  │     --batch-size INT        Batch size (default: 32)              │
-  │     --max-eval-samples INT  Evaluation samples (default: 1000)    │
-  │     --max-enc-len INT       Max encoder length (default: 256)    │
-  │     --max-dec-len INT       Max decoder length (default: 1024)    │
-  │     --max-gen-len INT       Max generation length (default: 512)  │
-  │     --temperature FLOAT     Sampling temperature (default: 0.8)   │
-  │     --throughput-runs INT   Throughput runs (default: 10)         │
-  │     --tool-call-samples INT Tool-call eval samples (default: 200) │
-  │                                                                   │
-  │   evaluate                                                        │
-  │     --checkpoint PATH       Path to model checkpoint (required)   │
-  │     --benchmarks [...]      wikitext2 lambada hellaswag arc_easy  │
-  │     --max-samples INT       Samples per benchmark (default: 500)  │
-  │                                                                   │
-  │   tpu                                                             │
-  │     create NAME             Create TPU (auto-finds zone)          │
-  │       --type STR            Accelerator (default: v6e-8)          │
-  │       --version STR         TPU OS (auto-detected from --type)    │
-  │     connect NAME            SSH config + connect (auto-zone)      │
-  │     claude NAME             Install Claude Code on instance       │
-  │     stop NAME               Stop instance (auto-zone)             │
-  │     start NAME              Start stopped instance (auto-zone)    │
-  │     delete NAME             Delete instance (auto-zone)           │
-  │     list                    List all TPU instances                │
-  │       --zone ZONE           Override auto-detected zone           │
-  │                                                                   │
-  └───────────────────────────────────────────────────────────────────┘
-"""
+HELP = """Check the readme"""
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
@@ -113,7 +33,7 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--max-eval-samples", type=int, default=None)
-    p.add_argument("--sparsity-ratio", type=float, default=0.5)
+    p.add_argument("--sparsity-ratio", type=float, default=0.0)
     p.add_argument("--group-size", type=int, default=32)
     p.add_argument("--prune-interval", type=int, default=100,
                    help="Steps between mask updates during gradual pruning (default: 100)")
@@ -128,20 +48,18 @@ def main():
     p.add_argument("--mat-shared-input", action="store_true",
                    help="Each unique input is repeated across all mat widths (default: unique input per width)")
     p.add_argument("--no-speech", action="store_true", help="Disable speech training (text-only)")
-    p.add_argument("--speech-every", type=int, default=3,
-                   help="Do one speech step every N text steps (default: 3)")
     p.add_argument("--max-mel-len", type=int, default=1024,
                    help="Max mel spectrogram frames (default: 1024)")
     p.add_argument("--n-mels", type=int, default=80,
                    help="Number of mel frequency bins (default: 80)")
     p.add_argument("--max-speech-samples", type=int, default=None,
-                   help="Max LibriSpeech training samples (default: all)")
+                   help="Max voice-tool-call training samples (default: all)")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--query", type=str, default=None, help="Query text for tool-call generation")
     p.add_argument("--tools", type=str, default=None, help="Tools JSON for tool-call generation")
-    p.add_argument("--audio", type=str, nargs="*", help="Audio file paths to transcribe")
+    p.add_argument("--audio", type=str, nargs="*", help="Audio file paths for voice-to-tool-call")
     p.add_argument("--max-len", type=int, default=512)
     p.add_argument("--seed", type=int, default=0)
 
@@ -154,6 +72,8 @@ def main():
     p.add_argument("--max-gen-len", type=int, default=512)
     p.add_argument("--tool-call-samples", type=int, default=200,
                    help="Samples for tool-call accuracy eval (default: 200)")
+    p.add_argument("--voice-tc-samples", type=int, default=50,
+                   help="Samples for voice-to-tool-call eval (default: 50)")
     p.add_argument("--throughput-runs", type=int, default=10)
 
     p = sub.add_parser("evaluate", add_help=False)

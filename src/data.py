@@ -10,21 +10,70 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 import numpy as np
-from datasets import Audio, load_dataset, load_from_disk
+from datasets import Audio, load_from_disk
 from tqdm import tqdm
 import sentencepiece as spm
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".data_cache")
 TOKENIZER_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tokenizer")
 TOKENIZER_PREFIX = os.path.join(TOKENIZER_DIR, "needle")
-TOOL_CALLS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "tool_calls")
+LOCAL_UNIFIED_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "tool_calls_unified")
+GCS_DATASET_PATH = "gs://cactus-dataset/tool_calls"
 
 PAD_ID = 0
 EOS_ID = 1
-BOS_ID = 2
+BOS_ID = 2  # reserved for SentencePiece, unused at runtime (EOS_ID serves as SOS)
 UNK_ID = 3
 TOOL_CALL_ID = 4
 TRANSCRIBE_ID = 5
+
+_unified_dataset_cache = None
+
+
+def _load_unified_dataset():
+    """Load the unified dataset from GCS (via gcsfs) or local fallback.
+
+    Caches the result in memory after first load.
+    Uses soundfile as the audio decoding backend.
+    """
+    global _unified_dataset_cache
+    if _unified_dataset_cache is not None:
+        return _unified_dataset_cache
+
+    # Try GCS first
+    try:
+        ds = load_from_disk(GCS_DATASET_PATH)
+        print(f"Loaded unified dataset from GCS ({len(ds)} rows)")
+        # Cache locally for faster subsequent loads
+        if not os.path.exists(LOCAL_UNIFIED_DIR):
+            ds.save_to_disk(LOCAL_UNIFIED_DIR)
+            print(f"  Cached locally to {LOCAL_UNIFIED_DIR}")
+        _unified_dataset_cache = _set_audio_backend(ds)
+        return _unified_dataset_cache
+    except Exception:
+        pass
+
+    # Fallback to local
+    if os.path.exists(LOCAL_UNIFIED_DIR):
+        ds = load_from_disk(LOCAL_UNIFIED_DIR)
+        print(f"Loaded unified dataset from {LOCAL_UNIFIED_DIR} ({len(ds)} rows)")
+        _unified_dataset_cache = _set_audio_backend(ds)
+        return _unified_dataset_cache
+
+    raise FileNotFoundError(
+        f"Unified dataset not found. Run scripts/build_dataset.py first, "
+        f"or ensure GCS path {GCS_DATASET_PATH} is accessible (pip install gcsfs)."
+    )
+
+
+def _set_audio_backend(ds):
+    """Disable automatic audio decoding to avoid torchcodec dependency.
+
+    Audio is decoded manually via soundfile in load_tool_call_audio().
+    """
+    if "audio" in ds.column_names:
+        ds = ds.cast_column("audio", Audio(sampling_rate=16000, decode=False))
+    return ds
 
 
 class NeedleTokenizer:
@@ -102,7 +151,7 @@ def train_tokenizer(vocab_size=8192, max_samples=None):
 
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
 
-    ds = load_from_disk(TOOL_CALLS_DIR)
+    ds = _load_unified_dataset()
     if max_samples:
         ds = ds.select(range(min(max_samples, len(ds))))
 
@@ -138,16 +187,37 @@ def train_tokenizer(vocab_size=8192, max_samples=None):
     return model_path
 
 
+GCS_TOKENIZER_PATH = "gs://cactus-dataset/tokenizer/"
+
+
 def get_tokenizer(max_samples=None):
     model_path = TOKENIZER_PREFIX + ".model"
     if not os.path.exists(model_path):
+        # Try downloading from GCS first
+        if _download_tokenizer_from_gcs():
+            return NeedleTokenizer(model_path)
         train_tokenizer(max_samples=max_samples)
     return NeedleTokenizer(model_path)
 
 
+def _download_tokenizer_from_gcs():
+    """Download tokenizer files from GCS. Returns True on success."""
+    import subprocess
+    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+    result = subprocess.run(
+        ["gcloud", "storage", "cp", "-r", GCS_TOKENIZER_PATH + "*", TOKENIZER_DIR + "/"],
+        capture_output=True, text=True,
+    )
+    model_path = TOKENIZER_PREFIX + ".model"
+    if result.returncode == 0 and os.path.exists(model_path):
+        print(f"Downloaded tokenizer from {GCS_TOKENIZER_PATH}")
+        return True
+    return False
+
+
 def load_tool_calls(split="train", max_samples=None):
     """Load tool-calling dataset, splitting 90/10 for train/val."""
-    ds = load_from_disk(TOOL_CALLS_DIR)
+    ds = _load_unified_dataset()
     n = len(ds)
     if split in ("validation", "val", "test"):
         ds = ds.select(range(int(n * 0.9), n))
@@ -196,11 +266,9 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=256, max_dec_len=1024):
         )
 
     pad_id = tokenizer.pad_token_id
-    bos_id = tokenizer.eos_token_id
     eos_id = tokenizer.eos_token_id
     tool_call_id = tokenizer.tool_call_token_id
 
-    # Encoder: query only. 
     enc_texts = [ex["query"] for ex in ds]
     tools_texts = [ex["tools"] for ex in ds]
     ans_texts = [ex["answers"] for ex in ds]
@@ -260,12 +328,10 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=256, max_dec_len=1024):
             prefix_len = 2 + len(t_tok)
             total_dec = prefix_len + len(a_tok) + 1
 
-        # Encoder
         el = len(e_tok)
         enc_inputs[i, :el] = e_tok
 
-        # Decoder input: [BOS, <tool_call>, tools..., answer...]
-        dec_inputs[i, 0] = bos_id
+        dec_inputs[i, 0] = eos_id
         dec_inputs[i, 1] = tool_call_id
         tl = len(t_tok)
         if tl > 0:
@@ -322,57 +388,56 @@ def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True, l
         yield batch
 
 
-get_text_batches = get_batches
 
+def load_tool_call_audio(split="train", max_samples=None):
+    """Load tool-call dataset entries that have TTS audio.
 
-# ─── Speech pipeline ───────────────────────────────────────────────────────────
+    Applies the same 90/10 split as load_tool_calls, then filters to entries
+    where the audio column is not None.
 
-def load_librispeech(split="train", max_samples=None):
-    """Load LibriSpeech-100 from HuggingFace (SPRINGLab/LibriSpeech-100).
-
-    The dataset has a single 'train' split, so we partition it:
-      - train / train.clean.100: first 90%
-      - validation.clean / test.clean / validation / test: last 10%
-
-    Audio decoding is disabled (to avoid torchcodec/torch dependency);
-    prepare_speech_pairs decodes audio bytes via soundfile instead.
+    Returns list of dicts: {query, answers, tools, audio_bytes, sampling_rate}.
     """
-    ds = load_dataset("SPRINGLab/LibriSpeech-100", split="train")
-    ds = ds.cast_column("audio", Audio(decode=False))
+    ds = _load_unified_dataset()
     n = len(ds)
-    if split in ("validation.clean", "validation", "test.clean", "test"):
-        ds = ds.select(range(int(n * 0.9), n))
-    elif split.startswith("train"):
-        ds = ds.select(range(int(n * 0.9)))
-    if max_samples:
-        ds = ds.select(range(min(max_samples, len(ds))))
-    return ds
 
+    if split in ("validation", "val", "test"):
+        indices = list(range(int(n * 0.9), n))
+    elif split == "train":
+        indices = list(range(int(n * 0.9)))
+    else:
+        indices = list(range(n))
 
-def _decode_audio(audio_data, target_sr=16000):
-    """Decode raw audio bytes from a datasets Audio(decode=False) field using soundfile."""
     import io
     import soundfile as sf
 
-    audio_bytes = audio_data["bytes"]
-    if audio_bytes is None:
-        path = audio_data["path"]
-        audio, sr = sf.read(path, dtype="float32")
-    else:
-        audio, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+    pairs = []
+    for idx in indices:
+        ex = ds[idx]
+        audio_val = ex.get("audio")
+        if audio_val is None:
+            continue
+        # With decode=False, audio_val is {"bytes": b"...", "path": ...}
+        raw_bytes = None
+        if isinstance(audio_val, dict):
+            raw_bytes = audio_val.get("bytes")
+        elif isinstance(audio_val, bytes):
+            raw_bytes = audio_val
+        if raw_bytes is None:
+            continue
+        audio_array, sr = sf.read(io.BytesIO(raw_bytes), dtype="float32")
+        if audio_array.ndim > 1:
+            audio_array = audio_array.mean(axis=1)
+        pairs.append({
+            "query": ex["query"],
+            "answers": ex["answers"],
+            "tools": ex["tools"],
+            "audio_array": audio_array.astype(np.float32),
+            "sampling_rate": sr,
+        })
+        if max_samples and len(pairs) >= max_samples:
+            break
 
-    # Convert stereo to mono
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-
-    # Resample if needed
-    if sr != target_sr:
-        from scipy.signal import resample
-        num_samples = int(len(audio) * target_sr / sr)
-        audio = resample(audio, num_samples).astype(np.float32)
-        sr = target_sr
-
-    return audio.astype(np.float32), sr
+    return pairs
 
 
 def compute_mel_spectrogram(audio, sr=16000, n_mels=80, n_fft=400, hop_length=160):
@@ -429,85 +494,168 @@ def _speech_cache_key(n_samples, n_mels, max_mel_len, max_dec_len):
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
-def prepare_speech_pairs(ds, tokenizer, n_mels=80, max_mel_len=1024, max_dec_len=128):
-    """Prepare speech encoder-decoder pairs with <transcribe> task token."""
+def build_audio_augmenter(sr=16000):
+    """Build an audiomentations augmentation pipeline for training.
 
-    cache_id = _speech_cache_key(len(ds), n_mels, max_mel_len, max_dec_len)
+    Returns an augmenter callable or None if audiomentations is unavailable.
+    """
+    try:
+        import audiomentations as A
+    except ImportError:
+        print("  WARNING: audiomentations not installed — no waveform augmentation")
+        return None
+
+    return A.Compose([
+        A.AddGaussianSNR(min_snr_db=10.0, max_snr_db=35.0, p=0.5),
+        A.AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.3),
+        A.TimeStretch(min_rate=0.9, max_rate=1.1, p=0.3),
+        A.PitchShift(min_semitones=-2, max_semitones=2, p=0.3),
+        A.Gain(min_gain_db=-6, max_gain_db=6, p=0.4),
+        A.LowPassFilter(min_cutoff_freq=3000, max_cutoff_freq=7500, p=0.2),
+        A.HighPassFilter(min_cutoff_freq=50, max_cutoff_freq=400, p=0.2),
+        A.ClippingDistortion(min_percentile_threshold=0, max_percentile_threshold=5, p=0.1),
+    ])
+
+
+def prepare_voice_tool_call_pairs(pairs, tokenizer, n_mels=80, max_mel_len=1024, max_dec_len=1024):
+    """Prepare voice-tool-call decoder arrays with <tool_call> task token.
+
+    Caches only decoder tokens + loss mask + audio arrays (NOT mels).
+    Mel spectrograms are computed on-the-fly by get_speech_batches to allow
+    online waveform augmentation during training.
+
+    Returns (audio_arrays, dec_inputs, dec_targets, loss_mask).
+    """
+
+    cache_id = _speech_cache_key(len(pairs), n_mels, max_mel_len, max_dec_len)
     cache_path = os.path.join(CACHE_DIR, cache_id)
-    if os.path.exists(cache_path + "_mel.npy"):
-        print(f"Loading cached speech data ({cache_id})...")
+    arrays_file = cache_path + "_arrays.npy"
+    if os.path.exists(arrays_file):
+        print(f"Loading cached voice-tool-call data ({cache_id})...")
         return (
-            np.load(cache_path + "_mel.npy"),
+            np.load(arrays_file, allow_pickle=True),
             np.load(cache_path + "_dec_in.npy"),
             np.load(cache_path + "_dec_tgt.npy"),
+            np.load(cache_path + "_loss_mask.npy"),
         )
 
     pad_id = tokenizer.pad_token_id
-    bos_id = tokenizer.eos_token_id
     eos_id = tokenizer.eos_token_id
-    transcribe_id = tokenizer.transcribe_token_id
+    tool_call_id = tokenizer.tool_call_token_id
 
-    mel_features = []
+    audio_arrays = []
     dec_inputs_list = []
     dec_targets_list = []
+    loss_mask_list = []
 
-    for example in tqdm(ds, desc="Processing speech"):
-        audio, sr = _decode_audio(example["audio"])
+    skipped = 0
+    for pair in tqdm(pairs, desc="Processing voice-tool-call"):
+        t_tok = tokenizer.encode(pair["tools"])[:max_dec_len - 2]
+        a_tok = tokenizer.encode(pair["answers"])
+
+        prefix_len = 2 + len(t_tok)
+        total_dec = prefix_len + len(a_tok) + 1
+
+        if total_dec > max_dec_len:
+            available_for_tools = max_dec_len - 2 - len(a_tok) - 1
+            if available_for_tools < 1:
+                skipped += 1
+                continue
+            t_tok = t_tok[:available_for_tools]
+            prefix_len = 2 + len(t_tok)
+
+        dec_in = np.full(max_dec_len, pad_id, dtype=np.int32)
+        dec_in[0] = eos_id
+        dec_in[1] = tool_call_id
+        tl = len(t_tok)
+        if tl > 0:
+            dec_in[2:2 + tl] = t_tok
+        al = len(a_tok)
+        if al > 0:
+            dec_in[prefix_len:prefix_len + al] = a_tok
+
+        # Decoder target: [<tool_call>, tools..., answer..., EOS]
+        dec_tgt = np.full(max_dec_len, pad_id, dtype=np.int32)
+        dec_tgt[0] = tool_call_id
+        if tl > 0:
+            dec_tgt[1:1 + tl] = t_tok
+        if al > 0:
+            dec_tgt[prefix_len - 1:prefix_len - 1 + al] = a_tok
+        dec_tgt[prefix_len - 1 + al] = eos_id
+
+        # Loss mask: 1 on answer positions + EOS only
+        lm = np.zeros(max_dec_len, dtype=np.float32)
+        lm[prefix_len - 1:prefix_len - 1 + al + 1] = 1.0
+
+        audio_arrays.append(pair["audio_array"])
+        dec_inputs_list.append(dec_in)
+        dec_targets_list.append(dec_tgt)
+        loss_mask_list.append(lm)
+
+    if skipped > 0:
+        print(f"  Skipped {skipped} examples (too long for max_dec_len={max_dec_len})")
+
+    audio_arrays = np.array(audio_arrays, dtype=object)
+    dec_inputs = np.stack(dec_inputs_list)
+    dec_targets = np.stack(dec_targets_list)
+    loss_mask = np.stack(loss_mask_list)
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    np.save(arrays_file, audio_arrays)
+    np.save(cache_path + "_dec_in.npy", dec_inputs)
+    np.save(cache_path + "_dec_tgt.npy", dec_targets)
+    np.save(cache_path + "_loss_mask.npy", loss_mask)
+    print(f"Cached {len(audio_arrays):,} voice-tool-call pairs to {CACHE_DIR}/{cache_id}")
+
+    return audio_arrays, dec_inputs, dec_targets, loss_mask
+
+
+def _load_mel_batch(audio_arrays, n_mels, max_mel_len, augmenter=None, sr=16000):
+    """Compute mel spectrograms for a batch of audio arrays.
+
+    If augmenter is provided, applies waveform augmentation before mel computation.
+    """
+    mels = []
+    for audio in audio_arrays:
+        audio = np.array(audio, dtype=np.float32)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+
+        if augmenter is not None:
+            audio = augmenter(samples=audio, sample_rate=sr)
 
         mel = compute_mel_spectrogram(audio, sr=sr, n_mels=n_mels)
 
-        # Pad or truncate mel to max_mel_len
         if mel.shape[0] > max_mel_len:
             mel = mel[:max_mel_len]
         elif mel.shape[0] < max_mel_len:
             pad_len = max_mel_len - mel.shape[0]
             mel = np.pad(mel, ((0, pad_len), (0, 0)))
 
-        # Tokenize transcript
-        text = example["text"].strip().lower()
-        tokens = tokenizer.encode(text)
-        # Leave room for <transcribe> prefix and EOS
-        tokens = tokens[:max_dec_len - 2]
+        mels.append(mel)
 
-        # Decoder input: [BOS, <transcribe>, tok1, tok2, ...]
-        dec_in = np.full(max_dec_len, pad_id, dtype=np.int32)
-        dec_in[0] = bos_id
-        dec_in[1] = transcribe_id
-        n_tok = len(tokens)
-        if n_tok > 0:
-            dec_in[2:2 + n_tok] = tokens
-
-        # Decoder target: [<transcribe>, tok1, tok2, ..., EOS]
-        dec_tgt = np.full(max_dec_len, pad_id, dtype=np.int32)
-        dec_tgt[0] = transcribe_id
-        if n_tok > 0:
-            dec_tgt[1:1 + n_tok] = tokens
-        dec_tgt[1 + n_tok] = eos_id
-
-        mel_features.append(mel)
-        dec_inputs_list.append(dec_in)
-        dec_targets_list.append(dec_tgt)
-
-    mel_features = np.stack(mel_features).astype(np.float32)
-    dec_inputs = np.stack(dec_inputs_list)
-    dec_targets = np.stack(dec_targets_list)
-
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    np.save(cache_path + "_mel.npy", mel_features)
-    np.save(cache_path + "_dec_in.npy", dec_inputs)
-    np.save(cache_path + "_dec_tgt.npy", dec_targets)
-    print(f"Cached {len(mel_features):,} speech pairs to {CACHE_DIR}/{cache_id}")
-
-    return mel_features, dec_inputs, dec_targets
+    return np.stack(mels).astype(np.float32)
 
 
-def get_speech_batches(mel_features, dec_inputs, dec_targets, batch_size, shuffle=True):
-    n = len(mel_features)
-    if shuffle:
-        perm = np.random.permutation(n)
-        mel_features = mel_features[perm]
-        dec_inputs = dec_inputs[perm]
-        dec_targets = dec_targets[perm]
+def get_speech_batches(audio_arrays, dec_inputs, dec_targets, batch_size,
+                       shuffle=True, loss_mask=None, n_mels=80, max_mel_len=1024,
+                       augmenter=None):
+    """Yield speech batches with on-the-fly mel computation and optional augmentation.
+
+    Args:
+        audio_arrays: array of audio waveform arrays (numpy float32)
+        dec_inputs, dec_targets, loss_mask: pre-tokenized decoder arrays
+        augmenter: audiomentations Compose pipeline (None = no augmentation)
+    """
+    n = len(audio_arrays)
+    indices = np.random.permutation(n) if shuffle else np.arange(n)
 
     for i in range(0, n - batch_size + 1, batch_size):
-        yield mel_features[i : i + batch_size], dec_inputs[i : i + batch_size], dec_targets[i : i + batch_size]
+        batch_idx = indices[i : i + batch_size]
+        batch_audio = audio_arrays[batch_idx]
+        mel_batch = _load_mel_batch(batch_audio, n_mels, max_mel_len, augmenter=augmenter)
+
+        batch = (mel_batch, dec_inputs[batch_idx], dec_targets[batch_idx])
+        if loss_mask is not None:
+            batch = batch + (loss_mask[batch_idx],)
+        yield batch

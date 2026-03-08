@@ -15,7 +15,6 @@ import numpy as np
 
 from .model import TransformerConfig
 
-# FFN kernel names that should be sliced in the d_ff dimension
 _FFN_KERNEL_NAMES = {"gate_proj", "up_proj", "down_proj"}
 
 
@@ -42,7 +41,6 @@ def export_submodel(checkpoint_path, factor, output_path):
         if arr.ndim != 2:
             return arr
 
-        # Check if this is an FFN kernel by looking at parent module name
         parent_name = None
         for part in key_path:
             name = part.key if hasattr(part, "key") else str(part)
@@ -53,15 +51,11 @@ def export_submodel(checkpoint_path, factor, output_path):
         if parent_name is None:
             return arr
 
-        # Both token_mix and channel_mix are sliced via ffn_mask
-
         rows, cols = arr.shape
         if parent_name in ("gate_proj", "up_proj"):
-            # (d_in, d_ff) → (d_in, d_ff_new)
             if cols == d_ff:
                 return arr[:, :d_ff_new]
         elif parent_name == "down_proj":
-            # (d_ff, d_out) → (d_ff_new, d_out)
             if rows == d_ff:
                 return arr[:d_ff_new, :]
 

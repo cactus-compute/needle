@@ -55,13 +55,12 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
         dec_buffer = dec_buffer.at[0, j].set(tok)
 
     @jax.jit
-    def decode_step(dec_buffer, encoder_out, src_mask):
+    def decode_step(dec_buffer, encoder_out):
         logits = model.apply(
             {"params": params},
             dec_buffer,
             encoder_out,
             self_mask=tgt_mask,
-            cross_mask=src_mask,
             method="decode",
         )
         return logits
@@ -72,10 +71,8 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
         sys.stdout.write(f"\n")
         sys.stdout.flush()
 
-    # Compile once on first call
-    logits = decode_step(dec_buffer, encoder_out, src_mask)
+    logits = decode_step(dec_buffer, encoder_out)
 
-    # Greedy decoding from end of prefix
     for i in range(prefix_len - 1, max_gen_len - 1):
         next_logits = logits[0, i]
         next_token = int(jnp.argmax(next_logits))
@@ -90,7 +87,7 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
             sys.stdout.write(tokenizer.decode([next_token]))
             sys.stdout.flush()
 
-        logits = decode_step(dec_buffer, encoder_out, src_mask)
+        logits = decode_step(dec_buffer, encoder_out)
 
     if stream:
         sys.stdout.write("\n")
@@ -114,52 +111,57 @@ def load_audio(path, target_sr=16000):
     return audio, sr
 
 
-def transcribe(model, params, tokenizer, audio_array, sr=16000, max_gen_len=128, temperature=0.8, seed=0, stream=True):
-    """Transcribe audio using the speech encoder pathway."""
+def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="[]", max_gen_len=512, seed=0, stream=True):
+    """Generate tool-call output from audio using the speech encoder pathway.
+
+    mel -> encode_speech -> decoder [BOS, <tool_call>, tools_tokens...] -> greedy decode.
+    Same structure as generate() but uses speech encoder + mel padding mask.
+    """
     n_mels = model.config.n_mels
     mel = compute_mel_spectrogram(audio_array, sr=sr, n_mels=n_mels)
     mel_input = jnp.array(mel)[None, :, :]  # (1, T_mel, n_mels)
 
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
-    transcribe_id = tokenizer.transcribe_token_id
+    tool_call_id = tokenizer.tool_call_token_id
 
     src_mask = make_mel_padding_mask(mel_input)
     encoder_out = model.apply(
         {"params": params}, mel_input, src_mask=src_mask, deterministic=True, method="encode_speech"
     )
 
+    # Build decoder prefix: [BOS, <tool_call>, tools_tokens...]
+    tools_tokens = tokenizer.encode(tools)
+    prefix = [eos_id, tool_call_id] + tools_tokens
+    prefix_len = len(prefix)
+
     tgt_mask = make_causal_mask(max_gen_len)
     dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
-    dec_buffer = dec_buffer.at[0, 0].set(eos_id)  # BOS = EOS in this tokenizer
-    dec_buffer = dec_buffer.at[0, 1].set(transcribe_id)
+    for j, tok in enumerate(prefix[:max_gen_len]):
+        dec_buffer = dec_buffer.at[0, j].set(tok)
 
     @jax.jit
-    def decode_step(dec_buffer, encoder_out, src_mask):
+    def decode_step(dec_buffer, encoder_out):
         logits = model.apply(
             {"params": params},
             dec_buffer,
             encoder_out,
             self_mask=tgt_mask,
-            cross_mask=src_mask,
             method="decode",
         )
         return logits
 
-    rng = jax.random.PRNGKey(seed)
     generated_tokens = []
 
     if stream:
         sys.stdout.write("\n")
         sys.stdout.flush()
 
-    logits = decode_step(dec_buffer, encoder_out, src_mask)
+    logits = decode_step(dec_buffer, encoder_out)
 
-    # Start generating from position 2 (after BOS + <transcribe>)
-    for i in range(1, max_gen_len - 1):
-        next_logits = logits[0, i] / temperature
-        rng, sample_rng = jax.random.split(rng)
-        next_token = jax.random.categorical(sample_rng, next_logits).item()
+    for i in range(prefix_len - 1, max_gen_len - 1):
+        next_logits = logits[0, i]
+        next_token = int(jnp.argmax(next_logits))
 
         if next_token == eos_id:
             break
@@ -171,7 +173,7 @@ def transcribe(model, params, tokenizer, audio_array, sr=16000, max_gen_len=128,
             sys.stdout.write(tokenizer.decode([next_token]))
             sys.stdout.flush()
 
-        logits = decode_step(dec_buffer, encoder_out, src_mask)
+        logits = decode_step(dec_buffer, encoder_out)
 
     if stream:
         sys.stdout.write("\n")
@@ -189,20 +191,22 @@ def main(args):
     param_count = sum(x.size for x in jax.tree.leaves(params))
     print(f"Model parameters: {param_count:,}")
 
-    # --- Audio transcription mode ---
+    # --- Voice-to-tool-call mode ---
     audio_files = getattr(args, "audio", None)
     if audio_files:
+        tools = getattr(args, "tools", None) or "[]"
         for i, audio_path in enumerate(audio_files):
-            print(f"\nTranscribing: {audio_path}")
+            print(f"\nVoice-to-tool-call: {audio_path}")
+            print(f"Tools: {tools[:80]}{'...' if len(tools) > 80 else ''}")
             audio, sr = load_audio(audio_path)
-            transcribe(
+            generate_from_audio(
                 model,
                 params,
                 tokenizer,
                 audio,
                 sr=sr,
+                tools=tools,
                 max_gen_len=args.max_len,
-                temperature=args.temperature,
                 seed=args.seed + i,
                 stream=True,
             )
@@ -241,7 +245,7 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default="checkpoints/checkpoint_epoch3.pkl")
     parser.add_argument("--query", type=str, default=None, help="Query text for tool-call generation")
     parser.add_argument("--tools", type=str, default=None, help="Tools JSON for tool-call generation")
-    parser.add_argument("--audio", type=str, nargs="*", help="Audio file paths to transcribe")
+    parser.add_argument("--audio", type=str, nargs="*", help="Audio file paths for voice-to-tool-call")
     parser.add_argument("--max-len", type=int, default=512)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
