@@ -11,38 +11,55 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+<<<<<<< HEAD
 import io
+=======
+>>>>>>> main
 import json
 import logging
 import mimetypes
 import os
 import re
+<<<<<<< HEAD
 import sys
+=======
+>>>>>>> main
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+<<<<<<< HEAD
 # Avoid hanging on shutdown due to hf-xet background transport in some environments.
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
+=======
+>>>>>>> main
 try:
     from datasets import Audio, load_dataset
 except ImportError as exc:  # pragma: no cover - import guard
     raise SystemExit(
+<<<<<<< HEAD
         f"Could not import 'datasets' with interpreter '{sys.executable}': {exc}\n"
         "Install into this interpreter with:\n"
         "  python -m pip install datasets"
+=======
+        "Missing dependency 'datasets'. Install with: pip install datasets"
+>>>>>>> main
     ) from exc
 
 try:
     from google.cloud import storage
 except ImportError as exc:  # pragma: no cover - import guard
     raise SystemExit(
+<<<<<<< HEAD
         f"Could not import 'google-cloud-storage' with interpreter '{sys.executable}': {exc}\n"
         "Install into this interpreter with:\n"
         "  python -m pip install google-cloud-storage"
+=======
+        "Missing dependency 'google-cloud-storage'. Install with: pip install google-cloud-storage"
+>>>>>>> main
     ) from exc
 
 try:
@@ -50,6 +67,7 @@ try:
 except ImportError:  # Optional fallback only when decoded arrays are encountered.
     sf = None
 
+<<<<<<< HEAD
 import numpy as np
 
 
@@ -85,6 +103,11 @@ METADATA_CSV_FIELDS = [
     "ingested_at_unix",
 ]
 
+=======
+
+LOGGER = logging.getLogger("collect_speech_to_gcs")
+
+>>>>>>> main
 
 @dataclass(frozen=True)
 class DatasetSplit:
@@ -95,6 +118,7 @@ class DatasetSplit:
     streaming: bool
 
 
+<<<<<<< HEAD
 @dataclass(frozen=True)
 class MelConfig:
     enabled: bool
@@ -113,6 +137,8 @@ class MelConfig:
     dtype: str
 
 
+=======
+>>>>>>> main
 class ManifestWriter:
     """Write sharded JSONL.gz manifests and upload each closed shard to GCS."""
 
@@ -123,14 +149,20 @@ class ManifestWriter:
         dataset_name: str,
         split: str,
         shard_size: int,
+<<<<<<< HEAD
         shard_namespace: str | None = None,
+=======
+>>>>>>> main
     ) -> None:
         self.bucket = bucket
         self.bucket_prefix = bucket_prefix.strip("/")
         self.dataset_name = dataset_name
         self.split = split
         self.shard_size = max(1, shard_size)
+<<<<<<< HEAD
         self.shard_namespace = shard_namespace.strip("/") if shard_namespace else None
+=======
+>>>>>>> main
 
         self._tmp_dir = tempfile.TemporaryDirectory(prefix="manifest_")
         self._file = None
@@ -155,11 +187,17 @@ class ManifestWriter:
             return
         self._file.close()
         filename = os.path.basename(self._path)
+<<<<<<< HEAD
         base_path = f"{self.bucket_prefix}/{self.dataset_name}/{self.split}/manifests"
         if self.shard_namespace:
             blob_path = f"{base_path}/{self.shard_namespace}/{filename}"
         else:
             blob_path = f"{base_path}/{filename}"
+=======
+        blob_path = (
+            f"{self.bucket_prefix}/{self.dataset_name}/{self.split}/manifests/{filename}"
+        )
+>>>>>>> main
         self.bucket.blob(blob_path).upload_from_filename(
             self._path, content_type="application/gzip"
         )
@@ -195,6 +233,7 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+<<<<<<< HEAD
 def _mono(audio: np.ndarray) -> np.ndarray:
     if audio.ndim == 1:
         return audio.astype(np.float32)
@@ -557,6 +596,8 @@ def _upload_metadata_csv(
     }
 
 
+=======
+>>>>>>> main
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
@@ -792,12 +833,15 @@ def _load_split(dataset_split: DatasetSplit, hf_token: str | None):
     ds = load_dataset(**kwargs)
 
     # For datasets with an Audio feature, keep decode disabled to avoid large in-memory arrays.
+<<<<<<< HEAD
     if dataset_split.logical_name == "emilia-large":
         try:
             ds = ds.cast_column("mp3", Audio(decode=False))
         except Exception as exc:  # pragma: no cover - best effort
             LOGGER.warning("Could not cast Emilia mp3 column with decode=False: %s", exc)
 
+=======
+>>>>>>> main
     if dataset_split.logical_name == "spgi-speech":
         try:
             ds = ds.cast_column("audio", Audio(decode=False))
@@ -807,6 +851,7 @@ def _load_split(dataset_split: DatasetSplit, hf_token: str | None):
     return ds
 
 
+<<<<<<< HEAD
 def _shard_namespace(shard_index: int, shard_count: int) -> str:
     return f"shard-{shard_index:05d}-of-{shard_count:05d}"
 
@@ -874,6 +919,8 @@ def _maybe_apply_worker_shard(
     )
 
 
+=======
+>>>>>>> main
 def _iter_dataset_to_gcs(
     bucket: storage.Bucket,
     dataset_split: DatasetSplit,
@@ -882,6 +929,7 @@ def _iter_dataset_to_gcs(
     manifest_shard_size: int,
     log_every: int,
     hf_token: str | None,
+<<<<<<< HEAD
     mel_cfg: MelConfig,
     worker_shard_count: int,
     worker_shard_index: int,
@@ -954,6 +1002,11 @@ def _iter_dataset_to_gcs(
         summary_uri = _upload_json(bucket, summary_blob, summary)
         summary["summary_uri"] = summary_uri
         return summary
+=======
+) -> dict[str, Any]:
+    start = time.time()
+    ds = _load_split(dataset_split, hf_token=hf_token)
+>>>>>>> main
 
     writer = ManifestWriter(
         bucket=bucket,
@@ -961,7 +1014,10 @@ def _iter_dataset_to_gcs(
         dataset_name=dataset_split.logical_name,
         split=dataset_split.split,
         shard_size=manifest_shard_size,
+<<<<<<< HEAD
         shard_namespace=shard_namespace,
+=======
+>>>>>>> main
     )
 
     uploaded = 0
@@ -969,6 +1025,7 @@ def _iter_dataset_to_gcs(
     bytes_uploaded = 0
     durations_found = 0
     duration_total = 0.0
+<<<<<<< HEAD
     mel_uploaded = 0
     mel_failed = 0
     mel_bytes = 0
@@ -979,6 +1036,8 @@ def _iter_dataset_to_gcs(
     metadata_csv_prefix = (
         f"gs://{bucket.name}/{prefix}/{dataset_split.logical_name}/{dataset_split.split}/metadata_csv/"
     )
+=======
+>>>>>>> main
 
     try:
         for idx, sample in enumerate(ds):
@@ -991,10 +1050,14 @@ def _iter_dataset_to_gcs(
                 f"{normalized.get('transcript') or ''}"
             )
             source_id = _sanitize_id(normalized["source_id"], fallback_seed=fallback_seed)
+<<<<<<< HEAD
             if effective_shard_count > 1:
                 item_id = f"{source_id}-w{worker_shard_index:05d}-{idx:09d}"
             else:
                 item_id = f"{source_id}-{idx:09d}"
+=======
+            item_id = f"{source_id}-{idx:09d}"
+>>>>>>> main
             audio_ext = _audio_field_ext_hint(
                 normalized["audio_field"], normalized["preferred_ext"]
             )
@@ -1022,6 +1085,7 @@ def _iter_dataset_to_gcs(
 
             bytes_uploaded += int(audio_info.get("num_bytes", 0))
             duration_s = normalized.get("duration_s")
+<<<<<<< HEAD
             decoded_audio = None
             decoded_sr = None
             if duration_s is None or mel_cfg.enabled:
@@ -1043,10 +1107,13 @@ def _iter_dataset_to_gcs(
                 duration_s = float(len(decoded_audio)) / float(decoded_sr)
                 normalized["duration_s"] = duration_s
 
+=======
+>>>>>>> main
             if duration_s is not None:
                 durations_found += 1
                 duration_total += float(duration_s)
 
+<<<<<<< HEAD
             timestamps = _extract_timestamps(normalized)
             mel_uri = None
             mel_info = None
@@ -1081,6 +1148,8 @@ def _iter_dataset_to_gcs(
                         exc,
                     )
 
+=======
+>>>>>>> main
             record = {
                 "dataset": dataset_split.logical_name,
                 "hf_dataset": dataset_split.hf_dataset,
@@ -1092,6 +1161,7 @@ def _iter_dataset_to_gcs(
                 "transcript": normalized.get("transcript"),
                 "language": normalized.get("language"),
                 "duration_s": duration_s,
+<<<<<<< HEAD
                 "timestamps": timestamps,
                 "audio": audio_info,
                 "gcs_mel_uri": mel_uri,
@@ -1128,6 +1198,14 @@ def _iter_dataset_to_gcs(
                     exc,
                 )
 
+=======
+                "audio": audio_info,
+                "source_url": normalized.get("source_url"),
+                "metadata": normalized.get("metadata"),
+                "raw_fields": normalized.get("raw_fields"),
+                "ingested_at_unix": int(time.time()),
+            }
+>>>>>>> main
             writer.write(record)
             uploaded += 1
 
@@ -1148,11 +1226,14 @@ def _iter_dataset_to_gcs(
         "hf_config": dataset_split.hf_config,
         "split": dataset_split.split,
         "streaming": dataset_split.streaming,
+<<<<<<< HEAD
         "worker_shard_count_requested": worker_shard_count,
         "worker_shard_count_effective": effective_shard_count,
         "worker_shard_index": worker_shard_index,
         "worker_shard_contiguous": worker_shard_contiguous,
         "worker_shard_namespace": shard_namespace,
+=======
+>>>>>>> main
         "num_uploaded": uploaded,
         "num_failed": failed,
         "bytes_uploaded": bytes_uploaded,
@@ -1160,6 +1241,7 @@ def _iter_dataset_to_gcs(
         "duration_s_total": round(duration_total, 3),
         "duration_h_total": round(duration_total / 3600.0, 3),
         "duration_s_counted_items": durations_found,
+<<<<<<< HEAD
         "mel_enabled": mel_cfg.enabled,
         "mel_preset": mel_cfg.preset,
         "mel_bins": mel_cfg.n_mels,
@@ -1172,11 +1254,14 @@ def _iter_dataset_to_gcs(
         "metadata_csv_failed": metadata_csv_failed,
         "metadata_csv_bytes": metadata_csv_bytes,
         "metadata_csv_bytes_gb": round(metadata_csv_bytes / (1024 ** 3), 4),
+=======
+>>>>>>> main
         "elapsed_s": round(elapsed_s, 3),
         "items_per_s": round(uploaded / elapsed_s, 3),
         "manifest_uris": writer.manifest_uris,
         "bucket": bucket.name,
         "prefix": prefix,
+<<<<<<< HEAD
         "worker_has_data": True,
     }
 
@@ -1188,6 +1273,13 @@ def _iter_dataset_to_gcs(
         summary_blob = (
             f"{prefix}/{dataset_split.logical_name}/{dataset_split.split}/summary.json"
         )
+=======
+    }
+
+    summary_blob = (
+        f"{prefix}/{dataset_split.logical_name}/{dataset_split.split}/summary.json"
+    )
+>>>>>>> main
     summary_uri = _upload_json(bucket, summary_blob, summary)
     summary["summary_uri"] = summary_uri
     return summary
@@ -1224,6 +1316,7 @@ def _build_work_items(args: argparse.Namespace) -> list[DatasetSplit]:
     return items
 
 
+<<<<<<< HEAD
 def _resolve_mel_config(args: argparse.Namespace) -> MelConfig:
     if not args.store_mel:
         return MelConfig(
@@ -1281,6 +1374,8 @@ def _resolve_mel_config(args: argparse.Namespace) -> MelConfig:
     )
 
 
+=======
+>>>>>>> main
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Collect speech datasets from HF into GCS with manifests."
@@ -1354,6 +1449,7 @@ def parse_args() -> argparse.Namespace:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+<<<<<<< HEAD
     parser.add_argument(
         "--store-mel",
         action=argparse.BooleanOptionalAction,
@@ -1414,6 +1510,8 @@ def parse_args() -> argparse.Namespace:
             "Set --no-shard-contiguous for round-robin assignment."
         ),
     )
+=======
+>>>>>>> main
     return parser.parse_args()
 
 
@@ -1423,6 +1521,7 @@ def main() -> None:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+<<<<<<< HEAD
     if args.shard_count < 1:
         raise SystemExit("--shard-count must be >= 1")
     if args.shard_index < 0:
@@ -1433,6 +1532,11 @@ def main() -> None:
     client = storage.Client(project=args.project) if args.project else storage.Client()
     bucket = client.bucket(args.bucket)
     mel_cfg = _resolve_mel_config(args)
+=======
+
+    client = storage.Client(project=args.project) if args.project else storage.Client()
+    bucket = client.bucket(args.bucket)
+>>>>>>> main
 
     work_items = _build_work_items(args)
     if not work_items:
@@ -1444,6 +1548,7 @@ def main() -> None:
         args.bucket,
         args.prefix.strip("/"),
     )
+<<<<<<< HEAD
     LOGGER.info(
         "Worker shard config: shard_count=%s shard_index=%s contiguous=%s",
         args.shard_count,
@@ -1462,6 +1567,8 @@ def main() -> None:
         mel_cfg.file_format,
         mel_cfg.dtype,
     )
+=======
+>>>>>>> main
 
     summaries = []
     for item in work_items:
@@ -1480,10 +1587,13 @@ def main() -> None:
             manifest_shard_size=args.manifest_shard_size,
             log_every=max(1, args.log_every),
             hf_token=args.hf_token,
+<<<<<<< HEAD
             mel_cfg=mel_cfg,
             worker_shard_count=args.shard_count,
             worker_shard_index=args.shard_index,
             worker_shard_contiguous=args.shard_contiguous,
+=======
+>>>>>>> main
         )
         summaries.append(summary)
         LOGGER.info(
@@ -1500,6 +1610,7 @@ def main() -> None:
         "bucket": args.bucket,
         "prefix": args.prefix.strip("/"),
         "completed_items": len(summaries),
+<<<<<<< HEAD
         "worker_shard_config": {
             "shard_count": args.shard_count,
             "shard_index": args.shard_index,
@@ -1521,6 +1632,8 @@ def main() -> None:
             "file_format": mel_cfg.file_format,
             "dtype": mel_cfg.dtype,
         },
+=======
+>>>>>>> main
         "datasets": summaries,
         "completed_at_unix": int(time.time()),
     }

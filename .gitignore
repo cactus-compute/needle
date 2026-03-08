@@ -89,4 +89,8 @@ checkpoints/
 wandb/
 .data_cache/
 tokenizer/
+<<<<<<< HEAD
 .python-version
+=======
+data/
+>>>>>>> main

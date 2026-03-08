@@ -11,6 +11,7 @@ audio + metadata manifests to a Google Cloud Storage bucket.
     - `kensho/spgispeech` (SPGISpeech)
   - Writes:
     - Audio files to `gs://<bucket>/<prefix>/<dataset>/<split>/audio/...`
+<<<<<<< HEAD
     - Mel spectrogram files to `.../mel/...` (`.npz` by default)
     - Sharded manifests to `.../manifests/manifest-*.jsonl.gz`
       - when worker sharding is enabled, manifests go under:
@@ -30,6 +31,11 @@ audio + metadata manifests to a Google Cloud Storage bucket.
     - `gcs_audio_uri`
     - `gcs_mel_uri` (if mel storage enabled)
     - `gcs_metadata_csv_uri` (one CSV file per audio sample)
+=======
+    - Sharded manifests to `.../manifests/manifest-*.jsonl.gz`
+    - Split summary to `.../summary.json`
+    - Run summary to `gs://<bucket>/<prefix>/run-summary-<ts>.json`
+>>>>>>> main
 
 ## Auth Requirements
 
@@ -40,24 +46,37 @@ audio + metadata manifests to a Google Cloud Storage bucket.
 ## Quick Smoke Test
 
 ```bash
+<<<<<<< HEAD
 python src/data_collection/collect_speech_to_gcs.py \
   --bucket YOUR_BUCKET \
   --prefix speech_datasets \
   --max-samples 100 \
   --datasets emilia-large spgi-speech \
   --mel-preset whisper
+=======
+python data_collection/collect_speech_to_gcs.py \
+  --bucket YOUR_BUCKET \
+  --prefix speech_datasets \
+  --max-samples 100 \
+  --datasets emilia-large spgi-speech
+>>>>>>> main
 ```
 
 ## Full Ingest Example
 
 ```bash
+<<<<<<< HEAD
 python src/data_collection/collect_speech_to_gcs.py \
+=======
+python data_collection/collect_speech_to_gcs.py \
+>>>>>>> main
   --bucket YOUR_BUCKET \
   --prefix speech_datasets \
   --datasets emilia-large spgi-speech \
   --spgi-config L \
   --emilia-splits train \
   --spgi-splits train \
+<<<<<<< HEAD
   --mel-preset whisper \
   --streaming
 ```
@@ -123,3 +142,13 @@ python src/data_collection/collect_speech_to_gcs.py \
   - `--[no-]shard-contiguous` shard assignment strategy
 - Keep `--shard-count` and `--shard-contiguous` fixed for a run. If you change
   them mid-run, use a new `--prefix` to avoid mixing naming layouts.
+=======
+  --streaming
+```
+
+## Notes
+
+- The default mode uses Hugging Face streaming to avoid local dataset materialization.
+- If you want SPGISpeech eval slices, use a different `--spgi-config` (for example
+  `dev` or `test`) and select its available split names via `--spgi-splits`.
+>>>>>>> main
