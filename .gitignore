@@ -90,3 +90,4 @@ wandb/
 .data_cache/
 tokenizer/
 data/
+docs/tokenization_plan.md
