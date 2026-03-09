@@ -56,6 +56,14 @@ def main():
                    help="Number of mel frequency bins (default: 80)")
     p.add_argument("--max-speech-samples", type=int, default=None,
                    help="Max voice-tool-call training samples (default: all)")
+    p.add_argument("--audio-aug-mode", type=str, default="white", choices=["none", "white", "full"],
+                   help="Waveform augmentation mode: none, white, or full (default: white)")
+    p.add_argument("--white-noise-p", type=float, default=0.5,
+                   help="Probability of applying white noise per sample (default: 0.5)")
+    p.add_argument("--white-noise-min-snr-db", type=float, default=8.0,
+                   help="Minimum white-noise SNR in dB (default: 8.0)")
+    p.add_argument("--white-noise-max-snr-db", type=float, default=30.0,
+                   help="Maximum white-noise SNR in dB (default: 30.0)")
 
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,

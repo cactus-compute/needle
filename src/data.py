@@ -988,20 +988,76 @@ def load_prepared_mels(mel_cache_id, mmap=False):
     return np.load(mel_file, mmap_mode=mmap_mode)
 
 
-def build_audio_augmenter(sr=16000):
-    """Build an audiomentations augmentation pipeline for training.
+class WhiteNoiseAugmenter:
+    """Simple white Gaussian noise augmenter with random SNR."""
 
-    Returns an augmenter callable or None if audiomentations is unavailable.
+    def __init__(self, p=0.5, min_snr_db=8.0, max_snr_db=30.0, seed=None):
+        self.p = float(np.clip(p, 0.0, 1.0))
+        self.min_snr_db = float(min(min_snr_db, max_snr_db))
+        self.max_snr_db = float(max(min_snr_db, max_snr_db))
+        self._rng = np.random.default_rng(seed)
+        self.name = "white"
+        self.transforms = ("white_noise",)
+
+    def __call__(self, samples, sample_rate):
+        del sample_rate
+        audio = np.asarray(samples, dtype=np.float32)
+        if audio.size == 0 or self.p <= 0.0:
+            return audio
+        if self._rng.random() > self.p:
+            return audio
+
+        signal_power = float(np.mean(audio * audio))
+        if signal_power <= 1e-12:
+            return audio
+
+        snr_db = float(self._rng.uniform(self.min_snr_db, self.max_snr_db))
+        noise = np.asarray(self._rng.standard_normal(audio.shape), dtype=np.float32)
+        noise_power = float(np.mean(noise * noise))
+        if noise_power <= 1e-12:
+            return audio
+
+        target_noise_power = signal_power / (10.0 ** (snr_db / 10.0))
+        scaled_noise = noise * np.sqrt(target_noise_power / noise_power)
+        mixed = audio + scaled_noise.astype(np.float32)
+        return np.clip(mixed, -1.0, 1.0).astype(np.float32)
+
+
+def build_audio_augmenter(sr=16000, mode="white", white_noise_p=0.5,
+                          white_noise_min_snr_db=8.0, white_noise_max_snr_db=30.0):
+    """Build a waveform augmentation pipeline for training.
+
+    Args:
+        mode: "none", "white", or "full".
     """
+    del sr
+    mode = (mode or "none").lower()
+    if mode == "none":
+        return None
+
+    white_noise = WhiteNoiseAugmenter(
+        p=white_noise_p,
+        min_snr_db=white_noise_min_snr_db,
+        max_snr_db=white_noise_max_snr_db,
+    )
+    if mode == "white":
+        return white_noise
+
+    if mode != "full":
+        raise ValueError(f"Unknown audio augmentation mode: {mode}")
+
     try:
         import audiomentations as A
     except ImportError:
-        print("  WARNING: audiomentations not installed — no waveform augmentation")
-        return None
+        print("  WARNING: audiomentations not installed — falling back to white-noise-only augmentation")
+        return white_noise
 
-    return A.Compose([
-        A.AddGaussianSNR(min_snr_db=10.0, max_snr_db=35.0, p=0.5),
-        A.AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.3),
+    augmenter = A.Compose([
+        A.AddGaussianSNR(
+            min_snr_db=white_noise.min_snr_db,
+            max_snr_db=white_noise.max_snr_db,
+            p=white_noise.p,
+        ),
         A.TimeStretch(min_rate=0.9, max_rate=1.1, p=0.3),
         A.PitchShift(min_semitones=-2, max_semitones=2, p=0.3),
         A.Gain(min_gain_db=-6, max_gain_db=6, p=0.4),
@@ -1009,6 +1065,8 @@ def build_audio_augmenter(sr=16000):
         A.HighPassFilter(min_cutoff_freq=50, max_cutoff_freq=400, p=0.2),
         A.ClippingDistortion(min_percentile_threshold=0, max_percentile_threshold=5, p=0.1),
     ])
+    augmenter.name = "full"
+    return augmenter
 
 
 def _load_mel_batch(audio_arrays, n_mels, max_mel_len, augmenter=None, sr=16000):
