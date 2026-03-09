@@ -14,8 +14,9 @@ from flax import jax_utils
 from flax.training import train_state
 
 from .data import (
-    get_batches, get_tokenizer, load_tinystories, prepare_text_pairs,
+    get_batches, get_tokenizer, prepare_text_pairs,
     load_librispeech, prepare_speech_pairs, get_speech_batches,
+    load_text_splits,
 )
 from .model import (
     EncoderDecoderTransformer,
@@ -474,9 +475,22 @@ def train(args):
     tokenizer = get_tokenizer(max_samples=args.max_samples)
 
     step_idx += 1
-    print(f"\n[{step_idx}/{total_data_steps}] Loading TinyStories dataset...")
-    ds = load_tinystories("train", max_samples=args.max_samples)
-    val_ds = load_tinystories("validation", max_samples=getattr(args, "max_eval_samples", None))
+    text_dataset = getattr(args, "text_dataset", "roneneldan/TinyStories")
+    text_dataset_config = getattr(args, "text_dataset_config", None)
+    text_train_split = getattr(args, "text_train_split", "train")
+    text_val_split = getattr(args, "text_val_split", "validation")
+    text_column = getattr(args, "text_column", None)
+    print(f"\n[{step_idx}/{total_data_steps}] Loading text dataset: {text_dataset}...")
+    ds, val_ds = load_text_splits(
+        dataset_id=text_dataset,
+        dataset_config=text_dataset_config,
+        train_split=text_train_split,
+        val_split=text_val_split,
+        text_column=text_column,
+        max_train_samples=args.max_samples,
+        max_val_samples=getattr(args, "max_eval_samples", None),
+        seed=args.seed,
+    )
 
     step_idx += 1
     print(f"\n[{step_idx}/{total_data_steps}] Preparing text pairs...")
@@ -985,5 +999,3 @@ def train(args):
     if use_wandb:
         wandb.finish()
     print("\nTraining complete.")
-
-

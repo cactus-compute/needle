@@ -23,6 +23,11 @@ HELP = """
   │     --max-enc-len INT        Max encoder seq length (default: 256)│
   │     --max-dec-len INT        Max decoder seq length (default: 256)│
   │     --max-samples INT        Training samples (default: all)      │
+  │     --text-dataset STR       HF dataset id (default: TinyStories) │
+  │     --text-dataset-config STR  HF dataset config name             │
+  │     --text-train-split STR   Train split (default: train)         │
+  │     --text-val-split STR     Val split (default: validation)      │
+  │     --text-column STR        Text column (auto if omitted)        │
   │     --mat-factors INT [...]   FFN shrink factors (default: 2 4 8)  │
   │     --sparsity-ratio FLOAT   Block prune ratio (default: 0.5)    │
   │     --group-size INT         Quant/prune group size (default: 32) │
@@ -75,6 +80,30 @@ HELP = """
   │     list                    List all TPU instances                │
   │       --zone ZONE           Override auto-detected zone           │
   │                                                                   │
+  │   data                                                            │
+  │     list                    List objects in dataset bucket         │
+  │       --prefix PREFIX       Bucket prefix (default: root)         │
+  │       --bucket NAME         Bucket name (default: needle-...)     │
+  │       --account EMAIL       gcloud account override               │
+  │       --impersonate-service-account EMAIL  SA impersonation       │
+  │       --recursive           Recurse prefixes (default: true)      │
+  │     pull REMOTE_PREFIX      Sync bucket prefix to local dir        │
+  │       --dest DIR            Local destination (default: data/)     │
+  │       --bucket NAME         Bucket name                            │
+  │       --account EMAIL       gcloud account override               │
+  │       --impersonate-service-account EMAIL  SA impersonation       │
+  │       --dry-run             Preview changes only                   │
+  │       --delete              Mirror mode: delete extra local files  │
+  │       --exclude REGEX       Exclude regex for rsync                │
+  │     push LOCAL_PATH         Sync local file/dir to bucket          │
+  │       --dest-prefix PREFIX  Destination prefix in bucket           │
+  │       --bucket NAME         Bucket name                            │
+  │       --account EMAIL       gcloud account override               │
+  │       --impersonate-service-account EMAIL  SA impersonation       │
+  │       --dry-run             Preview changes (dirs via rsync only)  │
+  │       --delete              Mirror mode for dir sync               │
+  │       --exclude REGEX       Exclude regex for rsync                │
+  │                                                                   │
   └───────────────────────────────────────────────────────────────────┘
 """
 
@@ -101,6 +130,11 @@ def main():
     p.add_argument("--max-enc-len", type=int, default=256)
     p.add_argument("--max-dec-len", type=int, default=256)
     p.add_argument("--max-samples", type=int, default=None)
+    p.add_argument("--text-dataset", type=str, default="roneneldan/TinyStories")
+    p.add_argument("--text-dataset-config", type=str, default=None)
+    p.add_argument("--text-train-split", type=str, default="train")
+    p.add_argument("--text-val-split", type=str, default="validation")
+    p.add_argument("--text-column", type=str, default=None)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
@@ -187,6 +221,36 @@ def main():
 
     tpu_sub.add_parser("list", add_help=False)
 
+    p = sub.add_parser("data", add_help=False)
+    data_sub = p.add_subparsers(dest="data_action")
+
+    dp = data_sub.add_parser("list", add_help=False)
+    dp.add_argument("--prefix", type=str, default="")
+    dp.add_argument("--bucket", type=str, default="needle-datasets-bucket")
+    dp.add_argument("--recursive", action="store_true", default=True)
+    dp.add_argument("--account", type=str, default=None)
+    dp.add_argument("--impersonate-service-account", type=str, default=None)
+
+    dp = data_sub.add_parser("pull", add_help=False)
+    dp.add_argument("remote_prefix", type=str)
+    dp.add_argument("--dest", type=str, default="data")
+    dp.add_argument("--bucket", type=str, default="needle-datasets-bucket")
+    dp.add_argument("--dry-run", action="store_true")
+    dp.add_argument("--delete", action="store_true")
+    dp.add_argument("--exclude", type=str, default=None)
+    dp.add_argument("--account", type=str, default=None)
+    dp.add_argument("--impersonate-service-account", type=str, default=None)
+
+    dp = data_sub.add_parser("push", add_help=False)
+    dp.add_argument("local_path", type=str)
+    dp.add_argument("--dest-prefix", type=str, default="")
+    dp.add_argument("--bucket", type=str, default="needle-datasets-bucket")
+    dp.add_argument("--dry-run", action="store_true")
+    dp.add_argument("--delete", action="store_true")
+    dp.add_argument("--exclude", type=str, default=None)
+    dp.add_argument("--account", type=str, default=None)
+    dp.add_argument("--impersonate-service-account", type=str, default=None)
+
     args = parser.parse_args()
 
     if not args.command:
@@ -216,3 +280,6 @@ def main():
     elif args.command == "tpu":
         from .tpu import tpu_dispatch
         tpu_dispatch(args)
+    elif args.command == "data":
+        from .data_bucket import data_dispatch
+        data_dispatch(args)

@@ -6,9 +6,6 @@ Before training the tool call head on real tool data, we pre-train it on synthet
 graph LR
     %% Synthetic data
     TL[Synthetic Tool List<br>random token IDs] --> Tool_dec[Tool Call Head<br>frozen base + LoRA]
-    CTX[Synthetic Context<br>with embedded values] --> Enc[Shared Encoder<br>frozen]
-    Enc --> Z[z-latent]
-    Z --> Tool_dec
     Tool_dec --> Loss[Structured Retrieval Loss]
 ```
 

@@ -6,6 +6,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+hf_token.sh
 downloads/
 eggs/
 .eggs/

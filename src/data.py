@@ -150,6 +150,72 @@ def load_tinystories(split="train", max_samples=None):
     return ds
 
 
+def _resolve_text_column(ds, text_column=None):
+    if text_column:
+        if text_column not in ds.column_names:
+            raise ValueError(
+                f"text column '{text_column}' not found in columns {ds.column_names}"
+            )
+        return text_column
+
+    candidates = (
+        "text",
+        "content",
+        "body",
+        "document",
+        "story",
+    )
+    for c in candidates:
+        if c in ds.column_names:
+            return c
+
+    raise ValueError(
+        f"Could not infer text column from {ds.column_names}. "
+        "Pass --text-column explicitly."
+    )
+
+
+def load_text_splits(
+    dataset_id="roneneldan/TinyStories",
+    dataset_config=None,
+    train_split="train",
+    val_split="validation",
+    text_column=None,
+    max_train_samples=None,
+    max_val_samples=None,
+    val_fraction=0.01,
+    seed=42,
+):
+    load_kwargs = {"path": dataset_id}
+    if dataset_config:
+        load_kwargs["name"] = dataset_config
+
+    train_ds = load_dataset(**load_kwargs, split=train_split)
+    try:
+        val_ds = load_dataset(**load_kwargs, split=val_split)
+    except Exception:
+        split = train_ds.train_test_split(test_size=val_fraction, seed=seed)
+        train_ds = split["train"]
+        val_ds = split["test"]
+
+    resolved_col = _resolve_text_column(train_ds, text_column=text_column)
+    if resolved_col != "text":
+        train_ds = train_ds.rename_column(resolved_col, "text")
+        if resolved_col in val_ds.column_names:
+            val_ds = val_ds.rename_column(resolved_col, "text")
+        else:
+            val_col = _resolve_text_column(val_ds, text_column=text_column)
+            if val_col != "text":
+                val_ds = val_ds.rename_column(val_col, "text")
+
+    if max_train_samples:
+        train_ds = train_ds.select(range(min(max_train_samples, len(train_ds))))
+    if max_val_samples:
+        val_ds = val_ds.select(range(min(max_val_samples, len(val_ds))))
+
+    return train_ds, val_ds
+
+
 def _tokenizer_hash():
     """Hash the tokenizer model file to detect retraining."""
     model_path = TOKENIZER_PREFIX + ".model"
