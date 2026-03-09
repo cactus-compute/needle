@@ -334,6 +334,60 @@ def _answer_grounded(query, answers_json):
     return False
 
 
+def _answer_calls_valid_tools(ex):
+    """Check that every tool called in the answer exists in the tools list."""
+    try:
+        answers = json.loads(ex["answers"])
+        tools = json.loads(ex["tools"])
+    except (json.JSONDecodeError, TypeError):
+        return True
+    if not answers:
+        return True
+    tool_names = {t["name"] for t in tools}
+    return all(a["name"] in tool_names for a in answers)
+
+
+def _answer_uses_valid_params(ex):
+    """Check that arguments in each call are a subset of the tool's schema params."""
+    try:
+        answers = json.loads(ex["answers"])
+        tools = json.loads(ex["tools"])
+    except (json.JSONDecodeError, TypeError):
+        return True
+    if not answers:
+        return True
+    tool_map = {t["name"]: set((t.get("parameters") or {}).keys()) for t in tools}
+    for a in answers:
+        schema_params = tool_map.get(a["name"])
+        if schema_params is None:
+            continue  # caught by _answer_calls_valid_tools
+        args = a.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        if not isinstance(args, dict):
+            continue
+        if args and not set(args.keys()).issubset(schema_params):
+            return False
+    return True
+
+
+def _deduplicate(dataset):
+    """Remove duplicate queries, keeping the first occurrence."""
+    seen = set()
+    keep = []
+    for i in range(len(dataset)):
+        q = dataset[i]["query"]
+        if q not in seen:
+            seen.add(q)
+            keep.append(i)
+    if len(keep) == len(dataset):
+        return dataset
+    return dataset.select(keep)
+
+
 def load_and_combine():
     parts = []
     for name, hf_id in DATASETS.items():
@@ -350,7 +404,12 @@ def load_and_combine():
 
         before = len(converted)
         converted = converted.filter(
-            lambda ex: not _has_placeholder_args(ex["answers"]) and _answer_grounded(ex["query"], ex["answers"]),
+            lambda ex: (
+                not _has_placeholder_args(ex["answers"])
+                and _answer_grounded(ex["query"], ex["answers"])
+                and _answer_calls_valid_tools(ex)
+                and _answer_uses_valid_params(ex)
+            ),
             desc=f"Filtering {name}",
         )
         dropped = before - len(converted)
@@ -361,6 +420,12 @@ def load_and_combine():
         parts.append(converted)
 
     combined = concatenate_datasets(parts)
+
+    before_dedup = len(combined)
+    combined = _deduplicate(combined)
+    dedup_dropped = before_dedup - len(combined)
+    if dedup_dropped:
+        print(f"\nDeduplicated: removed {dedup_dropped} duplicate queries")
 
     print(f"\nCompacting tool schemas...")
     combined = combined.map(
