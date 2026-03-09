@@ -1004,6 +1004,22 @@ def _fit_audio_to_length(wave, target_len, rng):
     return np.tile(wave, reps)[:target_len].astype(np.float32)
 
 
+def _fit_audio_to_length(wave, target_len, rng):
+    """Crop or tile a waveform to target length."""
+    wave = np.asarray(wave, dtype=np.float32).flatten()
+    if target_len <= 0:
+        return np.zeros(0, dtype=np.float32)
+    if wave.size == 0:
+        return np.zeros(target_len, dtype=np.float32)
+    if wave.size == target_len:
+        return wave
+    if wave.size > target_len:
+        start = int(rng.integers(0, wave.size - target_len + 1))
+        return wave[start:start + target_len]
+    reps = int(np.ceil(target_len / wave.size))
+    return np.tile(wave, reps)[:target_len].astype(np.float32)
+
+
 class WhiteNoiseAugmenter:
     """Simple white Gaussian noise augmenter with random SNR."""
 
