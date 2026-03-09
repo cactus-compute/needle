@@ -49,45 +49,40 @@ def _clear_local_caches():
 
 
 def tokenize(args):
-    # 1. Clear existing caches
     print("=== Clearing existing caches ===")
     _clear_gcs_caches()
     _clear_local_caches()
 
-    # 2. Train tokenizer and upload to GCS
     print("\n=== Training tokenizer ===")
     train_tokenizer(max_samples=args.max_samples, force=True)
     upload_tokenizer_to_gcs()
 
-    # 3. Load tokenizer
     tokenizer = get_tokenizer()
 
-    # 4. Tokenize text data + precompute mels (train + val)
     print("\n=== Tokenizing text data + precomputing mels ===")
     max_enc_len = getattr(args, "max_enc_len", 256)
     max_dec_len = getattr(args, "max_dec_len", 1024)
     n_mels = getattr(args, "n_mels", 80)
     max_mel_len = getattr(args, "max_mel_len", 1024)
+    batch_size = getattr(args, "batch_size", 5000)
 
     for split in ("train", "val"):
         print(f"\n--- {split} split ---")
         ds = load_tool_calls(split=split, max_samples=args.max_samples)
         _, _, _, _, kept_indices = prepare_tool_call_pairs(
-            ds, tokenizer, max_enc_len=max_enc_len, max_dec_len=max_dec_len
+            ds, tokenizer, max_enc_len=max_enc_len, max_dec_len=max_dec_len,
+            batch_size=batch_size,
         )
         text_cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len)
 
-        # Precompute mel spectrograms
         mel_cache_id = precompute_mels(
             kept_indices, n_mels=n_mels, max_mel_len=max_mel_len,
-            cache_id_prefix=split,
+            cache_id_prefix=split, batch_size=batch_size,
         )
 
-        # Save metadata for train.py to find caches
         _save_cache_metadata(split, text_cache_id, mel_cache_id, len(kept_indices),
                              max_enc_len, max_dec_len, n_mels, max_mel_len)
 
-    # 5. Optionally clean up local cache
     if args.cleanup and os.path.exists(CACHE_DIR):
         print(f"\n=== Cleaning up {CACHE_DIR}/ ===")
         shutil.rmtree(CACHE_DIR)
