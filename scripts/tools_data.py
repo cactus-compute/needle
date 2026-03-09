@@ -254,6 +254,85 @@ CONVERTERS = {
     "ToolACE": convert_toolace,
 }
 
+_PLACEHOLDER_VALUES = {
+    "john_doe", "jane_doe", "john.doe", "jane.doe",
+    "john_doe_456", "jane_doe_123",
+    "john.doe@example.com", "jane.doe@example.com",
+    "user@example.com", "test@example.com",
+    "example@example.com", "boss@company.com",
+    "1234567890", "0987654321",
+    "123 main st", "123 main street",
+}
+
+
+def _has_placeholder_args(answers_json):
+    """Check if any argument values are known placeholders."""
+    try:
+        answers = json.loads(answers_json)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not answers:
+        return False
+    for call in answers:
+        args = call.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        if not isinstance(args, dict):
+            continue
+        for val in args.values():
+            if isinstance(val, str) and val.lower().strip() in _PLACEHOLDER_VALUES:
+                return True
+    return False
+
+
+def _answer_grounded(query, answers_json):
+    """Check that at least one non-trivial argument value appears in the query.
+
+    For examples with function calls, this catches cases where the answer
+    contains hallucinated arguments that have nothing to do with the query.
+    Skips examples with no answers (no-call examples) — those are always kept.
+    Also skips examples where all arguments are booleans/numbers/short enums,
+    since those don't need to be grounded in the query text.
+    """
+    try:
+        answers = json.loads(answers_json)
+    except (json.JSONDecodeError, TypeError):
+        return True
+    if not answers:
+        return True
+
+    query_lower = query.lower()
+    has_string_arg = False
+
+    for call in answers:
+        args = call.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        if not isinstance(args, dict):
+            continue
+        for val in args.values():
+            if isinstance(val, str) and len(val) >= 3:
+                has_string_arg = True
+                val_lower = val.lower().strip()
+                if val_lower in query_lower:
+                    return True
+                val_words = val_lower.split()
+                if len(val_words) > 1:
+                    matches = sum(1 for w in val_words if len(w) >= 3 and w in query_lower)
+                    if matches >= len(val_words) * 0.5:
+                        return True
+
+    if not has_string_arg:
+        return True
+
+    return False
+
 
 def load_and_combine():
     parts = []
@@ -268,12 +347,21 @@ def load_and_combine():
         print(f"  Converting to xlam format...")
         converted = CONVERTERS[name](ds["train"])
         converted = converted.add_column("source", [name] * len(converted))
+
+        before = len(converted)
+        converted = converted.filter(
+            lambda ex: not _has_placeholder_args(ex["answers"]) and _answer_grounded(ex["query"], ex["answers"]),
+            desc=f"Filtering {name}",
+        )
+        dropped = before - len(converted)
+        if dropped:
+            print(f"  Filtered out {dropped} low-quality examples ({dropped*100/before:.1f}%)")
+
         print(f"  -> {len(converted)} examples")
         parts.append(converted)
 
     combined = concatenate_datasets(parts)
 
-    # Compact tool schemas: strip descriptions, keep only name + param name/type
     print(f"\nCompacting tool schemas...")
     combined = combined.map(
         lambda ex: {"tools": compact_tools(ex["tools"])},

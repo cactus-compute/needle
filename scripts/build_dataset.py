@@ -29,7 +29,9 @@ from tools_data import load_and_combine
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-VOICES = [
+# Voice templates — defined as Wavenet; the type (Wavenet/Neural2/Standard)
+# is swapped at synthesis time via _get_voice() to spread load across quotas.
+_VOICE_TEMPLATES = [
     ("en-GB", "en-GB-Wavenet-B", "MALE", True, False),
     ("en-GB", "en-GB-Wavenet-A", "FEMALE", True, False),
     ("en-AU", "en-AU-Wavenet-B", "MALE", True, False),
@@ -44,6 +46,26 @@ VOICES = [
     ("en-GB", "en-GB-Wavenet-A", "FEMALE", True, True),
     ("en-IN", "en-IN-Wavenet-A", "FEMALE", True, True),
 ]
+
+# Two voice types, each with its own 1k/min quota (2k/min total)
+_VOICE_TYPES = ["Wavenet", "Neural2"]
+
+
+def _get_voice(idx):
+    """Return (lang, voice_name, gender_str, configurable, child) for a sample.
+
+    Cycles through voice types (Wavenet→Neural2→Standard) via idx % 3,
+    then picks a voice template via (idx // 3) % len(_VOICE_TEMPLATES).
+    This distributes requests evenly across the three quota buckets.
+    """
+    vtype = _VOICE_TYPES[idx % len(_VOICE_TYPES)]
+    template = _VOICE_TEMPLATES[(idx // 3) % len(_VOICE_TEMPLATES)]
+    lang, base_name, gender, configurable, child = template
+    voice_name = base_name.replace("Wavenet", vtype)
+    return lang, voice_name, gender, configurable, child
+
+# Keep VOICES as alias for backfill (uses templates only)
+VOICES = _VOICE_TEMPLATES
 
 
 def _pcm_to_wav_bytes(pcm_bytes: bytes, sample_rate: int) -> bytes:
@@ -70,7 +92,7 @@ def _synthesize_one(client, idx, query, max_retries=5):
     from google.cloud import texttospeech
     from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
 
-    lang, voice_name, ssml_gender, configurable, child = VOICES[idx % len(VOICES)]
+    lang, voice_name, ssml_gender, configurable, child = _get_voice(idx)
     gender = getattr(texttospeech.SsmlVoiceGender, ssml_gender)
 
     synthesis_input = texttospeech.SynthesisInput(text=query)
@@ -127,9 +149,12 @@ def _load_text_dataset(output_path, max_samples):
     """
     existing_ds = None
     if os.path.exists(output_path):
-        logger.info(f"Found existing dataset at {output_path}, loading for resume...")
-        existing_ds = load_from_disk(output_path)
-        logger.info(f"  Existing dataset: {len(existing_ds)} rows")
+        try:
+            logger.info(f"Found existing dataset at {output_path}, loading for resume...")
+            existing_ds = load_from_disk(output_path)
+            logger.info(f"  Existing dataset: {len(existing_ds)} rows")
+        except (FileNotFoundError, Exception) as e:
+            logger.warning(f"Could not load existing dataset (will use audio cache only): {e}")
 
     logger.info("Loading and combining text datasets...")
     combined = load_and_combine()
@@ -244,25 +269,50 @@ def _synthesize_missing(combined, needs_tts, audio_data, voice_names, workers, r
 
     success, failed = 0, 0
     delay = 1.0 / rate_limit if rate_limit > 0 else 0
+    total = len(queries_to_synth)
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {}
-        for q in queries_to_synth:
-            futures[pool.submit(_worker, q)] = q
-            time.sleep(delay)
-        with tqdm(total=len(futures), desc="TTS") as pbar:
-            for future in as_completed(futures):
-                idx, wav_bytes, voice_name, err = future.result()
-                if wav_bytes is not None:
-                    wav_path = os.path.join(cache_dir, f"{idx}.wav")
-                    with open(wav_path, "wb") as f:
-                        f.write(wav_bytes)
-                    audio_data[idx] = wav_path
-                    voice_names[idx] = voice_name
-                    success += 1
-                else:
-                    failed += 1
-                    logger.warning(f"Failed idx={idx}: {err}")
-                pbar.update(1)
+        pending = {}
+        submitted = 0
+        qi = iter(queries_to_synth)
+
+        # Seed the pool with initial batch
+        for _ in range(min(workers * 2, total)):
+            q = next(qi)
+            pending[pool.submit(_worker, q)] = q
+            submitted += 1
+
+        with tqdm(total=total, desc="TTS") as pbar:
+            while pending:
+                done_set = set()
+                for fut in list(pending):
+                    if fut.done():
+                        done_set.add(fut)
+                if not done_set:
+                    # Wait for at least one to finish
+                    time.sleep(0.05)
+                    continue
+                for fut in done_set:
+                    idx, wav_bytes, voice_name, err = fut.result()
+                    if wav_bytes is not None:
+                        wav_path = os.path.join(cache_dir, f"{idx}.wav")
+                        with open(wav_path, "wb") as f:
+                            f.write(wav_bytes)
+                        audio_data[idx] = wav_path
+                        voice_names[idx] = voice_name
+                        success += 1
+                    else:
+                        failed += 1
+                        logger.warning(f"Failed idx={idx}: {err}")
+                    pbar.update(1)
+                    del pending[fut]
+
+                    # Submit new work to maintain pool pressure
+                    if submitted < total:
+                        q = next(qi)
+                        pending[pool.submit(_worker, q)] = q
+                        submitted += 1
+                        time.sleep(delay)
 
     logger.info(f"TTS done: {success} generated, {failed} failed")
 
@@ -333,10 +383,10 @@ def main():
     """Entry point for the unified dataset build pipeline."""
     parser = argparse.ArgumentParser(description="Build unified tool-call dataset with TTS audio")
     parser.add_argument("--max-samples", type=int, default=None, help="Max samples to process")
-    parser.add_argument("--workers", type=int, default=8, help="TTS concurrent workers (default: 8)")
+    parser.add_argument("--workers", type=int, default=16, help="TTS concurrent workers (default: 16)")
     parser.add_argument("--output", type=str, default="data/tool_calls_unified", help="Output directory")
-    parser.add_argument("--rate-limit", type=float, default=15.0,
-                        help="Max TTS requests per second (default: 15, quota is 1000/min)")
+    parser.add_argument("--rate-limit", type=float, default=30.0,
+                        help="Max TTS requests per second (default: 30, quota is 2x1000/min)")
     parser.add_argument("--gcs-upload", type=str, default=None,
                         help="GCS path to upload dataset (e.g. gs://cactus-dataset/tool_calls)")
     args = parser.parse_args()
