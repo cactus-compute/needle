@@ -12,20 +12,17 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 import numpy as np
 from datasets import Audio, load_from_disk
 from tqdm import tqdm
-import sentencepiece as spm
+
+from .tokenizer import (  # noqa: F401 — re-exported for existing callers
+    PAD_ID, EOS_ID, BOS_ID, UNK_ID, TOOL_CALL_ID, TRANSCRIBE_ID,
+    TOKENIZER_DIR, TOKENIZER_PREFIX, GCS_TOKENIZER_PATH,
+    pre_tokenize, NeedleTokenizer, _init_worker, _tokenize_chunk,
+    _tokenizer_hash, train_tokenizer, get_tokenizer, _download_tokenizer_from_gcs,
+)
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".data_cache")
-TOKENIZER_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tokenizer")
-TOKENIZER_PREFIX = os.path.join(TOKENIZER_DIR, "needle")
 LOCAL_UNIFIED_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "tool_calls_unified")
 GCS_DATASET_PATH = "gs://cactus-dataset/tool_calls"
-
-PAD_ID = 0
-EOS_ID = 1
-BOS_ID = 2  # reserved for SentencePiece, unused at runtime (EOS_ID serves as SOS)
-UNK_ID = 3
-TOOL_CALL_ID = 4
-TRANSCRIBE_ID = 5
 
 _unified_dataset_cache = None
 
@@ -76,145 +73,6 @@ def _set_audio_backend(ds):
     return ds
 
 
-class NeedleTokenizer:
-    """Wrapper around SentencePiece providing the interface the codebase expects."""
-
-    def __init__(self, model_path):
-        self.sp = spm.SentencePieceProcessor()
-        self.sp.Load(model_path)
-
-    @property
-    def pad_token_id(self):
-        return PAD_ID
-
-    @property
-    def eos_token_id(self):
-        return EOS_ID
-
-    @property
-    def bos_token_id(self):
-        return BOS_ID
-
-    @property
-    def tool_call_token_id(self):
-        return TOOL_CALL_ID
-
-    @property
-    def transcribe_token_id(self):
-        return TRANSCRIBE_ID
-
-    @property
-    def vocab_size(self):
-        return self.sp.GetPieceSize()
-
-    def encode(self, text):
-        return self.sp.Encode(text, out_type=int)
-
-    def decode(self, ids):
-        if isinstance(ids, (list, tuple)) and len(ids) > 0 and isinstance(ids[0], (list, tuple)):
-            return [self.sp.Decode(seq) for seq in ids]
-        return self.sp.Decode(list(ids))
-
-    def __call__(self, texts, truncation=True, max_length=None, **kwargs):
-        all_ids = []
-        for text in texts:
-            ids = self.sp.Encode(text, out_type=int)
-            if truncation and max_length:
-                ids = ids[:max_length]
-            all_ids.append(ids)
-        return {"input_ids": all_ids}
-
-
-_worker_sp = None
-_worker_max_len = None
-
-
-def _init_worker(model_path, max_length):
-    """Initializer for multiprocessing pool — loads SP model once per worker."""
-    global _worker_sp, _worker_max_len
-    _worker_sp = spm.SentencePieceProcessor()
-    _worker_sp.Load(model_path)
-    _worker_max_len = max_length
-
-
-def _tokenize_chunk(texts):
-    """Encode a chunk of texts in a worker process."""
-    return [_worker_sp.Encode(t, out_type=int)[:_worker_max_len] for t in texts]
-
-
-def train_tokenizer(vocab_size=8192, max_samples=None):
-    """Train a SentencePiece BPE tokenizer on tool-calling corpus."""
-    model_path = TOKENIZER_PREFIX + ".model"
-    if os.path.exists(model_path):
-        print(f"Tokenizer already exists at {model_path}")
-        return model_path
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    ds = _load_unified_dataset()
-    if max_samples:
-        ds = ds.select(range(min(max_samples, len(ds))))
-
-    print(f"Training SentencePiece BPE tokenizer (vocab_size={vocab_size}, samples={len(ds):,})...")
-
-    corpus_path = os.path.join(TOKENIZER_DIR, "corpus.txt")
-    with open(corpus_path, "w") as f:
-        for example in tqdm(ds, desc="Writing corpus"):
-            for field in ("query", "tools", "answers"):
-                text = example[field].strip()
-                if text:
-                    f.write(text + "\n")
-
-    spm.SentencePieceTrainer.Train(
-        input=corpus_path,
-        model_prefix=TOKENIZER_PREFIX,
-        vocab_size=vocab_size,
-        model_type="bpe",
-        pad_id=PAD_ID,
-        eos_id=EOS_ID,
-        bos_id=BOS_ID,
-        unk_id=UNK_ID,
-        user_defined_symbols=["<tool_call>", "<transcribe>"],
-        byte_fallback=True,
-        normalization_rule_name="identity",
-        num_threads=os.cpu_count(),
-        train_extremely_large_corpus=False,
-        minloglevel=2,
-    )
-
-    os.remove(corpus_path)
-    print(f"Tokenizer saved to {model_path}")
-    return model_path
-
-
-GCS_TOKENIZER_PATH = "gs://cactus-dataset/tokenizer/"
-
-
-def get_tokenizer(max_samples=None):
-    model_path = TOKENIZER_PREFIX + ".model"
-    if not os.path.exists(model_path):
-        # Try downloading from GCS first
-        if _download_tokenizer_from_gcs():
-            return NeedleTokenizer(model_path)
-        train_tokenizer(max_samples=max_samples)
-    return NeedleTokenizer(model_path)
-
-
-def _download_tokenizer_from_gcs():
-    """Download tokenizer files from GCS. Returns True on success."""
-    import subprocess
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-    result = subprocess.run(
-        ["gcloud", "storage", "cp", "-r", GCS_TOKENIZER_PATH + "*", TOKENIZER_DIR + "/"],
-        capture_output=True, text=True,
-    )
-    model_path = TOKENIZER_PREFIX + ".model"
-    if result.returncode == 0 and os.path.exists(model_path):
-        print(f"Downloaded tokenizer from {GCS_TOKENIZER_PATH}")
-        return True
-    return False
-
-
 def load_tool_calls(split="train", max_samples=None):
     """Load tool-calling dataset, splitting 90/10 for train/val."""
     ds = _load_unified_dataset()
@@ -226,15 +84,6 @@ def load_tool_calls(split="train", max_samples=None):
     if max_samples:
         ds = ds.select(range(min(max_samples, len(ds))))
     return ds
-
-
-def _tokenizer_hash():
-    """Hash the tokenizer model file to detect retraining."""
-    model_path = TOKENIZER_PREFIX + ".model"
-    if os.path.exists(model_path):
-        with open(model_path, "rb") as f:
-            return hashlib.md5(f.read()).hexdigest()[:8]
-    return "none"
 
 
 def _cache_key(prefix, n_samples, max_enc_len, max_dec_len):
