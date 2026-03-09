@@ -988,6 +988,22 @@ def load_prepared_mels(mel_cache_id, mmap=False):
     return np.load(mel_file, mmap_mode=mmap_mode)
 
 
+def _fit_audio_to_length(wave, target_len, rng):
+    """Crop or tile a waveform to target length."""
+    wave = np.asarray(wave, dtype=np.float32).flatten()
+    if target_len <= 0:
+        return np.zeros(0, dtype=np.float32)
+    if wave.size == 0:
+        return np.zeros(target_len, dtype=np.float32)
+    if wave.size == target_len:
+        return wave
+    if wave.size > target_len:
+        start = int(rng.integers(0, wave.size - target_len + 1))
+        return wave[start:start + target_len]
+    reps = int(np.ceil(target_len / wave.size))
+    return np.tile(wave, reps)[:target_len].astype(np.float32)
+
+
 class WhiteNoiseAugmenter:
     """Simple white Gaussian noise augmenter with random SNR."""
 
@@ -1023,12 +1039,69 @@ class WhiteNoiseAugmenter:
         return np.clip(mixed, -1.0, 1.0).astype(np.float32)
 
 
+class PersonNoiseAugmenter:
+    """Background speech augmentation with distance sampling and SNR control."""
+
+    def __init__(self, background_pool, n=10, r1=3.0, r2=10.0, r_ref=1.0,
+                 min_snr_db=15.0, max_snr_db=40.0, seed=None):
+        if r1 <= 0 or r2 <= r1 or r_ref <= 0:
+            raise ValueError("Require r1 > 0, r2 > r1, and r_ref > 0 for person noise augmentation.")
+        pool = []
+        for wave in background_pool:
+            arr = np.asarray(wave, dtype=np.float32).flatten()
+            if arr.size > 0:
+                pool.append(arr)
+        self.pool = pool
+        self.n = max(1, int(n))
+        self.r1 = float(r1)
+        self.r2 = float(r2)
+        self.r_ref = float(r_ref)
+        self.min_snr_db = float(min(min_snr_db, max_snr_db))
+        self.max_snr_db = float(max(min_snr_db, max_snr_db))
+        self._rng = np.random.default_rng(seed)
+        self.name = "person"
+        self.transforms = ("person_noise",)
+
+    def __call__(self, samples, sample_rate):
+        del sample_rate
+        audio = np.asarray(samples, dtype=np.float32).flatten()
+        if audio.size == 0 or len(self.pool) == 0:
+            return audio
+
+        replace = len(self.pool) < self.n
+        clip_ids = self._rng.choice(len(self.pool), size=self.n, replace=replace)
+
+        z = self._rng.uniform(0.0, 1.0, size=self.n)
+        r_z = np.sqrt(self.r1**2 + z * (self.r2**2 - self.r1**2))
+        gains = self.r_ref / np.maximum(r_z, 1e-6)
+
+        noise = np.zeros_like(audio, dtype=np.float32)
+        for clip_id, gain in zip(clip_ids, gains):
+            clip = _fit_audio_to_length(self.pool[int(clip_id)], len(audio), self._rng)
+            noise += float(gain) * clip
+
+        clean_rms = float(np.sqrt(np.mean(audio * audio) + 1e-12))
+        noise_rms = float(np.sqrt(np.mean(noise * noise) + 1e-12))
+        if clean_rms <= 1e-8 or noise_rms <= 1e-8:
+            return audio
+
+        target_snr_db = float(self._rng.uniform(self.min_snr_db, self.max_snr_db))
+        desired_noise_rms = clean_rms / (10.0 ** (target_snr_db / 20.0))
+        noise_scaled = noise * (desired_noise_rms / noise_rms)
+
+        mixed = audio + noise_scaled.astype(np.float32)
+        return np.clip(mixed, -1.0, 1.0).astype(np.float32)
+
+
 def build_audio_augmenter(sr=16000, mode="white", white_noise_p=0.5,
-                          white_noise_min_snr_db=8.0, white_noise_max_snr_db=30.0):
+                          white_noise_min_snr_db=8.0, white_noise_max_snr_db=30.0,
+                          person_noise_n=10, person_noise_r1=3.0, person_noise_r2=10.0,
+                          person_noise_r_ref=1.0, person_noise_min_snr_db=15.0,
+                          person_noise_max_snr_db=40.0, person_noise_pool=None):
     """Build a waveform augmentation pipeline for training.
 
     Args:
-        mode: "none", "white", or "full".
+        mode: "none", "white", "person", or "full".
     """
     del sr
     mode = (mode or "none").lower()
@@ -1042,6 +1115,20 @@ def build_audio_augmenter(sr=16000, mode="white", white_noise_p=0.5,
     )
     if mode == "white":
         return white_noise
+
+    if mode == "person":
+        if person_noise_pool is None or len(person_noise_pool) == 0:
+            print("  WARNING: person noise requested, but no background speech pool was provided")
+            return None
+        return PersonNoiseAugmenter(
+            background_pool=person_noise_pool,
+            n=person_noise_n,
+            r1=person_noise_r1,
+            r2=person_noise_r2,
+            r_ref=person_noise_r_ref,
+            min_snr_db=person_noise_min_snr_db,
+            max_snr_db=person_noise_max_snr_db,
+        )
 
     if mode != "full":
         raise ValueError(f"Unknown audio augmentation mode: {mode}")

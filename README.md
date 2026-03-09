@@ -172,10 +172,16 @@ needle [command]
   │     --max-mel-len INT       Max mel frames (default: 1024)        │
   │     --n-mels INT            Mel frequency bins (default: 80)      │
   │     --max-speech-samples INT  Max voice-tool-call samples         │
-  │     --audio-aug-mode STR    none|white|full (default: white)      │
+  │     --audio-aug-mode STR    none|white|person|full (default:white)│
   │     --white-noise-p FLOAT   White-noise apply prob (default: 0.5) │
   │     --white-noise-min-snr-db FLOAT  Min SNR dB (default: 8.0)     │
   │     --white-noise-max-snr-db FLOAT  Max SNR dB (default: 30.0)    │
+  │     --person-noise-n INT    Bg speaker clips per sample (def: 10) │
+  │     --person-noise-r1 FLOAT Min distance for person noise (3.0)   │
+  │     --person-noise-r2 FLOAT Max distance for person noise (10.0)  │
+  │     --person-noise-r-ref FL Reference distance for gain (1.0)      │
+  │     --person-noise-min-snr-db FL Min target SNR dB (default: 15.0) │
+  │     --person-noise-max-snr-db FL Max target SNR dB (default: 40.0) │
   │                                                                   │
   │   tokenize                                                        │
   │     --max-samples INT       Limit samples per split (dev/test)    │
