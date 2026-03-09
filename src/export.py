@@ -20,6 +20,19 @@ from .model import TransformerConfig
 _FFN_KERNEL_NAMES = {"gate_proj", "up_proj", "down_proj"}
 
 
+def _to_numpy(tree):
+    """Convert all JAX arrays in a pytree to numpy arrays."""
+    return jax.tree.map(
+        lambda x: np.asarray(x) if isinstance(x, jnp.ndarray) else x, tree
+    )
+
+
+def _param_stats(tree):
+    """Return (param_count, total_bytes) for a pytree of arrays."""
+    leaves = jax.tree.leaves(tree)
+    return sum(x.size for x in leaves), sum(x.nbytes for x in leaves)
+
+
 def export_submodel(checkpoint_path, factor, output_path):
     """Export a matryoshka sub-model from a full checkpoint.
 
@@ -50,9 +63,7 @@ def _export_topk(data, params, config, factor, output_path):
     ff_w = config.d_ff // factor
     per_layer_indices = [np.sort(np.argsort(-factor_logits[b])[:ff_w]) for b in range(factor_logits.shape[0])]
 
-    params_np = jax.tree.map(
-        lambda x: np.asarray(x) if isinstance(x, jnp.ndarray) else x, params
-    )
+    params_np = _to_numpy(params)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "wb") as f:
@@ -65,8 +76,7 @@ def _export_topk(data, params, config, factor, output_path):
         }, f)
 
     n_blocks = len(per_layer_indices)
-    orig_count = sum(x.size for x in jax.tree.leaves(params))
-    orig_bytes = sum(x.nbytes for x in jax.tree.leaves(params))
+    orig_count, orig_bytes = _param_stats(params)
 
     print(f"\n  TopK export: {output_path}")
     print(f"  ─────────────────────────────────────")
@@ -118,18 +128,14 @@ def _export_prefix(params, config, factor, output_path):
 
     new_config = replace(config, d_ff=d_ff_new)
 
-    sliced_np = jax.tree.map(
-        lambda x: np.asarray(x) if isinstance(x, jnp.ndarray) else x, sliced
-    )
+    sliced_np = _to_numpy(sliced)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "wb") as f:
         pickle.dump({"params": sliced_np, "config": new_config.__dict__}, f)
 
-    orig_count = sum(x.size for x in jax.tree.leaves(params))
-    new_count = sum(x.size for x in jax.tree.leaves(sliced_np))
-    orig_bytes = sum(x.nbytes for x in jax.tree.leaves(params))
-    new_bytes = sum(x.nbytes for x in jax.tree.leaves(sliced_np))
+    orig_count, orig_bytes = _param_stats(params)
+    new_count, new_bytes = _param_stats(sliced_np)
 
     print(f"\n  Export complete: {output_path}")
     print(f"  ─────────────────────────────────────")
