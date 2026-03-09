@@ -21,10 +21,23 @@ def load_checkpoint(path):
         data = pickle.load(f)
     params = jax.tree.map(jnp.array, data["params"])
     config = TransformerConfig(**data["config"])
-    return params, config
+    ffn_mask = _build_ffn_mask(data, config) if "mat_mask_indices" in data else None
+    return params, config, ffn_mask
 
 
-def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=0, stream=True, task_token_id=None):
+def _build_ffn_mask(data, config):
+    """Build (n_blocks, 1, d_ff) binary FFN mask from exported topk mask indices."""
+    indices = data["mat_mask_indices"]
+    n_blocks = len(indices)
+    mask = np.zeros((n_blocks, 1, config.d_ff), dtype=np.float32)
+    for b, idx in enumerate(indices):
+        mask[b, 0, idx] = 1.0
+    enc_mask = jnp.array(mask[:config.num_encoder_layers])
+    dec_mask = jnp.array(mask[config.num_encoder_layers:])
+    return {"encoder": enc_mask, "decoder": dec_mask}
+
+
+def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=0, stream=True, task_token_id=None, ffn_mask=None):
     """Generate tool-call output.
 
     Encoder: query only.
@@ -37,9 +50,12 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
     eos_id = tokenizer.eos_token_id
     tool_call_id = task_token_id if task_token_id is not None else tokenizer.tool_call_token_id
 
+    enc_ffn = ffn_mask["encoder"] if ffn_mask else None
+    dec_ffn = ffn_mask["decoder"] if ffn_mask else None
+
     src_mask = make_padding_mask(enc_input, pad_id)
     encoder_out = model.apply(
-        {"params": params}, enc_input, src_mask=src_mask, method="encode"
+        {"params": params}, enc_input, src_mask=src_mask, ffn_mask=enc_ffn, method="encode"
     )
 
     # Build decoder prefix: [BOS, <tool_call>, tools_tokens...]
@@ -61,6 +77,7 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
             dec_buffer,
             encoder_out,
             self_mask=tgt_mask,
+            ffn_mask=dec_ffn,
             method="decode",
         )
         return logits
@@ -111,7 +128,7 @@ def load_audio(path, target_sr=16000):
     return audio, sr
 
 
-def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="[]", max_gen_len=512, seed=0, stream=True):
+def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="[]", max_gen_len=512, seed=0, stream=True, ffn_mask=None):
     """Generate tool-call output from audio using the speech encoder pathway.
 
     mel -> encode_speech -> decoder [BOS, <tool_call>, tools_tokens...] -> greedy decode.
@@ -125,9 +142,12 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
     eos_id = tokenizer.eos_token_id
     tool_call_id = tokenizer.tool_call_token_id
 
+    enc_ffn = ffn_mask["encoder"] if ffn_mask else None
+    dec_ffn = ffn_mask["decoder"] if ffn_mask else None
+
     src_mask = make_mel_padding_mask(mel_input)
     encoder_out = model.apply(
-        {"params": params}, mel_input, src_mask=src_mask, deterministic=True, method="encode_speech"
+        {"params": params}, mel_input, src_mask=src_mask, ffn_mask=enc_ffn, deterministic=True, method="encode_speech"
     )
 
     # Build decoder prefix: [BOS, <tool_call>, tools_tokens...]
@@ -147,6 +167,7 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
             dec_buffer,
             encoder_out,
             self_mask=tgt_mask,
+            ffn_mask=dec_ffn,
             method="decode",
         )
         return logits
@@ -183,13 +204,15 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
 
 def main(args):
     print(f"Loading checkpoint: {args.checkpoint}")
-    params, config = load_checkpoint(args.checkpoint)
+    params, config, ffn_mask = load_checkpoint(args.checkpoint)
 
     model = EncoderDecoderTransformer(config)
     tokenizer = get_tokenizer()
 
     param_count = sum(x.size for x in jax.tree.leaves(params))
     print(f"Model parameters: {param_count:,}")
+    if ffn_mask:
+        print(f"TopK sub-model: per-layer FFN masking active")
 
     # --- Voice-to-tool-call mode ---
     audio_files = getattr(args, "audio", None)
@@ -200,15 +223,11 @@ def main(args):
             print(f"Tools: {tools[:80]}{'...' if len(tools) > 80 else ''}")
             audio, sr = load_audio(audio_path)
             generate_from_audio(
-                model,
-                params,
-                tokenizer,
-                audio,
-                sr=sr,
-                tools=tools,
+                model, params, tokenizer, audio,
+                sr=sr, tools=tools,
                 max_gen_len=args.max_len,
                 seed=args.seed + i,
-                stream=True,
+                stream=True, ffn_mask=ffn_mask,
             )
         return
 
@@ -229,14 +248,9 @@ def main(args):
         print(f"\nQuery: {q}")
         print(f"Tools: {t[:80]}{'...' if len(t) > 80 else ''}")
         generate(
-            model,
-            params,
-            tokenizer,
-            q,
-            tools=t,
-            max_gen_len=args.max_len,
-            seed=args.seed + i,
-            stream=True,
+            model, params, tokenizer, q,
+            tools=t, max_gen_len=args.max_len,
+            seed=args.seed + i, stream=True, ffn_mask=ffn_mask,
         )
 
 

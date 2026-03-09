@@ -10,43 +10,45 @@ from flax import jax_utils
 from .data import get_tokenizer
 from .model import (
     EncoderDecoderTransformer,
-    TransformerConfig,
     make_causal_mask,
     make_padding_mask,
 )
 from .run import load_checkpoint
 
 
-def _make_p_encode(model):
+def _make_p_encode(model, enc_ffn=None):
     """Create a pmap'd encode function."""
     def _encode(params, src, src_mask):
         return model.apply(
-            {"params": params}, src, src_mask=src_mask, method="encode",
+            {"params": params}, src, src_mask=src_mask, ffn_mask=enc_ffn, method="encode",
         )
     return jax.pmap(_encode, axis_name="batch")
 
 
-def _make_p_decode(model):
+def _make_p_decode(model, dec_ffn=None):
     """Create a pmap'd decode function."""
     def _decode(params, dec_input, encoder_out, tgt_mask, _unused_cross_mask):
         return model.apply(
             {"params": params}, dec_input, encoder_out,
-            self_mask=tgt_mask, method="decode",
+            self_mask=tgt_mask, ffn_mask=dec_ffn, method="decode",
         )
     return jax.pmap(_decode, axis_name="batch")
 
 
 def _shard_single(x, num_devices):
     """Replicate a single-sample batch across all devices for pmap."""
-    return jnp.broadcast_to(x, (num_devices, *x.shape[1:]))
+    return jnp.broadcast_to(x[None], (num_devices, *x.shape))
 
 
 def score_sequence(model, params, enc_tokens, dec_tokens, pad_id, sos_id=None,
-                   p_encode=None, p_decode=None, num_devices=1):
+                   p_encode=None, p_decode=None, num_devices=1, ffn_mask=None):
     """Compute average negative log-likelihood of dec_tokens given enc_tokens."""
     sos = sos_id if sos_id is not None else pad_id
     enc_input = jnp.array([enc_tokens])
     src_mask = make_padding_mask(enc_input, pad_id)
+
+    enc_ffn = ffn_mask["encoder"] if ffn_mask else None
+    dec_ffn = ffn_mask["decoder"] if ffn_mask else None
 
     if p_encode is not None and num_devices > 1:
         enc_s = _shard_single(enc_input, num_devices)
@@ -55,7 +57,7 @@ def score_sequence(model, params, enc_tokens, dec_tokens, pad_id, sos_id=None,
     else:
         p = params if num_devices <= 1 else jax_utils.unreplicate(params)
         encoder_out = model.apply(
-            {"params": p}, enc_input, src_mask=src_mask, method="encode",
+            {"params": p}, enc_input, src_mask=src_mask, ffn_mask=enc_ffn, method="encode",
         )
 
     dec_in = [sos] + list(dec_tokens[:-1])
@@ -71,7 +73,7 @@ def score_sequence(model, params, enc_tokens, dec_tokens, pad_id, sos_id=None,
         p = params if num_devices <= 1 else jax_utils.unreplicate(params)
         logits = model.apply(
             {"params": p}, dec_input, encoder_out,
-            self_mask=tgt_mask, method="decode",
+            self_mask=tgt_mask, ffn_mask=dec_ffn, method="decode",
         )[0]
 
     log_probs = jax.nn.log_softmax(logits if logits.ndim == 2 else logits[0])
@@ -81,7 +83,7 @@ def score_sequence(model, params, enc_tokens, dec_tokens, pad_id, sos_id=None,
 
 
 def eval_wikitext2(model, params, tokenizer, max_samples=500, max_len=256,
-                   num_devices=1, p_encode=None, p_decode=None):
+                   num_devices=1, p_encode=None, p_decode=None, ffn_mask=None):
     """Perplexity on WikiText-2 test split."""
     ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
 
@@ -91,6 +93,8 @@ def eval_wikitext2(model, params, tokenizer, max_samples=500, max_len=256,
     total_tokens = 0
     evaluated = 0
 
+    enc_ffn = ffn_mask["encoder"] if ffn_mask else None
+    dec_ffn = ffn_mask["decoder"] if ffn_mask else None
     single_params = jax_utils.unreplicate(params) if num_devices > 1 else params
 
     for example in ds:
@@ -116,7 +120,7 @@ def eval_wikitext2(model, params, tokenizer, max_samples=500, max_len=256,
             encoder_out = p_encode(params, enc_s, src_mask_s)[0:1]
         else:
             encoder_out = model.apply(
-                {"params": single_params}, enc_input, src_mask=src_mask, method="encode",
+                {"params": single_params}, enc_input, src_mask=src_mask, ffn_mask=enc_ffn, method="encode",
             )
 
         dec_in = [sos_id] + list(dec_tokens[:-1])
@@ -131,7 +135,7 @@ def eval_wikitext2(model, params, tokenizer, max_samples=500, max_len=256,
         else:
             logits = model.apply(
                 {"params": single_params}, dec_input, encoder_out,
-                self_mask=tgt_mask, method="decode",
+                self_mask=tgt_mask, ffn_mask=dec_ffn, method="decode",
             )
 
         log_probs = jax.nn.log_softmax(logits[0] if logits.ndim == 3 else logits[0])
@@ -150,7 +154,7 @@ def eval_wikitext2(model, params, tokenizer, max_samples=500, max_len=256,
 
 
 def eval_lambada(model, params, tokenizer, max_samples=500,
-                 num_devices=1, p_encode=None, p_decode=None):
+                 num_devices=1, p_encode=None, p_decode=None, ffn_mask=None):
     """Accuracy of predicting the final word on LAMBADA."""
     ds = load_dataset("EleutherAI/lambada_openai", "default", split="test")
 
@@ -159,6 +163,8 @@ def eval_lambada(model, params, tokenizer, max_samples=500,
     correct = 0
     total = 0
 
+    enc_ffn = ffn_mask["encoder"] if ffn_mask else None
+    dec_ffn = ffn_mask["decoder"] if ffn_mask else None
     single_params = jax_utils.unreplicate(params) if num_devices > 1 else params
 
     for example in ds:
@@ -183,7 +189,7 @@ def eval_lambada(model, params, tokenizer, max_samples=500,
             encoder_out = p_encode(params, enc_s, src_mask_s)[0:1]
         else:
             encoder_out = model.apply(
-                {"params": single_params}, enc_input, src_mask=src_mask, method="encode",
+                {"params": single_params}, enc_input, src_mask=src_mask, ffn_mask=enc_ffn, method="encode",
             )
 
         dec_in = jnp.array([[sos_id]])
@@ -197,7 +203,7 @@ def eval_lambada(model, params, tokenizer, max_samples=500,
         else:
             logits = model.apply(
                 {"params": single_params}, dec_in, encoder_out,
-                self_mask=tgt_mask, method="decode",
+                self_mask=tgt_mask, ffn_mask=dec_ffn, method="decode",
             )
 
         predicted = int(jnp.argmax(logits[0, 0] if logits.ndim == 3 else logits[0, 0]))
@@ -213,7 +219,7 @@ def eval_lambada(model, params, tokenizer, max_samples=500,
 
 
 def eval_hellaswag(model, params, tokenizer, max_samples=500,
-                   num_devices=1, p_encode=None, p_decode=None):
+                   num_devices=1, p_encode=None, p_decode=None, ffn_mask=None):
     """Accuracy on HellaSwag by scoring each candidate ending."""
     ds = load_dataset("Rowan/hellaswag", split="validation")
 
@@ -242,7 +248,7 @@ def eval_hellaswag(model, params, tokenizer, max_samples=500,
             dec_tokens = dec_tokens[:64]
             score = score_sequence(model, params, enc_tokens, dec_tokens, pad_id,
                                    sos_id=sos_id, p_encode=p_encode, p_decode=p_decode,
-                                   num_devices=num_devices)
+                                   num_devices=num_devices, ffn_mask=ffn_mask)
             scores.append(score)
 
         predicted = int(np.argmax(scores))
@@ -258,7 +264,7 @@ def eval_hellaswag(model, params, tokenizer, max_samples=500,
 
 
 def eval_arc_easy(model, params, tokenizer, max_samples=500,
-                  num_devices=1, p_encode=None, p_decode=None):
+                  num_devices=1, p_encode=None, p_decode=None, ffn_mask=None):
     """Accuracy on ARC-Easy by scoring each answer choice."""
     ds = load_dataset("allenai/ai2_arc", "ARC-Easy", split="test")
 
@@ -288,7 +294,7 @@ def eval_arc_easy(model, params, tokenizer, max_samples=500,
             dec_tokens = dec_tokens[:64]
             score = score_sequence(model, params, enc_tokens, dec_tokens, pad_id,
                                    sos_id=sos_id, p_encode=p_encode, p_decode=p_decode,
-                                   num_devices=num_devices)
+                                   num_devices=num_devices, ffn_mask=ffn_mask)
             scores.append(score)
 
         predicted_idx = int(np.argmax(scores))
@@ -317,7 +323,7 @@ def main(args):
     print(f"Detected {num_devices} device(s) for data-parallel evaluation")
 
     print(f"Loading checkpoint: {args.checkpoint}")
-    params, config = load_checkpoint(args.checkpoint)
+    params, config, ffn_mask = load_checkpoint(args.checkpoint)
     model = EncoderDecoderTransformer(config)
     tokenizer = get_tokenizer()
 
@@ -325,10 +331,15 @@ def main(args):
     print(f"Model parameters: {param_count:,}")
 
     # Replicate params across devices for pmap
+    enc_ffn = ffn_mask["encoder"] if ffn_mask else None
+    dec_ffn = ffn_mask["decoder"] if ffn_mask else None
+    if ffn_mask:
+        print(f"sub-model:   topk FFN masking active")
+
     if num_devices > 1:
         params = jax_utils.replicate(params)
-        p_encode = _make_p_encode(model)
-        p_decode = _make_p_decode(model)
+        p_encode = _make_p_encode(model, enc_ffn=enc_ffn)
+        p_decode = _make_p_decode(model, dec_ffn=dec_ffn)
         print(f"Params replicated across {num_devices} devices")
     else:
         p_encode = None
@@ -349,6 +360,7 @@ def main(args):
         result = BENCHMARKS[name](
             model, params, tokenizer, max_samples=args.max_samples,
             num_devices=num_devices, p_encode=p_encode, p_decode=p_decode,
+            ffn_mask=ffn_mask,
         )
         results[name] = result
 

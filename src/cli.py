@@ -1,7 +1,90 @@
 import argparse
 import sys
 
-HELP = """Check the readme"""
+HELP = """
+  ┌───────────────────────────────────────────────────────────────────┐
+  │                                                                   │
+  │      ┌─┐┌─┐┌─┐┌┬┐┬ ┬┌─┐  ┌┐┌┌─┐┌─┐┌┬┐┬  ┌─┐                       │
+  │      │  ├─┤│   │ │ │└─┐  │││├┤ ├┤  │││  ├┤                        │
+  │      └─┘┴ ┴└─┘ ┴ └─┘└─┘  ┘└┘└─┘└─┘─┴┘┴─┘└─┘                       │
+  │      ...the tiny model to rule them all...                        │
+  │                                                                   │
+  │   train                                                           │
+  │     --full                   Use full 1B config (~1.17B params)   │
+  │     --epochs INT             Training epochs (default: 1)         │
+  │     --batch-size INT         Batch size (default: 32)             │
+  │     --lr FLOAT               AdamW learning rate (default: 3e-4)  │
+  │     --muon-lr FLOAT          Muon learning rate (default: 0.02)   │
+  │     --d-model INT            Model dim (default: 512)             │
+  │     --num-heads INT          Attention heads (default: 8)         │
+  │     --num-kv-heads INT       KV heads for GQA (default: num-heads)│
+  │     --num-layers INT         Encoder layers (default: 8)          │
+  │     --num-dec-layers INT     Decoder layers (default: 4)          │
+  │     --max-enc-len INT        Max encoder seq length (default: 256)│
+  │     --max-dec-len INT        Max decoder seq length (default: 256)│
+  │     --max-samples INT        Training samples (default: all)      │
+  │     --mat-factors INT [...]   FFN shrink factors (default: 2 4 8)  │
+  │     --mat-method STR         static-prefix|topk (default: topk)  │
+  │     --mat-init-mode STR      saliency|prefix|normal (def: sal.)  │
+  │     --mat-warmup-frac FL     Saliency warmup fraction (def: 0.4) │
+  │     --mat-freeze-frac FL     Mask freeze fraction (default: 1.0) │
+  │     --mat-tau-start FLOAT    TopK tau start (default: 0.5)       │
+  │     --mat-tau-end FLOAT      TopK tau end (default: 0.1)         │
+  │     --mat-mask-lr FLOAT      Mask logit LR (default: 3e-3)       │
+  │     --sparsity-ratio FLOAT   Block prune ratio (default: 0.5)    │
+  │     --group-size INT         Quant/prune group size (default: 32) │
+  │     --prune-interval INT     Steps between mask updates (def: 100)│
+  │     --prune-start-frac FL    Start pruning at frac (def: 0.33)   │
+  │     --prune-end-frac FL      Lock mask at this frac (def: 0.67)  │
+  │     --activation STR         drelu|swiglu|geglu (default: drelu)  │
+  │     --warmup-ratio FLOAT     LR warmup ratio (default: 0.05)     │
+  │     --eval-every INT         Val eval interval (default: 1000)    │
+  │     --wandb                  Enable W&B logging                   │
+  │     --checkpoint PATH        Resume from checkpoint               │
+  │     --checkpoint-dir DIR     Checkpoint directory                 │
+  │     --seed INT               Random seed (default: 42)            │
+  │     --no-speech             Disable speech (text-only training)   │
+  │     --speech-every INT      Speech step every N text (default: 3) │
+  │     --max-mel-len INT       Max mel frames (default: 1024)        │
+  │     --n-mels INT            Mel frequency bins (default: 80)      │
+  │     --max-speech-samples INT  Max LibriSpeech samples             │
+  │                                                                   │
+  │   run                                                             │
+  │     --checkpoint PATH       Path to model checkpoint (required)   │
+  │     --query STR             Query text for tool-call generation   │
+  │     --tools STR             Tools JSON for tool-call generation   │
+  │     --audio PATH [...]      Audio files for voice-to-tool-call    │
+  │     --max-len INT           Max tokens to generate (default: 512) │
+  │     --seed INT              Random seed (default: 0)              │
+  │                                                                   │
+  │   test                                                            │
+  │     --checkpoint PATH       Path to model checkpoint (required)   │
+  │     --batch-size INT        Batch size (default: 32)              │
+  │     --max-eval-samples INT  Evaluation samples (default: 1000)    │
+  │     --max-gen-len INT       Max generation length (default: 512)  │
+  │     --tool-call-samples INT Tool-call accuracy samples (def: 200) │
+  │     --voice-tc-samples INT  Voice-tool-call samples (default: 50) │
+  │     --throughput-runs INT   Throughput runs (default: 10)         │
+  │                                                                   │
+  │   evaluate                                                        │
+  │     --checkpoint PATH       Path to model checkpoint (required)   │
+  │     --benchmarks [...]      wikitext2 lambada hellaswag arc_easy  │
+  │     --max-samples INT       Samples per benchmark (default: 500)  │
+  │                                                                   │
+  │   tpu                                                             │
+  │     create NAME             Create TPU (auto-finds zone)          │
+  │       --type STR            Accelerator (default: v6e-8)          │
+  │       --version STR         TPU OS (auto-detected from --type)    │
+  │     connect NAME            SSH config + connect (auto-zone)      │
+  │     claude NAME             Install Claude Code on instance       │
+  │     stop NAME               Stop instance (auto-zone)             │
+  │     start NAME              Start stopped instance (auto-zone)    │
+  │     delete NAME             Delete instance (auto-zone)           │
+  │     list                    List all TPU instances                │
+  │       --zone ZONE           Override auto-detected zone           │
+  │                                                                   │
+  └───────────────────────────────────────────────────────────────────┘
+"""
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
@@ -47,6 +130,22 @@ def main():
                    help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4 8)")
     p.add_argument("--mat-shared-input", action="store_true",
                    help="Each unique input is repeated across all mat widths (default: unique input per width)")
+    p.add_argument("--mat-method", choices=["static-prefix", "topk"], default="topk",
+                   help="Matryoshka method: 'static-prefix' (fixed first-N masks), 'topk' (saliency-based masks, default)")
+    p.add_argument("--mat-tau-start", type=float, default=0.5)
+    p.add_argument("--mat-tau-end", type=float, default=0.1)
+    p.add_argument("--mat-init-mode", choices=["prefix", "shuffled_prefix", "saliency", "normal", "zeros"], default="saliency")
+    p.add_argument("--mat-init-value", type=float, default=0.5)
+    p.add_argument("--mat-spread-lambda", type=float, default=0.0)
+    p.add_argument("--mat-warmup-frac", type=float, default=0.4,
+                   help="Fraction of total steps for vanilla warmup (no masks)")
+    p.add_argument("--mat-freeze-frac", type=float, default=1.0,
+                   help="Fraction of total steps at end with frozen hard masks")
+    p.add_argument("--mat-mask-lr", type=float, default=3e-3,
+                   help="Mask logit optimizer learning rate (default: 3e-3)")
+    p.add_argument("--mat-saliency-scale", type=float, default=1.0)
+    p.add_argument("--mat-gumbel", action="store_true",
+                   help="Use Gumbel noise for per-item mask diversity during topk learning")
     p.add_argument("--no-speech", action="store_true", help="Disable speech training (text-only)")
     p.add_argument("--max-mel-len", type=int, default=1024,
                    help="Max mel spectrogram frames (default: 1024)")
