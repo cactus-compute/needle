@@ -71,55 +71,63 @@
     strided DW conv · mat factors · INT4 QAT · Muon + AdamW
     text + speech encoder · <tool_call> task routing
 
-  Data Preprocessing
-  ──────────────────
+  Data Pipeline (needle tokenize → needle train)
+  ───────────────────────────────────────────────
 
-  Text (Tool-Call Dataset)                 Speech (Voice-Tool-Call)
-  ────────────────────────                 ────────────────────────
-
-     Unified dataset                         Unified dataset
-     (GCS / local)                           (GCS / local)
-         │                                       │
-         ▼                                       ▼
-  ┌──────────────┐                      ┌────────────────┐
-  │ SentencePiece│                      │ HF Audio col   │
-  │ BPE tokenize │                      │ decode (16kHz)  │
-  │ (8192 vocab) │                      └───────┬────────┘
-  └──────┬───────┘                              │
-         │                                      ▼
-         ▼                              ┌────────────────┐
-  ┌──────────────┐                      │ Augmentation   │
-  │ Encoder:     │                      │ (noise, pitch, │
-  │ query tokens │                      │  stretch, gain)│
-  └──────┬───────┘                      └───────┬────────┘
-         │                                      │
-         ▼                                      ▼
-  ┌──────────────────┐                  ┌────────────────┐
-  │ Decoder:         │                  │ Log-mel spec   │
-  │ [EOS]<tool_call> │                  │ 80 bins, 25ms  │
-  │ + tools tokens   │                  │ window, 10ms   │
-  │ + answer tokens  │                  │ hop (~100 f/s) │
-  │ → dec_in         │                  └───────┬────────┘
-  ├──────────────────┤                          │
-  │ <tool_call>      │                          ▼
-  │ + tools tokens   │                  ┌────────────────┐
-  │ + answer tokens  │                  │ Pad/trunc to   │
-  │ + [EOS]          │                  │ max_mel_len    │
-  │ → dec_tgt        │                  └───────┬────────┘
-  ├──────────────────┤                          │
-  │ Loss mask: 1.0   │                          ▼
-  │ on answer + EOS  │                  ┌────────────────┐
-  │ only (not tools) │                  │ Same decoder   │
-  └──────────────────┘                  │ format as text │
-                                        └────────────────┘
-         Both cached as
-         .npy in .data_cache/           Mel computed on-the-fly
-                                        (augment before mel)
-  ┌──────────────────────┐
-  │ Interleaved batches: │
-  │ 1:1 text / speech    │       Eval: voice-to-tool-call on
-  │ alternation          │       3 val samples per epoch
-  └──────────────────────┘
+  ┌─────────────────────────────────────────────────────────────┐
+  │  needle tokenize                                            │
+  │                                                             │
+  │  Unified dataset (GCS / local)                              │
+  │       │                                                     │
+  │       ├──── Text ──────────────── Speech ─────────┐         │
+  │       ▼                                           ▼         │
+  │  ┌──────────────┐                        ┌────────────────┐ │
+  │  │ SentencePiece│                        │ HF Audio col   │ │
+  │  │ BPE tokenize │                        │ decode (16kHz) │ │
+  │  │ (8192 vocab) │                        └───────┬────────┘ │
+  │  └──────┬───────┘                                │          │
+  │         │                                        ▼          │
+  │         ▼                                ┌────────────────┐ │
+  │  ┌──────────────────┐                    │ Log-mel spec   │ │
+  │  │ enc_inputs.npy   │                    │ 80 bins, 25ms  │ │
+  │  │ dec_inputs.npy   │                    │ window, 10ms   │ │
+  │  │ dec_targets.npy  │                    │ hop (~100 f/s) │ │
+  │  │ loss_mask.npy    │                    └───────┬────────┘ │
+  │  │ kept_idx.npy     │                            │          │
+  │  └──────┬───────────┘                            ▼          │
+  │         │                                ┌────────────────┐ │
+  │         │                                │ mels.npy       │ │
+  │         │                                │ (N,T,80) f32   │ │
+  │         │                                │ writable mmap  │ │
+  │         │                                └───────┬────────┘ │
+  │         │                                        │          │
+  │         └────────────┬───────────────────────────┘          │
+  │                      ▼                                      │
+  │               {split}_metadata.json                         │
+  │               .data_cache/ + GCS upload                     │
+  └─────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  needle train                                               │
+  │                                                             │
+  │  load_prepared_data(mmap=True)                              │
+  │  load_prepared_mels(mmap=True)                              │
+  │       │                                                     │
+  │       ▼                                                     │
+  │  ┌──────────────────────┐   ┌──────────────────────┐        │
+  │  │ PrefetchIterator     │   │ PrefetchIterator     │        │
+  │  │ text batches (4)     │   │ speech batches (4)   │        │
+  │  │ mmap → per-batch idx │   │ mmap → per-batch idx │        │
+  │  └──────────┬───────────┘   └──────────┬───────────┘        │
+  │             └───────────┬──────────────┘                    │
+  │                         ▼                                   │
+  │                  1:1 text/speech                            │
+  │                  alternation                                │
+  │                                                             │
+  │  ~42MB RAM (8 prefetched batches)                           │
+  │  SpecAugment for speech regularization                      │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Usage
@@ -164,6 +172,14 @@ needle [command]
   │     --max-mel-len INT       Max mel frames (default: 1024)        │
   │     --n-mels INT            Mel frequency bins (default: 80)      │
   │     --max-speech-samples INT  Max voice-tool-call samples         │
+  │                                                                   │
+  │   tokenize                                                        │
+  │     --max-samples INT       Limit samples per split (dev/test)    │
+  │     --cleanup               Delete local cache after GCS upload   │
+  │     --n-mels INT            Mel frequency bins (default: 80)      │
+  │     --max-mel-len INT       Max mel frames (default: 1024)        │
+  │     --max-enc-len INT       Max encoder seq len (default: 256)    │
+  │     --max-dec-len INT       Max decoder seq len (default: 1024)   │
   │                                                                   │
   │   run                                                             │
   │     --checkpoint PATH       Path to model checkpoint (required)   │

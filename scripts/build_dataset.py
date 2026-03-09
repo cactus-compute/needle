@@ -144,11 +144,11 @@ def _load_text_dataset(output_path, max_samples):
     return combined, existing_ds
 
 
-def _find_rows_needing_tts(combined, existing_ds):
-    """Identify which rows lack audio by inspecting the raw Arrow column.
+def _find_rows_needing_tts(combined, existing_ds, output_path):
+    """Identify which rows lack audio by checking the cache dir and existing dataset.
 
-    Accesses the underlying Arrow table directly to avoid triggering
-    HF audio decoding (which requires torchcodec).
+    First checks {output_path}/.audio_cache/ for WAV files from prior runs,
+    then falls back to inspecting the Arrow column in existing_ds.
 
     Returns:
         Set of row indices that need TTS synthesis.
@@ -156,57 +156,89 @@ def _find_rows_needing_tts(combined, existing_ds):
     n = len(combined)
     needs_tts = set(range(n))
 
+    cache_dir = os.path.join(output_path, ".audio_cache")
+    if os.path.isdir(cache_dir):
+        cached = 0
+        for fname in os.listdir(cache_dir):
+            if fname.endswith(".wav"):
+                try:
+                    idx = int(fname[:-4])
+                    if idx < n:
+                        needs_tts.discard(idx)
+                        cached += 1
+                except ValueError:
+                    pass
+        if cached:
+            logger.info(f"  {cached} rows found in audio cache")
+
     if existing_ds is not None and len(existing_ds) == n and "audio" in existing_ds.column_names:
         audio_column = existing_ds.data.column("audio")
         for i in range(n):
-            if audio_column[i].as_py() is not None:
+            if i in needs_tts and audio_column[i].as_py() is not None:
                 needs_tts.discard(i)
-        logger.info(f"  {n - len(needs_tts)} rows already have audio, {len(needs_tts)} need TTS")
 
+    logger.info(f"  {n - len(needs_tts)} rows already have audio, {len(needs_tts)} need TTS")
     return needs_tts
 
 
-def _recover_existing_audio(existing_ds, n, needs_tts):
-    """Extract audio bytes and voice names from a previously saved dataset.
+def _recover_existing_audio(existing_ds, n, needs_tts, output_path):
+    """Recover audio file paths from the cache dir and existing dataset.
 
-    Reads raw Arrow data to avoid triggering audio decoding.
+    Stores file paths (not bytes) to keep memory usage low.
 
     Returns:
         Tuple of (audio_data list, voice_names list).
+        audio_data entries are file paths (str) or None.
     """
     audio_data = [None] * n
     voice_names = [""] * n
+
+    cache_dir = os.path.join(output_path, ".audio_cache")
+    if os.path.isdir(cache_dir):
+        for i in range(n):
+            if i not in needs_tts:
+                wav_path = os.path.join(cache_dir, f"{i}.wav")
+                if os.path.exists(wav_path):
+                    audio_data[i] = wav_path
 
     if existing_ds is not None and len(existing_ds) == n and "audio" in existing_ds.column_names:
         audio_column = existing_ds.data.column("audio")
         voice_col = existing_ds["voice"] if "voice" in existing_ds.column_names else None
         for i in range(n):
-            if i not in needs_tts:
+            if i not in needs_tts and audio_data[i] is None:
                 raw = audio_column[i].as_py()
                 if isinstance(raw, dict) and raw.get("bytes"):
-                    audio_data[i] = raw["bytes"]
-                elif isinstance(raw, dict) and raw.get("path"):
-                    with open(raw["path"], "rb") as f:
-                        audio_data[i] = f.read()
-                if voice_col is not None:
-                    voice_names[i] = voice_col[i] or ""
+                    wav_path = os.path.join(cache_dir, f"{i}.wav")
+                    os.makedirs(cache_dir, exist_ok=True)
+                    with open(wav_path, "wb") as f:
+                        f.write(raw["bytes"])
+                    audio_data[i] = wav_path
+                elif isinstance(raw, dict) and raw.get("path") and os.path.exists(raw["path"]):
+                    audio_data[i] = raw["path"]
+            if voice_col is not None and i not in needs_tts:
+                voice_names[i] = voice_col[i] or ""
 
     return audio_data, voice_names
 
 
-def _synthesize_missing(combined, needs_tts, audio_data, voice_names, workers, rate_limit):
-    """Run TTS synthesis for all rows that lack audio.
+def _synthesize_missing(combined, needs_tts, audio_data, voice_names, workers, rate_limit, output_path):
+    """Run TTS synthesis, writing each WAV to disk immediately.
 
-    Uses a thread pool with rate-limited submission to stay within
-    GCP Cloud TTS API quotas.
+    Audio bytes are written to {output_path}/.audio_cache/{idx}.wav as they
+    arrive, keeping RAM usage constant regardless of dataset size. The
+    audio_data list stores file paths (not bytes) for later assembly.
     """
     if not needs_tts:
         return
 
     from google.cloud import texttospeech
 
+    cache_dir = os.path.join(output_path, ".audio_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+
     queries_to_synth = [(i, combined[i]["query"]) for i in sorted(needs_tts)]
     logger.info(f"Synthesizing TTS for {len(queries_to_synth)} rows with {workers} workers...")
+    logger.info(f"  Audio cache: {cache_dir}/")
 
     def _worker(item):
         idx, query = item
@@ -224,7 +256,10 @@ def _synthesize_missing(combined, needs_tts, audio_data, voice_names, workers, r
             for future in as_completed(futures):
                 idx, wav_bytes, voice_name, err = future.result()
                 if wav_bytes is not None:
-                    audio_data[idx] = wav_bytes
+                    wav_path = os.path.join(cache_dir, f"{idx}.wav")
+                    with open(wav_path, "wb") as f:
+                        f.write(wav_bytes)
+                    audio_data[idx] = wav_path
                     voice_names[idx] = voice_name
                     success += 1
                 else:
@@ -244,16 +279,28 @@ def _backfill_voice_names(voice_names):
 
 
 def _build_and_save(combined, audio_data, voice_names, output_path):
-    """Assemble the unified HF Dataset and save to disk.
+    """Assemble the unified HF Dataset from file paths and save to disk.
+
+    audio_data entries are file paths (str) or None. Each file is read
+    one at a time during assembly to avoid loading all audio into RAM.
 
     Returns:
         The saved Dataset.
     """
     n = len(combined)
-    logger.info("Building unified HF Dataset...")
+    has_audio = sum(1 for x in audio_data if x is not None)
+    logger.info(f"Building unified HF Dataset... ({has_audio}/{n} with audio)")
+
+    audio_column = []
+    for path in audio_data:
+        if path is not None and os.path.exists(path):
+            audio_column.append(path)
+        else:
+            audio_column.append(None)
+
     ds_dict = {
         "query": [combined[i]["query"] for i in range(n)],
-        "audio": audio_data,
+        "audio": audio_column,
         "tools": [combined[i]["tools"] for i in range(n)],
         "answers": [combined[i]["answers"] for i in range(n)],
         "source": [combined[i]["source"] for i in range(n)],
@@ -269,41 +316,19 @@ def _build_and_save(combined, audio_data, voice_names, output_path):
     return unified
 
 
-def _train_and_save_tokenizer(max_samples):
-    """Train a SentencePiece tokenizer on the unified dataset."""
-    from src.data import train_tokenizer, TOKENIZER_PREFIX
-    logger.info("Training tokenizer on unified dataset...")
-    model_path = train_tokenizer(max_samples=max_samples)
-    logger.info(f"Tokenizer ready at {model_path}")
-
-
 def _upload_to_gcs(output_path, gcs_upload):
-    """Upload the dataset and tokenizer to GCS via gcloud CLI."""
-    from src.data import TOKENIZER_PREFIX
-
+    """Upload the dataset to GCS via gcloud CLI."""
     logger.info(f"Uploading dataset to {gcs_upload}...")
+    import glob as globmod
+    files = globmod.glob(os.path.join(output_path, "*"))
     result = subprocess.run(
-        ["gcloud", "storage", "cp", "-r", output_path, gcs_upload],
+        ["gcloud", "storage", "cp"] + files + [gcs_upload + "/"],
         capture_output=True, text=True,
     )
     if result.returncode == 0:
         logger.info(f"Dataset upload complete: {gcs_upload}")
     else:
         logger.error(f"Dataset upload failed: {result.stderr}")
-        sys.exit(1)
-
-    gcs_bucket = gcs_upload.rsplit("/", 1)[0]
-    gcs_tokenizer_path = f"{gcs_bucket}/tokenizer/"
-    logger.info(f"Uploading tokenizer to {gcs_tokenizer_path}...")
-    tokenizer_dir = os.path.dirname(TOKENIZER_PREFIX)
-    result = subprocess.run(
-        ["gcloud", "storage", "cp", "-r", tokenizer_dir, gcs_tokenizer_path],
-        capture_output=True, text=True,
-    )
-    if result.returncode == 0:
-        logger.info(f"Tokenizer upload complete: {gcs_tokenizer_path}")
-    else:
-        logger.error(f"Tokenizer upload failed: {result.stderr}")
         sys.exit(1)
 
 
@@ -320,12 +345,11 @@ def main():
     args = parser.parse_args()
 
     combined, existing_ds = _load_text_dataset(args.output, args.max_samples)
-    needs_tts = _find_rows_needing_tts(combined, existing_ds)
-    audio_data, voice_names = _recover_existing_audio(existing_ds, len(combined), needs_tts)
-    _synthesize_missing(combined, needs_tts, audio_data, voice_names, args.workers, args.rate_limit)
+    needs_tts = _find_rows_needing_tts(combined, existing_ds, args.output)
+    audio_data, voice_names = _recover_existing_audio(existing_ds, len(combined), needs_tts, args.output)
+    _synthesize_missing(combined, needs_tts, audio_data, voice_names, args.workers, args.rate_limit, args.output)
     _backfill_voice_names(voice_names)
     _build_and_save(combined, audio_data, voice_names, args.output)
-    _train_and_save_tokenizer(args.max_samples)
 
     if args.gcs_upload:
         _upload_to_gcs(args.output, args.gcs_upload)

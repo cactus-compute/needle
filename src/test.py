@@ -7,14 +7,14 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from .data import get_batches, get_tokenizer, load_tool_calls, prepare_tool_call_pairs, load_tool_call_audio
+from .data import get_batches, get_tokenizer, load_tool_calls, prepare_tool_call_pairs, load_tool_call_audio, load_example_with_audio
 from .model import (
     EncoderDecoderTransformer,
     TransformerConfig,
     make_causal_mask,
     make_padding_mask,
 )
-from .run import load_checkpoint
+from .run import load_checkpoint, _get_decode_fn
 
 
 def compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, batch_size, pad_id, loss_mask=None):
@@ -54,22 +54,15 @@ def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is th
     eos_id = tokenizer.eos_token_id
 
     src_mask = make_padding_mask(enc_input, pad_id)
-    tgt_mask = make_causal_mask(max_gen_len)
+    decode_fn = _get_decode_fn(model, max_gen_len)
 
-    @jax.jit
-    def decode_step(dec_buffer, encoder_out):
-        logits = model.apply(
-            {"params": params}, dec_buffer, encoder_out,
-            self_mask=tgt_mask, method="decode",
-        )
-        return logits
-
+    # Warmup JIT
     encoder_out = model.apply(
         {"params": params}, enc_input, src_mask=src_mask, method="encode"
     )
     dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
     dec_buffer = dec_buffer.at[0, 0].set(eos_id)
-    decode_step(dec_buffer, encoder_out)
+    decode_fn(params, dec_buffer, encoder_out)
 
     tokens_generated = []
     latencies = []
@@ -83,7 +76,7 @@ def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is th
         encoder_out = model.apply(
             {"params": params}, enc_input, src_mask=src_mask, method="encode"
         )
-        logits = decode_step(dec_buffer, encoder_out)
+        logits = decode_fn(params, dec_buffer, encoder_out)
 
         num_tokens = 0
         for i in range(max_gen_len - 1):
@@ -95,7 +88,7 @@ def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is th
 
             num_tokens += 1
             dec_buffer = dec_buffer.at[0, i + 1].set(next_token)
-            logits = decode_step(dec_buffer, encoder_out)
+            logits = decode_fn(params, dec_buffer, encoder_out)
 
         elapsed = time.perf_counter() - start
         tokens_generated.append(num_tokens)
@@ -280,7 +273,7 @@ def benchmark_voice_tool_calls(model, params, tokenizer, num_samples=100, max_ge
     import json
     from .run import generate_from_audio
 
-    pairs = load_tool_call_audio("validation", max_samples=num_samples)
+    indices = load_tool_call_audio("validation", max_samples=num_samples)
 
     total = 0
     exact_match = 0
@@ -295,13 +288,14 @@ def benchmark_voice_tool_calls(model, params, tokenizer, num_samples=100, max_ge
     empty_pred = 0
     samples = []
 
-    for i, pair in enumerate(pairs):
+    for i, ds_idx in enumerate(indices):
+        pair = load_example_with_audio(ds_idx)
+        if pair["audio_array"] is None:
+            continue
         ref_text = pair["answers"]
-        audio = pair["audio_array"]
-        sr = pair["sampling_rate"]
 
         pred_text = generate_from_audio(
-            model, params, tokenizer, audio, sr=sr,
+            model, params, tokenizer, pair["audio_array"], sr=pair["sampling_rate"],
             tools=pair["tools"], max_gen_len=max_gen_len, seed=i, stream=False,
         ).strip()
 
@@ -387,7 +381,7 @@ def main(args):
 
     print(f"\nevaluating tool-call perplexity ({args.max_eval_samples} samples)...")
     ds = load_tool_calls("validation", max_samples=args.max_eval_samples)
-    enc_inputs, dec_inputs, dec_targets, loss_mask_arr = prepare_tool_call_pairs(
+    enc_inputs, dec_inputs, dec_targets, loss_mask_arr, _ = prepare_tool_call_pairs(
         ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
     ppl = compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, args.batch_size, config.pad_token_id, loss_mask=loss_mask_arr)

@@ -55,6 +55,20 @@ def main():
     p.add_argument("--max-speech-samples", type=int, default=None,
                    help="Max voice-tool-call training samples (default: all)")
 
+    p = sub.add_parser("tokenize", add_help=False)
+    p.add_argument("--max-samples", type=int, default=None,
+                   help="Limit samples per split (for dev/test)")
+    p.add_argument("--cleanup", action="store_true",
+                   help="Delete local .data_cache/ after GCS upload")
+    p.add_argument("--n-mels", type=int, default=80,
+                   help="Number of mel frequency bins (default: 80)")
+    p.add_argument("--max-mel-len", type=int, default=1024,
+                   help="Max mel spectrogram frames (default: 1024)")
+    p.add_argument("--max-enc-len", type=int, default=256,
+                   help="Max encoder sequence length (default: 256)")
+    p.add_argument("--max-dec-len", type=int, default=1024,
+                   help="Max decoder sequence length (default: 1024)")
+
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--query", type=str, default=None, help="Query text for tool-call generation")
@@ -119,7 +133,10 @@ def main():
         print(HELP)
         sys.exit(0)
 
-    if args.command == "train":
+    if args.command == "tokenize":
+        from .tokenize_data import tokenize
+        tokenize(args)
+    elif args.command == "train":
         if getattr(args, "full", False):
             args.d_model = 1536
             args.num_heads = 24
