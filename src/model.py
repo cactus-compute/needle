@@ -46,6 +46,7 @@ class TransformerConfig:
     activation: str = "drelu"
     num_memory_slots: int = 64
     n_mels: int = 80
+    dropout_rate: float = 0.1
 
     @property
     def jax_dtype(self):
@@ -180,24 +181,27 @@ class MemoryMixerBlock(nn.Module):
     num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
+    dropout_rate: float = 0.0
 
     @nn.compact
-    def __call__(self, x, s, mask=None, rope=None, ffn_mask=None):
+    def __call__(self, x, s, mask=None, rope=None, ffn_mask=None, deterministic=True):
         s_norm = ZCRMSNorm(dtype=self.dtype, name="pack_s_norm")(s)
         x_norm = ZCRMSNorm(dtype=self.dtype, name="pack_x_norm")(x)
-        s = s + MultiHeadAttention(
+        pack_out = MultiHeadAttention(
             self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype,
             rope_keys_only=True, name="pack_attn"
         )(s_norm, x_norm, mask=mask, rope=rope)
+        s = s + nn.Dropout(rate=self.dropout_rate)(pack_out, deterministic=deterministic)
 
-        s = s + MLPMixer(self.num_slots, self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation, name="mixer")(
+        mix_out = MLPMixer(self.num_slots, self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation, name="mixer")(
             ZCRMSNorm(dtype=self.dtype, name="mix_norm")(s), ffn_mask=ffn_mask
         )
+        s = s + nn.Dropout(rate=self.dropout_rate)(mix_out, deterministic=deterministic)
 
         residual = x
         x = ZCRMSNorm(dtype=self.dtype, name="local_norm")(x)
         x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation, name="local_ffn")(x, ffn_mask=ffn_mask)
-        x = x + residual
+        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic) + residual
 
         return x, s
 
@@ -207,7 +211,7 @@ class MemoryMixerEncoder(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, x, mask=None, rope=None, ffn_mask=None):
+    def __call__(self, x, mask=None, rope=None, ffn_mask=None, deterministic=True):
         cfg = self.config
         dt = cfg.jax_dtype
         x = x.astype(dt)
@@ -231,10 +235,10 @@ class MemoryMixerEncoder(nn.Module):
             mask = mask[..., :T_new]
 
         for i in range(cfg.num_encoder_layers):
-            x, s = nn.remat(MemoryMixerBlock)(
+            x, s = nn.remat(MemoryMixerBlock, static_argnums=(6,))(
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
-                cfg.num_memory_slots, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
-            )(x, s, mask=mask, rope=rope, ffn_mask=ffn_mask)
+                cfg.num_memory_slots, cfg.total_layers, dt, cfg.activation, cfg.dropout_rate, name=f"block_{i}"
+            )(x, s, mask, rope, ffn_mask, deterministic)
 
         s = ZCRMSNorm(dtype=dt, name="final_norm")(s)
         return s
@@ -248,27 +252,28 @@ class DecoderBlock(nn.Module):
     num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
+    dropout_rate: float = 0.0
 
     @nn.compact
-    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, ffn_mask=None):
+    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, ffn_mask=None, deterministic=True):
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
         x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
             x, x, mask=self_mask, rope=rope
         )
-        x = x + residual
+        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic) + residual
 
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
         x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="cross_attn")(
             x, encoder_out, mask=cross_mask
         )
-        x = x + residual
+        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic) + residual
 
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
         x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x, ffn_mask=ffn_mask)
-        x = x + residual
+        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic) + residual
 
         return x
 
@@ -278,15 +283,15 @@ class Decoder(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, ffn_mask=None):
+    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, ffn_mask=None, deterministic=True):
         cfg = self.config
         dt = cfg.jax_dtype
         x = x.astype(dt)
 
         for i in range(cfg.num_decoder_layers):
-            x = nn.remat(DecoderBlock)(
-                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
-            )(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, ffn_mask=ffn_mask)
+            x = nn.remat(DecoderBlock, static_argnums=(7,))(
+                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation, cfg.dropout_rate, name=f"block_{i}"
+            )(x, encoder_out, self_mask, cross_mask, rope, ffn_mask, deterministic)
 
         x = ZCRMSNorm(dtype=dt)(x)
         return x
@@ -344,10 +349,10 @@ class EncoderDecoderTransformer(nn.Module):
         head_dim = self.config.d_model // self.config.num_heads
         return precompute_rope_freqs(head_dim, seq_len, self.config.rope_theta)
 
-    def encode_text(self, src, src_mask=None, ffn_mask=None):
+    def encode_text(self, src, src_mask=None, ffn_mask=None, deterministic=True):
         x = self.embedding(src) * self.embed_scale
         rope = self._rope(src.shape[1])
-        return self.encoder(x, mask=src_mask, rope=rope, ffn_mask=ffn_mask)
+        return self.encoder(x, mask=src_mask, rope=rope, ffn_mask=ffn_mask, deterministic=deterministic)
 
     def encode(self, src, src_mask=None):
         """Backward-compatible alias for encode_text."""
@@ -357,13 +362,13 @@ class EncoderDecoderTransformer(nn.Module):
         mel = self.spec_augment(mel, deterministic=deterministic)
         x = self.mel_proj(mel) * self.embed_scale
         rope = self._rope(x.shape[1])
-        return self.encoder(x, mask=src_mask, rope=rope, ffn_mask=ffn_mask)
+        return self.encoder(x, mask=src_mask, rope=rope, ffn_mask=ffn_mask, deterministic=deterministic)
 
-    def decode(self, tgt, encoder_out, self_mask=None):
+    def decode(self, tgt, encoder_out, self_mask=None, deterministic=True):
         """Decode from encoder memory slots. No cross_mask needed (fixed-size slots)."""
         x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
-        x = self.decoder(x, encoder_out, self_mask=self_mask, cross_mask=None, rope=rope)
+        x = self.decoder(x, encoder_out, self_mask=self_mask, cross_mask=None, rope=rope, deterministic=deterministic)
         logits = x.astype(jnp.float32) @ self.embedding.embedding.T
         return logits
 
@@ -372,11 +377,11 @@ class EncoderDecoderTransformer(nn.Module):
         logits = self.decode(tgt, encoder_out, self_mask=tgt_mask)
         return logits
 
-    def _run_decoder(self, encoder_out, tgt, tgt_mask=None, ffn_mask=None):
+    def _run_decoder(self, encoder_out, tgt, tgt_mask=None, ffn_mask=None, deterministic=True):
         """Run decoder and return float32 hidden states."""
         x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
-        x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=None, rope=rope, ffn_mask=ffn_mask)
+        x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=None, rope=rope, ffn_mask=ffn_mask, deterministic=deterministic)
         return x.astype(jnp.float32)
 
     def _slot_diversity(self, encoder_out):
@@ -385,10 +390,10 @@ class EncoderDecoderTransformer(nn.Module):
         diag_sq = jnp.sum(jnp.diagonal(gram, axis1=1, axis2=2) ** 2)
         return (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
 
-    def forward_masked(self, src, tgt, src_mask=None, tgt_mask=None, ffn_mask=None):
+    def forward_masked(self, src, tgt, src_mask=None, tgt_mask=None, ffn_mask=None, deterministic=True):
         """Single forward with per-batch-item FFN masking. Returns (logits, slot_div)."""
-        encoder_out = self.encode_text(src, src_mask=src_mask, ffn_mask=ffn_mask)
-        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, ffn_mask=ffn_mask)
+        encoder_out = self.encode_text(src, src_mask=src_mask, ffn_mask=ffn_mask, deterministic=deterministic)
+        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, ffn_mask=ffn_mask, deterministic=deterministic)
         logits = x_f32 @ self.embedding.embedding.T
         slot_div = self._slot_diversity(encoder_out)
         return logits, slot_div
@@ -396,7 +401,7 @@ class EncoderDecoderTransformer(nn.Module):
     def forward_speech_masked(self, mel, tgt, src_mask=None, tgt_mask=None, ffn_mask=None, deterministic=True):
         """Single speech forward with per-batch-item FFN masking. Returns (logits, slot_div)."""
         encoder_out = self.encode_speech(mel, src_mask=src_mask, ffn_mask=ffn_mask, deterministic=deterministic)
-        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, ffn_mask=ffn_mask)
+        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, ffn_mask=ffn_mask, deterministic=deterministic)
         logits = x_f32 @ self.embedding.embedding.T
         slot_div = self._slot_diversity(encoder_out)
         return logits, slot_div

@@ -229,7 +229,7 @@ _MAT_FF_WIDTHS = ()
 _D_FF = 2048 
 
 
-def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, loss_mask):
+def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
     pad_id = 0
     src_mask = make_padding_mask(src, pad_id)
     tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
@@ -237,7 +237,9 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, lo
         {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
         src, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask,
         ffn_mask=ffn_mask,
+        deterministic=False,
         method="forward_masked",
+        rngs={"dropout": rng},
     )
     logits_f32 = logits.astype(jnp.float32)
     mask = loss_mask
@@ -253,13 +255,14 @@ def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, ffn_mask, 
     pad_id = 0
     src_mask = make_mel_padding_mask(mel)
     tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+    spec_rng, drop_rng = jax.random.split(rng)
     logits, slot_div = state.apply_fn(
         {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
         mel, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask,
         ffn_mask=ffn_mask,
         deterministic=False,
         method="forward_speech_masked",
-        rngs={"specaugment": rng},
+        rngs={"specaugment": spec_rng, "dropout": drop_rng},
     )
     logits_f32 = logits.astype(jnp.float32)
     mask = loss_mask
@@ -289,10 +292,10 @@ def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
     return jnp.concatenate(rows, axis=0)
 
 
-def _train_step_text(state, ema_params, src, tgt_in, tgt_out, causal_mask, ffn_mask, loss_mask):
+def _train_step_text(state, ema_params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
     ema_decay = 0.999
     loss, grads = jax.value_and_grad(
-        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, loss_mask)
+        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -302,11 +305,11 @@ def _train_step_text(state, ema_params, src, tgt_in, tgt_out, causal_mask, ffn_m
     return state, ema_params, loss, grad_norm
 
 
-def _train_step_text_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask, loss_mask):
+def _train_step_text_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask, rng, loss_mask):
     """Text training step with fused prune mask application."""
     ema_decay = 0.999
     loss, grads = jax.value_and_grad(
-        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, loss_mask)
+        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
@@ -514,6 +517,7 @@ def train(args):
             activation=getattr(args, "activation", "drelu"),
             num_memory_slots=getattr(args, "num_memory_slots", 64),
             n_mels=n_mels,
+            dropout_rate=getattr(args, "dropout", 0.1),
         )
 
     global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF
@@ -573,6 +577,7 @@ def train(args):
     print(f"  Memory slots  {config.num_memory_slots:>12}")
     print(f"  Activation    {config.activation:>12}")
     print(f"  Dtype         {config.dtype:>12}")
+    print(f"  Dropout       {config.dropout_rate:>12}")
     if not no_speech and train_mels is not None:
         print(f"  Speech        {speech_batches_per_epoch} batches/epoch")
         print(f"  n_mels        {n_mels:>12}")
@@ -612,7 +617,6 @@ def train(args):
     muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
     tokens_per_batch = effective_batch_size * (args.max_enc_len + args.max_dec_len)
 
-    # Create model instance once (JIT caches persist across epochs)
     eval_model = EncoderDecoderTransformer(config)
 
     last_val_ppl = None
@@ -690,13 +694,16 @@ def train(args):
                     tgt_out_b = shard_batch(tgt_out, num_devices)
                     lm_b = shard_batch(lm, num_devices)
 
+                rng, text_rng = jax.random.split(rng)
+                text_rngs = jax.random.split(text_rng, num_devices)
+
                 if prune_mask is not None:
                     state, ema_params, loss, grad_norm = p_train_step_masked(
-                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask, text_ffn_mask, lm_b,
+                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask, text_ffn_mask, text_rngs, lm_b,
                     )
                 else:
                     state, ema_params, loss, grad_norm = p_train_step(
-                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_ffn_mask, lm_b,
+                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_ffn_mask, text_rngs, lm_b,
                     )
 
                 text_loss_val = float(loss[0])
@@ -856,7 +863,6 @@ def train(args):
             mat_results[f] = (float(math.exp(min(avg, 20))),
                               _estimate_mat_params(config, f), config.d_ff // f)
 
-        # --- Speech val PPL (separate pass — different data) ---
         speech_val_ppl = None
         if speech_vl_fn is not None and val_mels is not None:
             sp_total_loss, sp_total_toks = 0.0, 0.0
@@ -888,7 +894,9 @@ def train(args):
         _val_start = int(len(_ds_full) * 0.9)
         val_kept = val_data["kept_indices"]
         n_eval_samples = min(3, len(val_kept))
-        eval_indices = val_kept[:n_eval_samples] + _val_start
+        step = max(1, len(val_kept) // n_eval_samples)
+        sample_indices = [val_kept[i * step] for i in range(n_eval_samples)]
+        eval_indices = np.array(sample_indices) + _val_start
 
         unified_samples = []
         for i, ds_idx in enumerate(eval_indices):

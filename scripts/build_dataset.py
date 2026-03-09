@@ -30,9 +30,6 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 VOICES = [
-    ("en-US", "en-US-Journey-D", "MALE", False, False),
-    ("en-US", "en-US-Journey-F", "FEMALE", False, False),
-    ("en-US", "en-US-Journey-O", "FEMALE", False, False),
     ("en-GB", "en-GB-Wavenet-B", "MALE", True, False),
     ("en-GB", "en-GB-Wavenet-A", "FEMALE", True, False),
     ("en-AU", "en-AU-Wavenet-B", "MALE", True, False),
@@ -336,10 +333,10 @@ def main():
     """Entry point for the unified dataset build pipeline."""
     parser = argparse.ArgumentParser(description="Build unified tool-call dataset with TTS audio")
     parser.add_argument("--max-samples", type=int, default=None, help="Max samples to process")
-    parser.add_argument("--workers", type=int, default=16, help="TTS concurrent workers (default: 16)")
+    parser.add_argument("--workers", type=int, default=8, help="TTS concurrent workers (default: 8)")
     parser.add_argument("--output", type=str, default="data/tool_calls_unified", help="Output directory")
-    parser.add_argument("--rate-limit", type=float, default=100.0,
-                        help="Max TTS requests per second (default: 100)")
+    parser.add_argument("--rate-limit", type=float, default=15.0,
+                        help="Max TTS requests per second (default: 15, quota is 1000/min)")
     parser.add_argument("--gcs-upload", type=str, default=None,
                         help="GCS path to upload dataset (e.g. gs://cactus-dataset/tool_calls)")
     args = parser.parse_args()
