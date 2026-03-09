@@ -70,6 +70,8 @@ def main():
                    help="Max encoder sequence length (default: 256)")
     p.add_argument("--max-dec-len", type=int, default=1024,
                    help="Max decoder sequence length (default: 1024)")
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="Process in batches of this size, uploading shards to GCS incrementally")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
