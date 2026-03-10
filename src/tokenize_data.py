@@ -68,7 +68,11 @@ def tokenize(args):
 
     for split in ("train", "val"):
         print(f"\n--- {split} split ---")
-        ds = load_tool_calls(split=split, max_samples=args.max_samples)
+        ds, global_indices = load_tool_calls(
+            split=split,
+            max_samples=args.max_samples,
+            return_global_indices=True,
+        )
         _, _, _, _, kept_indices = prepare_tool_call_pairs(
             ds, tokenizer, max_enc_len=max_enc_len, max_dec_len=max_dec_len,
             batch_size=batch_size,
@@ -76,7 +80,7 @@ def tokenize(args):
         text_cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len)
 
         mel_cache_id = precompute_mels(
-            kept_indices, n_mels=n_mels, max_mel_len=max_mel_len,
+            global_indices[kept_indices], n_mels=n_mels, max_mel_len=max_mel_len,
             cache_id_prefix=split, batch_size=batch_size,
         )
 

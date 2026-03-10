@@ -280,16 +280,31 @@ def _gcs_download_shards(cache_id, n_shards, shard_suffixes):
     return True
 
 
-def load_tool_calls(split="train", max_samples=None):
-    """Load tool-calling dataset, splitting 90/10 for train/val."""
+def load_tool_calls(split="train", max_samples=None, return_global_indices=False):
+    """Load tool-calling dataset, splitting 90/10 for train/val.
+
+    If return_global_indices is True, also return a numpy array mapping each
+    split-local row position back to its row id in the full unified dataset.
+    """
     ds = _load_unified_dataset()
     n = len(ds)
     if split in ("validation", "val", "test"):
-        ds = ds.select(range(int(n * 0.9), n))
+        start, end = int(n * 0.9), n
     elif split == "train":
-        ds = ds.select(range(int(n * 0.9)))
+        start, end = 0, int(n * 0.9)
+    else:
+        start, end = 0, n
+
+    global_indices = np.arange(start, end, dtype=np.int64)
+    ds = ds.select(range(start, end))
+
     if max_samples:
-        ds = ds.select(range(min(max_samples, len(ds))))
+        limit = min(max_samples, len(ds))
+        ds = ds.select(range(limit))
+        global_indices = global_indices[:limit]
+
+    if return_global_indices:
+        return ds, global_indices
     return ds
 
 
