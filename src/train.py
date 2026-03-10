@@ -891,10 +891,17 @@ def train(args):
 
         _val_start = len(enc_inputs)
         val_kept = val_data["kept_indices"]
-        n_eval_samples = min(3, len(val_kept))
-        step = max(1, len(val_kept) // n_eval_samples)
-        sample_indices = [val_kept[i * step] for i in range(n_eval_samples)]
-        eval_indices = np.array(sample_indices) + _val_start
+        n_eval_samples = 3
+        # Find samples with non-empty tool calls for representative eval
+        eval_indices = []
+        step = max(1, len(val_kept) // (n_eval_samples * 10))
+        for k in range(0, len(val_kept), step):
+            ds_idx = int(val_kept[k]) + _val_start
+            pair = load_example_with_audio(ds_idx)
+            if pair["answers"].strip() not in ("", "[]"):
+                eval_indices.append(ds_idx)
+                if len(eval_indices) >= n_eval_samples:
+                    break
 
         unified_samples = []
         for i, ds_idx in enumerate(eval_indices):
