@@ -181,6 +181,7 @@ def tpu_create(args):
              "--zone", zone,
              "--accelerator-type", args.accel_type,
              "--version", version,
+             "--data-disk-size", str(args.disk_size),
              "--project", PROJECT],
             check=False, capture=True,
         )
