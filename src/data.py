@@ -3,6 +3,7 @@ import json as _json
 import multiprocessing as mp
 import os
 import queue
+import subprocess
 import threading
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
@@ -13,7 +14,7 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 import numpy as np
-from datasets import Audio, load_from_disk
+from datasets import Audio, Dataset, concatenate_datasets, load_from_disk
 from tqdm import tqdm
 import sentencepiece as spm
 
@@ -23,6 +24,10 @@ TOKENIZER_DIR = os.path.join(_PROJECT_ROOT, "tokenizer")
 TOKENIZER_PREFIX = os.path.join(TOKENIZER_DIR, "needle")
 LOCAL_UNIFIED_DIR = os.path.join(_PROJECT_ROOT, "data", "tool_calls_unified")
 GCS_DATASET_PATH = "gs://cactus-dataset/tool_calls"
+JSONL_DATASET_PATHS = [
+    "gs://needle-datasets-bucket/datasets/xlam/openai_jsonl_v1/xlam_openai_jsonl/train",
+    "gs://needle-datasets-bucket/datasets/toucan/openai_jsonl_v1/toucan_openai_jsonl/train",
+]
 
 _MIN_SHM_BYTES = 200 * 1024**3 
 
@@ -56,6 +61,57 @@ TRANSCRIBE_ID = 5
 _unified_dataset_cache = None
 
 
+def _load_jsonl_shards(gcs_paths):
+    rows = []
+    for gcs_path in gcs_paths:
+        try:
+            result = subprocess.run(
+                ["gcloud", "storage", "ls", f"{gcs_path}/*.jsonl"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            shard_uris = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        except Exception as e:
+            print(f"Warning: could not list shards at {gcs_path}: {e}")
+            continue
+
+        for uri in shard_uris:
+            fname = os.path.basename(uri)
+            local_path = os.path.join(CACHE_DIR, fname)
+            try:
+                subprocess.run(
+                    ["gcloud", "storage", "cp", uri, local_path],
+                    capture_output=True,
+                    check=True,
+                )
+            except Exception as e:
+                print(f"Warning: could not download {uri}: {e}")
+                continue
+
+            with open(local_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = _json.loads(line)
+                    except Exception:
+                        continue
+                    messages = record.get("messages", [])
+                    query = messages[0]["content"] if messages else ""
+                    tool_calls = messages[1].get("tool_calls") if len(messages) > 1 else None
+                    rows.append({
+                        "query": query,
+                        "tools": _json.dumps(record.get("tools", [])),
+                        "answers": _json.dumps(tool_calls if tool_calls is not None else []),
+                    })
+
+    if not rows:
+        return None
+    return Dataset.from_list(rows)
+
+
 def _load_unified_dataset():
     """Load the unified dataset from GCS (via gcsfs) or local fallback.
 
@@ -80,16 +136,24 @@ def _load_unified_dataset():
     try:
         ds = load_from_disk(GCS_DATASET_PATH)
         print(f"Loaded unified dataset from GCS ({len(ds)} rows)")
-        _unified_dataset_cache = _set_audio_backend(ds)
-        return _unified_dataset_cache
+        ds = _set_audio_backend(ds)
     except Exception as e:
-        gcs_err = e
+        raise FileNotFoundError(
+            f"Unified dataset not found. Run scripts/build_dataset.py first, "
+            f"or ensure GCS path {GCS_DATASET_PATH} is accessible (pip install gcsfs). "
+            f"GCS error: {e}"
+        )
 
-    raise FileNotFoundError(
-        f"Unified dataset not found. Run scripts/build_dataset.py first, "
-        f"or ensure GCS path {GCS_DATASET_PATH} is accessible (pip install gcsfs). "
-        f"GCS error: {gcs_err}"
-    )
+    try:
+        jsonl_ds = _load_jsonl_shards(JSONL_DATASET_PATHS)
+        if jsonl_ds is not None:
+            ds = concatenate_datasets([ds, jsonl_ds])
+            print(f"Concatenated JSONL shards: total {len(ds)} rows")
+    except Exception as e:
+        print(f"Warning: failed to load JSONL shards, continuing with Arrow only: {e}")
+
+    _unified_dataset_cache = ds
+    return _unified_dataset_cache
 
 
 def _set_audio_backend(ds):
@@ -392,6 +456,15 @@ def _load_cache_metadata(split):
     return None
 
 
+def _tools_to_names(tools_json):
+    try:
+        tools = _json.loads(tools_json) if isinstance(tools_json, str) else tools_json
+        names = [t["function"]["name"] for t in tools if t.get("function", {}).get("name")]
+        return _json.dumps(names)
+    except Exception:
+        return tools_json
+
+
 def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=256, max_dec_len=1024, batch_size=None):
     """Prepare tool-call encoder-decoder pairs with <tool_call> task token.
 
@@ -447,7 +520,7 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=256, max_dec_len=1024, ba
     tool_call_id = tokenizer.tool_call_token_id
 
     enc_texts = [ex["query"] for ex in ds]
-    tools_texts = [ex["tools"] for ex in ds]
+    tools_texts = [_tools_to_names(ex["tools"]) for ex in ds]
     ans_texts = [ex["answers"] for ex in ds]
 
     num_workers = min(os.cpu_count() or 1, 8)
