@@ -280,28 +280,22 @@ def _gcs_download_shards(cache_id, n_shards, shard_suffixes):
     return True
 
 
-def load_tool_calls(split="train", max_samples=None, return_global_indices=False):
+def load_tool_calls(split="train", max_samples=None, return_global_indices=False,
+                    shuffle_before_split=False, shuffle_seed=42):
     """Load tool-calling dataset, splitting 90/10 for train/val.
 
     If return_global_indices is True, also return a numpy array mapping each
     split-local row position back to its row id in the full unified dataset.
     """
     ds = _load_unified_dataset()
-    n = len(ds)
-    if split in ("validation", "val", "test"):
-        start, end = int(n * 0.9), n
-    elif split == "train":
-        start, end = 0, int(n * 0.9)
-    else:
-        start, end = 0, n
-
-    global_indices = np.arange(start, end, dtype=np.int64)
-    ds = ds.select(range(start, end))
-
-    if max_samples:
-        limit = min(max_samples, len(ds))
-        ds = ds.select(range(limit))
-        global_indices = global_indices[:limit]
+    global_indices = _split_global_indices(
+        len(ds),
+        split=split,
+        max_samples=max_samples,
+        shuffle_before_split=shuffle_before_split,
+        shuffle_seed=shuffle_seed,
+    )
+    ds = ds.select(global_indices.tolist())
 
     if return_global_indices:
         return ds, global_indices
@@ -329,8 +323,30 @@ def _mel_cache_key(prefix, n_samples, n_mels, max_mel_len):
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
+def _split_global_indices(n, split="train", max_samples=None,
+                          shuffle_before_split=False, shuffle_seed=42):
+    """Return global row ids for the requested split of the unified dataset."""
+    if shuffle_before_split:
+        indices = np.random.default_rng(shuffle_seed).permutation(n).astype(np.int64)
+    else:
+        indices = np.arange(n, dtype=np.int64)
+
+    cut = int(n * 0.9)
+    if split in ("validation", "val", "test"):
+        indices = indices[cut:]
+    elif split == "train":
+        indices = indices[:cut]
+
+    if max_samples:
+        indices = indices[:min(max_samples, len(indices))]
+
+    return indices
+
+
 def _save_cache_metadata(split, text_cache_id, mel_cache_id, n_samples,
-                         max_enc_len, max_dec_len, n_mels, max_mel_len):
+                         max_enc_len, max_dec_len, n_mels, max_mel_len,
+                         split_max_samples=None, shuffle_before_split=False,
+                         split_seed=42):
     """Save metadata JSON for a split, upload to GCS."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     meta = {
@@ -342,6 +358,9 @@ def _save_cache_metadata(split, text_cache_id, mel_cache_id, n_samples,
         "max_dec_len": max_dec_len,
         "n_mels": n_mels,
         "max_mel_len": max_mel_len,
+        "split_max_samples": split_max_samples,
+        "shuffle_before_split": shuffle_before_split,
+        "split_seed": split_seed,
     }
     meta_path = os.path.join(CACHE_DIR, f"{split}_metadata.json")
     with open(meta_path, "w") as f:
@@ -610,25 +629,20 @@ def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True, l
 
 
 
-def load_tool_call_audio(split="train", max_samples=None):
+def load_tool_call_audio(split="train", max_samples=None,
+                         shuffle_before_split=False, shuffle_seed=42):
     """Return dataset-global indices for the given split.
 
     Applies the same 90/10 split as load_tool_calls. Audio is NOT loaded into memory.
     """
     ds = _load_unified_dataset()
-    n = len(ds)
-
-    if split in ("validation", "val", "test"):
-        start, end = int(n * 0.9), n
-    elif split == "train":
-        start, end = 0, int(n * 0.9)
-    else:
-        start, end = 0, n
-
-    indices = list(range(start, end))
-    if max_samples:
-        indices = indices[:max_samples]
-    return indices
+    return _split_global_indices(
+        len(ds),
+        split=split,
+        max_samples=max_samples,
+        shuffle_before_split=shuffle_before_split,
+        shuffle_seed=shuffle_seed,
+    ).tolist()
 
 
 def load_audio_for_index(idx):
@@ -931,6 +945,9 @@ def load_prepared_data(split, mmap=False):
 
         result["kept_indices"] = np.load(cache_path + "_kept_idx.npy", mmap_mode=mmap_mode)
         result["mel_cache_id"] = meta.get("mel_cache_id")
+        result["split_max_samples"] = meta.get("split_max_samples")
+        result["shuffle_before_split"] = meta.get("shuffle_before_split", False)
+        result["split_seed"] = meta.get("split_seed", 42)
         return result
 
     tc_suffixes = ["_enc.npy", "_dec_in.npy", "_dec_tgt.npy", "_loss_mask.npy", "_kept_idx.npy"]
@@ -948,6 +965,9 @@ def load_prepared_data(split, mmap=False):
         "loss_mask": np.load(cache_path + "_loss_mask.npy", mmap_mode=mmap_mode),
         "kept_indices": np.load(cache_path + "_kept_idx.npy", mmap_mode=mmap_mode),
         "mel_cache_id": meta.get("mel_cache_id"),
+        "split_max_samples": meta.get("split_max_samples"),
+        "shuffle_before_split": meta.get("shuffle_before_split", False),
+        "split_seed": meta.get("split_seed", 42),
     }
 
 

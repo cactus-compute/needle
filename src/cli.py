@@ -72,6 +72,10 @@ def main():
                    help="Max decoder sequence length (default: 1024)")
     p.add_argument("--batch-size", type=int, default=None,
                    help="Process in batches of this size, uploading shards to GCS incrementally")
+    p.add_argument("--shuffle-before-split", action="store_true",
+                   help="Shuffle the unified dataset before splitting into train/val")
+    p.add_argument("--split-seed", type=int, default=42,
+                   help="Seed for --shuffle-before-split (default: 42)")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)

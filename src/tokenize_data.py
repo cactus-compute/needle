@@ -72,6 +72,8 @@ def tokenize(args):
             split=split,
             max_samples=args.max_samples,
             return_global_indices=True,
+            shuffle_before_split=getattr(args, "shuffle_before_split", False),
+            shuffle_seed=getattr(args, "split_seed", 42),
         )
         _, _, _, _, kept_indices = prepare_tool_call_pairs(
             ds, tokenizer, max_enc_len=max_enc_len, max_dec_len=max_dec_len,
@@ -85,7 +87,10 @@ def tokenize(args):
         )
 
         _save_cache_metadata(split, text_cache_id, mel_cache_id, len(kept_indices),
-                             max_enc_len, max_dec_len, n_mels, max_mel_len)
+                             max_enc_len, max_dec_len, n_mels, max_mel_len,
+                             split_max_samples=args.max_samples,
+                             shuffle_before_split=getattr(args, "shuffle_before_split", False),
+                             split_seed=getattr(args, "split_seed", 42))
 
     if args.cleanup and os.path.exists(CACHE_DIR):
         print(f"\n=== Cleaning up {CACHE_DIR}/ ===")

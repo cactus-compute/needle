@@ -889,14 +889,19 @@ def train(args):
         from .run import generate, generate_from_audio
         tp = measure_throughput(eval_model, eval_params, tokenizer, num_runs=5)
 
-        from .data import _load_unified_dataset
-        _ds_full = _load_unified_dataset()
-        _val_start = int(len(_ds_full) * 0.9)
+        from .data import load_tool_calls
+        _, val_global_indices = load_tool_calls(
+            "validation",
+            max_samples=val_data.get("split_max_samples"),
+            return_global_indices=True,
+            shuffle_before_split=val_data.get("shuffle_before_split", False),
+            shuffle_seed=val_data.get("split_seed", 42),
+        )
         val_kept = val_data["kept_indices"]
         n_eval_samples = min(3, len(val_kept))
         step = max(1, len(val_kept) // n_eval_samples)
         sample_indices = [val_kept[i * step] for i in range(n_eval_samples)]
-        eval_indices = np.array(sample_indices) + _val_start
+        eval_indices = val_global_indices[np.array(sample_indices)]
 
         unified_samples = []
         for i, ds_idx in enumerate(eval_indices):
@@ -978,5 +983,4 @@ def train(args):
     if use_wandb:
         wandb.finish()
     print("\nTraining complete.")
-
 
