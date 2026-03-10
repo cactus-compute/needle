@@ -9,7 +9,7 @@ Pipeline:
 2. Keep language-matching rows (default: English only).
 3. Decode audio, resample, compute log-mel features.
 4. Upload audio + mel `.npy` files to GCS.
-5. Write/upload CSV metadata manifest.
+5. Write/upload sharded CSV metadata manifests.
 """
 
 from __future__ import annotations
@@ -343,6 +343,103 @@ def _create_storage_client(project: str | None, pool_size: int) -> storage.Clien
     return client
 
 
+class MetadataShardWriter:
+    """Write metadata rows to local CSV shards and optionally upload each shard."""
+
+    def __init__(
+        self,
+        fieldnames: list[str],
+        local_dir: str,
+        base_name: str,
+        shard_size: int,
+        bucket: storage.Bucket | None,
+        gcs_prefix: str,
+        dry_run: bool,
+    ) -> None:
+        self.fieldnames = fieldnames
+        self.local_dir = local_dir
+        self.base_name = base_name
+        self.shard_size = max(1, int(shard_size))
+        self.bucket = bucket
+        self.gcs_prefix = gcs_prefix.strip("/")
+        self.dry_run = dry_run
+
+        self.current_shard_idx = 0
+        self.rows_in_current_shard = 0
+        self.total_rows = 0
+        self.local_paths: list[str] = []
+        self.gcs_uris: list[str] = []
+
+        self._fp = None
+        self._writer = None
+        self._current_path = ""
+        self._open_new_shard()
+
+    def _shard_filename(self, shard_idx: int) -> str:
+        return f"{self.base_name}-part-{shard_idx:06d}.csv"
+
+    def _open_new_shard(self) -> None:
+        filename = self._shard_filename(self.current_shard_idx)
+        self._current_path = os.path.join(self.local_dir, filename)
+        self._fp = open(self._current_path, "w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._fp, fieldnames=self.fieldnames)
+        self._writer.writeheader()
+        self.rows_in_current_shard = 0
+
+    def _close_current_shard(self) -> None:
+        if self._fp is None:
+            return
+
+        self._fp.flush()
+        self._fp.close()
+
+        if self.rows_in_current_shard == 0:
+            if os.path.exists(self._current_path):
+                os.remove(self._current_path)
+            self._fp = None
+            self._writer = None
+            return
+
+        self.local_paths.append(self._current_path)
+        uploaded_uri = ""
+        if not self.dry_run and self.bucket is not None:
+            blob_path = f"{self.gcs_prefix}/{os.path.basename(self._current_path)}"
+            uploaded_uri = _upload_file(
+                bucket=self.bucket,
+                blob_path=blob_path,
+                filename=self._current_path,
+                content_type="text/csv",
+            )
+            self.gcs_uris.append(uploaded_uri)
+
+        logger.info(
+            "Metadata shard closed: file=%s rows=%s%s",
+            os.path.basename(self._current_path),
+            self.rows_in_current_shard,
+            f" uri={uploaded_uri}" if uploaded_uri else "",
+        )
+
+        self._fp = None
+        self._writer = None
+
+    def write_row(self, row: dict[str, Any]) -> None:
+        if self._writer is None or self._fp is None:
+            self._open_new_shard()
+
+        self._writer.writerow(row)
+        self.rows_in_current_shard += 1
+        self.total_rows += 1
+        self._fp.flush()
+
+        if self.rows_in_current_shard >= self.shard_size:
+            self._close_current_shard()
+            self.current_shard_idx += 1
+            self._open_new_shard()
+
+    def close(self) -> None:
+        self._close_current_shard()
+
+
 def _process_one(
     sample: dict[str, Any],
     source_index: int,
@@ -518,8 +615,26 @@ def _parse_args() -> argparse.Namespace:
         default=True,
         help="Upload source audio objects to GCS (default: true).",
     )
-    parser.add_argument("--csv-name", default=None, help="Output CSV filename in GCS.")
-    parser.add_argument("--local-csv-path", default=None, help="Optional local CSV output path.")
+    parser.add_argument(
+        "--metadata-shard-size",
+        type=int,
+        default=1000,
+        help="Metadata CSV rows per shard before rotation (default: 1000).",
+    )
+    parser.add_argument(
+        "--csv-name",
+        default=None,
+        help="Metadata base name (with or without .csv) used for shard filenames.",
+    )
+    parser.add_argument(
+        "--local-csv-path",
+        default=None,
+        help=(
+            "Optional local metadata output path. "
+            "If it ends with .csv, parent dir is used and filename stem becomes base name. "
+            "Otherwise it's treated as output directory."
+        ),
+    )
     parser.add_argument("--num-shards", type=int, default=1, help="Logical number of shards.")
     parser.add_argument("--shard-index", type=int, default=0, help="Shard index for this process.")
     parser.add_argument(
@@ -542,10 +657,35 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_metadata_output(args: argparse.Namespace) -> tuple[str, str]:
+    """Return (local_dir, base_name) for metadata shard output."""
+    if args.csv_name:
+        base_name = Path(args.csv_name).name
+        if base_name.lower().endswith(".csv"):
+            base_name = base_name[:-4]
+    elif args.num_shards > 1:
+        base_name = f"metadata-shard-{args.shard_index:03d}-of-{args.num_shards:03d}"
+    else:
+        base_name = "metadata"
+
+    if args.local_csv_path:
+        p = Path(args.local_csv_path)
+        if p.suffix.lower() == ".csv":
+            local_dir = str(p.parent if str(p.parent) else Path("."))
+            if not args.csv_name:
+                base_name = p.stem
+        else:
+            local_dir = str(p)
+    else:
+        local_dir = tempfile.mkdtemp(prefix="audio_data_")
+
+    os.makedirs(local_dir, exist_ok=True)
+    return local_dir, base_name
+
+
 def _drain_one_completed(
     futures: set[Future[WorkResult]],
-    csv_writer: csv.DictWriter,
-    csv_fp,
+    metadata_writer: MetadataShardWriter,
     counters: dict[str, int],
     log_every: int,
     started_at: float,
@@ -568,11 +708,10 @@ def _drain_one_completed(
                 logger.warning("Sample failed: %s", result.error)
             continue
 
-        csv_writer.writerow(result.row)
+        metadata_writer.write_row(result.row)
         counters["success"] += 1
 
         if counters["success"] % max(1, log_every) == 0:
-            csv_fp.flush()
             elapsed = max(0.001, time.time() - started_at)
             logger.info(
                 "Progress success=%s failed=%s completed=%s rate=%.2f samples/s",
@@ -616,20 +755,11 @@ def main() -> None:
     max_in_flight = args.max_in_flight if args.max_in_flight is not None else args.workers * 4
     max_in_flight = max(args.workers, max_in_flight)
     gcs_pool_size = args.gcs_pool_size if args.gcs_pool_size is not None else max(32, args.workers * 4)
+    if args.metadata_shard_size < 1:
+        raise SystemExit("--metadata-shard-size must be >= 1")
 
-    if args.csv_name:
-        csv_name = args.csv_name
-    elif args.num_shards > 1:
-        csv_name = f"metadata-shard-{args.shard_index:03d}-of-{args.num_shards:03d}.csv"
-    else:
-        csv_name = "metadata.csv"
-
-    if args.local_csv_path:
-        local_csv_path = args.local_csv_path
-        os.makedirs(os.path.dirname(os.path.abspath(local_csv_path)), exist_ok=True)
-    else:
-        tmp_dir = tempfile.mkdtemp(prefix="audio_data_")
-        local_csv_path = os.path.join(tmp_dir, csv_name)
+    local_metadata_dir, metadata_base_name = _resolve_metadata_output(args)
+    metadata_gcs_prefix = f"{args.prefix.strip('/')}/emilia-large/{args.split}/metadata"
 
     bucket: storage.Bucket | None = None
     if not args.dry_run:
@@ -704,10 +834,17 @@ def main() -> None:
     started_at = time.time()
     futures: set[Future[WorkResult]] = set()
 
-    with open(local_csv_path, "w", newline="", encoding="utf-8") as csv_fp:
-        writer = csv.DictWriter(csv_fp, fieldnames=fieldnames)
-        writer.writeheader()
+    metadata_writer = MetadataShardWriter(
+        fieldnames=fieldnames,
+        local_dir=local_metadata_dir,
+        base_name=metadata_base_name,
+        shard_size=args.metadata_shard_size,
+        bucket=bucket,
+        gcs_prefix=metadata_gcs_prefix,
+        dry_run=bool(args.dry_run),
+    )
 
+    try:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             for source_index, sample in enumerate(ds):
                 counters["source_rows_seen"] += 1
@@ -730,8 +867,7 @@ def main() -> None:
                 while counters["success"] + len(futures) >= args.target_samples and futures:
                     _drain_one_completed(
                         futures=futures,
-                        csv_writer=writer,
-                        csv_fp=csv_fp,
+                        metadata_writer=metadata_writer,
                         counters=counters,
                         log_every=args.log_every,
                         started_at=started_at,
@@ -744,8 +880,7 @@ def main() -> None:
                 while len(futures) >= max_in_flight:
                     _drain_one_completed(
                         futures=futures,
-                        csv_writer=writer,
-                        csv_fp=csv_fp,
+                        metadata_writer=metadata_writer,
                         counters=counters,
                         log_every=args.log_every,
                         started_at=started_at,
@@ -777,14 +912,13 @@ def main() -> None:
             while futures:
                 _drain_one_completed(
                     futures=futures,
-                    csv_writer=writer,
-                    csv_fp=csv_fp,
+                    metadata_writer=metadata_writer,
                     counters=counters,
                     log_every=args.log_every,
                     started_at=started_at,
                 )
-
-        csv_fp.flush()
+    finally:
+        metadata_writer.close()
 
     elapsed = max(0.001, time.time() - started_at)
     summary = {
@@ -803,6 +937,7 @@ def main() -> None:
         "sample_rate_hz": sample_rate,
         "n_mels": int(args.n_mels),
         "data_files": ds_kwargs.get("data_files"),
+        "metadata_shard_size": int(args.metadata_shard_size),
         "win_ms": float(args.win_ms),
         "hop_ms": float(args.hop_ms),
         "fmin_hz": float(args.fmin),
@@ -812,8 +947,12 @@ def main() -> None:
         "upload_audio": bool(args.upload_audio),
         "elapsed_s": round(elapsed, 3),
         "items_per_s": round(counters["success"] / elapsed, 4),
-        "local_csv_path": local_csv_path,
-        "local_csv_size_bytes": os.path.getsize(local_csv_path),
+        "metadata_local_dir": local_metadata_dir,
+        "metadata_local_num_shards": len(metadata_writer.local_paths),
+        "metadata_local_paths": metadata_writer.local_paths,
+        "metadata_gcs_prefix": metadata_gcs_prefix,
+        "metadata_gcs_num_shards": len(metadata_writer.gcs_uris),
+        "metadata_gcs_uris": metadata_writer.gcs_uris,
         "dry_run": bool(args.dry_run),
         "tools_data_sources": TOOL_DATASETS,
         "build_dataset_voice_count": len(BUILD_DATASET_VOICES),
@@ -827,15 +966,6 @@ def main() -> None:
     if bucket is None:  # pragma: no cover - defensive guard
         raise RuntimeError("GCS bucket is unexpectedly unavailable.")
 
-    csv_blob_path = f"{args.prefix.strip('/')}/emilia-large/{args.split}/{csv_name}"
-    csv_uri = _upload_file(
-        bucket=bucket,
-        blob_path=csv_blob_path,
-        filename=local_csv_path,
-        content_type="text/csv",
-    )
-    summary["csv_gcs_uri"] = csv_uri
-
     summary_blob_path = (
         f"{args.prefix.strip('/')}/emilia-large/{args.split}/summary-shard-{args.shard_index:03d}.json"
     )
@@ -848,10 +978,10 @@ def main() -> None:
     summary["summary_gcs_uri"] = summary_uri
 
     logger.info(
-        "Completed ingestion: success=%s failed=%s csv=%s summary=%s",
+        "Completed ingestion: success=%s failed=%s metadata_shards=%s summary=%s",
         counters["success"],
         counters["failed"],
-        csv_uri,
+        len(metadata_writer.gcs_uris),
         summary_uri,
     )
 
