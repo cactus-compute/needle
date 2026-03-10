@@ -889,9 +889,7 @@ def train(args):
         from .run import generate, generate_from_audio
         tp = measure_throughput(eval_model, eval_params, tokenizer, num_runs=5)
 
-        from .data import _load_unified_dataset
-        _ds_full = _load_unified_dataset()
-        _val_start = int(len(_ds_full) * 0.9)
+        _val_start = len(enc_inputs)
         val_kept = val_data["kept_indices"]
         n_eval_samples = min(3, len(val_kept))
         step = max(1, len(val_kept) // n_eval_samples)

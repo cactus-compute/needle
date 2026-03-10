@@ -217,7 +217,12 @@ class MemoryMixerEncoder(nn.Module):
         x = x.astype(dt)
 
         s_base = self.param("memory_slots", jinit.normal(stddev=0.02), (1, cfg.num_memory_slots, cfg.d_model))
-        x_pool = jnp.mean(x, axis=1)  # (B, d)
+        if mask is not None:
+            # mask: (B, 1, 1, T) -> (B, T)
+            pool_mask = mask[:, 0, 0, :x.shape[1]]
+            x_pool = jnp.sum(x * pool_mask[:, :, None], axis=1) / jnp.maximum(pool_mask.sum(axis=1, keepdims=True), 1.0)
+        else:
+            x_pool = jnp.mean(x, axis=1)  # (B, d)
         s_bias = nn.Dense(cfg.d_model, dtype=dt, use_bias=False, kernel_init=jinit.zeros, name="slot_init")(x_pool)
         s = jnp.broadcast_to(s_base.astype(dt), (x.shape[0], cfg.num_memory_slots, cfg.d_model)) + s_bias[:, None, :]
 

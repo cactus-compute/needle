@@ -17,15 +17,38 @@ from datasets import Audio, load_from_disk
 from tqdm import tqdm
 import sentencepiece as spm
 
-CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".data_cache")
-TOKENIZER_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tokenizer")
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+_DISK_CACHE_DIR = os.path.join(_PROJECT_ROOT, ".data_cache")
+TOKENIZER_DIR = os.path.join(_PROJECT_ROOT, "tokenizer")
 TOKENIZER_PREFIX = os.path.join(TOKENIZER_DIR, "needle")
-LOCAL_UNIFIED_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "tool_calls_unified")
+LOCAL_UNIFIED_DIR = os.path.join(_PROJECT_ROOT, "data", "tool_calls_unified")
 GCS_DATASET_PATH = "gs://cactus-dataset/tool_calls"
+
+_MIN_SHM_BYTES = 200 * 1024**3 
+
+
+def _pick_cache_dir():
+    """Use /dev/shm (tmpfs/RAM) when available and large enough, else disk."""
+    shm = "/dev/shm"
+    if os.path.isdir(shm):
+        try:
+            st = os.statvfs(shm)
+            avail = st.f_bavail * st.f_frsize
+            if avail >= _MIN_SHM_BYTES:
+                d = os.path.join(shm, "needle_cache")
+                os.makedirs(d, exist_ok=True)
+                return d
+        except OSError:
+            pass
+    os.makedirs(_DISK_CACHE_DIR, exist_ok=True)
+    return _DISK_CACHE_DIR
+
+
+CACHE_DIR = _pick_cache_dir()
 
 PAD_ID = 0
 EOS_ID = 1
-BOS_ID = 2  # reserved for SentencePiece, unused at runtime (EOS_ID serves as SOS)
+BOS_ID = 2  
 UNK_ID = 3
 TOOL_CALL_ID = 4
 TRANSCRIBE_ID = 5
@@ -631,6 +654,72 @@ def load_tool_call_audio(split="train", max_samples=None):
     return indices
 
 
+_GCS_SHARD_ROWS = 5000
+_GCS_N_SHARDS = 19
+_shard_cache = {} 
+
+
+def _load_shard(shard_idx):
+    """Load a single arrow shard, from local or GCS. Caches in memory."""
+    if shard_idx in _shard_cache:
+        return _shard_cache[shard_idx]
+
+    fname = f"data-{shard_idx:05d}-of-{_GCS_N_SHARDS:05d}.arrow"
+
+    local_path = os.path.join(LOCAL_UNIFIED_DIR, fname)
+    if os.path.exists(local_path):
+        import pyarrow as pa
+        source = pa.memory_map(local_path, "r")
+        try:
+            reader = pa.ipc.open_file(source)
+        except pa.lib.ArrowInvalid:
+            source.seek(0)
+            reader = pa.ipc.open_stream(source)
+        tbl = reader.read_all()
+        from datasets import Dataset
+        ds = Dataset(tbl)
+        ds = _set_audio_backend(ds)
+        _shard_cache[shard_idx] = ds
+        return ds
+
+    import subprocess
+    shm_dir = os.path.join(CACHE_DIR, "arrow_shards")
+    os.makedirs(shm_dir, exist_ok=True)
+    dest = os.path.join(shm_dir, fname)
+    if not os.path.exists(dest):
+        gcs_src = f"{GCS_DATASET_PATH}/{fname}"
+        subprocess.run(
+            ["gcloud", "storage", "cp", gcs_src, dest],
+            capture_output=True, text=True,
+        )
+    if not os.path.exists(dest):
+        raise FileNotFoundError(f"Failed to download shard {fname} from GCS")
+
+    import pyarrow as pa
+    source = pa.memory_map(dest, "r")
+    try:
+        reader = pa.ipc.open_file(source)
+    except pa.lib.ArrowInvalid:
+        source.seek(0)
+        reader = pa.ipc.open_stream(source)
+    tbl = reader.read_all()
+    from datasets import Dataset
+    ds = Dataset(tbl)
+    ds = _set_audio_backend(ds)
+    _shard_cache[shard_idx] = ds
+    return ds
+
+
+def _load_example_by_index(idx):
+    """Load a single example by global index, downloading only the needed shard."""
+    shard_idx = idx // _GCS_SHARD_ROWS
+    local_idx = idx % _GCS_SHARD_ROWS
+    shard = _load_shard(shard_idx)
+    if local_idx >= len(shard):
+        raise IndexError(f"Index {idx} out of range (shard {shard_idx} has {len(shard)} rows)")
+    return shard[local_idx]
+
+
 def load_audio_for_index(idx):
     """Load and decode audio for a single dataset index.
 
@@ -639,8 +728,7 @@ def load_audio_for_index(idx):
     import io
     import soundfile as sf
 
-    ds = _load_unified_dataset()
-    ex = ds[idx]
+    ex = _load_example_by_index(idx)
     audio_val = ex.get("audio")
     if audio_val is None:
         return None, None
@@ -662,10 +750,10 @@ def load_audio_for_index(idx):
 def load_example_with_audio(idx):
     """Load a dataset example with decoded audio for eval use.
 
+    Downloads only the needed arrow shard (~1-4GB) instead of the full dataset (~35GB).
     Returns dict with {query, answers, tools, audio_array, sampling_rate}.
     """
-    ds = _load_unified_dataset()
-    ex = ds[idx]
+    ex = _load_example_by_index(idx)
     audio, sr = load_audio_for_index(idx)
     return {
         "query": ex["query"],
