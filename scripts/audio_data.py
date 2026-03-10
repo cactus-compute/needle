@@ -296,17 +296,31 @@ def _create_storage_client(project: str | None) -> storage.Client:
 
     Some google-auth versions can fail during ADC GCE detection with:
       AttributeError: 'Request' object has no attribute 'session'
-    when metadata mTLS probing is enabled. Defaulting this mode to "never"
-    avoids that path unless the user explicitly sets it.
+    when metadata mTLS probing is enabled.
+
+    google-auth has used different mode strings across versions. We normalize
+    common aliases here so callers do not need to care about exact values.
     """
-    os.environ.setdefault("GCE_METADATA_MTLS_MODE", "never")
+    mode = (os.environ.get("GCE_METADATA_MTLS_MODE") or "").strip().lower()
+    alias_map = {
+        "never": "none",
+        "always": "strict",
+    }
+    if mode in alias_map:
+        mode = alias_map[mode]
+
+    # Force compatibility mode for this pipeline to avoid known google-auth
+    # metadata mTLS request/session bugs on some VM images.
+    if mode != "none":
+        os.environ["GCE_METADATA_MTLS_MODE"] = "none"
+
     try:
         return storage.Client(project=project) if project else storage.Client()
     except AttributeError as exc:
         if "'Request' object has no attribute 'session'" in str(exc):
             raise SystemExit(
                 "Google auth initialization failed during metadata probing. "
-                "Set `GCE_METADATA_MTLS_MODE=never` and configure ADC "
+                "Set `GCE_METADATA_MTLS_MODE=none` and configure ADC "
                 "(for example `gcloud auth application-default login`), then retry."
             ) from exc
         raise
