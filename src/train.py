@@ -1021,49 +1021,48 @@ def train(args):
         del params_np
         print(f"  [epoch {epoch + 1}] checkpoint saved in {time.perf_counter() - epoch_eval_t0:.1f}s")
 
-        from .test import measure_throughput
-        from .run import generate, generate_from_audio
-        tp = measure_throughput(eval_model, eval_params, tokenizer, num_runs=5)
-        print(f"  [epoch {epoch + 1}] throughput benchmark done in {time.perf_counter() - epoch_eval_t0:.1f}s")
-
-        from .data import load_tool_calls
-        _, val_global_indices = load_tool_calls(
-            "validation",
-            max_samples=val_data.get("split_max_samples"),
-            return_global_indices=True,
-            shuffle_before_split=val_data.get("shuffle_before_split", False),
-            shuffle_seed=val_data.get("split_seed", 42),
-        )
-        val_kept = val_data["kept_indices"]
-        n_eval_samples = min(3, len(val_kept))
-        step = max(1, len(val_kept) // n_eval_samples)
-        sample_indices = [val_kept[i * step] for i in range(n_eval_samples)]
-        eval_indices = val_global_indices[np.array(sample_indices)]
-
+        tp = {"tokens_per_second": float("nan"), "avg_latency_s": float("nan")}
         unified_samples = []
-        for i, ds_idx in enumerate(eval_indices):
-            pair = load_example_with_audio(int(ds_idx))
-            query = pair["query"][:80]
-            ref = pair["answers"][:120]
+        if not getattr(args, "skip_epoch_extras", False):
+            from .test import measure_throughput
+            from .run import generate, generate_from_audio
+            tp = measure_throughput(eval_model, eval_params, tokenizer, num_runs=5)
+            print(f"  [epoch {epoch + 1}] throughput benchmark done in {time.perf_counter() - epoch_eval_t0:.1f}s")
 
-            # Text prediction
-            text_pred = generate(
-                eval_model, eval_params, tokenizer, pair["query"],
-                tools=pair["tools"], max_gen_len=args.max_dec_len, seed=i, stream=False,
-                use_cfg=getattr(args, "cfg_inference", False),
-            ).strip()[:120]
+            from .data import load_tool_calls
+            _, val_global_indices = load_tool_calls(
+                "validation",
+                max_samples=val_data.get("split_max_samples"),
+                return_global_indices=True,
+                shuffle_before_split=val_data.get("shuffle_before_split", False),
+                shuffle_seed=val_data.get("split_seed", 42),
+            )
+            val_kept = val_data["kept_indices"]
+            n_eval_samples = min(3, len(val_kept))
+            step = max(1, len(val_kept) // n_eval_samples)
+            sample_indices = [val_kept[i * step] for i in range(n_eval_samples)]
+            eval_indices = val_global_indices[np.array(sample_indices)]
 
-            # Voice prediction
-            voice_pred = None
-            if not no_speech and pair["audio_array"] is not None:
-                voice_pred = generate_from_audio(
-                    eval_model, eval_params, tokenizer, pair["audio_array"], sr=pair["sampling_rate"],
+            for i, ds_idx in enumerate(eval_indices):
+                pair = load_example_with_audio(int(ds_idx))
+                query = pair["query"][:80]
+                ref = pair["answers"][:120]
+                text_pred = generate(
+                    eval_model, eval_params, tokenizer, pair["query"],
                     tools=pair["tools"], max_gen_len=args.max_dec_len, seed=i, stream=False,
                     use_cfg=getattr(args, "cfg_inference", False),
                 ).strip()[:120]
 
-            unified_samples.append((query, ref, text_pred, voice_pred))
-        print(f"  [epoch {epoch + 1}] sample generation done in {time.perf_counter() - epoch_eval_t0:.1f}s")
+                voice_pred = None
+                if not no_speech and pair["audio_array"] is not None:
+                    voice_pred = generate_from_audio(
+                        eval_model, eval_params, tokenizer, pair["audio_array"], sr=pair["sampling_rate"],
+                        tools=pair["tools"], max_gen_len=args.max_dec_len, seed=i, stream=False,
+                        use_cfg=getattr(args, "cfg_inference", False),
+                    ).strip()[:120]
+
+                unified_samples.append((query, ref, text_pred, voice_pred))
+            print(f"  [epoch {epoch + 1}] sample generation done in {time.perf_counter() - epoch_eval_t0:.1f}s")
 
         del eval_params
 
