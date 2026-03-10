@@ -10,42 +10,41 @@
   Architecture                                        Training Pipeline
   ────────────                                        ─────────────────
 
-               ┌──────────────┐  ┌──────────────┐
-               │ Transcription│  │    Story     │   ┌──────────────────────┐
-               └──────┬───────┘  └──────┬───────┘   │ Mat loss at factors  │
-                      └───────┬─────────┘            │ + INT4 QAT (g=32)    │
-                          ┌───┴───────┐              │ + z-loss + slot div  │
-                          │  Softmax  │              │ mixed text/speech    │
-                          └─────┬─────┘              │ batches              │
-                    ┌─────┬─────┴─────┬─────┐        └──────────┬───────────┘
-                    │  @E[:d_ff/f] for each │                    │
-                    │  f in mat_factors     │        ┌──────────┴───────────┐
-                    └─────┬─────┬─────┬─────┘        │ Grad clip (norm 1.0) │
-                          ┌─────┴─────┐              │ Muon  (2D kernels)   │
-                          │ Linear (T)│  ← tied      │ AdamW (all else)     │
-                          └─────┬─────┘              │ WSD LR schedule      │
-                          ┌─────┴─────┐              └──────────┬───────────┘
-                          │ ZCRMSNorm │                         │
-                          └─────┬─────┘              ┌──────────┴───────────┐
-                       ┌────────┴────────┐           │   Sparsification     │
-                       │ Decoder x N_dec │           │  cubic schedule      │
-                       │┌───────────────┐│           │  mask every N steps  │
-                       ││ Masked Self   ││           └──────────┬───────────┘
-                       ││ Attn + RoPE   ││                      │
-                       │├───────────────┤│           ┌──────────┴───────────┐
-  ┌──────────────┐  S  ││   Cross       ││           │ EMA params (β=0.999) │
-  │ MemoryMixer  │────────▶ Attention   ││           └──────────┬───────────┘
-  │ Encoder      │     │├───────────────┤│                      │
-  │  x N_enc     │     ││  Gated FFN    ││           ┌──────────┴───────────┐
-  │              │     │└───────────────┘│           │ Checkpoint           │
-  │ ┌──────────┐ │     └────────┬────────┘           │  full params, can    │
-  │ │Pack:     │ │        ┌─────┴─────┐              │  export mat slices    │
-  │ │ S←X Attn │ │        │ Embedding │  ← shared    └──────────────────────┘
-  │ │ RoPE keys│ │        └─────┬─────┘
+                    ┌──────────────┐
+                    │  Tool Call   │                ┌──────────────────────┐
+                    └──────┬───────┘                │ Mat loss at factors  │
+                          ┌┴──────────┐             │ + INT4 QAT (g=32)    │
+                          │  Softmax  │             │ + z-loss + slot div  │
+                          └─────┬─────┘             │ 1:1 text/speech     │
+                    ┌─────┬─────┴─────┬─────┐       │ alternation          │
+                    │  @E[:d_ff/f] for each │       └──────────┬───────────┘
+                    │  f in mat_factors     │                  │
+                    └─────┬─────┬─────┬─────┘       ┌──────────┴───────────┐
+                          ┌─────┴─────┐             │ Grad clip (norm 1.0) │
+                          │ Linear (T)│  ← tied     │ Muon  (2D kernels)   │
+                          └─────┬─────┘             │ AdamW (all else)     │
+                          ┌─────┴─────┐             │ WSD LR schedule      │
+                          │ ZCRMSNorm │             └──────────┬───────────┘
+                          └─────┬─────┘                        │
+                       ┌────────┴────────┐          ┌──────────┴───────────┐
+                       │ Decoder x N_dec │          │   Sparsification     │
+                       │┌───────────────┐│          │  cubic schedule      │
+                       ││ Masked Self   ││          │  mask every N steps  │
+                       ││ Attn + RoPE   ││          └──────────┬───────────┘
+                       │├───────────────┤│                     │
+  ┌──────────────┐  S  ││   Cross       ││          ┌──────────┴───────────┐
+  │ MemoryMixer  │────────▶ Attention   ││          │ EMA params (β=0.999) │
+  │ Encoder      │     │├───────────────┤│          └──────────┬───────────┘
+  │  x N_enc     │     ││  Gated FFN    ││                     │
+  │              │     │└───────────────┘│          ┌──────────┴───────────┐
+  │ ┌──────────┐ │     └────────┬────────┘          │ Checkpoint           │
+  │ │Pack:     │ │        ┌─────┴─────┐             │  full params, can    │
+  │ │ S←X Attn │ │        │ Embedding │  ← shared   │  export mat slices    │
+  │ │ RoPE keys│ │        └─────┬─────┘             └──────────────────────┘
   │ ├──────────┤ │      ┌───────┴───────┐
-  │ │Mix:      │ │      │ <transcribe>  │
-  │ │ MLP-Mixer│ │      │ or <story>    │
-  │ │ on S     │ │      │ + target      │
+  │ │Mix:      │ │      │[EOS]<tool_call>│
+  │ │ MLP-Mixer│ │      │ + tools       │
+  │ │ on S     │ │      │ + answer      │
   │ ├──────────┤ │      └───────────────┘
   │ │Local:    │ │
   │ │Gated FFN │ │
@@ -64,56 +63,71 @@
          │                  │
     ┌────┴──────┐    ┌──────┴───────┐
     │   Text    │    │   Audio      │
-    │  tokens   │    │  mel spec    │
+    │  query    │    │  waveform    │
     └───────────┘    └──────────────┘
 
     d=512 (default) / 1536 (--full) · GQA · QK-norm
     SentencePiece BPE (8192) · gated dReLU · ZCRMSNorm · RoPE
     strided DW conv · mat factors · INT4 QAT · Muon + AdamW
-    text + speech encoder · <transcribe> / <story> task routing
+    text + speech encoder · <tool_call> task routing
 
-  Data Preprocessing
-  ──────────────────
+  Data Pipeline (needle tokenize → needle train)
+  ───────────────────────────────────────────────
 
-  Text (TinyStories)                    Speech (LibriSpeech-100)
-  ──────────────────                    ────────────────────────
-
-     TinyStories                          LibriSpeech-100
-         │                                       │
-         ▼                                       ▼
-  ┌──────────────┐                      ┌────────────────┐
-  │ SentencePiece│                      │ soundfile      │
-  │ BPE tokenize │                      │ decode (16kHz) │
-  │ (8192 vocab) │                      └───────┬────────┘
-  └──────┬───────┘                              │
-         │                                      ▼
-         ▼                              ┌────────────────┐
-  ┌──────────────┐                      │ Log-mel spec   │
-  │ Split at 30% │                      │ 80 bins, 25ms  │
-  │ enc / dec    │                      │ window, 10ms   │
-  └──┬───────┬───┘                      │ hop (~100 f/s) │
-     │       │                          └───────┬────────┘
-     ▼       ▼                                  │
-  ┌─────┐ ┌──────────────┐                      ▼
-  │ enc │ │ [BOS]<story> │              ┌────────────────┐
-  │ ids │ │ + tokens     │              │ Pad/trunc to   │
-  └─────┘ │ → dec_in     │              │ max_mel_len    │
-          ├──────────────┤              └───────┬────────┘
-          │ <story>      │                      │
-          │ + tokens     │                      ▼
-          │ + [EOS]      │              ┌────────────────┐
-          │ → dec_tgt    │              │ [BOS]<transcr> │
-          └──────────────┘              │ + tokens       │
-                                        │ → dec_in       │
-         Both cached as                 ├────────────────┤
-         .npy in .data_cache/           │ <transcr>      │
-                                        │ + tokens       │
-  ┌──────────────────────┐              │ + [EOS]        │
-  │ Interleaved batches: │              │ → dec_tgt      │
-  │ 1 speech every N     │              └────────────────┘
-  │ text steps           │
-  │ (--speech-every N)   │       Eval: WER on 3 val samples
-  └──────────────────────┘       at end of each epoch
+  ┌─────────────────────────────────────────────────────────────┐
+  │  needle tokenize                                            │
+  │                                                             │
+  │  Unified dataset (GCS / local)                              │
+  │       │                                                     │
+  │       ├──── Text ──────────────── Speech ─────────┐         │
+  │       ▼                                           ▼         │
+  │  ┌──────────────┐                        ┌────────────────┐ │
+  │  │ SentencePiece│                        │ HF Audio col   │ │
+  │  │ BPE tokenize │                        │ decode (16kHz) │ │
+  │  │ (8192 vocab) │                        └───────┬────────┘ │
+  │  └──────┬───────┘                                │          │
+  │         │                                        ▼          │
+  │         ▼                                ┌────────────────┐ │
+  │  ┌──────────────────┐                    │ Log-mel spec   │ │
+  │  │ enc_inputs.npy   │                    │ 80 bins, 25ms  │ │
+  │  │ dec_inputs.npy   │                    │ window, 10ms   │ │
+  │  │ dec_targets.npy  │                    │ hop (~100 f/s) │ │
+  │  │ loss_mask.npy    │                    └───────┬────────┘ │
+  │  │ kept_idx.npy     │                            │          │
+  │  └──────┬───────────┘                            ▼          │
+  │         │                                ┌────────────────┐ │
+  │         │                                │ mels.npy       │ │
+  │         │                                │ (N,T,80) f32   │ │
+  │         │                                │ writable mmap  │ │
+  │         │                                └───────┬────────┘ │
+  │         │                                        │          │
+  │         └────────────┬───────────────────────────┘          │
+  │                      ▼                                      │
+  │               {split}_metadata.json                         │
+  │               .data_cache/ + GCS upload                     │
+  └─────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  needle train                                               │
+  │                                                             │
+  │  load_prepared_data(mmap=True)                              │
+  │  load_prepared_mels(mmap=True)                              │
+  │       │                                                     │
+  │       ▼                                                     │
+  │  ┌──────────────────────┐   ┌──────────────────────┐        │
+  │  │ PrefetchIterator     │   │ PrefetchIterator     │        │
+  │  │ text batches (4)     │   │ speech batches (4)   │        │
+  │  │ mmap → per-batch idx │   │ mmap → per-batch idx │        │
+  │  └──────────┬───────────┘   └──────────┬───────────┘        │
+  │             └───────────┬──────────────┘                    │
+  │                         ▼                                   │
+  │                  1:1 text/speech                            │
+  │                  alternation                                │
+  │                                                             │
+  │  ~42MB RAM (8 prefetched batches)                           │
+  │  SpecAugment for speech regularization                      │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Usage
@@ -128,70 +142,80 @@ needle [command]
   ┌───────────────────────────────────────────────────────────────────┐
   │                                                                   │
   │   train                                                           │
-  │     --full                  Use full 1B config (~1.17B params)    │
-  │     --epochs INT            Training epochs (default: 1)          │
-  │     --batch-size INT        Batch size (default: 32)              │
-  │     --lr FLOAT              AdamW learning rate (default: 3e-4)   │
-  │     --muon-lr FLOAT         Muon learning rate (default: 0.02)    │
-  │     --d-model INT           Model dim (default: 512)              │
-  │     --num-heads INT         Attention heads (default: 8)          │
-  │     --num-kv-heads INT      KV heads for GQA (default: num-heads) │
-  │     --num-layers INT        Encoder layers (default: 8)           │
-  │     --num-dec-layers INT    Decoder layers (default: 4)           │
-  │     --max-enc-len INT       Max encoder seq length (default: 256) │
-  │     --max-dec-len INT       Max decoder seq length (default: 256) │
-  │     --max-samples INT       Training samples (default: all)       │
-  │     --mat-factors INT [...]  FFN shrink factors (default: 2 4 8)   │
-  │     --sparsity-ratio FLOAT  Block prune ratio (default: 0.5)     │
-  │     --group-size INT        Quant/prune group size (default: 32)  │
-  │     --prune-interval INT    Steps between mask updates (def: 100) │
-  │     --prune-start-frac FL   Start pruning at frac (def: 0.33)    │
-  │     --prune-end-frac FL     Lock mask at this frac (def: 0.67)   │
-  │     --activation STR        drelu|swiglu|geglu (default: drelu)   │
-  │     --warmup-ratio FLOAT    LR warmup ratio (default: 0.05)      │
-  │     --eval-every INT        Val eval interval (default: 1000)     │
-  │     --wandb                 Enable W&B logging                    │
-  │     --checkpoint PATH       Resume from checkpoint                │
-  │     --checkpoint-dir DIR    Checkpoint directory                  │
-  │     --seed INT              Random seed (default: 42)             │
+  │     --full                   Use full 1B config (~1.17B params)   │
+  │     --epochs INT             Training epochs (default: 1)         │
+  │     --batch-size INT         Batch size (default: 32)             │
+  │     --lr FLOAT               AdamW learning rate (default: 3e-4)  │
+  │     --muon-lr FLOAT          Muon learning rate (default: 0.02)   │
+  │     --d-model INT            Model dim (default: 512)             │
+  │     --num-heads INT          Attention heads (default: 8)         │
+  │     --num-kv-heads INT       KV heads for GQA (default: num-heads)│
+  │     --num-layers INT         Encoder layers (default: 4)          │
+  │     --num-dec-layers INT     Decoder layers (default: 4)          │
+  │     --max-enc-len INT        Max encoder seq len (default: 256)   │
+  │     --max-dec-len INT        Max decoder seq len (default: 1024)  │
+  │     --max-samples INT        Training samples (default: all)      │
+  │     --mat-factors INT [...]   FFN shrink factors (default: 2 4 8) │
+  │     --sparsity-ratio FLOAT   Block prune ratio (default: 0.0)     │
+  │     --group-size INT         Quant/prune group size (default: 32) │
+  │     --prune-interval INT     Steps between mask updates (def: 100)│
+  │     --prune-start-frac FL    Start pruning at frac (def: 0.33)    │
+  │     --prune-end-frac FL      Lock mask at this frac (def: 0.67)   │
+  │     --activation STR         drelu|swiglu|geglu (default: drelu)  │
+  │     --warmup-ratio FLOAT     LR warmup ratio (default: 0.05)      │
+  │     --eval-every INT         Val eval interval (default: 1000)    │
+  │     --wandb                  Enable W&B logging                   │
+  │     --checkpoint PATH        Resume from checkpoint               │
+  │     --checkpoint-dir DIR     Checkpoint directory                 │
+  │     --seed INT               Random seed (default: 42)            │
   │     --no-speech             Disable speech (text-only training)   │
-  │     --speech-every INT      Speech step every N text (default: 3) │
   │     --max-mel-len INT       Max mel frames (default: 1024)        │
   │     --n-mels INT            Mel frequency bins (default: 80)      │
-  │     --max-speech-samples INT  Max LibriSpeech samples             │
+  │     --max-speech-samples INT  Max voice-tool-call samples         │
+  │                                                                   │
+  │   tokenize                                                        │
+  │     --max-samples INT       Limit samples per split (dev/test)    │
+  │     --cleanup               Delete local cache after GCS upload   │
+  │     --n-mels INT            Mel frequency bins (default: 80)      │
+  │     --max-mel-len INT       Max mel frames (default: 1024)        │
+  │     --max-enc-len INT       Max encoder seq len (default: 256)    │
+  │     --max-dec-len INT       Max decoder seq len (default: 1024)   │
   │                                                                   │
   │   run                                                             │
-  │     --checkpoint PATH      Path to model checkpoint (required)    │
-  │     --prompts STR [...]    One or more prompts to continue        │
-  │     --audio PATH [...]     Audio files to transcribe              │
-  │     --max-len INT          Max tokens to generate (default: 128)  │
-  │     --temperature FLOAT    Sampling temperature (default: 0.8)    │
-  │     --seed INT             Random seed (default: 0)               │
+  │     --checkpoint PATH       Path to model checkpoint (required)   │
+  │     --query STR             Query text for tool-call generation   │
+  │     --tools STR             Tools JSON for tool-call generation   │
+  │     --audio PATH [...]      Audio files for voice-to-tool-call    │
+  │     --max-len INT           Max tokens to generate (default: 512) │
+  │     --seed INT              Random seed (default: 0)              │
   │                                                                   │
   │   test                                                            │
-  │     --checkpoint PATH      Path to model checkpoint (required)    │
-  │     --batch-size INT       Batch size (default: 32)               │
-  │     --max-eval-samples INT Evaluation samples (default: 1000)     │
-  │     --max-gen-len INT      Max generation length (default: 128)   │
-  │     --temperature FLOAT    Sampling temperature (default: 0.8)    │
-  │     --throughput-runs INT  Throughput runs (default: 10)          │
+  │     --checkpoint PATH       Path to model checkpoint (required)   │
+  │     --batch-size INT        Batch size (default: 32)              │
+  │     --max-eval-samples INT  Evaluation samples (default: 1000)    │
+  │     --max-enc-len INT       Max encoder length (default: 256)    │
+  │     --max-dec-len INT       Max decoder length (default: 1024)    │
+  │     --max-gen-len INT       Max generation length (default: 512)  │
+  │     --throughput-runs INT   Throughput runs (default: 10)         │
+  │     --tool-call-samples INT Tool-call eval samples (default: 200) │
+  │     --voice-tc-samples INT  Voice-TC eval samples (default: 50)  │
   │                                                                   │
   │   evaluate                                                        │
-  │     --checkpoint PATH      Path to model checkpoint (required)    │
-  │     --benchmarks [...]     wikitext2 lambada hellaswag arc_easy   │
-  │     --max-samples INT      Samples per benchmark (default: 500)   │
+  │     --checkpoint PATH       Path to model checkpoint (required)   │
+  │     --benchmarks [...]      wikitext2 lambada hellaswag arc_easy  │
+  │     --max-samples INT       Samples per benchmark (default: 500)  │
   │                                                                   │
   │   tpu                                                             │
-  │     create NAME            Create TPU (auto-finds zone)           │
-  │       --type STR           Accelerator (default: v6e-8)           │
-  │       --version STR        TPU OS (auto-detected from --type)     │
-  │     connect NAME           SSH config + connect (auto-zone)       │
-  │     claude NAME            Install Claude Code on instance        │
-  │     stop NAME              Stop instance (auto-zone)              │
-  │     start NAME             Start stopped instance (auto-zone)     │
-  │     delete NAME            Delete instance (auto-zone)            │
-  │     list                   List all TPU instances                 │
-  │       --zone ZONE          Override auto-detected zone            │
+  │     create NAME             Create TPU (auto-finds zone)          │
+  │       --type STR            Accelerator (default: v6e-8)          │
+  │       --version STR         TPU OS (auto-detected from --type)    │
+  │     connect NAME            SSH config + connect (auto-zone)      │
+  │     claude NAME             Install Claude Code on instance       │
+  │     stop NAME               Stop instance (auto-zone)             │
+  │     start NAME              Start stopped instance (auto-zone)    │
+  │     delete NAME             Delete instance (auto-zone)           │
+  │     list                    List all TPU instances                │
+  │       --zone ZONE           Override auto-detected zone           │
   │                                                                   │
   └───────────────────────────────────────────────────────────────────┘
 ```
@@ -210,19 +234,21 @@ needle [command]
 
   Dataset
   ──────────────────────────────────────────
-  Text                100B tokens (~400 GB)
-  Audio               Emilia subset
-                      200k × 20s clips (~1.1k hrs)
-                      ~200M audio tokens
-                      ~13M transcription tokens
-                      ~27 GB (from ~4.5 TB full dataset)
+  Text                Tool-call pairs
+                      (query, tools, answers)
+                      from GCS unified dataset
+  Audio               TTS-generated speech
+                      (GCP Cloud TTS voices)
+                      16kHz WAV, HF Audio col
   ──────────────────────────────────────────
 
-  100M quick-experiment estimates (--default)
+  100M params — 10M multimodal triples (5 epochs)
   ──────────────────────────────────────────
-  Total tokens        1B text + 1k hrs audio ≈ 1.2B
-  Total FLOPs         6 × 102M × 1.2B ≈ 7.2e17
-  MFU (100M model)    ~15% → ~138 effective TFLOPS/chip
+  Triples          10M (text / voice / image → JSON tool calls)
+  Tokens/triple    ~300 avg (text ~180, voice ~390, image ~336)
+  Total tokens     10M × 300 × 5 epochs ≈ 15B
+  Total FLOPs      6 × 100M × 15B ≈ 9e18
+  MFU (100M)       ~15% → ~138 effective TFLOPS/chip
 
   ┌────────────────────┬──────────┬──────────┬──────────┐
   │                    │  v6e-8   │  v6e-16  │  v6e-32  │
@@ -231,27 +257,9 @@ needle [command]
   │ Total HBM          │ 256 GB   │ 512 GB   │ 1024 GB  │
   │ Scaling eff.       │ 0.9×     │ 0.8×     │ 0.7×     │
   │ Eff. TFLOPS        │ 994      │ 1,766    │ 3,091    │
-  │ Est. time          │ ~12min   │ ~7min    │ ~4min    │
+  │ Est. time          │ ~2.5h    │ ~1.4h    │ ~49min   │
   │ On-demand $/hr     │ $21.60   │ $43.20   │ $86.40   │
-  │ Est. total cost    │ ~$4      │ ~$5      │ ~$6      │
-  └────────────────────┴──────────┴──────────┴──────────┘
-
-  1B multimodal training estimates (--full)
-  ──────────────────────────────────────────
-  Total tokens        100B text + 250k hrs audio ≈ 145B
-  Total FLOPs         6 × 1.17B × 145B ≈ 1.0e21
-  MFU (1B model)      ~30% → ~275 effective TFLOPS/chip
-
-  ┌────────────────────┬──────────┬──────────┬──────────┐
-  │                    │  v6e-8   │  v6e-16  │  v6e-32  │
-  ├────────────────────┼──────────┼──────────┼──────────┤
-  │ Chips              │ 8        │ 16       │ 32       │
-  │ Total HBM          │ 256 GB   │ 512 GB   │ 1024 GB  │
-  │ Scaling eff.       │ 0.9×     │ 0.8×     │ 0.7×     │
-  │ Eff. TFLOPS        │ 1,980    │ 3,520    │ 6,160    │
-  │ Est. time          │ ~143h    │ ~80h     │ ~46h     │
-  │ On-demand $/hr     │ $21.60   │ $43.20   │ $86.40   │
-  │ Est. total cost    │ ~$3,090  │ ~$3,460  │ ~$3,970  │
+  │ Est. total cost    │ ~$54     │ ~$61     │ ~$71     │
   └────────────────────┴──────────┴──────────┴──────────┘
 ```
 

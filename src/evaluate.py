@@ -1,6 +1,5 @@
 import argparse
 import math
-import pickle
 
 import jax
 import jax.numpy as jnp
@@ -15,14 +14,7 @@ from .model import (
     make_causal_mask,
     make_padding_mask,
 )
-
-
-def load_checkpoint(path):
-    with open(path, "rb") as f:
-        data = pickle.load(f)
-    params = jax.tree.map(jnp.array, data["params"])
-    config = TransformerConfig(**data["config"])
-    return params, config
+from .run import load_checkpoint
 
 
 def _make_p_encode(model):
@@ -36,22 +28,12 @@ def _make_p_encode(model):
 
 def _make_p_decode(model):
     """Create a pmap'd decode function."""
-    def _decode(params, dec_input, encoder_out, tgt_mask, cross_mask):
+    def _decode(params, dec_input, encoder_out, tgt_mask, _unused_cross_mask):
         return model.apply(
             {"params": params}, dec_input, encoder_out,
-            self_mask=tgt_mask, cross_mask=cross_mask, method="decode",
+            self_mask=tgt_mask, method="decode",
         )
     return jax.pmap(_decode, axis_name="batch")
-
-
-def _make_p_forward(model):
-    """Create a pmap'd full forward function."""
-    def _forward(params, src, tgt_in, src_mask, tgt_mask, cross_mask):
-        return model.apply(
-            {"params": params}, src, tgt_in,
-            src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=cross_mask,
-                   )
-    return jax.pmap(_forward, axis_name="batch")
 
 
 def _shard_single(x, num_devices):
@@ -59,18 +41,14 @@ def _shard_single(x, num_devices):
     return jnp.broadcast_to(x, (num_devices, *x.shape[1:]))
 
 
-def _shard_batch(x, num_devices):
-    """Reshape batch for pmap: (N, ...) -> (num_devices, per_device, ...)."""
-    return x.reshape(num_devices, -1, *x.shape[1:])
-
-
-def score_sequence(model, params, enc_tokens, dec_tokens, pad_id, p_encode=None, p_decode=None, num_devices=1):
+def score_sequence(model, params, enc_tokens, dec_tokens, pad_id, sos_id=None,
+                   p_encode=None, p_decode=None, num_devices=1):
     """Compute average negative log-likelihood of dec_tokens given enc_tokens."""
+    sos = sos_id if sos_id is not None else pad_id
     enc_input = jnp.array([enc_tokens])
     src_mask = make_padding_mask(enc_input, pad_id)
 
     if p_encode is not None and num_devices > 1:
-        # Replicate single sample across devices, run pmap, take first result
         enc_s = _shard_single(enc_input, num_devices)
         src_mask_s = _shard_single(src_mask, num_devices)
         encoder_out = p_encode(params, enc_s, src_mask_s)[0:1]
@@ -80,22 +58,20 @@ def score_sequence(model, params, enc_tokens, dec_tokens, pad_id, p_encode=None,
             {"params": p}, enc_input, src_mask=src_mask, method="encode",
         )
 
-    dec_in = [pad_id] + list(dec_tokens[:-1])
+    dec_in = [sos] + list(dec_tokens[:-1])
     dec_input = jnp.array([dec_in])
     tgt_mask = make_causal_mask(len(dec_in))
-    cross_mask = src_mask
 
     if p_decode is not None and num_devices > 1:
         dec_s = _shard_single(dec_input, num_devices)
         tgt_mask_s = jnp.broadcast_to(tgt_mask, (num_devices, *tgt_mask.shape[1:]))
-        cross_mask_s = _shard_single(cross_mask, num_devices)
         enc_out_s = _shard_single(encoder_out, num_devices)
-        logits = p_decode(params, dec_s, enc_out_s, tgt_mask_s, cross_mask_s)[0]
+        logits = p_decode(params, dec_s, enc_out_s, tgt_mask_s, None)[0]
     else:
         p = params if num_devices <= 1 else jax_utils.unreplicate(params)
         logits = model.apply(
             {"params": p}, dec_input, encoder_out,
-            self_mask=tgt_mask, cross_mask=cross_mask, method="decode",
+            self_mask=tgt_mask, method="decode",
         )[0]
 
     log_probs = jax.nn.log_softmax(logits if logits.ndim == 2 else logits[0])
@@ -110,6 +86,7 @@ def eval_wikitext2(model, params, tokenizer, max_samples=500, max_len=256,
     ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
 
     pad_id = tokenizer.pad_token_id
+    sos_id = tokenizer.eos_token_id
     total_nll = 0.0
     total_tokens = 0
     evaluated = 0
@@ -142,20 +119,19 @@ def eval_wikitext2(model, params, tokenizer, max_samples=500, max_len=256,
                 {"params": single_params}, enc_input, src_mask=src_mask, method="encode",
             )
 
-        dec_in = [pad_id] + list(dec_tokens[:-1])
+        dec_in = [sos_id] + list(dec_tokens[:-1])
         dec_input = jnp.array([dec_in])
         tgt_mask = make_causal_mask(len(dec_in))
 
         if p_decode is not None and num_devices > 1:
             dec_s = _shard_single(dec_input, num_devices)
             tgt_mask_s = jnp.broadcast_to(tgt_mask, (num_devices, *tgt_mask.shape[1:]))
-            cross_mask_s = _shard_single(src_mask, num_devices)
             enc_out_s = _shard_single(encoder_out, num_devices)
-            logits = p_decode(params, dec_s, enc_out_s, tgt_mask_s, cross_mask_s)[0]
+            logits = p_decode(params, dec_s, enc_out_s, tgt_mask_s, None)[0]
         else:
             logits = model.apply(
                 {"params": single_params}, dec_input, encoder_out,
-                self_mask=tgt_mask, cross_mask=src_mask, method="decode",
+                self_mask=tgt_mask, method="decode",
             )
 
         log_probs = jax.nn.log_softmax(logits[0] if logits.ndim == 3 else logits[0])
@@ -179,6 +155,7 @@ def eval_lambada(model, params, tokenizer, max_samples=500,
     ds = load_dataset("EleutherAI/lambada_openai", "default", split="test")
 
     pad_id = tokenizer.pad_token_id
+    sos_id = tokenizer.eos_token_id
     correct = 0
     total = 0
 
@@ -209,19 +186,18 @@ def eval_lambada(model, params, tokenizer, max_samples=500,
                 {"params": single_params}, enc_input, src_mask=src_mask, method="encode",
             )
 
-        dec_in = jnp.array([[pad_id]])
+        dec_in = jnp.array([[sos_id]])
         tgt_mask = make_causal_mask(1)
 
         if p_decode is not None and num_devices > 1:
             dec_s = _shard_single(dec_in, num_devices)
             tgt_mask_s = jnp.broadcast_to(tgt_mask, (num_devices, *tgt_mask.shape[1:]))
-            cross_mask_s = _shard_single(src_mask, num_devices)
             enc_out_s = _shard_single(encoder_out, num_devices)
-            logits = p_decode(params, dec_s, enc_out_s, tgt_mask_s, cross_mask_s)[0]
+            logits = p_decode(params, dec_s, enc_out_s, tgt_mask_s, None)[0]
         else:
             logits = model.apply(
                 {"params": single_params}, dec_in, encoder_out,
-                self_mask=tgt_mask, cross_mask=src_mask, method="decode",
+                self_mask=tgt_mask, method="decode",
             )
 
         predicted = int(jnp.argmax(logits[0, 0] if logits.ndim == 3 else logits[0, 0]))
@@ -242,6 +218,7 @@ def eval_hellaswag(model, params, tokenizer, max_samples=500,
     ds = load_dataset("Rowan/hellaswag", split="validation")
 
     pad_id = tokenizer.pad_token_id
+    sos_id = tokenizer.eos_token_id
     correct = 0
     total = 0
 
@@ -254,7 +231,6 @@ def eval_hellaswag(model, params, tokenizer, max_samples=500,
         if not enc_tokens:
             continue
 
-        # Truncate context to keep it manageable
         enc_tokens = enc_tokens[:192]
 
         scores = []
@@ -265,7 +241,8 @@ def eval_hellaswag(model, params, tokenizer, max_samples=500,
                 continue
             dec_tokens = dec_tokens[:64]
             score = score_sequence(model, params, enc_tokens, dec_tokens, pad_id,
-                                   p_encode=p_encode, p_decode=p_decode, num_devices=num_devices)
+                                   sos_id=sos_id, p_encode=p_encode, p_decode=p_decode,
+                                   num_devices=num_devices)
             scores.append(score)
 
         predicted = int(np.argmax(scores))
@@ -286,6 +263,7 @@ def eval_arc_easy(model, params, tokenizer, max_samples=500,
     ds = load_dataset("allenai/ai2_arc", "ARC-Easy", split="test")
 
     pad_id = tokenizer.pad_token_id
+    sos_id = tokenizer.eos_token_id
     correct = 0
     total = 0
 
@@ -309,7 +287,8 @@ def eval_arc_easy(model, params, tokenizer, max_samples=500,
                 continue
             dec_tokens = dec_tokens[:64]
             score = score_sequence(model, params, enc_tokens, dec_tokens, pad_id,
-                                   p_encode=p_encode, p_decode=p_decode, num_devices=num_devices)
+                                   sos_id=sos_id, p_encode=p_encode, p_decode=p_decode,
+                                   num_devices=num_devices)
             scores.append(score)
 
         predicted_idx = int(np.argmax(scores))

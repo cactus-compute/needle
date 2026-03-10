@@ -89,3 +89,5 @@ checkpoints/
 wandb/
 .data_cache/
 tokenizer/
+data/
+voice_samples/
