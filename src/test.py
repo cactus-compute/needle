@@ -113,6 +113,69 @@ def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is th
     }
 
 
+def compute_repetition_rate(texts):
+    bigram_rep_rates = []
+    for text in texts:
+        words = text.lower().split()
+        if len(words) < 2:
+            bigram_rep_rates.append(0.0)
+            continue
+        bigrams = [(words[i], words[i + 1]) for i in range(len(words) - 1)]
+        unique = len(set(bigrams))
+        bigram_rep_rates.append(1.0 - unique / len(bigrams))
+    return float(np.mean(bigram_rep_rates))
+
+
+def benchmark_generation_quality(model, params, tokenizer, prompts, max_gen_len=128, temperature=0.8):
+    from .run import generate
+
+    generations = []
+    for i, prompt in enumerate(prompts):
+        text = generate(model, params, tokenizer, prompt, max_gen_len, temperature, seed=i, stream=False)
+        generations.append(text)
+
+    lengths = [len(tokenizer.encode(t)) for t in generations]
+    rep_rate = compute_repetition_rate(generations)
+
+    return {
+        "avg_generation_length": float(np.mean(lengths)),
+        "min_generation_length": int(np.min(lengths)),
+        "max_generation_length": int(np.max(lengths)),
+        "bigram_repetition_rate": rep_rate,
+        "generations": list(zip(prompts, generations)),
+    }
+
+
+def compute_wer(hypotheses, references):
+    """Compute word error rate using edit distance."""
+    total_edits = 0
+    total_ref_words = 0
+
+    for hyp, ref in zip(hypotheses, references):
+        hyp_words = hyp.lower().split()
+        ref_words = ref.lower().split()
+        n = len(ref_words)
+        m = len(hyp_words)
+
+        # DP edit distance
+        d = [[0] * (m + 1) for _ in range(n + 1)]
+        for i in range(n + 1):
+            d[i][0] = i
+        for j in range(m + 1):
+            d[0][j] = j
+        for i in range(1, n + 1):
+            for j in range(1, m + 1):
+                if ref_words[i - 1] == hyp_words[j - 1]:
+                    d[i][j] = d[i - 1][j - 1]
+                else:
+                    d[i][j] = 1 + min(d[i - 1][j], d[i][j - 1], d[i - 1][j - 1])
+
+        total_edits += d[n][m]
+        total_ref_words += n
+
+    return total_edits / max(total_ref_words, 1)
+
+
 def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=512, ffn_mask=None):
     """Generate tool-call predictions and compute structured metrics."""
     import json

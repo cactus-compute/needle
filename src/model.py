@@ -46,7 +46,7 @@ class TransformerConfig:
     activation: str = "drelu"
     num_memory_slots: int = 64
     n_mels: int = 80
-    dropout_rate: float = 0.1
+    dropout_rate: float = 0.0
 
     @property
     def jax_dtype(self):
@@ -460,7 +460,7 @@ class EncoderDecoderTransformer(nn.Module):
         mat_logits = self._eval_sub_models(encode_fn, src, tgt, src_mask, tgt_mask, src.shape[0], x_f32.dtype, mat_ff_widths, mat_ffn_masks)
         return logits, slot_div, mat_logits
 
-    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mat_ff_widths=None, mat_ffn_masks=None):
+    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, mat_ff_widths=None, mat_ffn_masks=None):
         return self._forward_with_aux_impl(self.encode_text, src, tgt, src_mask=src_mask, tgt_mask=tgt_mask,
                                            mat_ff_widths=mat_ff_widths, mat_ffn_masks=mat_ffn_masks)
 

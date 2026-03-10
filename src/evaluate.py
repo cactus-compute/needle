@@ -37,7 +37,7 @@ def _make_p_decode(model, dec_ffn=None):
 
 def _shard_single(x, num_devices):
     """Replicate a single-sample batch across all devices for pmap."""
-    return jnp.broadcast_to(x[None], (num_devices, *x.shape))
+    return jnp.broadcast_to(x, (num_devices, *x.shape[1:]))
 
 
 def score_sequence(model, params, enc_tokens, dec_tokens, pad_id, sos_id=None,

@@ -218,11 +218,16 @@ def main(args):
             print(f"Tools: {tools[:80]}{'...' if len(tools) > 80 else ''}")
             audio, sr = load_audio(audio_path)
             generate_from_audio(
-                model, params, tokenizer, audio,
-                sr=sr, tools=tools,
+                model,
+                params,
+                tokenizer,
+                audio,
+                sr=sr,
+                tools=tools,
                 max_gen_len=args.max_len,
                 seed=args.seed + i,
-                stream=True, ffn_mask=ffn_mask,
+                stream=True,
+                ffn_mask=ffn_mask,
             )
         return
 
@@ -242,9 +247,15 @@ def main(args):
         print(f"\nQuery: {q}")
         print(f"Tools: {t[:80]}{'...' if len(t) > 80 else ''}")
         generate(
-            model, params, tokenizer, q,
-            tools=t, max_gen_len=args.max_len,
-            seed=args.seed + i, stream=True, ffn_mask=ffn_mask,
+            model,
+            params,
+            tokenizer,
+            q,
+            tools=t,
+            max_gen_len=args.max_len,
+            seed=args.seed + i,
+            stream=True,
+            ffn_mask=ffn_mask,
         )
 
 
