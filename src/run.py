@@ -14,6 +14,7 @@ from .model import (
     make_padding_mask,
     make_mel_padding_mask,
 )
+from .tool_cfg import ToolCallCFG
 
 
 _decode_fn_cache = {}
@@ -48,7 +49,17 @@ def load_checkpoint(path):
     return params, config
 
 
-def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=0, stream=True, task_token_id=None):
+def _select_next_token(next_logits, allowed_ids=None):
+    if allowed_ids is None:
+        return int(jnp.argmax(next_logits))
+    allowed_ids = jnp.array(allowed_ids, dtype=jnp.int32)
+    masked = jnp.full_like(next_logits, jnp.finfo(next_logits.dtype).min)
+    masked = masked.at[allowed_ids].set(next_logits[allowed_ids])
+    return int(jnp.argmax(masked))
+
+
+def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=0,
+             stream=True, task_token_id=None, use_cfg=False):
     """Generate tool-call output.
 
     Encoder: query only.
@@ -66,7 +77,7 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
         {"params": params}, enc_input, src_mask=src_mask, method="encode"
     )
 
-    tools_tokens = tokenizer.encode(tools)
+    tools_tokens = tokenizer.encode_tool_schema(tools)
     prefix = [eos_id, tool_call_id] + tools_tokens
     prefix_len = min(len(prefix), max_gen_len)
 
@@ -77,6 +88,8 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
     decode_fn = _get_decode_fn(model, max_gen_len)
 
     generated_tokens = []
+    cfg = ToolCallCFG(tokenizer, tools) if use_cfg else None
+    streamed_text = ""
 
     if stream:
         sys.stdout.write(f"\n")
@@ -86,16 +99,21 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
 
     for i in range(prefix_len - 1, max_gen_len - 1):
         next_logits = logits[0, i]
-        next_token = int(jnp.argmax(next_logits))
+        allowed_ids = cfg.allowed_next_ids(training=False) if cfg is not None else None
+        next_token = _select_next_token(next_logits, allowed_ids)
 
         if next_token == eos_id:
             break
 
         generated_tokens.append(next_token)
+        if cfg is not None:
+            cfg.step(next_token)
         dec_buffer = dec_buffer.at[0, i + 1].set(next_token)
 
         if stream:
-            sys.stdout.write(tokenizer.decode([next_token]))
+            current_text = tokenizer.decode_structured(generated_tokens)
+            sys.stdout.write(current_text[len(streamed_text):])
+            streamed_text = current_text
             sys.stdout.flush()
 
         logits = decode_fn(params, dec_buffer, encoder_out)
@@ -103,7 +121,7 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
     if stream:
         sys.stdout.write("\n")
 
-    return tokenizer.decode(generated_tokens)
+    return tokenizer.decode_structured(generated_tokens)
 
 
 def load_audio(path, target_sr=16000):
@@ -120,7 +138,8 @@ def load_audio(path, target_sr=16000):
     return audio, sr
 
 
-def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="[]", max_gen_len=512, seed=0, stream=True):
+def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="[]",
+                        max_gen_len=512, seed=0, stream=True, use_cfg=False):
     """Generate tool-call output from audio using the speech encoder pathway.
 
     mel -> encode_speech -> decoder [BOS, <tool_call>, tools_tokens...] -> greedy decode.
@@ -139,7 +158,7 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
         {"params": params}, mel_input, src_mask=src_mask, deterministic=True, method="encode_speech"
     )
 
-    tools_tokens = tokenizer.encode(tools)
+    tools_tokens = tokenizer.encode_tool_schema(tools)
     prefix = [eos_id, tool_call_id] + tools_tokens
     prefix_len = min(len(prefix), max_gen_len)
 
@@ -150,6 +169,8 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
     decode_fn = _get_decode_fn(model, max_gen_len)
 
     generated_tokens = []
+    cfg = ToolCallCFG(tokenizer, tools) if use_cfg else None
+    streamed_text = ""
 
     if stream:
         sys.stdout.write("\n")
@@ -159,16 +180,21 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
 
     for i in range(prefix_len - 1, max_gen_len - 1):
         next_logits = logits[0, i]
-        next_token = int(jnp.argmax(next_logits))
+        allowed_ids = cfg.allowed_next_ids(training=False) if cfg is not None else None
+        next_token = _select_next_token(next_logits, allowed_ids)
 
         if next_token == eos_id:
             break
 
         generated_tokens.append(next_token)
+        if cfg is not None:
+            cfg.step(next_token)
         dec_buffer = dec_buffer.at[0, i + 1].set(next_token)
 
         if stream:
-            sys.stdout.write(tokenizer.decode([next_token]))
+            current_text = tokenizer.decode_structured(generated_tokens)
+            sys.stdout.write(current_text[len(streamed_text):])
+            streamed_text = current_text
             sys.stdout.flush()
 
         logits = decode_fn(params, dec_buffer, encoder_out)
@@ -176,7 +202,7 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
     if stream:
         sys.stdout.write("\n")
 
-    return tokenizer.decode(generated_tokens)
+    return tokenizer.decode_structured(generated_tokens)
 
 
 def main(args):
@@ -206,6 +232,7 @@ def main(args):
                 max_gen_len=args.max_len,
                 seed=args.seed + i,
                 stream=True,
+                use_cfg=getattr(args, "cfg_inference", False),
             )
         return
 
@@ -233,6 +260,7 @@ def main(args):
             max_gen_len=args.max_len,
             seed=args.seed + i,
             stream=True,
+            use_cfg=getattr(args, "cfg_inference", False),
         )
 
 
@@ -244,6 +272,7 @@ def parse_args():
     parser.add_argument("--audio", type=str, nargs="*", help="Audio file paths for voice-to-tool-call")
     parser.add_argument("--max-len", type=int, default=512)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--cfg-inference", action="store_true")
     return parser.parse_args()
 
 

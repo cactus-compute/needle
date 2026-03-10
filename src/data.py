@@ -12,6 +12,7 @@ import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
+import math
 import numpy as np
 from datasets import Audio, load_from_disk
 from tqdm import tqdm
@@ -29,6 +30,43 @@ BOS_ID = 2  # reserved for SentencePiece, unused at runtime (EOS_ID serves as SO
 UNK_ID = 3
 TOOL_CALL_ID = 4
 TRANSCRIBE_ID = 5
+
+JSON_LBRACK = "<json_lbrack>"
+JSON_RBRACK = "<json_rbrack>"
+JSON_LBRACE = "<json_lbrace>"
+JSON_RBRACE = "<json_rbrace>"
+JSON_COLON = "<json_colon>"
+JSON_COMMA = "<json_comma>"
+JSON_QUOTE = "<json_quote>"
+JSON_TRUE = "<json_true>"
+JSON_FALSE = "<json_false>"
+JSON_NULL = "<json_null>"
+JSON_KEY_NAME = "<json_key_name>"
+JSON_KEY_PARAMETERS = "<json_key_parameters>"
+JSON_KEY_ARGUMENTS = "<json_key_arguments>"
+
+JSON_SPECIAL_LITERALS = {
+    JSON_LBRACK: "[",
+    JSON_RBRACK: "]",
+    JSON_LBRACE: "{",
+    JSON_RBRACE: "}",
+    JSON_COLON: ":",
+    JSON_COMMA: ",",
+    JSON_QUOTE: '"',
+    JSON_TRUE: "true",
+    JSON_FALSE: "false",
+    JSON_NULL: "null",
+    JSON_KEY_NAME: '"name"',
+    JSON_KEY_PARAMETERS: '"parameters"',
+    JSON_KEY_ARGUMENTS: '"arguments"',
+}
+JSON_SPECIAL_SYMBOLS = tuple(JSON_SPECIAL_LITERALS.keys())
+JSON_KEY_SYMBOLS = {
+    "name": JSON_KEY_NAME,
+    "parameters": JSON_KEY_PARAMETERS,
+    "arguments": JSON_KEY_ARGUMENTS,
+}
+TRAINABLE_SPECIAL_SYMBOLS = ["<tool_call>", "<transcribe>", *JSON_SPECIAL_SYMBOLS]
 
 _unified_dataset_cache = None
 
@@ -79,12 +117,198 @@ def _set_audio_backend(ds):
     return ds
 
 
+def _normalize_tool_schema_spec(tools_text):
+    try:
+        tools = _json.loads(tools_text)
+    except (_json.JSONDecodeError, TypeError):
+        return []
+
+    if not isinstance(tools, list):
+        return []
+
+    normalized = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name", ""))
+        params = tool.get("parameters")
+        if not isinstance(params, dict):
+            params = {}
+        ordered_params = [(str(k), params[k]) for k in params.keys()]
+        normalized.append({"name": name, "parameters": ordered_params})
+    return normalized
+
+
+def _normalize_tool_call_spec(answer_text, tools_text):
+    schema = _normalize_tool_schema_spec(tools_text)
+    param_order = {tool["name"]: [name for name, _ in tool["parameters"]] for tool in schema}
+
+    try:
+        calls = _json.loads(answer_text)
+    except (_json.JSONDecodeError, TypeError):
+        calls = []
+
+    if not isinstance(calls, list):
+        calls = []
+
+    normalized = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        name = str(call.get("name", ""))
+        args = call.get("arguments")
+        if not isinstance(args, dict):
+            args = {}
+        ordered = []
+        seen = set()
+        for arg_name in param_order.get(name, ()):
+            if arg_name in args:
+                ordered.append((arg_name, args[arg_name]))
+                seen.add(arg_name)
+        for arg_name, arg_value in args.items():
+            if arg_name not in seen:
+                ordered.append((str(arg_name), arg_value))
+        normalized.append({"name": name, "arguments": ordered})
+    return normalized
+
+
+def _escape_json_string_content(text):
+    content = _json.dumps(str(text), ensure_ascii=True)[1:-1]
+    content = content.replace('\\"', '\\u0022')
+    content = content.replace("<", "\\u003c").replace(">", "\\u003e")
+    return content
+
+
+def _number_to_text(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return "0"
+        text = format(value, ".15g")
+        if text == "-0":
+            return "0"
+        return text
+    return _json.dumps(value, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+
+
+def _string_segments(text):
+    return [JSON_QUOTE, _escape_json_string_content(text), JSON_QUOTE]
+
+
+def _generic_json_segments(value):
+    if isinstance(value, str):
+        return _string_segments(value)
+    if value is True:
+        return [JSON_TRUE]
+    if value is False:
+        return [JSON_FALSE]
+    if value is None:
+        return [JSON_NULL]
+    if isinstance(value, (int, float)):
+        return [_number_to_text(value)]
+    if isinstance(value, list):
+        segments = [JSON_LBRACK]
+        for i, item in enumerate(value):
+            if i:
+                segments.append(JSON_COMMA)
+            segments.extend(_generic_json_segments(item))
+        segments.append(JSON_RBRACK)
+        return segments
+    if isinstance(value, dict):
+        segments = [JSON_LBRACE]
+        for i, (key, item) in enumerate(value.items()):
+            if i:
+                segments.append(JSON_COMMA)
+            segments.extend(_string_segments(str(key)))
+            segments.append(JSON_COLON)
+            segments.extend(_generic_json_segments(item))
+        segments.append(JSON_RBRACE)
+        return segments
+    return _string_segments(str(value))
+
+
+def _tool_schema_to_segments(tools_text):
+    schema = _normalize_tool_schema_spec(tools_text)
+    segments = [JSON_LBRACK]
+    for i, tool in enumerate(schema):
+        if i:
+            segments.append(JSON_COMMA)
+        segments.append(JSON_LBRACE)
+        segments.extend([JSON_KEY_NAME, JSON_COLON, *_string_segments(tool["name"])])
+        segments.append(JSON_COMMA)
+        segments.extend([JSON_KEY_PARAMETERS, JSON_COLON, JSON_LBRACE])
+        for j, (param_name, param_type) in enumerate(tool["parameters"]):
+            if j:
+                segments.append(JSON_COMMA)
+            segments.extend(_string_segments(param_name))
+            segments.append(JSON_COLON)
+            segments.extend(_generic_json_segments(param_type))
+        segments.extend([JSON_RBRACE, JSON_RBRACE])
+    segments.append(JSON_RBRACK)
+    return segments
+
+
+def _tool_call_to_segments(answer_text, tools_text):
+    calls = _normalize_tool_call_spec(answer_text, tools_text)
+    segments = [JSON_LBRACK]
+    for i, call in enumerate(calls):
+        if i:
+            segments.append(JSON_COMMA)
+        segments.append(JSON_LBRACE)
+        segments.extend([JSON_KEY_NAME, JSON_COLON, *_string_segments(call["name"])])
+        segments.append(JSON_COMMA)
+        segments.extend([JSON_KEY_ARGUMENTS, JSON_COLON, JSON_LBRACE])
+        for j, (arg_name, arg_value) in enumerate(call["arguments"]):
+            if j:
+                segments.append(JSON_COMMA)
+            segments.extend(_string_segments(arg_name))
+            segments.append(JSON_COLON)
+            segments.extend(_generic_json_segments(arg_value))
+        segments.extend([JSON_RBRACE, JSON_RBRACE])
+    segments.append(JSON_RBRACK)
+    return segments
+
+
+def _segments_to_training_text(segments):
+    return " ".join(segments)
+
+
 class NeedleTokenizer:
     """Wrapper around SentencePiece providing the interface the codebase expects."""
 
     def __init__(self, model_path):
         self.sp = spm.SentencePieceProcessor()
         self.sp.Load(model_path)
+        self.json_token_ids = {}
+        for symbol in JSON_SPECIAL_SYMBOLS:
+            piece_id = int(self.sp.PieceToId(symbol))
+            if piece_id < 0 or self.sp.IdToPiece(piece_id) != symbol:
+                raise ValueError(
+                    "Tokenizer is missing structured JSON symbols. "
+                    "Re-run `needle tokenize` to retrain the tokenizer."
+                )
+            self.json_token_ids[symbol] = piece_id
+        self._special_id_to_literal = {
+            self.json_token_ids[symbol]: literal
+            for symbol, literal in JSON_SPECIAL_LITERALS.items()
+        }
+        excluded = {
+            PAD_ID,
+            EOS_ID,
+            BOS_ID,
+            TOOL_CALL_ID,
+            TRANSCRIBE_ID,
+            *self._special_id_to_literal.keys(),
+        }
+        self.regular_token_ids = np.array(
+            [i for i in range(self.sp.GetPieceSize()) if i not in excluded],
+            dtype=np.int32,
+        )
 
     @property
     def pad_token_id(self):
@@ -113,10 +337,59 @@ class NeedleTokenizer:
     def encode(self, text):
         return self.sp.Encode(text, out_type=int)
 
+    def _encode_segments(self, segments):
+        ids = []
+        for segment in segments:
+            token_id = self.json_token_ids.get(segment)
+            if token_id is not None:
+                ids.append(token_id)
+            elif segment:
+                ids.extend(self.sp.Encode(segment, out_type=int))
+        return ids
+
+    def encode_tool_schema(self, tools_text):
+        return self._encode_segments(_tool_schema_to_segments(tools_text))
+
+    def encode_tool_call(self, answer_text, tools_text):
+        return self._encode_segments(_tool_call_to_segments(answer_text, tools_text))
+
+    def encode_json_string_content(self, text):
+        return self.sp.Encode(_escape_json_string_content(text), out_type=int)
+
+    def encode_json_number(self, value):
+        return self.sp.Encode(_number_to_text(value), out_type=int)
+
+    def decode_structured(self, ids):
+        if isinstance(ids, (list, tuple)) and len(ids) > 0 and isinstance(ids[0], (list, tuple, np.ndarray)):
+            return [self.decode_structured(seq) for seq in ids]
+
+        out = []
+        regular = []
+        for token_id in list(ids):
+            token_id = int(token_id)
+            literal = self._special_id_to_literal.get(token_id)
+            if literal is None:
+                regular.append(token_id)
+                continue
+            if regular:
+                out.append(self.sp.Decode(regular))
+                regular = []
+            out.append(literal)
+        if regular:
+            out.append(self.sp.Decode(regular))
+        return "".join(out)
+
     def decode(self, ids):
-        if isinstance(ids, (list, tuple)) and len(ids) > 0 and isinstance(ids[0], (list, tuple)):
-            return [self.sp.Decode(seq) for seq in ids]
-        return self.sp.Decode(list(ids))
+        return self.decode_structured(ids)
+
+    def token_surface(self, token_id):
+        token_id = int(token_id)
+        if token_id in self._special_id_to_literal:
+            return self._special_id_to_literal[token_id]
+        return self.sp.Decode([token_id])
+
+    def quote_token_id(self):
+        return self.json_token_ids[JSON_QUOTE]
 
     def __call__(self, texts, truncation=True, max_length=None, **kwargs):
         all_ids = []
@@ -163,10 +436,17 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
     corpus_path = os.path.join(TOKENIZER_DIR, "corpus.txt")
     with open(corpus_path, "w") as f:
         for example in tqdm(ds, desc="Writing corpus"):
-            for field in ("query", "tools", "answers"):
-                text = example[field].strip()
-                if text:
-                    f.write(text + "\n")
+            query = example["query"].strip()
+            if query:
+                f.write(query + "\n")
+
+            tools_text = _segments_to_training_text(_tool_schema_to_segments(example["tools"]))
+            if tools_text:
+                f.write(tools_text + "\n")
+
+            answers_text = _segments_to_training_text(_tool_call_to_segments(example["answers"], example["tools"]))
+            if answers_text:
+                f.write(answers_text + "\n")
 
     spm.SentencePieceTrainer.Train(
         input=corpus_path,
@@ -177,7 +457,7 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
         eos_id=EOS_ID,
         bos_id=BOS_ID,
         unk_id=UNK_ID,
-        user_defined_symbols=["<tool_call>", "<transcribe>"],
+        user_defined_symbols=TRAINABLE_SPECIAL_SYMBOLS,
         byte_fallback=True,
         normalization_rule_name="identity",
         num_threads=os.cpu_count(),
@@ -346,7 +626,7 @@ def _split_global_indices(n, split="train", max_samples=None,
 def _save_cache_metadata(split, text_cache_id, mel_cache_id, n_samples,
                          max_enc_len, max_dec_len, n_mels, max_mel_len,
                          split_max_samples=None, shuffle_before_split=False,
-                         split_seed=42):
+                         split_seed=42, toucan_cache_path=None):
     """Save metadata JSON for a split, upload to GCS."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     meta = {
@@ -361,6 +641,7 @@ def _save_cache_metadata(split, text_cache_id, mel_cache_id, n_samples,
         "split_max_samples": split_max_samples,
         "shuffle_before_split": shuffle_before_split,
         "split_seed": split_seed,
+        "toucan_cache_path": toucan_cache_path,
     }
     meta_path = os.path.join(CACHE_DIR, f"{split}_metadata.json")
     with open(meta_path, "w") as f:
@@ -457,19 +738,17 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=256, max_dec_len=1024, ba
         enc_results = pool.map(_tokenize_chunk, enc_chunks)
     all_enc_tokens = [tok for chunk in enc_results for tok in chunk]
 
-    tools_chunks = [tools_texts[i:i + chunk_size] for i in range(0, len(tools_texts), chunk_size)]
-    print(f"Tokenizing tools ({num_workers} workers)...")
-    with mp.Pool(num_workers, initializer=_init_worker,
-                 initargs=(model_path, max_dec_len - 2)) as pool:
-        tools_results = pool.map(_tokenize_chunk, tools_chunks)
-    all_tools_tokens = [tok for chunk in tools_results for tok in chunk]
+    print("Tokenizing tools (structured JSON)...")
+    all_tools_tokens = [
+        tokenizer.encode_tool_schema(text)[:max_dec_len - 2]
+        for text in tqdm(tools_texts, desc="Encoding tools")
+    ]
 
-    ans_chunks = [ans_texts[i:i + chunk_size] for i in range(0, len(ans_texts), chunk_size)]
-    print(f"Tokenizing answers ({num_workers} workers)...")
-    with mp.Pool(num_workers, initializer=_init_worker,
-                 initargs=(model_path, max_dec_len)) as pool:
-        ans_results = pool.map(_tokenize_chunk, ans_chunks)
-    all_ans_tokens = [tok for chunk in ans_results for tok in chunk]
+    print("Tokenizing answers (structured JSON)...")
+    all_ans_tokens = [
+        tokenizer.encode_tool_call(answer, tools)[:max_dec_len]
+        for answer, tools in tqdm(zip(ans_texts, tools_texts), total=len(ans_texts), desc="Encoding answers")
+    ]
 
     n = len(ds)
 
@@ -626,6 +905,14 @@ def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True, l
         if loss_mask is not None:
             batch = batch + (np.array(loss_mask[idx]),)
         yield batch
+
+
+def get_text_mel_batches(enc_inputs, mel_data, batch_size, shuffle=True):
+    n = len(enc_inputs)
+    indices = np.random.permutation(n) if shuffle else np.arange(n)
+    for i in range(0, n - batch_size + 1, batch_size):
+        idx = indices[i : i + batch_size]
+        yield np.array(enc_inputs[idx]), np.array(mel_data[idx])
 
 
 
@@ -948,6 +1235,7 @@ def load_prepared_data(split, mmap=False):
         result["split_max_samples"] = meta.get("split_max_samples")
         result["shuffle_before_split"] = meta.get("shuffle_before_split", False)
         result["split_seed"] = meta.get("split_seed", 42)
+        result["toucan_cache_path"] = meta.get("toucan_cache_path")
         return result
 
     tc_suffixes = ["_enc.npy", "_dec_in.npy", "_dec_tgt.npy", "_loss_mask.npy", "_kept_idx.npy"]
@@ -968,6 +1256,7 @@ def load_prepared_data(split, mmap=False):
         "split_max_samples": meta.get("split_max_samples"),
         "shuffle_before_split": meta.get("shuffle_before_split", False),
         "split_seed": meta.get("split_seed", 42),
+        "toucan_cache_path": meta.get("toucan_cache_path"),
     }
 
 

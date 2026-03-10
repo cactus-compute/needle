@@ -131,7 +131,7 @@ def benchmark_generation_quality(model, params, tokenizer, prompts, max_gen_len=
 
     generations = []
     for i, prompt in enumerate(prompts):
-        text = generate(model, params, tokenizer, prompt, max_gen_len, temperature, seed=i, stream=False)
+        text = generate(model, params, tokenizer, prompt, max_gen_len=max_gen_len, seed=i, stream=False)
         generations.append(text)
 
     lengths = [len(tokenizer.encode(t)) for t in generations]
@@ -177,7 +177,7 @@ def compute_wer(hypotheses, references):
 
 
 def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=512,
-                         shuffle_before_split=False, shuffle_seed=42):
+                         shuffle_before_split=False, shuffle_seed=42, use_cfg=False):
     """Generate tool-call predictions and compute structured metrics."""
     import json
     from .run import generate
@@ -209,7 +209,7 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
 
         pred_text = generate(
             model, params, tokenizer, ex["query"],
-            tools=ex["tools"], max_gen_len=max_gen_len, seed=i, stream=False,
+            tools=ex["tools"], max_gen_len=max_gen_len, seed=i, stream=False, use_cfg=use_cfg,
         ).strip()
 
         try:
@@ -283,7 +283,7 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
 
 
 def benchmark_voice_tool_calls(model, params, tokenizer, num_samples=100, max_gen_len=512,
-                               shuffle_before_split=False, shuffle_seed=42):
+                               shuffle_before_split=False, shuffle_seed=42, use_cfg=False):
     """Generate tool-call predictions from audio and compute structured metrics."""
     import json
     from .run import generate_from_audio
@@ -316,7 +316,7 @@ def benchmark_voice_tool_calls(model, params, tokenizer, num_samples=100, max_ge
 
         pred_text = generate_from_audio(
             model, params, tokenizer, pair["audio_array"], sr=pair["sampling_rate"],
-            tools=pair["tools"], max_gen_len=max_gen_len, seed=i, stream=False,
+            tools=pair["tools"], max_gen_len=max_gen_len, seed=i, stream=False, use_cfg=use_cfg,
         ).strip()
 
         try:
@@ -424,6 +424,7 @@ def main(args):
             max_gen_len=args.max_gen_len,
             shuffle_before_split=split_shuffle,
             shuffle_seed=split_seed,
+            use_cfg=getattr(args, "cfg_inference", False),
         )
 
     print(f"\n  ─────────────────────────────────────")
@@ -460,6 +461,7 @@ def main(args):
             max_gen_len=args.max_gen_len,
             shuffle_before_split=split_shuffle,
             shuffle_seed=split_seed,
+            use_cfg=getattr(args, "cfg_inference", False),
         )
         print(f"\n  ─── Voice-Tool-Call Metrics ─────────")
         print(f"  JSON parse rate  {vtc['json_parse_rate']:>10.1%}")
@@ -502,6 +504,7 @@ def parse_args():
                         help="Samples for tool-call accuracy eval (default: 200)")
     parser.add_argument("--voice-tc-samples", type=int, default=50,
                         help="Samples for voice-to-tool-call eval (default: 50)")
+    parser.add_argument("--cfg-inference", action="store_true")
     return parser.parse_args()
 
 

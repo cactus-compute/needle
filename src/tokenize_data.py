@@ -28,6 +28,7 @@ from .data import (
     train_tokenizer,
     upload_tokenizer_to_gcs,
 )
+from .toucan import cache_toucan_examples
 
 
 def _clear_gcs_caches():
@@ -58,6 +59,18 @@ def tokenize(args):
     upload_tokenizer_to_gcs()
 
     tokenizer = get_tokenizer()
+    toucan_path = None
+
+    if getattr(args, "toucan_config", None):
+        print("\n=== Caching Toucan tool definitions ===")
+        toucan_path = cache_toucan_examples(
+            config=args.toucan_config,
+            split="train",
+            max_samples=getattr(args, "toucan_max_samples", None),
+            tokenizer=tokenizer,
+            max_text_len=max(getattr(args, "max_enc_len", 256), getattr(args, "max_dec_len", 1024)),
+        )
+        print(f"Cached Toucan examples to {toucan_path}")
 
     print("\n=== Tokenizing text data + precomputing mels ===")
     max_enc_len = getattr(args, "max_enc_len", 256)
@@ -90,7 +103,8 @@ def tokenize(args):
                              max_enc_len, max_dec_len, n_mels, max_mel_len,
                              split_max_samples=args.max_samples,
                              shuffle_before_split=getattr(args, "shuffle_before_split", False),
-                             split_seed=getattr(args, "split_seed", 42))
+                             split_seed=getattr(args, "split_seed", 42),
+                             toucan_cache_path=toucan_path)
 
     if args.cleanup and os.path.exists(CACHE_DIR):
         print(f"\n=== Cleaning up {CACHE_DIR}/ ===")

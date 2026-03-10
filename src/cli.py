@@ -56,6 +56,14 @@ def main():
                    help="Number of mel frequency bins (default: 80)")
     p.add_argument("--max-speech-samples", type=int, default=None,
                    help="Max voice-tool-call training samples (default: all)")
+    p.add_argument("--cfg-inference", action="store_true",
+                   help="Enable CFG-constrained sample generation during training")
+    p.add_argument("--tool-contrastive-weight", type=float, default=0.0,
+                   help="Auxiliary Toucan tool-alignment loss weight")
+    p.add_argument("--audio-text-contrastive-weight", type=float, default=0.0,
+                   help="Auxiliary paired audio-text SigLIP loss weight")
+    p.add_argument("--skip-epoch-extras", action="store_true",
+                   help="Skip epoch-end throughput benchmark and qualitative sample generation")
 
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,
@@ -76,6 +84,10 @@ def main():
                    help="Shuffle the unified dataset before splitting into train/val")
     p.add_argument("--split-seed", type=int, default=42,
                    help="Seed for --shuffle-before-split (default: 42)")
+    p.add_argument("--toucan-config", type=str, default=None,
+                   help="Optional Toucan subset to parse and cache during tokenization")
+    p.add_argument("--toucan-max-samples", type=int, default=None,
+                   help="Optional max samples for Toucan parsing")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
@@ -84,6 +96,7 @@ def main():
     p.add_argument("--audio", type=str, nargs="*", help="Audio file paths for voice-to-tool-call")
     p.add_argument("--max-len", type=int, default=512)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--cfg-inference", action="store_true")
 
     p = sub.add_parser("test", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
@@ -97,6 +110,7 @@ def main():
     p.add_argument("--voice-tc-samples", type=int, default=50,
                    help="Samples for voice-to-tool-call eval (default: 50)")
     p.add_argument("--throughput-runs", type=int, default=10)
+    p.add_argument("--cfg-inference", action="store_true")
 
     p = sub.add_parser("evaluate", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
