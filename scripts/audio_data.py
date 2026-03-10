@@ -291,6 +291,27 @@ def _upload_file(bucket: storage.Bucket, blob_path: str, filename: str, content_
     return f"gs://{bucket.name}/{blob_path}"
 
 
+def _create_storage_client(project: str | None) -> storage.Client:
+    """Create a GCS client with a safer default for metadata mTLS probing.
+
+    Some google-auth versions can fail during ADC GCE detection with:
+      AttributeError: 'Request' object has no attribute 'session'
+    when metadata mTLS probing is enabled. Defaulting this mode to "never"
+    avoids that path unless the user explicitly sets it.
+    """
+    os.environ.setdefault("GCE_METADATA_MTLS_MODE", "never")
+    try:
+        return storage.Client(project=project) if project else storage.Client()
+    except AttributeError as exc:
+        if "'Request' object has no attribute 'session'" in str(exc):
+            raise SystemExit(
+                "Google auth initialization failed during metadata probing. "
+                "Set `GCE_METADATA_MTLS_MODE=never` and configure ADC "
+                "(for example `gcloud auth application-default login`), then retry."
+            ) from exc
+        raise
+
+
 def _process_one(
     sample: dict[str, Any],
     source_index: int,
@@ -559,7 +580,7 @@ def main() -> None:
 
     bucket: storage.Bucket | None = None
     if not args.dry_run:
-        client = storage.Client(project=args.project) if args.project else storage.Client()
+        client = _create_storage_client(args.project)
         bucket = client.bucket(args.bucket)
 
     logger.info(
