@@ -57,9 +57,9 @@ def main():
     p.add_argument("--max-speech-samples", type=int, default=None,
                    help="Max voice-tool-call training samples (default: all)")
     p.add_argument("--audio-aug-mode", type=str, default="white", choices=["none", "white", "person", "full"],
-                   help="Waveform augmentation mode: none, white, person, or full (default: white)")
+                   help="Speech augmentation mode for precomputed mels: none, white, person, or full (default: white)")
     p.add_argument("--white-noise-p", type=float, default=0.5,
-                   help="Probability of applying white noise per sample (default: 0.5)")
+                   help="Probability of applying mel-white-noise per sample (default: 0.5)")
     p.add_argument("--white-noise-min-snr-db", type=float, default=8.0,
                    help="Minimum white-noise SNR in dB (default: 8.0)")
     p.add_argument("--white-noise-max-snr-db", type=float, default=30.0,

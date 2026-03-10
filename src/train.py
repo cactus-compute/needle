@@ -15,6 +15,7 @@ from flax.training import train_state
 
 from .data import (
     get_batches, get_tokenizer, get_speech_batches,
+    build_audio_augmenter,
     load_prepared_data, load_prepared_mels,
     load_example_with_audio,
     PrefetchIterator, count_batches,
@@ -487,12 +488,35 @@ def train(args):
 
     train_mels = None
     val_mels = None
+    speech_augmenter = None
     if not no_speech:
         step_idx += 1
         print(f"\n[{step_idx}/{total_data_steps}] Loading precomputed mel spectrograms (mmap)...")
         train_mels = load_prepared_mels(train_data["mel_cache_id"], mmap=True)
         val_mels = load_prepared_mels(val_data["mel_cache_id"], mmap=True)
         print(f"      {len(train_mels):,} train / {len(val_mels):,} val mel spectrograms (memory-mapped)")
+
+        speech_augmenter = build_audio_augmenter(
+            sr=16000,
+            mode=getattr(args, "audio_aug_mode", "white"),
+            white_noise_p=getattr(args, "white_noise_p", 0.5),
+            white_noise_min_snr_db=getattr(args, "white_noise_min_snr_db", 8.0),
+            white_noise_max_snr_db=getattr(args, "white_noise_max_snr_db", 30.0),
+            person_noise_n=getattr(args, "person_noise_n", 10),
+            person_noise_r1=getattr(args, "person_noise_r1", 3.0),
+            person_noise_r2=getattr(args, "person_noise_r2", 10.0),
+            person_noise_r_ref=getattr(args, "person_noise_r_ref", 1.0),
+            person_noise_min_snr_db=getattr(args, "person_noise_min_snr_db", 15.0),
+            person_noise_max_snr_db=getattr(args, "person_noise_max_snr_db", 40.0),
+            person_noise_pool=train_mels,
+        )
+        if speech_augmenter is not None:
+            aug_name = getattr(speech_augmenter, "name", getattr(args, "audio_aug_mode", "white"))
+            num_transforms = len(getattr(speech_augmenter, "transforms", ()))
+            if num_transforms > 0:
+                print(f"      Speech augmentation: {aug_name} ({num_transforms} transforms)")
+            else:
+                print(f"      Speech augmentation: {aug_name}")
 
     effective_batch_size = args.batch_size * num_devices
 
@@ -650,7 +674,7 @@ def train(args):
         if not no_speech and train_mels is not None:
             speech_batch_iter = PrefetchIterator(
                 lambda: get_speech_batches(train_mels, dec_inputs, dec_targets, unique_batch_size,
-                                           loss_mask=train_loss_mask),
+                                           loss_mask=train_loss_mask, augmenter=speech_augmenter),
                 prefetch=4,
             )
 
