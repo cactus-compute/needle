@@ -1014,12 +1014,14 @@ def train(args):
         near_zero = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(params_np))
         sparsity = near_zero / total_params * 100
 
-        ckpt_name = f"needle_{args.num_layers}_{args.d_model}_{global_step}.pkl"
-        ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
-        with open(ckpt_path, "wb") as f:
-            pickle.dump({"params": params_np, "config": config.__dict__}, f)
+        ckpt_path = "(skipped)"
+        if not getattr(args, "no_checkpoints", False):
+            ckpt_name = f"needle_{args.num_layers}_{args.d_model}_{global_step}.pkl"
+            ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
+            with open(ckpt_path, "wb") as f:
+                pickle.dump({"params": params_np, "config": config.__dict__}, f)
+            print(f"  [epoch {epoch + 1}] checkpoint saved in {time.perf_counter() - epoch_eval_t0:.1f}s")
         del params_np
-        print(f"  [epoch {epoch + 1}] checkpoint saved in {time.perf_counter() - epoch_eval_t0:.1f}s")
 
         tp = {"tokens_per_second": float("nan"), "avg_latency_s": float("nan")}
         unified_samples = []

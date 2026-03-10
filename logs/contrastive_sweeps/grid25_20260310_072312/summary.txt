@@ -1,0 +1,32 @@
+mode=grid25
+epochs=1
+eval_every=1000000
+skip_epoch_extras=True
+no_checkpoints=True
+cfg_inference=False
+
+at_0p0__tool_0p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p0__tool_0p0.log
+at_0p0__tool_0p1	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p0__tool_0p1.log
+at_0p0__tool_0p5	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p0__tool_0p5.log
+at_0p0__tool_1p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p0__tool_1p0.log
+at_0p0__tool_2p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p0__tool_2p0.log
+at_0p1__tool_0p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p1__tool_0p0.log
+at_0p1__tool_0p1	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p1__tool_0p1.log
+at_0p1__tool_0p5	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p1__tool_0p5.log
+at_0p1__tool_1p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p1__tool_1p0.log
+at_0p1__tool_2p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p1__tool_2p0.log
+at_0p5__tool_0p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p5__tool_0p0.log
+at_0p5__tool_0p1	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p5__tool_0p1.log
+at_0p5__tool_0p5	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p5__tool_0p5.log
+at_0p5__tool_1p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p5__tool_1p0.log
+at_0p5__tool_2p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_0p5__tool_2p0.log
+at_1p0__tool_0p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_1p0__tool_0p0.log
+at_1p0__tool_0p1	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_1p0__tool_0p1.log
+at_1p0__tool_0p5	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_1p0__tool_0p5.log
+at_1p0__tool_1p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_1p0__tool_1p0.log
+at_1p0__tool_2p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_1p0__tool_2p0.log
+at_2p0__tool_0p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_2p0__tool_0p0.log
+at_2p0__tool_0p1	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_2p0__tool_0p1.log
+at_2p0__tool_0p5	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_2p0__tool_0p5.log
+at_2p0__tool_1p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_2p0__tool_1p0.log
+at_2p0__tool_2p0	returncode=0	log=/home/karen/needle/logs/contrastive_sweeps/grid25_20260310_072312/at_2p0__tool_2p0.log

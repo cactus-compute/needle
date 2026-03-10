@@ -64,6 +64,8 @@ def main():
                    help="Auxiliary paired audio-text SigLIP loss weight")
     p.add_argument("--skip-epoch-extras", action="store_true",
                    help="Skip epoch-end throughput benchmark and qualitative sample generation")
+    p.add_argument("--no-checkpoints", action="store_true",
+                   help="Skip epoch checkpoint writes")
 
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,
