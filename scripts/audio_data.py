@@ -79,6 +79,15 @@ except Exception:  # pragma: no cover - optional metadata only
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+ENGLISH_ONLY_DATA_FILES = [
+    "Emilia/EN/*.tar",
+    "Emilia-YODAS/EN/*.tar",
+]
 
 
 @dataclass
@@ -435,6 +444,21 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--split", default="train", help="Dataset split (default: train).")
     parser.add_argument(
+        "--data-files",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional HF data file globs (e.g. Emilia/EN/*.tar). "
+            "If omitted and --english-only-paths is enabled, EN shards are used."
+        ),
+    )
+    parser.add_argument(
+        "--english-only-paths",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When true, stream only Emilia EN shard paths by default.",
+    )
+    parser.add_argument(
         "--hf-token",
         default=os.environ.get("HF_TOKEN"),
         help="Hugging Face token (or set HF_TOKEN).",
@@ -620,8 +644,15 @@ def main() -> None:
         "split": args.split,
         "streaming": args.streaming,
     }
+    if args.data_files:
+        ds_kwargs["data_files"] = args.data_files
+    elif args.english_only_paths:
+        ds_kwargs["data_files"] = ENGLISH_ONLY_DATA_FILES
     if args.hf_token:
         ds_kwargs["token"] = args.hf_token
+
+    if "data_files" in ds_kwargs:
+        logger.info("Using data_files filters: %s", ds_kwargs["data_files"])
 
     ds = load_dataset(**ds_kwargs)
     ds = ds.cast_column("mp3", Audio(decode=False))
@@ -755,6 +786,7 @@ def main() -> None:
         "max_in_flight": max_in_flight,
         "sample_rate_hz": sample_rate,
         "n_mels": int(args.n_mels),
+        "data_files": ds_kwargs.get("data_files"),
         "win_ms": float(args.win_ms),
         "hop_ms": float(args.hop_ms),
         "fmin_hz": float(args.fmin),
