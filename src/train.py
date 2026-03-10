@@ -891,39 +891,111 @@ def train(args):
 
         _val_start = len(enc_inputs)
         val_kept = val_data["kept_indices"]
-        n_eval_samples = 3
-        # Find samples with non-empty tool calls for representative eval
-        eval_indices = []
-        step = max(1, len(val_kept) // (n_eval_samples * 10))
-        for k in range(0, len(val_kept), step):
+
+        # Pick 5 display samples (shuffled for diversity): 4 with tool calls, 1 without
+        sample_rng = np.random.RandomState(epoch + 7)
+        sample_pool = sample_rng.permutation(len(val_kept))
+        display_with, display_without = [], []
+        for k in sample_pool:
+            if len(display_with) >= 4 and len(display_without) >= 1:
+                break
             ds_idx = int(val_kept[k]) + _val_start
             pair = load_example_with_audio(ds_idx)
-            if pair["answers"].strip() not in ("", "[]"):
-                eval_indices.append(ds_idx)
-                if len(eval_indices) >= n_eval_samples:
-                    break
+            is_empty = pair["answers"].strip() in ("", "[]")
+            if not is_empty and len(display_with) < 4:
+                display_with.append((ds_idx, pair))
+            elif is_empty and len(display_without) < 1:
+                display_without.append((ds_idx, pair))
+        display_pairs = display_with + display_without
 
         unified_samples = []
-        for i, ds_idx in enumerate(eval_indices):
-            pair = load_example_with_audio(int(ds_idx))
-            query = pair["query"][:80]
-            ref = pair["answers"][:120]
-
-            # Text prediction
+        for i, (ds_idx, pair) in enumerate(display_pairs):
             text_pred = generate(
                 eval_model, eval_params, tokenizer, pair["query"],
                 tools=pair["tools"], max_gen_len=args.max_dec_len, seed=i, stream=False,
-            ).strip()[:120]
+            ).strip()
 
-            # Voice prediction
             voice_pred = None
             if not no_speech and pair["audio_array"] is not None:
                 voice_pred = generate_from_audio(
                     eval_model, eval_params, tokenizer, pair["audio_array"], sr=pair["sampling_rate"],
                     tools=pair["tools"], max_gen_len=args.max_dec_len, seed=i, stream=False,
-                ).strip()[:120]
+                ).strip()
 
-            unified_samples.append((query, ref, text_pred, voice_pred))
+            unified_samples.append({
+                "query": pair["query"],
+                "tools": pair["tools"],
+                "ref": pair["answers"],
+                "text": text_pred,
+                "voice": voice_pred,
+            })
+
+        import json as _json_mod
+        tc_n, tc_exact, tc_name_tp, tc_name_fp, tc_name_fn = 0, 0, 0, 0, 0
+        tc_call_tp, tc_call_fp, tc_call_fn, tc_parse_err = 0, 0, 0, 0
+        tc_with_n = 25
+        tc_without_n = 5
+        tc_rng = np.random.RandomState(epoch + 42)
+        tc_pool = tc_rng.permutation(len(val_kept))
+        tc_with, tc_without = [], []
+        for k in tc_pool:
+            if len(tc_with) >= tc_with_n and len(tc_without) >= tc_without_n:
+                break
+            ds_idx = int(val_kept[k]) + _val_start
+            pair = load_example_with_audio(ds_idx)
+            ref_text = pair["answers"].strip()
+            is_empty = ref_text in ("", "[]")
+            if not is_empty and len(tc_with) < tc_with_n:
+                tc_with.append((ds_idx, pair))
+            elif is_empty and len(tc_without) < tc_without_n:
+                tc_without.append((ds_idx, pair))
+        tc_eval_pairs = tc_with + tc_without
+
+        def _call_key(c):
+            if not isinstance(c, dict): return None
+            return _json_mod.dumps({"name": c.get("name"), "arguments": c.get("arguments")}, sort_keys=True)
+
+        for i, (ds_idx, pair) in enumerate(tc_eval_pairs):
+            ref_text = pair["answers"].strip()
+            pred_text = generate(
+                eval_model, eval_params, tokenizer, pair["query"],
+                tools=pair["tools"], max_gen_len=args.max_dec_len, seed=ds_idx, stream=False,
+            ).strip()
+            try:
+                ref_calls = _json_mod.loads(ref_text)
+            except (ValueError, TypeError):
+                ref_calls = []
+            try:
+                pred_calls = _json_mod.loads(pred_text)
+                if not isinstance(pred_calls, list):
+                    pred_calls = [pred_calls] if isinstance(pred_calls, dict) else []
+            except (ValueError, TypeError):
+                tc_parse_err += 1
+                pred_calls = []
+            tc_n += 1
+            if _json_mod.dumps(pred_calls, sort_keys=True) == _json_mod.dumps(ref_calls, sort_keys=True):
+                tc_exact += 1
+            ref_names = {c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c}
+            pred_names = {c["name"] for c in pred_calls if isinstance(c, dict) and "name" in c}
+            tc_name_tp += len(pred_names & ref_names)
+            tc_name_fp += len(pred_names - ref_names)
+            tc_name_fn += len(ref_names - pred_names)
+            rk = {_call_key(c) for c in ref_calls} - {None}
+            pk = {_call_key(c) for c in pred_calls} - {None}
+            tc_call_tp += len(pk & rk)
+            tc_call_fp += len(pk - rk)
+            tc_call_fn += len(rk - pk)
+
+        tc_metrics = {}
+        if tc_n > 0:
+            tc_metrics["parse_rate"] = 1.0 - tc_parse_err / tc_n
+            tc_metrics["exact_match"] = tc_exact / tc_n
+            np_ = tc_name_tp + tc_name_fp
+            nr_ = tc_name_tp + tc_name_fn
+            tc_metrics["name_f1"] = 2 * tc_name_tp / max(np_ + nr_, 1)
+            cp_ = tc_call_tp + tc_call_fp
+            cr_ = tc_call_tp + tc_call_fn
+            tc_metrics["call_f1"] = 2 * tc_call_tp / max(cp_ + cr_, 1)
 
         del eval_params
 
@@ -947,18 +1019,29 @@ def train(args):
             for factor in sorted(mat_results.keys()):
                 mat_ppl, mat_params, ff_w = mat_results[factor]
                 print(f"  {str(factor)+'x':>6}  {ff_w:>6}  {mat_ppl:>10.2f}  {mat_params:>12,}")
+        if tc_metrics:
+            print(f"  ─── Tool-Call Accuracy ({tc_n} samples) ──")
+            print(f"  JSON parse     {tc_metrics['parse_rate']:>10.1%}")
+            print(f"  Exact match    {tc_metrics['exact_match']:>10.1%}")
+            print(f"  Name F1        {tc_metrics['name_f1']:>10.3f}")
+            print(f"  Call F1        {tc_metrics['call_f1']:>10.3f}")
         print(f"  ─────────────────────────────────────")
         print(f"  Throughput     {tp['tokens_per_second']:>10.1f} tok/s")
         print(f"  Latency        {tp['avg_latency_s']:>11.3f}s")
         if unified_samples:
-            print(f"  ─── Samples ────────────────────────")
-            for query, ref, text_pred, voice_pred in unified_samples:
-                print(f"  Q: {query}")
-                print(f"  R: {ref}")
-                print(f"  T: {text_pred or '(empty)'}")
-                if voice_pred is not None:
-                    print(f"  V: {voice_pred or '(empty)'}")
-                print()
+            print(f"  ─── Samples ({len(unified_samples)}) ───────────────────")
+            for j, s in enumerate(unified_samples):
+                print(f"  [{j+1}] Query: {s['query'][:120]}")
+                tools_short = s["tools"][:120]
+                if len(s["tools"]) > 120:
+                    tools_short += "..."
+                print(f"      Tools: {tools_short}")
+                print(f"      Ref:   {s['ref'][:200] or '[]'}")
+                print(f"      Text:  {s['text'][:200] or '(empty)'}")
+                if s["voice"] is not None:
+                    print(f"      Voice: {s['voice'][:200] or '(empty)'}")
+                if j < len(unified_samples) - 1:
+                    print()
         print(f"  ─────────────────────────────────────")
         print(f"  Checkpoint: {ckpt_path}")
         print(f"  ─────────────────────────────────────\n")
@@ -978,6 +1061,11 @@ def train(args):
             for factor, (mat_ppl, mat_params, _) in mat_results.items():
                 log_dict[f"epoch/mat_ppl_{factor}x"] = mat_ppl
                 log_dict[f"epoch/mat_params_{factor}x"] = mat_params
+            if tc_metrics:
+                log_dict["epoch/tc_parse_rate"] = tc_metrics["parse_rate"]
+                log_dict["epoch/tc_exact_match"] = tc_metrics["exact_match"]
+                log_dict["epoch/tc_name_f1"] = tc_metrics["name_f1"]
+                log_dict["epoch/tc_call_f1"] = tc_metrics["call_f1"]
             wandb.log(log_dict)
 
     if use_wandb:
