@@ -16,6 +16,30 @@ from .model import (
 )
 
 
+_decode_fn_cache = {}
+
+
+def _get_decode_fn(model, max_gen_len, ffn_mask=None):
+    """Return a JIT-compiled decode function, cached by (model, max_gen_len, ffn_mask).
+
+    params is an explicit argument (not closed over) so the same compiled
+    function can be reused across calls with different params.
+    """
+    key = (id(model), max_gen_len, id(ffn_mask) if ffn_mask is not None else None)
+    if key not in _decode_fn_cache:
+        tgt_mask = make_causal_mask(max_gen_len)
+
+        @jax.jit
+        def decode_step(params, dec_buffer, encoder_out):
+            return model.apply(
+                {"params": params}, dec_buffer, encoder_out,
+                self_mask=tgt_mask, ffn_mask=ffn_mask, method="decode",
+            )
+
+        _decode_fn_cache[key] = decode_step
+    return _decode_fn_cache[key]
+
+
 def load_checkpoint(path):
     with open(path, "rb") as f:
         data = pickle.load(f)
@@ -58,29 +82,15 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
         {"params": params}, enc_input, src_mask=src_mask, ffn_mask=enc_ffn, method="encode"
     )
 
-    # Build decoder prefix: [BOS, <tool_call>, tools_tokens...]
     tools_tokens = tokenizer.encode(tools)
     prefix = [eos_id, tool_call_id] + tools_tokens
-    prefix_len = len(prefix)
+    prefix_len = min(len(prefix), max_gen_len)
 
-    # Fixed-size buffer so JAX compiles once
-    tgt_mask = make_causal_mask(max_gen_len)
     dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
-    # Fill prefix
     for j, tok in enumerate(prefix[:max_gen_len]):
         dec_buffer = dec_buffer.at[0, j].set(tok)
 
-    @jax.jit
-    def decode_step(dec_buffer, encoder_out):
-        logits = model.apply(
-            {"params": params},
-            dec_buffer,
-            encoder_out,
-            self_mask=tgt_mask,
-            ffn_mask=dec_ffn,
-            method="decode",
-        )
-        return logits
+    decode_fn = _get_decode_fn(model, max_gen_len, ffn_mask=dec_ffn)
 
     generated_tokens = []
 
@@ -88,7 +98,7 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
         sys.stdout.write(f"\n")
         sys.stdout.flush()
 
-    logits = decode_step(dec_buffer, encoder_out)
+    logits = decode_fn(params, dec_buffer, encoder_out)
 
     for i in range(prefix_len - 1, max_gen_len - 1):
         next_logits = logits[0, i]
@@ -104,7 +114,7 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
             sys.stdout.write(tokenizer.decode([next_token]))
             sys.stdout.flush()
 
-        logits = decode_step(dec_buffer, encoder_out)
+        logits = decode_fn(params, dec_buffer, encoder_out)
 
     if stream:
         sys.stdout.write("\n")
@@ -116,10 +126,8 @@ def load_audio(path, target_sr=16000):
     """Load an audio file and resample to target_sr. Returns (audio_array, sr)."""
     import soundfile as sf
     audio, sr = sf.read(path, dtype="float32")
-    # Convert stereo to mono
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
-    # Resample if needed
     if sr != target_sr:
         from scipy.signal import resample
         num_samples = int(len(audio) * target_sr / sr)
@@ -150,27 +158,15 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
         {"params": params}, mel_input, src_mask=src_mask, ffn_mask=enc_ffn, deterministic=True, method="encode_speech"
     )
 
-    # Build decoder prefix: [BOS, <tool_call>, tools_tokens...]
     tools_tokens = tokenizer.encode(tools)
     prefix = [eos_id, tool_call_id] + tools_tokens
-    prefix_len = len(prefix)
+    prefix_len = min(len(prefix), max_gen_len)
 
-    tgt_mask = make_causal_mask(max_gen_len)
     dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
     for j, tok in enumerate(prefix[:max_gen_len]):
         dec_buffer = dec_buffer.at[0, j].set(tok)
 
-    @jax.jit
-    def decode_step(dec_buffer, encoder_out):
-        logits = model.apply(
-            {"params": params},
-            dec_buffer,
-            encoder_out,
-            self_mask=tgt_mask,
-            ffn_mask=dec_ffn,
-            method="decode",
-        )
-        return logits
+    decode_fn = _get_decode_fn(model, max_gen_len, ffn_mask=dec_ffn)
 
     generated_tokens = []
 
@@ -178,7 +174,7 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
         sys.stdout.write("\n")
         sys.stdout.flush()
 
-    logits = decode_step(dec_buffer, encoder_out)
+    logits = decode_fn(params, dec_buffer, encoder_out)
 
     for i in range(prefix_len - 1, max_gen_len - 1):
         next_logits = logits[0, i]
@@ -194,7 +190,7 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
             sys.stdout.write(tokenizer.decode([next_token]))
             sys.stdout.flush()
 
-        logits = decode_step(dec_buffer, encoder_out)
+        logits = decode_fn(params, dec_buffer, encoder_out)
 
     if stream:
         sys.stdout.write("\n")
@@ -214,7 +210,6 @@ def main(args):
     if ffn_mask:
         print(f"TopK sub-model: per-layer FFN masking active")
 
-    # --- Voice-to-tool-call mode ---
     audio_files = getattr(args, "audio", None)
     if audio_files:
         tools = getattr(args, "tools", None) or "[]"
@@ -231,7 +226,6 @@ def main(args):
             )
         return
 
-    # --- Tool-call generation mode ---
     query = getattr(args, "query", None)
     tools = getattr(args, "tools", None) or "[]"
 

@@ -97,13 +97,13 @@ def main():
     p = sub.add_parser("train", add_help=False)
     p.add_argument("--full", action="store_true")
     p.add_argument("--checkpoint", type=str, default=None)
-    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--d-model", type=int, default=512)
-    p.add_argument("--num-heads", type=int, default=8)
-    p.add_argument("--num-kv-heads", type=int, default=None)
+    p.add_argument("--num-heads", type=int, default=16)
+    p.add_argument("--num-kv-heads", type=int, default=8)
     p.add_argument("--num-layers", type=int, default=4)
     p.add_argument("--num-dec-layers", type=int, default=4)
     p.add_argument("--max-enc-len", type=int, default=256)
@@ -146,6 +146,8 @@ def main():
     p.add_argument("--mat-saliency-scale", type=float, default=1.0)
     p.add_argument("--mat-gumbel", action="store_true",
                    help="Use Gumbel noise for per-item mask diversity during topk learning")
+    p.add_argument("--dropout", type=float, default=0.0,
+                   help="Dropout rate for residual connections (default: 0.1)")
     p.add_argument("--no-speech", action="store_true", help="Disable speech training (text-only)")
     p.add_argument("--max-mel-len", type=int, default=1024,
                    help="Max mel spectrogram frames (default: 1024)")
@@ -153,6 +155,22 @@ def main():
                    help="Number of mel frequency bins (default: 80)")
     p.add_argument("--max-speech-samples", type=int, default=None,
                    help="Max voice-tool-call training samples (default: all)")
+
+    p = sub.add_parser("tokenize", add_help=False)
+    p.add_argument("--max-samples", type=int, default=None,
+                   help="Limit samples per split (for dev/test)")
+    p.add_argument("--cleanup", action="store_true",
+                   help="Delete local .data_cache/ after GCS upload")
+    p.add_argument("--n-mels", type=int, default=80,
+                   help="Number of mel frequency bins (default: 80)")
+    p.add_argument("--max-mel-len", type=int, default=1024,
+                   help="Max mel spectrogram frames (default: 1024)")
+    p.add_argument("--max-enc-len", type=int, default=256,
+                   help="Max encoder sequence length (default: 256)")
+    p.add_argument("--max-dec-len", type=int, default=1024,
+                   help="Max decoder sequence length (default: 1024)")
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="Process in batches of this size, uploading shards to GCS incrementally")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
@@ -218,7 +236,10 @@ def main():
         print(HELP)
         sys.exit(0)
 
-    if args.command == "train":
+    if args.command == "tokenize":
+        from .tokenize_data import tokenize
+        tokenize(args)
+    elif args.command == "train":
         if getattr(args, "full", False):
             args.d_model = 1536
             args.num_heads = 24
