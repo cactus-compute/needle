@@ -31,6 +31,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from requests.adapters import HTTPAdapter
 
 try:
     import numpy as np
@@ -300,7 +301,7 @@ def _upload_file(bucket: storage.Bucket, blob_path: str, filename: str, content_
     return f"gs://{bucket.name}/{blob_path}"
 
 
-def _create_storage_client(project: str | None) -> storage.Client:
+def _create_storage_client(project: str | None, pool_size: int) -> storage.Client:
     """Create a GCS client with a safer default for metadata mTLS probing.
 
     Some google-auth versions can fail during ADC GCE detection with:
@@ -324,7 +325,7 @@ def _create_storage_client(project: str | None) -> storage.Client:
         os.environ["GCE_METADATA_MTLS_MODE"] = "none"
 
     try:
-        return storage.Client(project=project) if project else storage.Client()
+        client = storage.Client(project=project) if project else storage.Client()
     except AttributeError as exc:
         if "'Request' object has no attribute 'session'" in str(exc):
             raise SystemExit(
@@ -333,6 +334,13 @@ def _create_storage_client(project: str | None) -> storage.Client:
                 "(for example `gcloud auth application-default login`), then retry."
             ) from exc
         raise
+
+    # Increase HTTP connection pool for concurrent object uploads.
+    if pool_size > 0:
+        adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size, max_retries=0)
+        client._http.mount("https://", adapter)
+        client._http.mount("http://", adapter)
+    return client
 
 
 def _process_one(
@@ -492,6 +500,12 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Max pending futures (default: workers*4).",
     )
+    parser.add_argument(
+        "--gcs-pool-size",
+        type=int,
+        default=None,
+        help="GCS HTTP connection pool size (default: max(32, workers*4)).",
+    )
     parser.add_argument("--sample-rate", type=int, default=16000, help="Target sample rate.")
     parser.add_argument("--n-mels", type=int, default=80, help="Number of mel bins.")
     parser.add_argument("--win-ms", type=float, default=25.0, help="STFT window length in ms.")
@@ -601,6 +615,7 @@ def main() -> None:
     )
     max_in_flight = args.max_in_flight if args.max_in_flight is not None else args.workers * 4
     max_in_flight = max(args.workers, max_in_flight)
+    gcs_pool_size = args.gcs_pool_size if args.gcs_pool_size is not None else max(32, args.workers * 4)
 
     if args.csv_name:
         csv_name = args.csv_name
@@ -618,7 +633,7 @@ def main() -> None:
 
     bucket: storage.Bucket | None = None
     if not args.dry_run:
-        client = _create_storage_client(args.project)
+        client = _create_storage_client(args.project, pool_size=gcs_pool_size)
         bucket = client.bucket(args.bucket)
 
     logger.info(
@@ -784,6 +799,7 @@ def main() -> None:
         "num_language_rows_seen": counters["language_rows_seen"],
         "workers": args.workers,
         "max_in_flight": max_in_flight,
+        "gcs_pool_size": gcs_pool_size,
         "sample_rate_hz": sample_rate,
         "n_mels": int(args.n_mels),
         "data_files": ds_kwargs.get("data_files"),
