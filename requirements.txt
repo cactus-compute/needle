@@ -10,4 +10,6 @@ pyyaml
 sentencepiece
 google-cloud-texttospeech
 audiomentations
-gcsfsgoogle-cloud-storage
+google-cloud-storage
+soundfile
+scipy
