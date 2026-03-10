@@ -47,8 +47,24 @@ def main():
                    help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4 8)")
     p.add_argument("--mat-shared-input", action="store_true",
                    help="Each unique input is repeated across all mat widths (default: unique input per width)")
+    p.add_argument("--mat-method", choices=["static-prefix", "topk"], default="topk",
+                   help="Matryoshka method: 'static-prefix' (fixed first-N masks), 'topk' (saliency-based masks, default)")
+    p.add_argument("--mat-tau-start", type=float, default=0.5)
+    p.add_argument("--mat-tau-end", type=float, default=0.1)
+    p.add_argument("--mat-init-mode", choices=["prefix", "shuffled_prefix", "saliency", "normal", "zeros"], default="saliency")
+    p.add_argument("--mat-init-value", type=float, default=0.5)
+    p.add_argument("--mat-spread-lambda", type=float, default=0.0)
+    p.add_argument("--mat-warmup-frac", type=float, default=0.4,
+                   help="Fraction of total steps for vanilla warmup (no masks)")
+    p.add_argument("--mat-freeze-frac", type=float, default=1.0,
+                   help="Fraction of total steps at end with frozen hard masks")
+    p.add_argument("--mat-mask-lr", type=float, default=3e-3,
+                   help="Mask logit optimizer learning rate (default: 3e-3)")
+    p.add_argument("--mat-saliency-scale", type=float, default=1.0)
+    p.add_argument("--mat-gumbel", action="store_true",
+                   help="Use Gumbel noise for per-item mask diversity during topk learning")
     p.add_argument("--dropout", type=float, default=0.0,
-                   help="Dropout rate for residual connections (default: 0.1)")
+                   help="Dropout rate for residual connections (default: 0.0)")
     p.add_argument("--no-speech", action="store_true", help="Disable speech training (text-only)")
     p.add_argument("--max-mel-len", type=int, default=1024,
                    help="Max mel spectrogram frames (default: 1024)")

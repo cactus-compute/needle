@@ -10,16 +10,18 @@ import optax
 from .data import get_batches, get_tokenizer, load_tool_calls, prepare_tool_call_pairs, load_tool_call_audio, load_example_with_audio
 from .model import (
     EncoderDecoderTransformer,
-    TransformerConfig,
     make_causal_mask,
     make_padding_mask,
 )
 from .run import load_checkpoint, _get_decode_fn
 
 
-def compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, batch_size, pad_id, loss_mask=None):
+def compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, batch_size, pad_id, loss_mask=None, ffn_mask=None):
     total_loss = 0.0
     total_tokens = 0
+
+    enc_ffn = ffn_mask["encoder"] if ffn_mask else None
+    dec_ffn = ffn_mask["decoder"] if ffn_mask else None
 
     for batch in get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=False, loss_mask=loss_mask):
         if loss_mask is not None:
@@ -34,9 +36,12 @@ def compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, batch
         src_mask = make_padding_mask(src, pad_id)
         tgt_mask = make_causal_mask(tgt_in.shape[1]) & make_padding_mask(tgt_in, pad_id)
 
+        encoder_out = model.apply(
+            {"params": params}, src, src_mask=src_mask, ffn_mask=enc_ffn, method="encode",
+        )
         logits = model.apply(
-            {"params": params}, src, tgt_in,
-            src_mask=src_mask, tgt_mask=tgt_mask,
+            {"params": params}, tgt_in, encoder_out,
+            self_mask=tgt_mask, ffn_mask=dec_ffn, method="decode",
         )
 
         loss = optax.softmax_cross_entropy_with_integer_labels(logits, tgt_out)
@@ -47,18 +52,21 @@ def compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, batch
     return math.exp(avg_nll)
 
 
-def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is the weather?', max_gen_len=64):
+def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is the weather?', max_gen_len=64, ffn_mask=None):
     enc_tokens = tokenizer.encode(prompt)
     enc_input = jnp.array([enc_tokens])
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
 
     src_mask = make_padding_mask(enc_input, pad_id)
-    decode_fn = _get_decode_fn(model, max_gen_len)
+    enc_ffn = ffn_mask["encoder"] if ffn_mask else None
+    dec_ffn = ffn_mask["decoder"] if ffn_mask else None
+
+    decode_fn = _get_decode_fn(model, max_gen_len, ffn_mask=dec_ffn)
 
     # Warmup JIT
     encoder_out = model.apply(
-        {"params": params}, enc_input, src_mask=src_mask, method="encode"
+        {"params": params}, enc_input, src_mask=src_mask, ffn_mask=enc_ffn, method="encode"
     )
     dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
     dec_buffer = dec_buffer.at[0, 0].set(eos_id)
@@ -74,7 +82,7 @@ def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is th
 
         start = time.perf_counter()
         encoder_out = model.apply(
-            {"params": params}, enc_input, src_mask=src_mask, method="encode"
+            {"params": params}, enc_input, src_mask=src_mask, ffn_mask=enc_ffn, method="encode"
         )
         logits = decode_fn(params, dec_buffer, encoder_out)
 
@@ -168,7 +176,7 @@ def compute_wer(hypotheses, references):
     return total_edits / max(total_ref_words, 1)
 
 
-def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=512):
+def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=512, ffn_mask=None):
     """Generate tool-call predictions and compute structured metrics."""
     import json
     from .run import generate
@@ -196,6 +204,7 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
         pred_text = generate(
             model, params, tokenizer, ex["query"],
             tools=ex["tools"], max_gen_len=max_gen_len, seed=i, stream=False,
+            ffn_mask=ffn_mask,
         ).strip()
 
         try:
@@ -268,7 +277,7 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
     }
 
 
-def benchmark_voice_tool_calls(model, params, tokenizer, num_samples=100, max_gen_len=512):
+def benchmark_voice_tool_calls(model, params, tokenizer, num_samples=100, max_gen_len=512, ffn_mask=None):
     """Generate tool-call predictions from audio and compute structured metrics."""
     import json
     from .run import generate_from_audio
@@ -297,6 +306,7 @@ def benchmark_voice_tool_calls(model, params, tokenizer, num_samples=100, max_ge
         pred_text = generate_from_audio(
             model, params, tokenizer, pair["audio_array"], sr=pair["sampling_rate"],
             tools=pair["tools"], max_gen_len=max_gen_len, seed=i, stream=False,
+            ffn_mask=ffn_mask,
         ).strip()
 
         try:
@@ -370,7 +380,7 @@ def benchmark_voice_tool_calls(model, params, tokenizer, num_samples=100, max_ge
 
 
 def main(args):
-    params, config = load_checkpoint(args.checkpoint)
+    params, config, ffn_mask = load_checkpoint(args.checkpoint)
     model = EncoderDecoderTransformer(config)
     tokenizer = get_tokenizer()
 
@@ -378,19 +388,21 @@ def main(args):
     print(f"\ncheckpoint:  {args.checkpoint}")
     print(f"parameters:  {param_count:,}")
     print(f"config:      d={config.d_model}, heads={config.num_heads}, layers={config.num_encoder_layers}/{config.num_decoder_layers}")
+    if ffn_mask:
+        print(f"sub-model:   topk FFN masking active")
 
     print(f"\nevaluating tool-call perplexity ({args.max_eval_samples} samples)...")
     ds = load_tool_calls("validation", max_samples=args.max_eval_samples)
     enc_inputs, dec_inputs, dec_targets, loss_mask_arr, _ = prepare_tool_call_pairs(
         ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
-    ppl = compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, args.batch_size, config.pad_token_id, loss_mask=loss_mask_arr)
+    ppl = compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, args.batch_size, config.pad_token_id, loss_mask=loss_mask_arr, ffn_mask=ffn_mask)
 
     tc_samples = getattr(args, "tool_call_samples", 200)
     tc = None
     if tc_samples > 0:
         print(f"\nevaluating tool-call accuracy ({tc_samples} samples)...")
-        tc = benchmark_tool_calls(model, params, tokenizer, num_samples=tc_samples, max_gen_len=args.max_gen_len)
+        tc = benchmark_tool_calls(model, params, tokenizer, num_samples=tc_samples, max_gen_len=args.max_gen_len, ffn_mask=ffn_mask)
 
     print(f"\n  ─────────────────────────────────────")
     print(f"  Tool-Call Metrics")
@@ -420,7 +432,7 @@ def main(args):
     voice_tc_samples = getattr(args, "voice_tc_samples", 50)
     if voice_tc_samples > 0:
         print(f"\nevaluating voice-to-tool-call ({voice_tc_samples} samples)...")
-        vtc = benchmark_voice_tool_calls(model, params, tokenizer, num_samples=voice_tc_samples, max_gen_len=args.max_gen_len)
+        vtc = benchmark_voice_tool_calls(model, params, tokenizer, num_samples=voice_tc_samples, max_gen_len=args.max_gen_len, ffn_mask=ffn_mask)
         print(f"\n  ─── Voice-Tool-Call Metrics ─────────")
         print(f"  JSON parse rate  {vtc['json_parse_rate']:>10.1%}")
         print(f"  Exact match      {vtc['exact_match']:>10.1%}")
@@ -442,7 +454,7 @@ def main(args):
                 print()
 
     print(f"\nmeasuring throughput ({args.throughput_runs} runs)...")
-    throughput = measure_throughput(model, params, tokenizer, num_runs=args.throughput_runs)
+    throughput = measure_throughput(model, params, tokenizer, num_runs=args.throughput_runs, ffn_mask=ffn_mask)
     print(f"avg tokens:  {throughput['avg_tokens_generated']:.1f}")
     print(f"avg latency: {throughput['avg_latency_s']:.3f}s")
     print(f"tokens/sec:  {throughput['tokens_per_second']:.1f}")

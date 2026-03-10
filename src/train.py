@@ -1,4 +1,3 @@
-import argparse
 import math
 import os
 import pickle
@@ -22,6 +21,7 @@ from .data import (
 from .model import (
     EncoderDecoderTransformer,
     TransformerConfig,
+    count_params,
     make_causal_mask,
     make_padding_mask,
     make_mel_padding_mask,
@@ -225,8 +225,85 @@ def _quantize_params(params, group_size=32):
 
 _GROUP_SIZE = 32
 _MAT_FACTORS = ()
-_MAT_FF_WIDTHS = () 
-_D_FF = 2048 
+_MAT_FF_WIDTHS = ()  # precomputed d_ff widths per factor
+_D_FF = 2048  # set in train()
+_N_BLOCKS = 12  # num_encoder_layers + num_decoder_layers, set in train()
+_MAT_SPREAD_LAMBDA = 0.01
+_MAT_GUMBEL = False
+
+
+def topk_mask(logits, k, tau, hard):
+    """Differentiable top-k mask. logits: (d_ff,), k: int, tau/hard: JAX scalars.
+
+    Learning phase (hard=False): returns soft sigmoid mask for gradient flow.
+    Freeze phase (hard=True): returns stop_gradient hard mask — no STE.
+    Ties at threshold may select slightly more than k neurons; this is negligible
+    and export uses exact argsort top-k for the final mask.
+    """
+    if k >= logits.shape[0]:
+        return jnp.ones_like(logits)
+    topk_vals = jax.lax.top_k(logits, k)[0]
+    threshold = topk_vals[-1]
+    y_soft = jax.nn.sigmoid((logits - threshold) / tau)
+    y_hard = (y_soft >= 0.5).astype(y_soft.dtype)
+    frozen = jax.lax.stop_gradient(y_hard)
+    return jnp.where(hard, frozen, y_soft)
+
+
+def _gumbel_sample(rng, shape):
+    """Sample from Gumbel(0, 1) distribution."""
+    u = jax.random.uniform(rng, shape, minval=1e-20, maxval=1.0)
+    return -jnp.log(-jnp.log(u))
+
+
+def _make_ffn_mask_topk(batch_size, d_ff, mask_logits, mat_ff_widths, tau, hard, step_rng):
+    """Build (n_blocks, batch, d_ff) per-layer topk mask.
+
+    mask_logits: (n_mat, n_blocks, d_ff). tau/hard: JAX scalars.
+    step_rng: PRNGKey for Gumbel noise (used only if _MAT_GUMBEL is True).
+    Returns (n_blocks, batch, d_ff) stacked mask.
+    """
+    n_blocks = mask_logits.shape[1]
+    n_widths = 1 + len(mat_ff_widths)
+    per_width = batch_size // n_widths
+    remainder = batch_size - per_width * n_widths
+
+    block_masks = []
+    for b in range(n_blocks):
+        rows = [jnp.ones((per_width, d_ff), dtype=jnp.bfloat16)]
+        for i, ff_w in enumerate(mat_ff_widths):
+            logits_b = mask_logits[i, b]  # (d_ff,)
+            if _MAT_GUMBEL:
+                sub_rng = jax.random.fold_in(step_rng, b * 1000 + i)
+                noise = _gumbel_sample(sub_rng, (per_width, d_ff))
+                # Zero noise in hard/freeze mode so all items converge
+                noise = noise * (1.0 - hard.astype(jnp.float32))
+                noisy = logits_b[None, :] + noise  # (per_width, d_ff)
+                m = jax.vmap(lambda l: topk_mask(l, k=ff_w, tau=tau, hard=hard))(noisy)
+            else:
+                m = topk_mask(logits_b, k=ff_w, tau=tau, hard=hard)
+                m = jnp.broadcast_to(m[None, :], (per_width, d_ff))
+            rows.append(m.astype(jnp.bfloat16))
+        if remainder > 0:
+            rows.append(jnp.ones((remainder, d_ff), dtype=jnp.bfloat16))
+        block_masks.append(jnp.concatenate(rows, axis=0))
+    return jnp.stack(block_masks)  # (n_blocks, batch, d_ff)
+
+
+def _compute_ce(logits, tgt_out, slot_div, loss_mask=None):
+    """Shared CE + z-loss + slot-div computation."""
+    pad_id = 0
+    logits_f32 = logits.astype(jnp.float32)
+    if loss_mask is not None:
+        mask = loss_mask
+    else:
+        mask = (tgt_out != pad_id).astype(jnp.float32)
+    ce_loss = jnp.sum(
+        optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
+    ) / jnp.maximum(jnp.sum(mask), 1.0)
+    z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
+    div_loss = 1e-4 * slot_div
+    return ce_loss + z_loss + div_loss
 
 
 def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
@@ -241,14 +318,7 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rn
         method="forward_masked",
         rngs={"dropout": rng},
     )
-    logits_f32 = logits.astype(jnp.float32)
-    mask = loss_mask
-    ce_loss = jnp.sum(
-        optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
-    ) / jnp.maximum(jnp.sum(mask), 1.0)
-    z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
-    div_loss = 1e-4 * slot_div
-    return ce_loss + z_loss + div_loss
+    return _compute_ce(logits, tgt_out, slot_div, loss_mask=loss_mask)
 
 
 def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
@@ -264,14 +334,54 @@ def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, ffn_mask, 
         method="forward_speech_masked",
         rngs={"specaugment": spec_rng, "dropout": drop_rng},
     )
-    logits_f32 = logits.astype(jnp.float32)
-    mask = loss_mask
-    ce_loss = jnp.sum(
-        optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
-    ) / jnp.maximum(jnp.sum(mask), 1.0)
-    z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
-    div_loss = 1e-4 * slot_div
-    return ce_loss + z_loss + div_loss
+    return _compute_ce(logits, tgt_out, slot_div, loss_mask=loss_mask)
+
+
+def _forward_masked(state, params, src, tgt_in, causal_mask, ffn_mask, is_speech=False, spec_rng=None, drop_rng=None):
+    """Dispatch forward_masked or forward_speech_masked based on is_speech."""
+    q_params = _quantize_params(params, group_size=_GROUP_SIZE)
+    tgt_mask = causal_mask & make_padding_mask(tgt_in, 0)
+    deterministic = drop_rng is None
+    rngs = {}
+    if drop_rng is not None:
+        rngs["dropout"] = drop_rng
+    if spec_rng is not None:
+        rngs["specaugment"] = spec_rng
+    if is_speech:
+        return state.apply_fn(
+            {"params": q_params}, src, tgt_in,
+            src_mask=make_mel_padding_mask(src), tgt_mask=tgt_mask,
+            ffn_mask=ffn_mask, deterministic=deterministic,
+            method="forward_speech_masked", rngs=rngs,
+        )
+    else:
+        return state.apply_fn(
+            {"params": q_params}, src, tgt_in,
+            src_mask=make_padding_mask(src, 0), tgt_mask=tgt_mask,
+            ffn_mask=ffn_mask, deterministic=deterministic,
+            method="forward_masked", rngs=rngs,
+        )
+
+
+def _topk_loss(state, params, mask_logits, src, tgt_in, tgt_out, causal_mask,
+               tau, hard, step_rng, is_speech=False, spec_rng=None, loss_mask=None, drop_rng=None):
+    """Topk loss for text or speech. Builds masks inside for gradient flow."""
+    ffn_mask = _make_ffn_mask_topk(src.shape[0], _D_FF, mask_logits, _MAT_FF_WIDTHS, tau, hard, step_rng)
+    logits, slot_div = _forward_masked(state, params, src, tgt_in, causal_mask, ffn_mask,
+                                       is_speech=is_speech, spec_rng=spec_rng, drop_rng=drop_rng)
+    loss = _compute_ce(logits, tgt_out, slot_div, loss_mask=loss_mask)
+    if _MAT_SPREAD_LAMBDA > 0:
+        spread = jnp.mean(jnp.var(mask_logits, axis=-1))
+        loss = loss - _MAT_SPREAD_LAMBDA * spread
+    return loss
+
+
+def _warmup_loss(state, params, src, tgt_in, tgt_out, causal_mask, is_speech=False, spec_rng=None, loss_mask=None, drop_rng=None):
+    """Full-model-only loss (no matryoshka) for topk warmup phase."""
+    ffn_mask = jnp.ones((src.shape[0], _D_FF), dtype=jnp.bfloat16)
+    logits, slot_div = _forward_masked(state, params, src, tgt_in, causal_mask, ffn_mask,
+                                       is_speech=is_speech, spec_rng=spec_rng, drop_rng=drop_rng)
+    return _compute_ce(logits, tgt_out, slot_div, loss_mask=loss_mask)
 
 
 def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
@@ -292,78 +402,142 @@ def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
     return jnp.concatenate(rows, axis=0)
 
 
-def _train_step_text(state, ema_params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
-    ema_decay = 0.999
-    loss, grads = jax.value_and_grad(
-        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
-    )(state.params)
+def _grad_step(state, ema_params, loss_fn, prune_mask=None):
+    """Shared body for all non-topk train steps: grad, pmean, apply, ema."""
+    loss, grads = jax.value_and_grad(loss_fn)(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
-    grad_norm = optax.global_norm(grads)
-    state = state.apply_gradients(grads=grads)
-    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
-    return state, ema_params, loss, grad_norm
+    state, ema_params = _apply_and_ema(state, ema_params, grads, prune_mask)
+    return state, ema_params, loss, optax.global_norm(grads)
+
+
+def _train_step_text(state, ema_params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
+    return _grad_step(state, ema_params,
+        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask))
 
 
 def _train_step_text_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask, rng, loss_mask):
-    """Text training step with fused prune mask application."""
-    ema_decay = 0.999
-    loss, grads = jax.value_and_grad(
-        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
-    )(state.params)
-    grads = jax.lax.pmean(grads, axis_name="batch")
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    grad_norm = optax.global_norm(grads)
-    state = state.apply_gradients(grads=grads)
-    masked_params = jax.tree.map(lambda w, m: w * m, state.params, prune_mask)
-    state = state.replace(params=masked_params)
-    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, masked_params)
-    return state, ema_params, loss, grad_norm
+    return _grad_step(state, ema_params,
+        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask),
+        prune_mask=prune_mask)
 
 
 def _train_step_speech(state, ema_params, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
-    ema_decay = 0.999
-    loss, grads = jax.value_and_grad(
-        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
-    )(state.params)
-    grads = jax.lax.pmean(grads, axis_name="batch")
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    grad_norm = optax.global_norm(grads)
-    state = state.apply_gradients(grads=grads)
-    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
-    return state, ema_params, loss, grad_norm
+    return _grad_step(state, ema_params,
+        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask))
 
 
 def _train_step_speech_masked(state, ema_params, mel, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask, rng, loss_mask):
-    """Speech training step with fused prune mask application."""
-    ema_decay = 0.999
+    return _grad_step(state, ema_params,
+        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask),
+        prune_mask=prune_mask)
+
+
+def _apply_and_ema(state, ema_params, grads, prune_mask=None):
+    """Apply gradients, optional prune mask, and EMA update. Returns (state, ema)."""
+    state = state.apply_gradients(grads=grads)
+    if prune_mask is not None:
+        params = jax.tree.map(lambda w, m: w * m, state.params, prune_mask)
+        state = state.replace(params=params)
+    else:
+        params = state.params
+    ema = jax.tree.map(lambda e, p: 0.999 * e + 0.001 * p, ema_params, params)
+    return state, ema
+
+
+def _train_step_text_warmup(state, ema_params, src, tgt_in, tgt_out, causal_mask, drop_rng, loss_mask):
+    """Text warmup step (no matryoshka). Returns grads for saliency accumulation."""
     loss, grads = jax.value_and_grad(
-        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
+        lambda p: _warmup_loss(state, p, src, tgt_in, tgt_out, causal_mask, loss_mask=loss_mask, drop_rng=drop_rng)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     loss = jax.lax.pmean(loss, axis_name="batch")
-    grad_norm = optax.global_norm(grads)
-    state = state.apply_gradients(grads=grads)
-    masked_params = jax.tree.map(lambda w, m: w * m, state.params, prune_mask)
-    state = state.replace(params=masked_params)
-    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, masked_params)
-    return state, ema_params, loss, grad_norm
+    state, ema_params = _apply_and_ema(state, ema_params, grads)
+    return state, ema_params, loss, optax.global_norm(grads), grads
 
 
-def _make_p_train_step():
-    return jax.pmap(_train_step_text, axis_name="batch", donate_argnums=(0, 1))
+def _train_step_speech_warmup(state, ema_params, mel, tgt_in, tgt_out, causal_mask, spec_rng, drop_rng, loss_mask):
+    """Speech warmup step (no matryoshka)."""
+    loss, grads = jax.value_and_grad(
+        lambda p: _warmup_loss(state, p, mel, tgt_in, tgt_out, causal_mask, is_speech=True, spec_rng=spec_rng, loss_mask=loss_mask, drop_rng=drop_rng)
+    )(state.params)
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    loss = jax.lax.pmean(loss, axis_name="batch")
+    state, ema_params = _apply_and_ema(state, ema_params, grads)
+    return state, ema_params, loss, optax.global_norm(grads), grads
 
 
-def _make_p_train_step_masked():
-    return jax.pmap(_train_step_text_masked, axis_name="batch", donate_argnums=(0, 1))
+def _topk_grad_step(state, ema_params, mask_logits, loss_fn, prune_mask=None):
+    """Shared body for all topk train steps: grad, pmean, apply, ema."""
+    (loss, (p_grads, ml_grads)) = jax.value_and_grad(loss_fn, argnums=(0, 1))(state.params, mask_logits)
+    p_grads = jax.lax.pmean(p_grads, axis_name="batch")
+    ml_grads = jax.lax.pmean(ml_grads, axis_name="batch")
+    loss = jax.lax.pmean(loss, axis_name="batch")
+    state, ema_params = _apply_and_ema(state, ema_params, p_grads, prune_mask)
+    return state, ema_params, ml_grads, loss, optax.global_norm(p_grads)
 
 
-def _make_p_train_step_speech():
-    return jax.pmap(_train_step_speech, axis_name="batch", donate_argnums=(0, 1))
+def _train_step_text_topk(state, ema_params, mask_logits, src, tgt_in, tgt_out, causal_mask, tau, hard, step_rng, drop_rng, loss_mask):
+    return _topk_grad_step(state, ema_params, mask_logits,
+        lambda p, ml: _topk_loss(state, p, ml, src, tgt_in, tgt_out, causal_mask, tau, hard, step_rng, loss_mask=loss_mask, drop_rng=drop_rng))
 
 
-def _make_p_train_step_speech_masked():
-    return jax.pmap(_train_step_speech_masked, axis_name="batch", donate_argnums=(0, 1))
+def _train_step_text_topk_masked(state, ema_params, mask_logits, src, tgt_in, tgt_out, causal_mask, prune_mask, tau, hard, step_rng, drop_rng, loss_mask):
+    return _topk_grad_step(state, ema_params, mask_logits,
+        lambda p, ml: _topk_loss(state, p, ml, src, tgt_in, tgt_out, causal_mask, tau, hard, step_rng, loss_mask=loss_mask, drop_rng=drop_rng),
+        prune_mask=prune_mask)
+
+
+def _train_step_speech_topk(state, ema_params, mask_logits, mel, tgt_in, tgt_out, causal_mask, tau, hard, step_rng, spec_rng, drop_rng, loss_mask):
+    return _topk_grad_step(state, ema_params, mask_logits,
+        lambda p, ml: _topk_loss(state, p, ml, mel, tgt_in, tgt_out, causal_mask, tau, hard, step_rng, is_speech=True, spec_rng=spec_rng, loss_mask=loss_mask, drop_rng=drop_rng))
+
+
+def _train_step_speech_topk_masked(state, ema_params, mask_logits, mel, tgt_in, tgt_out, causal_mask, prune_mask, tau, hard, step_rng, spec_rng, drop_rng, loss_mask):
+    return _topk_grad_step(state, ema_params, mask_logits,
+        lambda p, ml: _topk_loss(state, p, ml, mel, tgt_in, tgt_out, causal_mask, tau, hard, step_rng, is_speech=True, spec_rng=spec_rng, loss_mask=loss_mask, drop_rng=drop_rng),
+        prune_mask=prune_mask)
+
+
+def _extract_ffn_saliency(grads, d_ff, n_enc, n_dec):
+    """Extract per-layer per-FFN-neuron saliency from param gradients.
+
+    Returns (n_blocks, d_ff) array of neuron importance scores per block.
+    """
+    n_blocks = n_enc + n_dec
+    saliency = np.zeros((n_blocks, d_ff), dtype=np.float32)
+    for path, leaf in jax.tree_util.tree_leaves_with_path(grads):
+        path_str = "/".join(p.key if hasattr(p, "key") else str(p) for p in path)
+        if "down_proj" not in path_str or "kernel" not in path_str or leaf.ndim != 2:
+            continue
+        g = np.array(leaf)
+        if g.shape[0] != d_ff:
+            continue
+        neuron_sal = np.sum(g ** 2, axis=1)
+        for part in path:
+            name = part.key if hasattr(part, "key") else str(part)
+            if name.startswith("block_"):
+                block_idx = int(name.split("_")[1])
+                if "encoder" in path_str:
+                    saliency[block_idx] += neuron_sal
+                elif "decoder" in path_str:
+                    saliency[n_enc + block_idx] += neuron_sal
+                break
+    return saliency
+
+
+def _update_mask_logits(ml_grads, mask_logits, mask_tx, mask_opt_state):
+    """Host-side mask logit optimizer step. Returns (updated mask_logits, opt_state)."""
+    ml_grads_np = np.array(jax_utils.unreplicate(ml_grads))
+    ml_np = np.array(jax_utils.unreplicate(mask_logits))
+    updates, mask_opt_state = mask_tx.update(ml_grads_np, mask_opt_state, ml_np)
+    ml_np = optax.apply_updates(ml_np, updates)
+    return jax_utils.replicate(jnp.array(ml_np)), mask_opt_state
+
+
+def _pmap_train_step(step_fn):
+    """Create a pmap'd train step from any step function."""
+    return jax.pmap(step_fn, axis_name="batch", donate_argnums=(0, 1))
 
 
 def _make_val_loss_fn(apply_fn):
@@ -381,18 +555,23 @@ def _make_val_loss_fn(apply_fn):
     return val_loss_batch
 
 
-def _make_mat_val_loss_fn(apply_fn, ff_width):
-    """Val loss for matryoshka sub-model at given FFN width."""
+def _make_mat_val_loss_fn(apply_fn, ff_width=None, ffn_mask=None):
+    """Val loss for matryoshka sub-model at given FFN width or with a topk ffn_mask."""
     @jax.jit
     def val_loss_batch(params, src, tgt_in, tgt_out, causal_mask, loss_mask):
         pad_id = 0
         src_mask = make_padding_mask(src, pad_id)
         tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+        kwargs = {}
+        if ffn_mask is not None:
+            kwargs["mat_ffn_masks"] = [ffn_mask]
+        else:
+            kwargs["mat_ff_widths"] = (ff_width,)
         logits, _, mat_logits = apply_fn(
             {"params": params}, src, tgt_in,
             src_mask=src_mask, tgt_mask=tgt_mask,
-            mat_ff_widths=(ff_width,),
             method="forward_with_aux",
+            **kwargs,
         )
         trunc_logits = mat_logits[0].astype(jnp.float32)
         loss = optax.softmax_cross_entropy_with_integer_labels(trunc_logits, tgt_out)
@@ -416,6 +595,16 @@ def _make_speech_val_loss_fn(apply_fn):
         mask = loss_mask
         return jnp.sum(loss * mask), jnp.sum(mask)
     return val_loss_batch
+
+
+def _eval_val_ppl(loss_fn, params, batches, causal_mask):
+    """Evaluate validation perplexity over batches. Returns PPL (capped at exp(20))."""
+    total_loss, total_toks = 0.0, 0.0
+    for vb in batches:
+        vl, vt = loss_fn(params, vb[0], vb[1], vb[2], causal_mask, vb[3])
+        total_loss += float(vl)
+        total_toks += float(vt)
+    return float(math.exp(min(total_loss / max(total_toks, 1), 20)))
 
 
 def _estimate_mat_params(config, matryoshka_factor):
@@ -446,6 +635,12 @@ def _estimate_mat_params(config, matryoshka_factor):
 def shard_batch(batch, num_devices):
     """Reshape a batch array so leading dim is (num_devices, per_device_batch, ...)."""
     return batch.reshape(num_devices, -1, *batch.shape[1:])
+
+
+def _tile_for_mat(arr, num_devices, per_width, n_widths):
+    """Tile a batch for shared-input matryoshka: repeat each sample across all widths."""
+    s = arr.reshape(num_devices, per_width, *arr.shape[1:])
+    return np.tile(s, (1, n_widths) + (1,) * (arr.ndim - 1))
 
 
 def train(args):
@@ -517,12 +712,13 @@ def train(args):
             activation=getattr(args, "activation", "drelu"),
             num_memory_slots=getattr(args, "num_memory_slots", 64),
             n_mels=n_mels,
-            dropout_rate=getattr(args, "dropout", 0.1),
+            dropout_rate=getattr(args, "dropout", 0.0),
         )
 
-    global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF
+    global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF, _N_BLOCKS, _MAT_SPREAD_LAMBDA, _MAT_GUMBEL
     _GROUP_SIZE = getattr(args, "group_size", 32)
     _D_FF = config.d_ff
+    _N_BLOCKS = config.num_encoder_layers + config.num_decoder_layers
     mat_factors_raw = getattr(args, "mat_factors", None)
     if mat_factors_raw:
         _MAT_FACTORS = tuple(f for f in mat_factors_raw if f > 1)
@@ -531,16 +727,39 @@ def train(args):
         _MAT_FACTORS = ()
         _MAT_FF_WIDTHS = ()
     n_widths = 1 + len(_MAT_FF_WIDTHS) if _MAT_FF_WIDTHS else 1
-    p_train_step = _make_p_train_step()
-    p_train_step_masked = _make_p_train_step_masked()
-    p_train_step_speech = _make_p_train_step_speech()
-    p_train_step_speech_masked = _make_p_train_step_speech_masked()
+
+    # Fallback defaults here are for programmatic callers; CLI defaults are in cli.py
+    mat_method = getattr(args, "mat_method", "static-prefix")
+    use_topk = mat_method == "topk" and _MAT_FF_WIDTHS
+    mat_tau_start = getattr(args, "mat_tau_start", 0.5)
+    mat_tau_end = getattr(args, "mat_tau_end", 0.1)
+    mat_warmup_frac = getattr(args, "mat_warmup_frac", 0.15)
+    mat_freeze_frac = getattr(args, "mat_freeze_frac", 0.2)
+    # These globals are read inside pmap-traced functions; must be set before pmap creation below
+    _MAT_SPREAD_LAMBDA = getattr(args, "mat_spread_lambda", 0.01)
+    _MAT_GUMBEL = getattr(args, "mat_gumbel", False)
+
+    if use_topk:
+        p_train_step_warmup = _pmap_train_step(_train_step_text_warmup)
+        p_train_step_warmup_speech = _pmap_train_step(_train_step_speech_warmup)
+        p_train_step_topk = _pmap_train_step(_train_step_text_topk)
+        p_train_step_topk_masked = _pmap_train_step(_train_step_text_topk_masked)
+        p_train_step_speech_topk = _pmap_train_step(_train_step_speech_topk)
+        p_train_step_speech_topk_masked = _pmap_train_step(_train_step_speech_topk_masked)
+    p_train_step = _pmap_train_step(_train_step_text)
+    p_train_step_masked = _pmap_train_step(_train_step_text_masked)
+    p_train_step_speech = _pmap_train_step(_train_step_speech)
+    p_train_step_speech_masked = _pmap_train_step(_train_step_speech_masked)
 
     np.random.seed(args.seed)
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
 
     mat_shared_input = getattr(args, "mat_shared_input", False)
+    if use_topk and mat_shared_input:
+        raise ValueError("--mat-shared-input is incompatible with --mat-method topk")
+    # With shared input, each unique sample is repeated n_widths times,
+    # so we fetch smaller batches but take more steps per epoch.
     unique_batch_size = effective_batch_size // n_widths if (mat_shared_input and n_widths > 1) else effective_batch_size
     text_batches_per_epoch = count_batches(len(enc_inputs), unique_batch_size)
     if not no_speech and train_mels is not None:
@@ -562,10 +781,57 @@ def train(args):
         print(f"  Loaded checkpoint params into train state")
 
     ema_params = jax.tree.map(jnp.copy, state.params)
+
+    # --- TopK mask logit init ---
+    mask_logits = None
+    mask_opt_state = None
+    mask_tx = None
+    use_saliency = False
+    saliency_accum = None
+    saliency_steps = 0
+    if use_topk:
+        n_mat = len(_MAT_FF_WIDTHS)
+        n_blocks = _N_BLOCKS
+        init_mode = getattr(args, "mat_init_mode", "normal")
+        init_value = getattr(args, "mat_init_value", 0.5)
+        saliency_scale = getattr(args, "mat_saliency_scale", 1.0)
+        rng, mask_rng = jax.random.split(rng)
+        d_ff = config.d_ff
+        use_saliency = init_mode == "saliency"
+        if init_mode == "prefix":
+            positions = jnp.arange(d_ff, dtype=jnp.float32)
+            ramp = init_value * (1.0 - 2.0 * positions / max(1, d_ff - 1))
+            mask_logits = jnp.broadcast_to(ramp[None, None, :], (n_mat, n_blocks, d_ff)).copy()
+        elif init_mode == "shuffled_prefix":
+            positions = jnp.arange(d_ff, dtype=jnp.float32)
+            ramp = init_value * (1.0 - 2.0 * positions / max(1, d_ff - 1))
+            rows = []
+            for i in range(n_mat * n_blocks):
+                rng, perm_rng = jax.random.split(rng)
+                perm = jax.random.permutation(perm_rng, d_ff)
+                rows.append(ramp[perm])
+            mask_logits = jnp.stack(rows).reshape(n_mat, n_blocks, d_ff)
+        elif init_mode == "saliency":
+            mask_logits = jnp.zeros((n_mat, n_blocks, d_ff))
+            saliency_accum = np.zeros((n_blocks, d_ff), dtype=np.float32)
+        elif init_mode == "normal":
+            mask_logits = jax.random.normal(mask_rng, (n_mat, n_blocks, d_ff)) * init_value
+        else:
+            mask_logits = jnp.zeros((n_mat, n_blocks, d_ff))
+        mask_lr = getattr(args, "mat_mask_lr", 3e-3)
+        mask_tx = optax.adam(learning_rate=mask_lr)
+        mask_opt_state = mask_tx.init(np.array(mask_logits))
+        if resume_checkpoint and "mask_logits" in ckpt_data:
+            mask_logits = jnp.array(ckpt_data["mask_logits"])
+            use_saliency = False
+            print(f"  Loaded mask logits from checkpoint")
+
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
+    if use_topk:
+        mask_logits = jax_utils.replicate(mask_logits)
 
-    param_count = sum(x.size for x in jax.tree.leaves(jax_utils.unreplicate(state).params))
+    param_count = count_params(jax_utils.unreplicate(state).params)
     decay_steps = max(1, int(total_steps * 0.15))
     stable_steps = total_steps - warmup_steps - decay_steps
 
@@ -584,6 +850,16 @@ def train(args):
         print(f"  max_mel_len   {max_mel_len:>12}")
     else:
         print(f"  Speech               disabled")
+    if use_topk:
+        print(f"  Mat method          topk (learned)")
+        print(f"  Mat tau       {mat_tau_start:.2f} -> {mat_tau_end:.2f}")
+        print(f"  Mat warmup    {mat_warmup_frac*100:.0f}% / freeze {mat_freeze_frac*100:.0f}%")
+        print(f"  Mat spread λ  {_MAT_SPREAD_LAMBDA}")
+        print(f"  Mat per-layer  {n_blocks} blocks")
+        if _MAT_GUMBEL:
+            print(f"  Mat Gumbel           enabled")
+    else:
+        print(f"  Mat method           static-prefix")
     print(f"  ─────────────────────────────────────")
     print(f"  Devices       {num_devices:>12}")
     print(f"  Batch         {args.batch_size:>7} x {num_devices} = {effective_batch_size}")
@@ -629,6 +905,9 @@ def train(args):
     prune_end_frac = getattr(args, "prune_end_frac", 0.67)
 
     weight_prune_epoch = 0 if sparsity_ratio > 0 else -1
+    mat_warmup_end = int(total_steps * mat_warmup_frac) if use_topk else 0
+    # freeze_frac=1.0 → freeze_start=0 → no learning phase (saliency-only mode, intentional)
+    mat_freeze_start = int(total_steps * (1 - mat_freeze_frac)) if use_topk else 0
 
     for epoch in range(args.epochs):
         if epoch == weight_prune_epoch and not gradual_sparsify_done:
@@ -661,6 +940,19 @@ def train(args):
         pbar = tqdm(range(steps_this_epoch), desc=f"Epoch {epoch + 1}/{args.epochs}")
 
         for step_i in pbar:
+            # --- TopK phase tracking ---
+            topk_active = False
+            cur_tau = mat_tau_start
+            cur_hard = False
+            if use_topk:
+                topk_active = global_step >= mat_warmup_end
+                cur_hard = global_step >= mat_freeze_start
+                if topk_active and not cur_hard:
+                    progress = min(1.0, (global_step - mat_warmup_end) / max(1, mat_freeze_start - mat_warmup_end))
+                    cur_tau = mat_tau_start * (mat_tau_end / mat_tau_start) ** progress
+                elif cur_hard:
+                    cur_tau = 0.001
+
             t0 = time.perf_counter()
 
             do_speech = (step_i % 2 == 1) and speech_idx < speech_batches_per_epoch
@@ -679,15 +971,9 @@ def train(args):
                 src, tgt_in, tgt_out, lm = next(text_batch_iter)
                 text_idx += 1
 
-                if n_widths > 1 and mat_shared_input:
-                    per_width = args.batch_size // n_widths
-                    def _tile_for_mat(arr):
-                        s = arr.reshape(num_devices, per_width, *arr.shape[1:])
-                        return np.tile(s, (1, n_widths) + (1,) * (arr.ndim - 1))
-                    src_b = _tile_for_mat(src)
-                    tgt_in_b = _tile_for_mat(tgt_in)
-                    tgt_out_b = _tile_for_mat(tgt_out)
-                    lm_b = _tile_for_mat(lm)
+                if not use_topk and n_widths > 1 and mat_shared_input:
+                    tile = lambda arr: _tile_for_mat(arr, num_devices, args.batch_size // n_widths, n_widths)
+                    src_b, tgt_in_b, tgt_out_b, lm_b = tile(src), tile(tgt_in), tile(tgt_out), tile(lm)
                 else:
                     src_b = shard_batch(src, num_devices)
                     tgt_in_b = shard_batch(tgt_in, num_devices)
@@ -697,14 +983,41 @@ def train(args):
                 rng, text_rng = jax.random.split(rng)
                 text_rngs = jax.random.split(text_rng, num_devices)
 
-                if prune_mask is not None:
-                    state, ema_params, loss, grad_norm = p_train_step_masked(
-                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask, text_ffn_mask, text_rngs, lm_b,
+                if topk_active:
+                    tau_arr = jax_utils.replicate(jnp.float32(cur_tau))
+                    hard_arr = jax_utils.replicate(jnp.bool_(cur_hard))
+                    rng, step_rng = jax.random.split(rng)
+                    step_rngs = jax.random.split(step_rng, num_devices)
+                    if prune_mask is not None:
+                        state, ema_params, ml_grads, loss, grad_norm = p_train_step_topk_masked(
+                            state, ema_params, mask_logits, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask, tau_arr, hard_arr, step_rngs, text_rngs, lm_b,
+                        )
+                    else:
+                        state, ema_params, ml_grads, loss, grad_norm = p_train_step_topk(
+                            state, ema_params, mask_logits, src_b, tgt_in_b, tgt_out_b, causal_mask, tau_arr, hard_arr, step_rngs, text_rngs, lm_b,
+                        )
+                    if not cur_hard:
+                        mask_logits, mask_opt_state = _update_mask_logits(ml_grads, mask_logits, mask_tx, mask_opt_state)
+                elif use_topk and not topk_active:
+                    state, ema_params, loss, grad_norm, warmup_grads = p_train_step_warmup(
+                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_rngs, lm_b,
                     )
+                    if use_saliency and saliency_accum is not None:
+                        grads_unr = jax_utils.unreplicate(warmup_grads)
+                        step_saliency = _extract_ffn_saliency(grads_unr, config.d_ff, config.num_encoder_layers, config.num_decoder_layers)
+                        saliency_steps += 1
+                        beta = 0.99
+                        saliency_accum = beta * saliency_accum + (1 - beta) * step_saliency
+                        del grads_unr
                 else:
-                    state, ema_params, loss, grad_norm = p_train_step(
-                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_ffn_mask, text_rngs, lm_b,
-                    )
+                    if prune_mask is not None:
+                        state, ema_params, loss, grad_norm = p_train_step_masked(
+                            state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask, text_ffn_mask, text_rngs, lm_b,
+                        )
+                    else:
+                        state, ema_params, loss, grad_norm = p_train_step(
+                            state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_ffn_mask, text_rngs, lm_b,
+                        )
 
                 text_loss_val = float(loss[0])
                 text_losses.append(text_loss_val)
@@ -715,37 +1028,69 @@ def train(args):
                 mel_batch, sp_tgt_in, sp_tgt_out, sp_lm = next(speech_batch_iter)
                 speech_idx += 1
 
-                if n_widths > 1 and mat_shared_input:
-                    per_width = args.batch_size // n_widths
-                    def _tile_sp(arr):
-                        s = arr.reshape(num_devices, per_width, *arr.shape[1:])
-                        return np.tile(s, (1, n_widths) + (1,) * (arr.ndim - 1))
-                    mel_b = _tile_sp(mel_batch)
-                    sp_tgt_in_b = _tile_sp(sp_tgt_in)
-                    sp_tgt_out_b = _tile_sp(sp_tgt_out)
-                    sp_lm_b = _tile_sp(sp_lm)
+                if not use_topk and n_widths > 1 and mat_shared_input:
+                    tile = lambda arr: _tile_for_mat(arr, num_devices, args.batch_size // n_widths, n_widths)
+                    mel_b, sp_tgt_in_b, sp_tgt_out_b, sp_lm_b = tile(mel_batch), tile(sp_tgt_in), tile(sp_tgt_out), tile(sp_lm)
                 else:
                     mel_b = shard_batch(mel_batch, num_devices)
                     sp_tgt_in_b = shard_batch(sp_tgt_in, num_devices)
                     sp_tgt_out_b = shard_batch(sp_tgt_out, num_devices)
                     sp_lm_b = shard_batch(sp_lm, num_devices)
 
-                rng, spec_rng = jax.random.split(rng)
-                spec_rngs = jax.random.split(spec_rng, num_devices)
-
-                if prune_mask is not None:
-                    state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech_masked(
-                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, prune_mask, text_ffn_mask, spec_rngs, sp_lm_b,
+                if topk_active:
+                    tau_arr = jax_utils.replicate(jnp.float32(cur_tau))
+                    hard_arr = jax_utils.replicate(jnp.bool_(cur_hard))
+                    rng, step_rng, spec_rng, drop_rng = jax.random.split(rng, 4)
+                    step_rngs = jax.random.split(step_rng, num_devices)
+                    spec_rngs = jax.random.split(spec_rng, num_devices)
+                    drop_rngs = jax.random.split(drop_rng, num_devices)
+                    if prune_mask is not None:
+                        state, ema_params, ml_grads, sp_loss, sp_grad_norm = p_train_step_speech_topk_masked(
+                            state, ema_params, mask_logits, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, prune_mask, tau_arr, hard_arr, step_rngs, spec_rngs, drop_rngs, sp_lm_b,
+                        )
+                    else:
+                        state, ema_params, ml_grads, sp_loss, sp_grad_norm = p_train_step_speech_topk(
+                            state, ema_params, mask_logits, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, tau_arr, hard_arr, step_rngs, spec_rngs, drop_rngs, sp_lm_b,
+                        )
+                    if not cur_hard:
+                        mask_logits, mask_opt_state = _update_mask_logits(ml_grads, mask_logits, mask_tx, mask_opt_state)
+                elif use_topk and not topk_active:
+                    rng, spec_rng, drop_rng = jax.random.split(rng, 3)
+                    spec_rngs = jax.random.split(spec_rng, num_devices)
+                    drop_rngs = jax.random.split(drop_rng, num_devices)
+                    state, ema_params, sp_loss, sp_grad_norm, _ = p_train_step_warmup_speech(
+                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, spec_rngs, drop_rngs, sp_lm_b,
                     )
                 else:
-                    state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech(
-                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, text_ffn_mask, spec_rngs, sp_lm_b,
-                    )
+                    speech_ffn_mask = text_ffn_mask
+                    rng, speech_rng = jax.random.split(rng)
+                    speech_rngs = jax.random.split(speech_rng, num_devices)
+                    if prune_mask is not None:
+                        state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech_masked(
+                            state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, prune_mask, speech_ffn_mask, speech_rngs, sp_lm_b,
+                        )
+                    else:
+                        state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech(
+                            state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, speech_ffn_mask, speech_rngs, sp_lm_b,
+                        )
                 speech_loss_val = float(sp_loss[0])
                 speech_losses.append(speech_loss_val)
                 step_grad_norm = float(sp_grad_norm[0])
                 text_loss_val = text_losses[-1] if text_losses else float("nan")
                 global_step += 1
+
+            # Saliency init: promote accumulated saliency into mask_logits at warmup end
+            if use_saliency and saliency_accum is not None and global_step >= mat_warmup_end:
+                print(f"\n  Saliency init: {saliency_steps} warmup steps accumulated")
+                logits_np = np.zeros_like(saliency_accum)
+                for bl in range(n_blocks):
+                    ranks = np.argsort(np.argsort(-saliency_accum[bl])).astype(np.float32)
+                    logits_np[bl] = saliency_scale * (1.0 - 2.0 * ranks / max(1, config.d_ff - 1))
+                mask_logits_np = np.broadcast_to(logits_np[None, :, :], (n_mat, n_blocks, config.d_ff)).copy()
+                mask_logits = jax_utils.replicate(jnp.array(mask_logits_np))
+                mask_opt_state = mask_tx.init(mask_logits_np)
+                saliency_accum = None
+                print(f"  Saliency logit range: [{logits_np.min():.3f}, {logits_np.max():.3f}]")
 
             if epoch == weight_prune_epoch and not gradual_sparsify_done:
                 epoch_step += 1
@@ -762,13 +1107,9 @@ def train(args):
             if global_step % eval_every == 0 or global_step == total_steps:
                 _eval_params = jax_utils.unreplicate(ema_params)
                 val_causal = make_causal_mask(args.max_dec_len)
-                total_loss, total_toks = 0.0, 0.0
-                for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False, loss_mask=val_loss_mask):
-                    vl, vt = val_loss_fn(_eval_params, vb[0], vb[1], vb[2], val_causal, vb[3])
-                    total_loss += float(vl)
-                    total_toks += float(vt)
-                last_val_ppl = float(math.exp(min(total_loss / max(total_toks, 1), 20)))
-
+                last_val_ppl = _eval_val_ppl(val_loss_fn, _eval_params,
+                    get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False, loss_mask=val_loss_mask),
+                    val_causal)
                 del _eval_params
 
             postfix = {
@@ -781,6 +1122,9 @@ def train(args):
                     postfix["sparsification"] = f"{current_sparsity*100:.1f}%"
                 else:
                     postfix["sparsification"] = "done"
+            if use_topk and topk_active:
+                phase = "freeze" if cur_hard else "learn"
+                postfix["mat"] = f"{phase} τ={cur_tau:.3f}"
             pbar.set_postfix(**postfix)
 
             if use_wandb:
@@ -796,6 +1140,9 @@ def train(args):
                     log_dict["train/speech_loss"] = speech_loss_val
                 if epoch == weight_prune_epoch and not gradual_sparsify_done:
                     log_dict["train/scheduled_sparsity"] = current_sparsity
+                if use_topk:
+                    log_dict["train/mat_tau"] = cur_tau
+                    log_dict["train/mat_topk_active"] = int(topk_active)
                 if global_step % eval_every == 0 or global_step == total_steps:
                     log_dict["val/text_ppl"] = last_val_ppl
                 wandb.log(log_dict)
@@ -816,7 +1163,7 @@ def train(args):
                 params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
             ema_params = jax.tree.map(lambda w, m: w * m, ema_params, prune_mask)
             final_pruned = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
-            total_p = sum(x.size for x in jax.tree.leaves(final_pruned))
+            total_p = count_params(final_pruned)
             zero_p = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(final_pruned))
             print(f"\n  Gradual sparsification complete — mask locked.")
             print(f"  Final sparsity: {zero_p/total_p*100:.2f}% ({zero_p:,}/{total_p:,} near-zero)")
@@ -830,11 +1177,22 @@ def train(args):
         val_causal = make_causal_mask(args.max_dec_len)
 
         q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE)
+        topk_hard_masks = {}
         mat_vl_fns = {}
         if _MAT_FACTORS:
             _apply_fn = jax_utils.unreplicate(state).apply_fn
-            mat_vl_fns = {f: _make_mat_val_loss_fn(_apply_fn, fw)
-                          for f, fw in zip(_MAT_FACTORS, _MAT_FF_WIDTHS)}
+            if use_topk:
+                ml_unr = jax_utils.unreplicate(mask_logits)
+                n_blocks_eval = ml_unr.shape[1]
+                for i, ff_w in enumerate(_MAT_FF_WIDTHS):
+                    block_masks = [topk_mask(ml_unr[i, b], k=ff_w, tau=jnp.float32(0.001), hard=jnp.bool_(True))
+                                   for b in range(n_blocks_eval)]
+                    topk_hard_masks[ff_w] = jnp.stack(block_masks)
+            for f, fw in zip(_MAT_FACTORS, _MAT_FF_WIDTHS):
+                if fw in topk_hard_masks:
+                    mat_vl_fns[f] = _make_mat_val_loss_fn(_apply_fn, ffn_mask=topk_hard_masks[fw])
+                else:
+                    mat_vl_fns[f] = _make_mat_val_loss_fn(_apply_fn, fw)
             del _apply_fn
 
         full_loss, full_toks = 0.0, 0.0
@@ -881,8 +1239,14 @@ def train(args):
 
         ckpt_name = f"needle_{args.num_layers}_{args.d_model}_{global_step}.pkl"
         ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
+        ckpt_data_out = {"params": params_np, "config": config.__dict__}
+        if use_topk:
+            ml_np = np.array(jax_utils.unreplicate(mask_logits))
+            ckpt_data_out["mask_logits"] = ml_np
+            ckpt_data_out["mat_method"] = "topk"
+            ckpt_data_out["mat_factors"] = list(_MAT_FACTORS)
         with open(ckpt_path, "wb") as f:
-            pickle.dump({"params": params_np, "config": config.__dict__}, f)
+            pickle.dump(ckpt_data_out, f)
         del params_np
 
         from .test import measure_throughput
