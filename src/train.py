@@ -748,7 +748,6 @@ def train(args):
             max_enc_len=args.max_enc_len,
         )
 
-        # Split results back
         display_preds = all_preds[:len(display_pairs)]
         tc_preds = all_preds[len(display_pairs):]
 
@@ -764,6 +763,9 @@ def train(args):
         tc_n, tc_exact, tc_name_tp, tc_name_fp, tc_name_fn = 0, 0, 0, 0, 0
         tc_call_tp, tc_call_fp, tc_call_fn, tc_parse_err = 0, 0, 0, 0
         tc_args_correct, tc_args_total = 0, 0
+        tc_halluc_params, tc_total_pred_params = 0, 0
+        tc_missing_params, tc_total_ref_params = 0, 0
+        tc_correct_values, tc_matched_params = 0, 0
 
         def _call_key(c):
             if not isinstance(c, dict): return None
@@ -809,6 +811,34 @@ def train(args):
                     if any(pred_args == _json_mod.dumps(ra, sort_keys=True) for ra in ref_by_name[c["name"]]):
                         tc_args_correct += 1
 
+            # Parameter-level metrics
+            try:
+                tool_defs = _json_mod.loads(ex["tools"])
+                tool_param_map = {t["name"]: set((t.get("parameters") or {}).keys()) for t in tool_defs if isinstance(t, dict) and "name" in t}
+            except (ValueError, TypeError):
+                tool_param_map = {}
+            for c in pred_calls:
+                if not isinstance(c, dict) or "name" not in c:
+                    continue
+                cname = c["name"]
+                if cname not in tool_param_map:
+                    continue
+                schema_keys = tool_param_map[cname]
+                pred_keys = set((c.get("arguments") or {}).keys())
+                tc_total_pred_params += len(pred_keys)
+                tc_halluc_params += len(pred_keys - schema_keys)
+                # Find matching reference call for missing/value metrics
+                if cname in ref_by_name:
+                    ref_args = ref_by_name[cname][0]
+                    ref_keys = set((ref_args if isinstance(ref_args, dict) else {}).keys())
+                    tc_total_ref_params += len(ref_keys)
+                    tc_missing_params += len(ref_keys - pred_keys)
+                    matched_keys = pred_keys & ref_keys
+                    tc_matched_params += len(matched_keys)
+                    for k in matched_keys:
+                        if _json_mod.dumps(c.get("arguments", {})[k], sort_keys=True) == _json_mod.dumps(ref_args[k], sort_keys=True):
+                            tc_correct_values += 1
+
         tc_metrics = {}
         if tc_n > 0:
             tc_metrics["parse_rate"] = 1.0 - tc_parse_err / tc_n
@@ -820,6 +850,9 @@ def train(args):
             cr_ = tc_call_tp + tc_call_fn
             tc_metrics["call_f1"] = 2 * tc_call_tp / max(cp_ + cr_, 1)
             tc_metrics["args_acc"] = tc_args_correct / max(tc_args_total, 1)
+            tc_metrics["param_haluc"] = tc_halluc_params / max(tc_total_pred_params, 1)
+            tc_metrics["param_miss"] = tc_missing_params / max(tc_total_ref_params, 1)
+            tc_metrics["value_acc"] = tc_correct_values / max(tc_matched_params, 1)
 
         del eval_params
 
@@ -842,6 +875,9 @@ def train(args):
             print(f"  ─── Tool-Call Accuracy ({tc_n} samples) ──")
             print(f"  JSON parse     {tc_metrics['parse_rate']:>10.1%}")
             print(f"  Name F1        {tc_metrics['name_f1']:>10.1%}")
+            print(f"  Param haluc    {tc_metrics['param_haluc']:>10.1%}")
+            print(f"  Param miss     {tc_metrics['param_miss']:>10.1%}")
+            print(f"  Value acc      {tc_metrics['value_acc']:>10.1%}")
             print(f"  Args acc       {tc_metrics['args_acc']:>10.1%}")
             print(f"  Call F1        {tc_metrics['call_f1']:>10.1%}")
             print(f"  Exact match    {tc_metrics['exact_match']:>10.1%}")
@@ -879,6 +915,9 @@ def train(args):
                 log_dict["epoch/tc_parse_rate"] = tc_metrics["parse_rate"]
                 log_dict["epoch/tc_exact_match"] = tc_metrics["exact_match"]
                 log_dict["epoch/tc_name_f1"] = tc_metrics["name_f1"]
+                log_dict["epoch/tc_param_haluc"] = tc_metrics["param_haluc"]
+                log_dict["epoch/tc_param_miss"] = tc_metrics["param_miss"]
+                log_dict["epoch/tc_value_acc"] = tc_metrics["value_acc"]
                 log_dict["epoch/tc_args_acc"] = tc_metrics["args_acc"]
                 log_dict["epoch/tc_call_f1"] = tc_metrics["call_f1"]
             wandb.log(log_dict)

@@ -192,6 +192,14 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
     json_parse_errors = 0
     empty_ref = 0
     empty_pred = 0
+    args_correct = 0
+    args_total = 0
+    halluc_params = 0
+    total_pred_params = 0
+    missing_params = 0
+    total_ref_params = 0
+    correct_values = 0
+    matched_params = 0
     samples = []
 
     def call_key(c):
@@ -240,6 +248,43 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
         fp_calls += len(pred_keys - ref_keys)
         fn_calls += len(ref_keys - pred_keys)
 
+        ref_by_name = {}
+        for c in ref_calls:
+            if isinstance(c, dict) and "name" in c:
+                ref_by_name.setdefault(c["name"], []).append(c.get("arguments", {}))
+        for c in pred_calls:
+            if isinstance(c, dict) and "name" in c and c["name"] in ref_by_name:
+                args_total += 1
+                pa = json.dumps(c.get("arguments", {}), sort_keys=True)
+                if any(pa == json.dumps(ra, sort_keys=True) for ra in ref_by_name[c["name"]]):
+                    args_correct += 1
+
+        try:
+            tool_defs = json.loads(ex["tools"])
+            tool_param_map = {t["name"]: set((t.get("parameters") or {}).keys()) for t in tool_defs if isinstance(t, dict) and "name" in t}
+        except (json.JSONDecodeError, TypeError):
+            tool_param_map = {}
+        for c in pred_calls:
+            if not isinstance(c, dict) or "name" not in c:
+                continue
+            cname = c["name"]
+            if cname not in tool_param_map:
+                continue
+            schema_keys = tool_param_map[cname]
+            p_keys = set((c.get("arguments") or {}).keys())
+            total_pred_params += len(p_keys)
+            halluc_params += len(p_keys - schema_keys)
+            if cname in ref_by_name:
+                ref_args = ref_by_name[cname][0]
+                r_keys = set((ref_args if isinstance(ref_args, dict) else {}).keys())
+                total_ref_params += len(r_keys)
+                missing_params += len(r_keys - p_keys)
+                m_keys = p_keys & r_keys
+                matched_params += len(m_keys)
+                for k in m_keys:
+                    if json.dumps(c.get("arguments", {})[k], sort_keys=True) == json.dumps(ref_args[k], sort_keys=True):
+                        correct_values += 1
+
     name_precision = tp_names / max(tp_names + fp_names, 1)
     name_recall = tp_names / max(tp_names + fn_names, 1)
     name_f1 = 2 * name_precision * name_recall / max(name_precision + name_recall, 1e-9)
@@ -255,6 +300,10 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
         "name_precision": name_precision,
         "name_recall": name_recall,
         "name_f1": name_f1,
+        "args_acc": args_correct / max(args_total, 1),
+        "param_haluc": halluc_params / max(total_pred_params, 1),
+        "param_miss": missing_params / max(total_ref_params, 1),
+        "value_acc": correct_values / max(matched_params, 1),
         "call_precision": call_precision,
         "call_recall": call_recall,
         "call_f1": call_f1,
@@ -298,6 +347,11 @@ def main(args):
         print(f"  Precision        {tc['name_precision']:>10.3f}")
         print(f"  Recall           {tc['name_recall']:>10.3f}")
         print(f"  F1               {tc['name_f1']:>10.3f}")
+        print(f"  ─── Parameter-Level ────────────────")
+        print(f"  Param haluc      {tc['param_haluc']:>10.1%}")
+        print(f"  Param miss       {tc['param_miss']:>10.1%}")
+        print(f"  Value acc        {tc['value_acc']:>10.1%}")
+        print(f"  Args acc         {tc['args_acc']:>10.1%}")
         print(f"  ─── Full Call (name+args) ───────────")
         print(f"  Precision        {tc['call_precision']:>10.3f}")
         print(f"  Recall           {tc['call_recall']:>10.3f}")

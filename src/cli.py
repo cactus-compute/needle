@@ -17,7 +17,7 @@ def main():
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
-    p.add_argument("--d-model", type=int, default=512)
+    p.add_argument("--d-model", type=int, default=768)
     p.add_argument("--num-heads", type=int, default=16)
     p.add_argument("--num-kv-heads", type=int, default=8)
     p.add_argument("--num-layers", type=int, default=4)
@@ -46,7 +46,7 @@ def main():
                    help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4)")
     p.add_argument("--mat-shared-input", action="store_true",
                    help="Each unique input is repeated across all mat widths (default: unique input per width)")
-    p.add_argument("--dropout", type=float, default=0.05,
+    p.add_argument("--dropout", type=float, default=0.1,
                    help="Dropout rate for residual connections (default: 0.1)")
 
     p = sub.add_parser("tokenize", add_help=False)
