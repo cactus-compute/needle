@@ -1,6 +1,0 @@
-mode=grid25
-epochs=1
-eval_every=1000000
-skip_epoch_extras=True
-cfg_inference=False
-

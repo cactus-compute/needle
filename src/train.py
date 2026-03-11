@@ -256,11 +256,9 @@ def train(args):
             args.max_dec_len,
             max_eval_samples=getattr(args, "max_eval_samples", None),
         )
-        ckpt_path = "(skipped)"
-        if not getattr(args, "no_checkpoints", False):
-            ckpt_name = f"needle_stage2_{config.num_encoder_layers}_{config.d_model}_{global_step}.pkl"
-            ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
-            save_checkpoint(ckpt_path, eval_params, config, extra={"stage": "stage2"})
+        ckpt_name = f"needle_stage2_{config.num_encoder_layers}_{config.d_model}_{global_step}.pkl"
+        ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
+        save_checkpoint(ckpt_path, eval_params, config, extra={"stage": "stage2"})
 
         print(f"\n  Epoch {epoch + 1}/{args.epochs}")
         print(f"  Train loss     {sum(losses) / max(len(losses), 1):.4f}")

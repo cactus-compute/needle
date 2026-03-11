@@ -7,15 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from .data import (
-    _load_cache_metadata,
-    get_batches,
-    get_tokenizer,
-    load_tool_calls,
-    prepare_tool_call_pairs,
-    load_tool_call_audio,
-    load_example_with_audio,
-)
+from .data import get_batches, get_tokenizer, load_tool_calls, prepare_tool_call_pairs, load_tool_call_audio, load_example_with_audio
 from .model import (
     EncoderDecoderTransformer,
     TransformerConfig,
@@ -131,7 +123,7 @@ def benchmark_generation_quality(model, params, tokenizer, prompts, max_gen_len=
 
     generations = []
     for i, prompt in enumerate(prompts):
-        text = generate(model, params, tokenizer, prompt, max_gen_len=max_gen_len, seed=i, stream=False)
+        text = generate(model, params, tokenizer, prompt, max_gen_len, temperature, seed=i, stream=False)
         generations.append(text)
 
     lengths = [len(tokenizer.encode(t)) for t in generations]
@@ -176,19 +168,13 @@ def compute_wer(hypotheses, references):
     return total_edits / max(total_ref_words, 1)
 
 
-def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=512,
-                         shuffle_before_split=False, shuffle_seed=42, use_cfg=False):
+def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=512):
     """Generate tool-call predictions and compute structured metrics."""
     import json
     from .run import generate
     from .data import load_tool_calls
 
-    ds = load_tool_calls(
-        "validation",
-        max_samples=num_samples,
-        shuffle_before_split=shuffle_before_split,
-        shuffle_seed=shuffle_seed,
-    )
+    ds = load_tool_calls("validation", max_samples=num_samples)
 
     total = 0
     exact_match = 0
@@ -209,7 +195,7 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
 
         pred_text = generate(
             model, params, tokenizer, ex["query"],
-            tools=ex["tools"], max_gen_len=max_gen_len, seed=i, stream=False, use_cfg=use_cfg,
+            tools=ex["tools"], max_gen_len=max_gen_len, seed=i, stream=False,
         ).strip()
 
         try:
@@ -282,18 +268,12 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
     }
 
 
-def benchmark_voice_tool_calls(model, params, tokenizer, num_samples=100, max_gen_len=512,
-                               shuffle_before_split=False, shuffle_seed=42, use_cfg=False):
+def benchmark_voice_tool_calls(model, params, tokenizer, num_samples=100, max_gen_len=512):
     """Generate tool-call predictions from audio and compute structured metrics."""
     import json
     from .run import generate_from_audio
 
-    indices = load_tool_call_audio(
-        "validation",
-        max_samples=num_samples,
-        shuffle_before_split=shuffle_before_split,
-        shuffle_seed=shuffle_seed,
-    )
+    indices = load_tool_call_audio("validation", max_samples=num_samples)
 
     total = 0
     exact_match = 0
@@ -316,7 +296,7 @@ def benchmark_voice_tool_calls(model, params, tokenizer, num_samples=100, max_ge
 
         pred_text = generate_from_audio(
             model, params, tokenizer, pair["audio_array"], sr=pair["sampling_rate"],
-            tools=pair["tools"], max_gen_len=max_gen_len, seed=i, stream=False, use_cfg=use_cfg,
+            tools=pair["tools"], max_gen_len=max_gen_len, seed=i, stream=False,
         ).strip()
 
         try:
@@ -393,9 +373,6 @@ def main(args):
     params, config = load_checkpoint(args.checkpoint)
     model = EncoderDecoderTransformer(config)
     tokenizer = get_tokenizer()
-    val_meta = _load_cache_metadata("val") or {}
-    split_shuffle = val_meta.get("shuffle_before_split", False)
-    split_seed = val_meta.get("split_seed", 42)
 
     param_count = sum(x.size for x in jax.tree.leaves(params))
     print(f"\ncheckpoint:  {args.checkpoint}")
@@ -403,12 +380,7 @@ def main(args):
     print(f"config:      d={config.d_model}, heads={config.num_heads}, layers={config.num_encoder_layers}/{config.num_decoder_layers}")
 
     print(f"\nevaluating tool-call perplexity ({args.max_eval_samples} samples)...")
-    ds = load_tool_calls(
-        "validation",
-        max_samples=args.max_eval_samples,
-        shuffle_before_split=split_shuffle,
-        shuffle_seed=split_seed,
-    )
+    ds = load_tool_calls("validation", max_samples=args.max_eval_samples)
     enc_inputs, dec_inputs, dec_targets, loss_mask_arr, _ = prepare_tool_call_pairs(
         ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
@@ -418,14 +390,7 @@ def main(args):
     tc = None
     if tc_samples > 0:
         print(f"\nevaluating tool-call accuracy ({tc_samples} samples)...")
-        tc = benchmark_tool_calls(
-            model, params, tokenizer,
-            num_samples=tc_samples,
-            max_gen_len=args.max_gen_len,
-            shuffle_before_split=split_shuffle,
-            shuffle_seed=split_seed,
-            use_cfg=getattr(args, "cfg_inference", False),
-        )
+        tc = benchmark_tool_calls(model, params, tokenizer, num_samples=tc_samples, max_gen_len=args.max_gen_len)
 
     print(f"\n  ─────────────────────────────────────")
     print(f"  Tool-Call Metrics")
@@ -455,14 +420,7 @@ def main(args):
     voice_tc_samples = getattr(args, "voice_tc_samples", 50)
     if voice_tc_samples > 0:
         print(f"\nevaluating voice-to-tool-call ({voice_tc_samples} samples)...")
-        vtc = benchmark_voice_tool_calls(
-            model, params, tokenizer,
-            num_samples=voice_tc_samples,
-            max_gen_len=args.max_gen_len,
-            shuffle_before_split=split_shuffle,
-            shuffle_seed=split_seed,
-            use_cfg=getattr(args, "cfg_inference", False),
-        )
+        vtc = benchmark_voice_tool_calls(model, params, tokenizer, num_samples=voice_tc_samples, max_gen_len=args.max_gen_len)
         print(f"\n  ─── Voice-Tool-Call Metrics ─────────")
         print(f"  JSON parse rate  {vtc['json_parse_rate']:>10.1%}")
         print(f"  Exact match      {vtc['exact_match']:>10.1%}")
@@ -504,7 +462,6 @@ def parse_args():
                         help="Samples for tool-call accuracy eval (default: 200)")
     parser.add_argument("--voice-tc-samples", type=int, default=50,
                         help="Samples for voice-to-tool-call eval (default: 50)")
-    parser.add_argument("--cfg-inference", action="store_true")
     return parser.parse_args()
 
 

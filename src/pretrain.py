@@ -38,45 +38,6 @@ _TOOL_CONTRASTIVE_WEIGHT = 1.0
 _AUDIO_TEXT_CONTRASTIVE_WEIGHT = 1.0
 
 
-def _assert_stage1_batch_shapes(mel, transcript_text, tgt_in, tgt_out, loss_mask,
-                                tc_q, tc_tools, tc_labels, tc_tool_mask,
-                                effective_batch_size, max_mel_len, n_mels,
-                                max_enc_len, max_dec_len):
-    expected = {
-        "mel": (effective_batch_size, max_mel_len, n_mels),
-        "transcript_text": (effective_batch_size, max_enc_len),
-        "tgt_in": (effective_batch_size, max_dec_len),
-        "tgt_out": (effective_batch_size, max_dec_len),
-        "loss_mask": (effective_batch_size, max_dec_len),
-        "tc_q": (effective_batch_size, max_enc_len),
-    }
-    actual = {
-        "mel": mel.shape,
-        "transcript_text": transcript_text.shape,
-        "tgt_in": tgt_in.shape,
-        "tgt_out": tgt_out.shape,
-        "loss_mask": loss_mask.shape,
-        "tc_q": tc_q.shape,
-    }
-    for name, shape in expected.items():
-        if actual[name] != shape:
-            raise ValueError(f"Unexpected {name} shape {actual[name]}, expected {shape}")
-
-    if tc_tools.shape[0] != effective_batch_size or tc_tools.shape[2] != max_enc_len:
-        raise ValueError(
-            f"Unexpected tc_tools shape {tc_tools.shape}, expected "
-            f"({effective_batch_size}, n_tools, {max_enc_len})"
-        )
-    if tc_labels.shape != tc_tool_mask.shape or tc_labels.shape[0] != effective_batch_size:
-        raise ValueError(
-            f"Unexpected Toucan label/mask shapes {tc_labels.shape} and {tc_tool_mask.shape}"
-        )
-    if tc_labels.shape[1] != tc_tools.shape[1]:
-        raise ValueError(
-            f"Toucan tool dimension mismatch: tc_tools={tc_tools.shape}, tc_labels={tc_labels.shape}"
-        )
-
-
 def _tool_contrastive_loss(state, params, contrastive_q, contrastive_tools, contrastive_labels, contrastive_tool_mask):
     pad_id = 0
     q_mask = make_padding_mask(contrastive_q, pad_id)
@@ -321,10 +282,6 @@ def pretrain(args):
         ckpt_params = None
 
     effective_batch_size = args.batch_size * num_devices
-    if effective_batch_size % num_devices != 0:
-        raise ValueError(
-            f"Effective batch size {effective_batch_size} must be divisible by num_devices {num_devices}"
-        )
     batches_per_epoch = count_batches(len(train_prepared["text_inputs"]), effective_batch_size)
     total_steps = batches_per_epoch * args.epochs
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
@@ -366,7 +323,6 @@ def pretrain(args):
     global_step = 0
     last_val_ppl = None
     eval_every = getattr(args, "eval_every", 1000)
-    checked_batch_shapes = False
 
     for epoch in range(args.epochs):
         losses = []
@@ -390,30 +346,6 @@ def pretrain(args):
         for _ in pbar:
             mel, text_enc, tgt_in, tgt_out, lm = next(speech_iter)
             tc_q, tc_tools, tc_labels, tc_tool_mask = next(contrastive_iter)
-
-            if not checked_batch_shapes:
-                _assert_stage1_batch_shapes(
-                    mel,
-                    text_enc,
-                    tgt_in,
-                    tgt_out,
-                    lm,
-                    tc_q,
-                    tc_tools,
-                    tc_labels,
-                    tc_tool_mask,
-                    effective_batch_size,
-                    args.max_mel_len,
-                    args.n_mels,
-                    args.max_enc_len,
-                    args.max_dec_len,
-                )
-                print(
-                    "  Stage 1 batch shapes "
-                    f"mel={mel.shape} text={text_enc.shape} tgt={tgt_in.shape} "
-                    f"tc_q={tc_q.shape} tc_tools={tc_tools.shape}"
-                )
-                checked_batch_shapes = True
 
             mel_b = shard_batch(mel, num_devices)
             text_enc_b = shard_batch(text_enc, num_devices)
@@ -496,11 +428,9 @@ def pretrain(args):
             args.max_dec_len,
             max_eval_samples=getattr(args, "max_eval_samples", None),
         )
-        ckpt_path = "(skipped)"
-        if not getattr(args, "no_checkpoints", False):
-            ckpt_name = f"needle_stage1_{config.num_encoder_layers}_{config.d_model}_{global_step}.pkl"
-            ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
-            save_checkpoint(ckpt_path, eval_params, config, extra={"stage": "stage1"})
+        ckpt_name = f"needle_stage1_{config.num_encoder_layers}_{config.d_model}_{global_step}.pkl"
+        ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
+        save_checkpoint(ckpt_path, eval_params, config, extra={"stage": "stage1"})
 
         print(f"\n  Epoch {epoch + 1}/{args.epochs}")
         print(f"  Train loss     {sum(losses) / max(len(losses), 1):.4f}")

@@ -18,7 +18,6 @@ import subprocess
 
 from .data import (
     CACHE_DIR,
-    GCS_CACHE_PATH,
     GCS_TOKENIZER_PATH,
     EMILIA_SPEECH_GCS_PREFIX,
     TOKENIZER_DIR,
@@ -35,16 +34,6 @@ from .data import (
     upload_tokenizer_to_gcs,
 )
 from .toucan import cache_toucan_examples
-
-
-def _clear_gcs_cache():
-    """Remove existing shared prepared-cache files."""
-    path = GCS_CACHE_PATH + "/*"
-    print(f"Clearing {path} ...")
-    subprocess.run(
-        ["gcloud", "storage", "rm", "-r", path],
-        capture_output=True, text=True,
-    )
 
 
 def _clear_gcs_tokenizer():
@@ -68,9 +57,6 @@ def _clear_local_caches():
 def tokenize(args):
     print("=== Clearing existing local caches ===")
     _clear_local_caches()
-    if getattr(args, "clear_gcs_cache", False):
-        print("\n=== Clearing shared GCS cache ===")
-        _clear_gcs_cache()
     if getattr(args, "overwrite_gcs_tokenizer", False):
         print("\n=== Clearing shared GCS tokenizer ===")
         _clear_gcs_tokenizer()
