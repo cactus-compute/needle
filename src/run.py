@@ -48,13 +48,26 @@ def load_checkpoint(path):
     return params, config
 
 
-def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=0, stream=True, task_token_id=None):
+def _build_encoder_input(tokenizer, query, tools, max_enc_len=1024):
+    """Build encoder input: [query..., <tools>, tools...] truncated to max_enc_len."""
+    tools_sep_id = tokenizer.tools_token_id
+    q_toks = tokenizer.encode(query)
+    t_toks = tokenizer.encode(tools)
+    max_query = max_enc_len - 2 
+    if len(q_toks) > max_query:
+        q_toks = q_toks[:max_query]
+    remaining = max_enc_len - len(q_toks) - 1  
+    t_toks = t_toks[:remaining]
+    return q_toks + [tools_sep_id] + t_toks
+
+
+def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, max_enc_len=1024, seed=0, stream=True, task_token_id=None):
     """Generate tool-call output.
 
-    Encoder: query only.
-    Decoder: prefilled with [EOS, <tool_call>, tools_tokens...], then greedy decode.
+    Encoder: [query_tokens..., <tools>, tools_tokens...] truncated to max_enc_len.
+    Decoder: prefilled with [EOS, <tool_call>], then greedy decode.
     """
-    enc_tokens = tokenizer.encode(query)
+    enc_tokens = _build_encoder_input(tokenizer, query, tools, max_enc_len)
     enc_input = jnp.array([enc_tokens])
 
     pad_id = tokenizer.pad_token_id
@@ -66,13 +79,12 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
         {"params": params}, enc_input, src_mask=src_mask, method="encode"
     )
 
-    tools_tokens = tokenizer.encode(tools)
-    prefix = [eos_id, tool_call_id] + tools_tokens
-    prefix_len = min(len(prefix), max_gen_len)
+    prefix = [eos_id, tool_call_id]
+    prefix_len = 2
 
     dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
-    for j, tok in enumerate(prefix[:max_gen_len]):
-        dec_buffer = dec_buffer.at[0, j].set(tok)
+    dec_buffer = dec_buffer.at[0, 0].set(eos_id)
+    dec_buffer = dec_buffer.at[0, 1].set(tool_call_id)
 
     decode_fn = _get_decode_fn(model, max_gen_len)
 
@@ -104,6 +116,68 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
         sys.stdout.write("\n")
 
     return tokenizer.decode(generated_tokens)
+
+
+def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=512, max_enc_len=1024):
+    """Batch-generate tool-call outputs for multiple examples at once.
+
+    Encoder: [query_tokens..., <tools>, tools_tokens...] per example, truncated to max_enc_len.
+    Decoder: uniform prefix [EOS, <tool_call>] for all examples.
+
+    Returns a list of decoded strings, one per example.
+    """
+    B = len(queries)
+    pad_id = tokenizer.pad_token_id
+    eos_id = tokenizer.eos_token_id
+    tool_call_id = tokenizer.tool_call_token_id
+
+    # --- Encode: [query..., <tools>, tools...] per example, truncated ---
+    enc_token_lists = []
+    for q, t in zip(queries, tools_list):
+        enc_token_lists.append(_build_encoder_input(tokenizer, q, t, max_enc_len))
+    max_enc = max(len(toks) for toks in enc_token_lists)
+    enc_input = np.full((B, max_enc), pad_id, dtype=np.int32)
+    for i, toks in enumerate(enc_token_lists):
+        enc_input[i, :len(toks)] = toks
+    enc_input = jnp.array(enc_input)
+    src_mask = make_padding_mask(enc_input, pad_id)
+
+    encoder_out = model.apply(
+        {"params": params}, enc_input, src_mask=src_mask, method="encode"
+    )
+
+    # --- Decoder prefix: uniform [EOS, <tool_call>] (prefix_len=2) ---
+    prefix_len = 2
+    dec_buffer = np.full((B, max_gen_len), pad_id, dtype=np.int32)
+    dec_buffer[:, 0] = eos_id
+    dec_buffer[:, 1] = tool_call_id
+    dec_buffer = jnp.array(dec_buffer)
+
+    decode_fn = _get_decode_fn(model, max_gen_len)
+
+    # --- Autoregressive decoding ---
+    finished = [False] * B
+    gen_tokens = [[] for _ in range(B)]
+
+    logits = decode_fn(params, dec_buffer, encoder_out)
+
+    for pos in range(prefix_len - 1, max_gen_len - 1):
+        for i in range(B):
+            if finished[i]:
+                continue
+            next_token = int(jnp.argmax(logits[i, pos]))
+            if next_token == eos_id:
+                finished[i] = True
+                continue
+            gen_tokens[i].append(next_token)
+            dec_buffer = dec_buffer.at[i, pos + 1].set(next_token)
+
+        if all(finished):
+            break
+
+        logits = decode_fn(params, dec_buffer, encoder_out)
+
+    return [tokenizer.decode(toks) for toks in gen_tokens]
 
 
 def load_audio(path, target_sr=16000):

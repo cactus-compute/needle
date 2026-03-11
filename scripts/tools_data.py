@@ -1,33 +1,22 @@
 """
 Unified tool-calling dataset builder.
 
-Loads four HuggingFace tool-calling datasets and converts them all into the
-xlam-function-calling-60k schema:
+Loads HuggingFace tool-calling datasets and converts them into a common schema:
 
     query   : str   – the user's natural-language request
     answers : str   – JSON list of {"name": ..., "arguments": {...}} tool calls
     tools   : str   – JSON list of available tool definitions
     source  : str   – which dataset the example came from
 
-Datasets and their native formats:
+Datasets:
 
 1. Salesforce/xlam-function-calling-60k
    Already in the target schema (query, answers, tools).
 
-2. Salesforce/APIGen-MT-5k
-   Multi-turn conversations with human/gpt/function_call/observation roles.
-   We extract the first user message as the query and collect all function_call
-   messages (excluding internal "think" calls) as answers.
-
-3. glaiveai/glaive-function-calling-v2
+2. glaiveai/glaive-function-calling-v2
    Tool definitions embedded in the system prompt; chat is a flat string with
    USER:/A: role markers and <functioncall> tags. Examples with empty answers
    (answers=[]) are kept so the model learns when NOT to call functions.
-
-4. Team-ACE/ToolACE
-   Tool definitions as a JSON array in the system prompt; function calls use a
-   bracket syntax [FuncName(key=val, ...)] where names may contain spaces. Only
-   examples with at least one parsed function call are kept.
 """
 
 import json
@@ -39,42 +28,12 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 
 DATASETS = {
     "xlam-function-calling-60k": "Salesforce/xlam-function-calling-60k",
-    "APIGen-MT-5k": "Salesforce/APIGen-MT-5k",
     "glaive-function-calling": "glaiveai/glaive-function-calling-v2",
-    "ToolACE": "Team-ACE/ToolACE",
 }
 
 
 def convert_xlam(dataset):
     return dataset.select_columns(["query", "answers", "tools"])
-
-
-def convert_apigen_mt(dataset):
-    rows = []
-    for ex in dataset:
-        convs = ex["conversations"]
-        tools = ex["tools"]
-
-        query = None
-        answers = []
-        for msg in convs:
-            if msg["from"] == "human" and query is None:
-                query = msg["value"]
-            elif msg["from"] == "function_call":
-                try:
-                    fc = json.loads(msg["value"])
-                    if fc.get("name") != "think":
-                        answers.append(fc)
-                except json.JSONDecodeError:
-                    pass
-
-        if query:
-            rows.append({
-                "query": query,
-                "answers": json.dumps(answers),
-                "tools": tools,
-            })
-    return Dataset.from_list(rows)
 
 
 def convert_glaive(dataset):
@@ -149,109 +108,9 @@ def _parse_glaive_chat(chat):
     return query, answers
 
 
-def convert_toolace(dataset):
-    rows = []
-    for ex in dataset:
-        tools = _parse_toolace_tools(ex["system"])
-        convs = ex["conversations"]
-
-        query = None
-        answers = []
-        for msg in convs:
-            if msg["from"] == "user" and query is None:
-                query = msg["value"]
-            elif msg["from"] == "assistant" and query is not None:
-                calls = _parse_toolace_calls(msg["value"])
-                if calls:
-                    answers.extend(calls)
-                    break
-
-        if query and answers:
-            rows.append({
-                "query": query,
-                "answers": json.dumps(answers),
-                "tools": json.dumps(tools),
-            })
-    return Dataset.from_list(rows)
-
-
-def _parse_toolace_tools(system_text):
-    """Extract tool list from ToolACE system prompt (JSON array after 'invoke:')."""
-    match = re.search(r'invoke:\s*(\[)', system_text)
-    if not match:
-        return []
-    start = match.start(1)
-    depth = 0
-    for i in range(start, len(system_text)):
-        if system_text[i] == '[':
-            depth += 1
-        elif system_text[i] == ']':
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(system_text[start:i + 1])
-                except json.JSONDecodeError:
-                    return []
-    return []
-
-
-def _parse_toolace_calls(text):
-    """Parse [FuncName(key=val, ...)] calls. Function names may contain spaces."""
-    answers = []
-    bracket_match = re.search(r'\[(.+)\]', text, re.DOTALL)
-    if not bracket_match:
-        return answers
-
-    inner = bracket_match.group(1)
-    for m in re.finditer(r'([\w][\w ]*?\w|\w)\(([^)]*)\)', inner):
-        name = m.group(1).strip()
-        args_str = m.group(2)
-        arguments = {}
-        for arg_m in re.finditer(
-            r'(\w+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|\'((?:[^\'\\]|\\.)*)\'|(\[[^\]]*\])|([^,)]+))',
-            args_str,
-        ):
-            key = arg_m.group(1)
-            val = next(
-                (g for g in (arg_m.group(2), arg_m.group(3), arg_m.group(4), arg_m.group(5)) if g is not None),
-                None,
-            )
-            if val is not None:
-                val = val.strip()
-                try:
-                    val = json.loads(val)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            arguments[key] = val
-        answers.append({"name": name, "arguments": arguments})
-    return answers
-
-
-def compact_tools(tools_json):
-    """Strip verbose schema descriptions, keep only function name + param name/type."""
-    try:
-        tools = json.loads(tools_json)
-    except (json.JSONDecodeError, TypeError):
-        return tools_json
-    compact = []
-    for t in tools:
-        params = {}
-        raw_params = t.get("parameters", {})
-        props = raw_params.get("properties", raw_params) if isinstance(raw_params, dict) else {}
-        for pname, pdef in props.items():
-            if isinstance(pdef, dict):
-                params[pname] = pdef.get("type", "string")
-            else:
-                params[pname] = str(pdef)
-        compact.append({"name": t["name"], "parameters": params})
-    return json.dumps(compact)
-
-
 CONVERTERS = {
     "xlam-function-calling-60k": convert_xlam,
-    "APIGen-MT-5k": convert_apigen_mt,
     "glaive-function-calling": convert_glaive,
-    "ToolACE": convert_toolace,
 }
 
 _PLACEHOLDER_VALUES = {
@@ -421,17 +280,21 @@ def load_and_combine():
 
     combined = concatenate_datasets(parts)
 
+    # Drop no-call examples with empty tools (trivial negatives)
+    before_empty = len(combined)
+    combined = combined.filter(
+        lambda ex: json.loads(ex["answers"]) != [] or json.loads(ex["tools"]) != [],
+        desc="Removing empty-tools no-call examples",
+    )
+    empty_dropped = before_empty - len(combined)
+    if empty_dropped:
+        print(f"\nRemoved {empty_dropped} no-call examples with empty tools")
+
     before_dedup = len(combined)
     combined = _deduplicate(combined)
     dedup_dropped = before_dedup - len(combined)
     if dedup_dropped:
         print(f"\nDeduplicated: removed {dedup_dropped} duplicate queries")
-
-    print(f"\nCompacting tool schemas...")
-    combined = combined.map(
-        lambda ex: {"tools": compact_tools(ex["tools"])},
-        desc="Compacting tools",
-    )
 
     empty_count = sum(1 for ex in combined if json.loads(ex["answers"]) == [])
     print(f"\n{'='*60}")
