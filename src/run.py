@@ -63,7 +63,7 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, seed=
     """Generate tool-call output.
 
     Encoder: query only.
-    Decoder: prefilled with [BOS, <tool_call>, tools_tokens...], then greedy decode.
+    Decoder: prefilled with [EOS, <tool_call>, tools_tokens...], then greedy decode.
     """
     enc_tokens = tokenizer.encode(query)
     enc_input = jnp.array([enc_tokens])

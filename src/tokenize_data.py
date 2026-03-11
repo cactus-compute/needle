@@ -1,12 +1,14 @@
-"""Standalone tokenization pipeline: train tokenizer and pre-tokenize all data.
+"""Stage 2 tokenization pipeline for tool-call text data.
 
-Trains the SentencePiece tokenizer and tokenizes train + val splits for both
-text and voice data, caching everything on GCS. Running fresh overwrites all
-existing tokenizer + caches.
+Retrains the local SentencePiece tokenizer, optionally updates the shared GCS
+tokenizer, and prepares the train + val text tool-call caches used by Stage 2.
+The old unified-dataset mel precompute path is intentionally not part of this
+pipeline anymore.
 
 Usage:
     needle tokenize                         # full run
     needle tokenize --max-samples 1000      # dev/test
+    needle tokenize --overwrite-gcs-tokenizer
     needle tokenize --cleanup               # delete local cache after GCS upload
 """
 
@@ -18,31 +20,45 @@ from .data import (
     CACHE_DIR,
     GCS_CACHE_PATH,
     GCS_TOKENIZER_PATH,
+    EMILIA_SPEECH_GCS_PREFIX,
     TOKENIZER_DIR,
     _cache_key,
     _save_cache_metadata,
     get_tokenizer,
+    load_emilia_speech_metadata,
     load_tool_calls,
-    precompute_mels,
+    prefetch_emilia_mels,
+    prepare_transcription_pairs,
     prepare_tool_call_pairs,
+    save_prepared_transcription_data,
     train_tokenizer,
     upload_tokenizer_to_gcs,
 )
 from .toucan import cache_toucan_examples
 
 
-def _clear_gcs_caches():
-    """Remove existing GCS cache and tokenizer files."""
-    for path in [GCS_CACHE_PATH + "/*", GCS_TOKENIZER_PATH + "*"]:
-        print(f"Clearing {path} ...")
-        subprocess.run(
-            ["gcloud", "storage", "rm", "-r", path],
-            capture_output=True, text=True,
-        )
+def _clear_gcs_cache():
+    """Remove existing shared prepared-cache files."""
+    path = GCS_CACHE_PATH + "/*"
+    print(f"Clearing {path} ...")
+    subprocess.run(
+        ["gcloud", "storage", "rm", "-r", path],
+        capture_output=True, text=True,
+    )
+
+
+def _clear_gcs_tokenizer():
+    """Remove the shared tokenizer files."""
+    path = GCS_TOKENIZER_PATH + "*"
+    print(f"Clearing {path} ...")
+    subprocess.run(
+        ["gcloud", "storage", "rm", "-r", path],
+        capture_output=True, text=True,
+    )
 
 
 def _clear_local_caches():
-    """Remove local .data_cache/ and tokenizer/ directories."""
+    """Remove local cache and tokenizer directories."""
     for d in [CACHE_DIR, TOKENIZER_DIR]:
         if os.path.exists(d):
             print(f"Removing {d}/ ...")
@@ -50,41 +66,74 @@ def _clear_local_caches():
 
 
 def tokenize(args):
-    print("=== Clearing existing caches ===")
-    _clear_gcs_caches()
+    print("=== Clearing existing local caches ===")
     _clear_local_caches()
+    if getattr(args, "clear_gcs_cache", False):
+        print("\n=== Clearing shared GCS cache ===")
+        _clear_gcs_cache()
+    if getattr(args, "overwrite_gcs_tokenizer", False):
+        print("\n=== Clearing shared GCS tokenizer ===")
+        _clear_gcs_tokenizer()
 
-    print("\n=== Training tokenizer ===")
+    print("\n=== Training local tokenizer ===")
     train_tokenizer(max_samples=args.max_samples, force=True)
-    upload_tokenizer_to_gcs()
+    if getattr(args, "overwrite_gcs_tokenizer", False):
+        upload_tokenizer_to_gcs()
+    else:
+        print("Skipping shared GCS tokenizer upload")
 
     tokenizer = get_tokenizer()
-    toucan_path = None
+    print("\n=== Caching Toucan tool definitions for Stage 1 ===")
+    toucan_path = cache_toucan_examples(
+        config=args.toucan_config,
+        split="train",
+        max_samples=getattr(args, "toucan_max_samples", None),
+        tokenizer=tokenizer,
+        max_text_len=max(getattr(args, "max_enc_len", 256), getattr(args, "max_dec_len", 1024)),
+    )
+    print(f"Cached Toucan examples to {toucan_path}")
 
-    if getattr(args, "toucan_config", None):
-        print("\n=== Caching Toucan tool definitions ===")
-        toucan_path = cache_toucan_examples(
-            config=args.toucan_config,
-            split="train",
-            max_samples=getattr(args, "toucan_max_samples", None),
-            tokenizer=tokenizer,
-            max_text_len=max(getattr(args, "max_enc_len", 256), getattr(args, "max_dec_len", 1024)),
+    print("\n=== Tokenizing Emilia transcription data for Stage 1 ===")
+    speech_prefix = getattr(args, "speech_gcs_prefix", EMILIA_SPEECH_GCS_PREFIX)
+    speech_val_ratio = getattr(args, "speech_val_ratio", 0.01)
+    speech_max_samples = getattr(args, "max_speech_samples", None) or args.max_samples
+    stage1_mel_uris = []
+    for split in ("train", "val"):
+        rows = load_emilia_speech_metadata(
+            split,
+            gcs_prefix=speech_prefix,
+            max_samples=speech_max_samples,
+            val_ratio=speech_val_ratio,
+            seed=getattr(args, "split_seed", 42),
         )
-        print(f"Cached Toucan examples to {toucan_path}")
+        prepared = prepare_transcription_pairs(rows, tokenizer, args.max_enc_len, args.max_dec_len)
+        cache_id = save_prepared_transcription_data(
+            split,
+            prepared,
+            args.max_enc_len,
+            args.max_dec_len,
+            gcs_prefix=speech_prefix,
+            val_ratio=speech_val_ratio,
+            split_max_samples=speech_max_samples,
+        )
+        stage1_mel_uris.extend(prepared["mel_uris"].tolist())
+        print(f"Cached {len(rows):,} Emilia {split} examples ({cache_id})")
 
-    print("\n=== Tokenizing text data + precomputing mels ===")
+    print("\n=== Mirroring Emilia mel files for Stage 1 ===")
+    use_rsync = speech_max_samples is None
+    mirrored = prefetch_emilia_mels(stage1_mel_uris, gcs_prefix=speech_prefix, use_rsync=use_rsync)
+    print(f"Mirrored {mirrored:,} Emilia mel files into local cache")
+
+    print("\n=== Tokenizing Stage 2 text tool-call data ===")
     max_enc_len = getattr(args, "max_enc_len", 256)
     max_dec_len = getattr(args, "max_dec_len", 1024)
-    n_mels = getattr(args, "n_mels", 80)
-    max_mel_len = getattr(args, "max_mel_len", 1024)
     batch_size = getattr(args, "batch_size", 5000)
 
     for split in ("train", "val"):
         print(f"\n--- {split} split ---")
-        ds, global_indices = load_tool_calls(
+        ds = load_tool_calls(
             split=split,
             max_samples=args.max_samples,
-            return_global_indices=True,
             shuffle_before_split=getattr(args, "shuffle_before_split", False),
             shuffle_seed=getattr(args, "split_seed", 42),
         )
@@ -94,13 +143,8 @@ def tokenize(args):
         )
         text_cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len)
 
-        mel_cache_id = precompute_mels(
-            global_indices[kept_indices], n_mels=n_mels, max_mel_len=max_mel_len,
-            cache_id_prefix=split, batch_size=batch_size,
-        )
-
-        _save_cache_metadata(split, text_cache_id, mel_cache_id, len(kept_indices),
-                             max_enc_len, max_dec_len, n_mels, max_mel_len,
+        _save_cache_metadata(split, text_cache_id, None, len(kept_indices),
+                             max_enc_len, max_dec_len, None, None,
                              split_max_samples=args.max_samples,
                              shuffle_before_split=getattr(args, "shuffle_before_split", False),
                              split_seed=getattr(args, "split_seed", 42),

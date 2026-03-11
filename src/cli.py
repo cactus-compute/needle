@@ -33,37 +33,58 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--max-eval-samples", type=int, default=None)
-    p.add_argument("--sparsity-ratio", type=float, default=0.0)
     p.add_argument("--group-size", type=int, default=32)
-    p.add_argument("--prune-interval", type=int, default=100,
-                   help="Steps between mask updates during gradual pruning (default: 100)")
-    p.add_argument("--prune-start-frac", type=float, default=0.33,
-                   help="Fraction of epoch to train before starting gradual pruning (default: 0.33)")
-    p.add_argument("--prune-end-frac", type=float, default=0.67,
-                   help="Fraction of epoch at which pruning finishes and mask locks (default: 0.67)")
     p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu"])
     p.add_argument("--num-memory-slots", type=int, default=64)
-    p.add_argument("--mat-factors", type=int, nargs="*", default=[2, 4, 8],
-                   help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4 8)")
-    p.add_argument("--mat-shared-input", action="store_true",
-                   help="Each unique input is repeated across all mat widths (default: unique input per width)")
     p.add_argument("--dropout", type=float, default=0.0,
                    help="Dropout rate for residual connections (default: 0.1)")
-    p.add_argument("--no-speech", action="store_true", help="Disable speech training (text-only)")
     p.add_argument("--max-mel-len", type=int, default=1024,
                    help="Max mel spectrogram frames (default: 1024)")
     p.add_argument("--n-mels", type=int, default=80,
                    help="Number of mel frequency bins (default: 80)")
-    p.add_argument("--max-speech-samples", type=int, default=None,
-                   help="Max voice-tool-call training samples (default: all)")
-    p.add_argument("--cfg-inference", action="store_true",
-                   help="Enable CFG-constrained sample generation during training")
-    p.add_argument("--tool-contrastive-weight", type=float, default=0.0,
-                   help="Auxiliary Toucan tool-alignment loss weight")
-    p.add_argument("--audio-text-contrastive-weight", type=float, default=0.0,
-                   help="Auxiliary paired audio-text SigLIP loss weight")
-    p.add_argument("--skip-epoch-extras", action="store_true",
-                   help="Skip epoch-end throughput benchmark and qualitative sample generation")
+    p.add_argument("--no-checkpoints", action="store_true",
+                   help="Skip epoch checkpoint writes")
+
+    p = sub.add_parser("pretrain", add_help=False)
+    p.add_argument("--full", action="store_true")
+    p.add_argument("--checkpoint", type=str, default=None)
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--muon-lr", type=float, default=0.02)
+    p.add_argument("--d-model", type=int, default=512)
+    p.add_argument("--num-heads", type=int, default=16)
+    p.add_argument("--num-kv-heads", type=int, default=8)
+    p.add_argument("--num-layers", type=int, default=4)
+    p.add_argument("--num-dec-layers", type=int, default=4)
+    p.add_argument("--max-enc-len", type=int, default=256)
+    p.add_argument("--max-dec-len", type=int, default=1024)
+    p.add_argument("--max-samples", type=int, default=None)
+    p.add_argument("--max-speech-samples", type=int, default=None)
+    p.add_argument("--warmup-ratio", type=float, default=0.05)
+    p.add_argument("--wandb", action="store_true")
+    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
+    p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--eval-every", type=int, default=1000)
+    p.add_argument("--max-eval-samples", type=int, default=None)
+    p.add_argument("--group-size", type=int, default=32)
+    p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu"])
+    p.add_argument("--num-memory-slots", type=int, default=64)
+    p.add_argument("--dropout", type=float, default=0.0,
+                   help="Dropout rate for residual connections (default: 0.1)")
+    p.add_argument("--max-mel-len", type=int, default=1024,
+                   help="Max mel spectrogram frames (default: 1024)")
+    p.add_argument("--n-mels", type=int, default=80,
+                   help="Number of mel frequency bins (default: 80)")
+    p.add_argument("--speech-gcs-prefix", type=str, default="gs://cactus-dataset/speech-datav1/emilia-large")
+    p.add_argument("--speech-val-ratio", type=float, default=0.01)
+    p.add_argument("--toucan-config", type=str, default="Kimi-K2")
+    p.add_argument("--toucan-max-samples", type=int, default=None)
+    p.add_argument("--tool-contrastive-weight", type=float, default=1.0,
+                   help="Toucan query-description contrastive loss weight")
+    p.add_argument("--audio-text-contrastive-weight", type=float, default=1.0,
+                   help="Paired audio-text SigLIP loss weight")
     p.add_argument("--no-checkpoints", action="store_true",
                    help="Skip epoch checkpoint writes")
 
@@ -72,10 +93,6 @@ def main():
                    help="Limit samples per split (for dev/test)")
     p.add_argument("--cleanup", action="store_true",
                    help="Delete local .data_cache/ after GCS upload")
-    p.add_argument("--n-mels", type=int, default=80,
-                   help="Number of mel frequency bins (default: 80)")
-    p.add_argument("--max-mel-len", type=int, default=1024,
-                   help="Max mel spectrogram frames (default: 1024)")
     p.add_argument("--max-enc-len", type=int, default=256,
                    help="Max encoder sequence length (default: 256)")
     p.add_argument("--max-dec-len", type=int, default=1024,
@@ -86,10 +103,18 @@ def main():
                    help="Shuffle the unified dataset before splitting into train/val")
     p.add_argument("--split-seed", type=int, default=42,
                    help="Seed for --shuffle-before-split (default: 42)")
-    p.add_argument("--toucan-config", type=str, default=None,
-                   help="Optional Toucan subset to parse and cache during tokenization")
+    p.add_argument("--speech-gcs-prefix", type=str, default="gs://cactus-dataset/speech-datav1/emilia-large")
+    p.add_argument("--speech-val-ratio", type=float, default=0.01)
+    p.add_argument("--max-speech-samples", type=int, default=None,
+                   help="Optional cap for Emilia Stage 1 preprocessing")
+    p.add_argument("--toucan-config", type=str, default="Kimi-K2",
+                   help="Toucan subset to parse and cache during tokenization")
     p.add_argument("--toucan-max-samples", type=int, default=None,
-                   help="Optional max samples for Toucan parsing")
+                   help="Optional max samples for Toucan Stage 1 preprocessing")
+    p.add_argument("--clear-gcs-cache", action="store_true",
+                   help="Delete shared prepared-cache artifacts in GCS before uploading new ones")
+    p.add_argument("--overwrite-gcs-tokenizer", action="store_true",
+                   help="Overwrite the shared GCS tokenizer after retraining locally")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
@@ -160,6 +185,16 @@ def main():
     if args.command == "tokenize":
         from .tokenize_data import tokenize
         tokenize(args)
+    elif args.command == "pretrain":
+        if getattr(args, "full", False):
+            args.d_model = 1536
+            args.num_heads = 24
+            args.num_kv_heads = 8
+            args.num_layers = 12
+            args.num_dec_layers = 4
+            args.num_memory_slots = 128
+        from .pretrain import pretrain
+        pretrain(args)
     elif args.command == "train":
         if getattr(args, "full", False):
             args.d_model = 1536
@@ -168,7 +203,6 @@ def main():
             args.num_layers = 12
             args.num_dec_layers = 4
             args.num_memory_slots = 128
-            args.mat_factors = [2, 3, 4, 8, 16]
         from .train import train
         train(args)
     elif args.command == "run":
