@@ -27,13 +27,13 @@ def main():
     p.add_argument("--max-enc-len", type=int, default=DEFAULT_MAX_ENC_LEN)
     p.add_argument("--max-dec-len", type=int, default=DEFAULT_MAX_DEC_LEN)
     p.add_argument("--max-samples", type=int, default=None)
-    p.add_argument("--warmup-ratio", type=float, default=0.05)
+    p.add_argument("--warmup-ratio", type=float, default=0.1)
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--eval-every", type=int, default=500)
-    p.add_argument("--max-eval-samples", type=int, default=None)
+    p.add_argument("--eval-every", type=int, default=1000)
+    p.add_argument("--max-eval-samples", type=int, default=5000)
     p.add_argument("--sparsity-ratio", type=float, default=0.0)
     p.add_argument("--group-size", type=int, default=32)
     p.add_argument("--prune-interval", type=int, default=100,
@@ -58,6 +58,12 @@ def main():
                    help=f"Max encoder sequence length (default: {DEFAULT_MAX_ENC_LEN})")
     p.add_argument("--max-dec-len", type=int, default=DEFAULT_MAX_DEC_LEN,
                    help=f"Max decoder sequence length (default: {DEFAULT_MAX_DEC_LEN})")
+    p.add_argument("--w-name", type=float, default=3.0,
+                   help="Loss weight for tool name tokens (default: 3.0)")
+    p.add_argument("--w-value", type=float, default=2.0,
+                   help="Loss weight for argument value tokens (default: 2.0)")
+    p.add_argument("--w-key", type=float, default=1.5,
+                   help="Loss weight for argument key tokens (default: 1.5)")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
@@ -70,7 +76,7 @@ def main():
     p = sub.add_parser("eval", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--max-eval-samples", type=int, default=1000)
+    p.add_argument("--max-eval-samples", type=int, default=5000)
     p.add_argument("--max-enc-len", type=int, default=DEFAULT_MAX_ENC_LEN)
     p.add_argument("--max-dec-len", type=int, default=DEFAULT_MAX_DEC_LEN)
     p.add_argument("--max-gen-len", type=int, default=DEFAULT_MAX_GEN_LEN)

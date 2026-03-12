@@ -53,10 +53,15 @@ def tokenize(args):
             max_samples=args.max_samples,
             return_global_indices=True,
         )
+        w_name = getattr(args, "w_name", 3.0)
+        w_value = getattr(args, "w_value", 2.0)
+        w_key = getattr(args, "w_key", 1.5)
         _, _, _, _, kept_indices = prepare_tool_call_pairs(
             ds, tokenizer, max_enc_len=max_enc_len, max_dec_len=max_dec_len,
+            w_name=w_name, w_value=w_value, w_key=w_key,
         )
-        text_cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len)
+        text_cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len,
+                                   w_name, w_value, w_key)
 
         _save_cache_metadata(split, text_cache_id, len(kept_indices),
                              max_enc_len, max_dec_len)

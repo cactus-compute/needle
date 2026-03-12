@@ -17,6 +17,8 @@ from datasets import Audio, Dataset, load_from_disk
 from tqdm import tqdm
 import sentencepiece as spm
 
+import re as _re
+
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 _DISK_CACHE_DIR = os.path.join(_PROJECT_ROOT, ".data_cache")
 TOKENIZER_DIR = os.path.join(_PROJECT_ROOT, "tokenizer")
@@ -91,6 +93,90 @@ DEFAULT_MAX_DEC_LEN = 512
 DEFAULT_MAX_GEN_LEN = 512
 
 _unified_dataset_cache = None
+
+
+def _mark_json_value(s, char_w, key, value_str, weight):
+    """Find '"key": "value_str"' or '"key": value_str' in s, mark value chars."""
+    # For string values: "key": "value"
+    pattern_str = f'"{_re.escape(key)}"\\s*:\\s*"{_re.escape(value_str)}"'
+    for m in _re.finditer(pattern_str, s):
+        # Mark only the value part (inside quotes)
+        tail = s[m.start() + len(f'"{key}"'):m.end()]
+        val_offset = tail.index(f'"{value_str}"') + 1
+        val_start = m.start() + len(f'"{key}"') + val_offset
+        val_end = val_start + len(value_str)
+        char_w[val_start:val_end] = np.maximum(char_w[val_start:val_end], weight)
+        return
+    # For non-string values: "key": 123 or "key": true etc.
+    pattern_ns = f'"{_re.escape(key)}"\\s*:\\s*{_re.escape(value_str)}'
+    for m in _re.finditer(pattern_ns, s):
+        colon_offset = s[m.start():m.end()].index(':')
+        val_start = m.start() + colon_offset + 1
+        while val_start < m.end() and s[val_start] == ' ':
+            val_start += 1
+        val_end = m.end()
+        char_w[val_start:val_end] = np.maximum(char_w[val_start:val_end], weight)
+        return
+
+
+def _mark_json_key_in_args(s, char_w, key, weight):
+    """Mark the argument key string (inside quotes) in the JSON."""
+    for m in _re.finditer(f'"{_re.escape(key)}"\\s*:', s):
+        char_w[m.start() + 1:m.start() + 1 + len(key)] = np.maximum(
+            char_w[m.start() + 1:m.start() + 1 + len(key)], weight)
+
+
+def _token_weights_for_answer(answer_str, token_ids, sp_model,
+                               w_name=3.0, w_value=2.0, w_key=1.5):
+    """Compute per-token loss weights based on JSON structure.
+
+    Parses the answer JSON to identify character spans of tool names,
+    argument keys, and argument values, then maps to token-level weights
+    using SentencePiece byte offsets.
+    """
+    n = len(token_ids)
+    weights = np.ones(n, dtype=np.float32)
+
+    try:
+        calls = _json.loads(answer_str)
+    except (ValueError, TypeError):
+        return weights
+
+    if not isinstance(calls, list):
+        return weights
+
+    char_w = np.ones(len(answer_str), dtype=np.float32)
+
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        name = call.get("name", "")
+        if name:
+            _mark_json_value(answer_str, char_w, "name", name, w_name)
+
+        args = call.get("arguments", {})
+        if isinstance(args, dict):
+            for k, v in args.items():
+                _mark_json_key_in_args(answer_str, char_w, k, w_key)
+                v_str = _json.dumps(v) if not isinstance(v, str) else v
+                _mark_json_value(answer_str, char_w, k, v_str, w_value)
+
+    # Map char weights to token weights via SentencePiece pieces
+    pieces = sp_model.Encode(answer_str, out_type=str)
+    pos = 0
+    for i, piece in enumerate(pieces):
+        if i >= n:
+            break
+        raw = piece.replace('\u2581', ' ')
+        plen = len(raw)
+        if plen > 0 and pos + plen <= len(answer_str):
+            token_w = char_w[pos:pos + plen].max()
+            weights[i] = token_w
+            pos += plen
+        else:
+            pos += max(plen, 1)
+
+    return weights
 
 
 def _load_unified_dataset():
@@ -293,9 +379,10 @@ def _tokenizer_hash():
     return "none"
 
 
-def _cache_key(prefix, n_samples, max_enc_len, max_dec_len):
+def _cache_key(prefix, n_samples, max_enc_len, max_dec_len,
+               w_name=3.0, w_value=2.0, w_key=1.5):
     tok_hash = _tokenizer_hash()
-    key = f"{prefix}_{tok_hash}_{n_samples}_{max_enc_len}_{max_dec_len}"
+    key = f"{prefix}_{tok_hash}_{n_samples}_{max_enc_len}_{max_dec_len}_{w_name}_{w_value}_{w_key}"
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
@@ -323,18 +410,20 @@ def _load_cache_metadata(split):
     return None
 
 
-def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_dec_len=DEFAULT_MAX_DEC_LEN):
+def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_dec_len=DEFAULT_MAX_DEC_LEN,
+                            w_name=3.0, w_value=2.0, w_key=1.5):
     """Prepare tool-call encoder-decoder pairs with <tool_call> task token.
 
     Encoder input: [query_tokens..., <tools>, tools_tokens...] truncated to max_enc_len.
     Decoder input:  [EOS, <tool_call>, answer_tokens..., PAD...]
     Decoder target: [<tool_call>, answer_tokens..., EOS, PAD...]
-    Loss mask: 1 on answer + trailing EOS positions only.
+    Loss mask: token-level weights based on JSON structure (tool names, arg keys/values).
 
     Returns (enc_inputs, dec_inputs, dec_targets, loss_mask, kept_indices).
     """
 
-    cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len)
+    cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len,
+                          w_name, w_value, w_key)
     cache_path = os.path.join(CACHE_DIR, cache_id)
 
     tc_suffixes = ["_enc.npy", "_dec_in.npy", "_dec_tgt.npy", "_loss_mask.npy", "_kept_idx.npy"]
@@ -388,7 +477,7 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
 
     n = len(ds)
 
-    def _fill_sample(j, e_tok, t_tok, a_tok, enc_arr, dec_in_arr, dec_tgt_arr, lm_arr):
+    def _fill_sample(j, e_tok, t_tok, a_tok, ans_text, enc_arr, dec_in_arr, dec_tgt_arr, lm_arr):
         """Fill arrays at position j for one sample. Returns False if skipped."""
         al = len(a_tok)
         # Decoder needs: [EOS, <tool_call>, answer..., EOS] = 2 + al + 1
@@ -419,8 +508,11 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
             dec_tgt_arr[j, 1:1 + al] = a_tok
         dec_tgt_arr[j, 1 + al] = eos_id
 
-        # Loss mask: answer tokens + trailing EOS
-        lm_arr[j, 1:1 + al + 1] = 1.0
+        # Token-level loss weighting
+        token_weights = _token_weights_for_answer(ans_text, a_tok, tokenizer.sp,
+                                                   w_name=w_name, w_value=w_value, w_key=w_key)
+        lm_arr[j, 1:1 + len(token_weights)] = token_weights
+        lm_arr[j, 1 + al] = 1.0  # EOS stays at baseline weight
         return True
 
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -433,8 +525,8 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     skipped = 0
     for i in range(n):
         if not _fill_sample(i, all_enc_tokens[i], all_tools_tokens[i],
-                            all_ans_tokens[i], enc_inputs, dec_inputs,
-                            dec_targets, loss_mask):
+                            all_ans_tokens[i], ans_texts[i], enc_inputs,
+                            dec_inputs, dec_targets, loss_mask):
             skipped += 1
 
     if skipped > 0:
