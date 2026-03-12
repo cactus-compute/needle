@@ -480,7 +480,7 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     if shuffle_tools:
         tools_texts = [_shuffle_tools_json(t, seed=i) for i, t in enumerate(tools_texts)]
 
-    num_workers = min(os.cpu_count() or 1, 8)
+    num_workers = max(1, (os.cpu_count() or 1) // 2)
     model_path = TOKENIZER_PREFIX + ".model"
     chunk_size = max(1, len(enc_texts) // (num_workers * 4))
 

@@ -443,6 +443,8 @@ def train(args):
 
     mat_shared_input = getattr(args, "mat_shared_input", False)
     unique_batch_size = effective_batch_size // n_widths if (mat_shared_input and n_widths > 1) else effective_batch_size
+   
+    unique_batch_size = (unique_batch_size // num_devices) * num_devices
     text_batches_per_epoch = count_batches(len(enc_inputs), unique_batch_size)
     num_batches = text_batches_per_epoch
     total_steps = num_batches * args.epochs
@@ -490,15 +492,17 @@ def train(args):
         (num_devices, 1, args.max_dec_len, args.max_dec_len),
     )
 
-    text_ffn_mask = _make_ffn_mask(args.batch_size, config.d_ff, _MAT_FF_WIDTHS)
+    per_width = args.batch_size // n_widths if n_widths > 1 else args.batch_size
+    mat_per_device = per_width * n_widths  # actual per-device batch (may < args.batch_size)
+    text_ffn_mask = _make_ffn_mask(mat_per_device, config.d_ff, _MAT_FF_WIDTHS)
     text_ffn_mask = jnp.broadcast_to(
         text_ffn_mask[None, :, :],
-        (num_devices, args.batch_size, config.d_ff),
+        (num_devices, mat_per_device, config.d_ff),
     )
     if n_widths > 1:
         print(f"  Mat factors   {n_widths} (full + {', '.join(str(f)+'x' for f in _MAT_FACTORS)})")
         if mat_shared_input:
-            print(f"  Mat mode      shared input ({unique_batch_size // num_devices}/dev x {n_widths} repeats)")
+            print(f"  Mat mode      shared input ({per_width}/dev x {n_widths} repeats)")
         else:
             print(f"  Mat mode      unique input ({args.batch_size}/dev, random width)")
 
@@ -544,7 +548,6 @@ def train(args):
             src, tgt_in, tgt_out, lm = next(text_batch_iter)
 
             if n_widths > 1 and mat_shared_input:
-                per_width = args.batch_size // n_widths
                 def _tile_for_mat(arr):
                     s = arr.reshape(num_devices, per_width, *arr.shape[1:])
                     return np.tile(s, (1, n_widths) + (1,) * (arr.ndim - 1))

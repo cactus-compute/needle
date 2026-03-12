@@ -31,11 +31,15 @@ Datasets:
 
 import ast
 import json
+import multiprocessing as mp
+import os
 import random
 import re
 from collections import Counter
 
 from datasets import load_dataset, Dataset, concatenate_datasets
+
+_NUM_WORKERS = max(1, (os.cpu_count() or 1) // 2)
 
 
 DATASETS = {
@@ -54,17 +58,27 @@ def convert_xlam(dataset):
     return dataset.select_columns(["query", "answers", "tools"])
 
 
-def convert_glaive(dataset):
+def _convert_glaive_chunk(chunk):
     rows = []
-    for ex in dataset:
-        tools = _extract_json_objects(ex["system"])
-        query, answers = _parse_glaive_chat(ex["chat"])
+    for system, chat in chunk:
+        tools = _extract_json_objects(system)
+        query, answers = _parse_glaive_chat(chat)
         if query:
             rows.append({
                 "query": query,
                 "answers": json.dumps(answers),
                 "tools": json.dumps(tools),
             })
+    return rows
+
+
+def convert_glaive(dataset):
+    pairs = list(zip(dataset["system"], dataset["chat"]))
+    chunk_size = max(1, len(pairs) // (_NUM_WORKERS * 4))
+    chunks = [pairs[i:i + chunk_size] for i in range(0, len(pairs), chunk_size)]
+    with mp.Pool(_NUM_WORKERS) as pool:
+        results = pool.map(_convert_glaive_chunk, chunks)
+    rows = [r for chunk in results for r in chunk]
     return Dataset.from_list(rows)
 
 
@@ -192,17 +206,17 @@ def _extract_toucan_calls(messages_json, tool_names=None):
     return calls
 
 
-def convert_toucan(dataset):
+def _convert_toucan_chunk(chunk):
     rows = []
-    for ex in dataset:
-        query = (ex.get("question") or "").strip()
+    for question, tools_raw, messages in chunk:
+        query = (question or "").strip()
         if not query:
             continue
-        tools = _convert_openai_tools(ex.get("available_tools") or ex.get("tools") or "[]")
+        tools = _convert_openai_tools(tools_raw or "[]")
         if not tools:
             continue
         tool_names = {t["name"] for t in tools}
-        calls = _extract_toucan_calls(ex.get("messages", "[]"), tool_names)
+        calls = _extract_toucan_calls(messages or "[]", tool_names)
         if not calls:
             continue
         rows.append({
@@ -210,6 +224,24 @@ def convert_toucan(dataset):
             "answers": json.dumps(calls),
             "tools": json.dumps(tools),
         })
+    return rows
+
+
+def convert_toucan(dataset):
+    questions = dataset["question"]
+    if "available_tools" in dataset.column_names:
+        tools_raw = dataset["available_tools"]
+    elif "tools" in dataset.column_names:
+        tools_raw = dataset["tools"]
+    else:
+        tools_raw = ["[]"] * len(dataset)
+    messages = dataset["messages"]
+    triples = list(zip(questions, tools_raw, messages))
+    chunk_size = max(1, len(triples) // (_NUM_WORKERS * 4))
+    chunks = [triples[i:i + chunk_size] for i in range(0, len(triples), chunk_size)]
+    with mp.Pool(_NUM_WORKERS) as pool:
+        results = pool.map(_convert_toucan_chunk, chunks)
+    rows = [r for chunk in results for r in chunk]
     return Dataset.from_list(rows)
 
 
@@ -360,12 +392,9 @@ def _parse_toolace_calls(text, tool_names):
     return calls
 
 
-def convert_toolace(dataset):
+def _convert_toolace_chunk(chunk):
     rows = []
-    for ex in dataset:
-        system = ex.get("system", "")
-        convs = ex.get("conversations", [])
-
+    for system, convs in chunk:
         raw_tools = _extract_toolace_tools(system)
         tools = _convert_openai_tools(raw_tools)
         if not tools:
@@ -395,6 +424,16 @@ def convert_toolace(dataset):
             "answers": json.dumps(calls),
             "tools": json.dumps(tools),
         })
+    return rows
+
+
+def convert_toolace(dataset):
+    pairs = list(zip(dataset["system"], dataset["conversations"]))
+    chunk_size = max(1, len(pairs) // (_NUM_WORKERS * 4))
+    chunks = [pairs[i:i + chunk_size] for i in range(0, len(pairs), chunk_size)]
+    with mp.Pool(_NUM_WORKERS) as pool:
+        results = pool.map(_convert_toolace_chunk, chunks)
+    rows = [r for chunk in results for r in chunk]
     return Dataset.from_list(rows)
 
 
@@ -443,19 +482,17 @@ def _extract_nemotron_calls(messages, tool_names=None):
     return calls
 
 
-def convert_nemotron(dataset):
+def _convert_nemotron_chunk(chunk):
     rows = []
-    for ex in dataset:
-        tools_raw = ex.get("tools") or []
-        tools = _convert_openai_tools(tools_raw)
+    for tools_raw, messages in chunk:
+        tools = _convert_openai_tools(tools_raw or [])
         if not tools:
             continue
 
         tool_names = {t["name"] for t in tools}
-        messages = ex.get("messages") or []
 
         query = None
-        for msg in messages:
+        for msg in (messages or []):
             if isinstance(msg, dict) and msg.get("role") == "user":
                 query = (msg.get("content") or "").strip()
                 break
@@ -472,6 +509,16 @@ def convert_nemotron(dataset):
             "answers": json.dumps(calls),
             "tools": json.dumps(tools),
         })
+    return rows
+
+
+def convert_nemotron(dataset):
+    pairs = list(zip(dataset["tools"], dataset["messages"]))
+    chunk_size = max(1, len(pairs) // (_NUM_WORKERS * 4))
+    chunks = [pairs[i:i + chunk_size] for i in range(0, len(pairs), chunk_size)]
+    with mp.Pool(_NUM_WORKERS) as pool:
+        results = pool.map(_convert_nemotron_chunk, chunks)
+    rows = [r for chunk in results for r in chunk]
     return Dataset.from_list(rows)
 
 
@@ -569,10 +616,12 @@ def _deduplicate(dataset):
     Same query with same tools but different answers (e.g. from different LLMs)
     is deduplicated since the model only needs one answer per (query, tools) pair.
     """
+    queries = dataset["query"]
+    tools = dataset["tools"]
     seen = set()
     keep = []
-    for i in range(len(dataset)):
-        key = (dataset[i]["query"], dataset[i]["tools"])
+    for i in range(len(queries)):
+        key = (queries[i], tools[i])
         if key not in seen:
             seen.add(key)
             keep.append(i)
@@ -677,6 +726,7 @@ def load_and_combine():
                 and _answer_uses_valid_params(ex)
             ),
             desc=f"Filtering {name}",
+            num_proc=_NUM_WORKERS,
         )
         dropped = before - len(converted)
         if dropped:
@@ -692,6 +742,7 @@ def load_and_combine():
     combined = combined.filter(
         lambda ex: json.loads(ex["answers"]) != [] or json.loads(ex["tools"]) != [],
         desc="Removing empty-tools no-call examples",
+        num_proc=_NUM_WORKERS,
     )
     empty_dropped = before_empty - len(combined)
     if empty_dropped:
