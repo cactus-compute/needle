@@ -23,7 +23,6 @@ from .data import (
     prepare_tool_call_pairs,
     train_tokenizer,
 )
-from .gcs import upload_tokenized_data, upload_tokenizer
 
 
 def _clear_local_caches():
@@ -69,6 +68,7 @@ def tokenize(args):
                              max_enc_len, max_dec_len)
 
     try:
+        from .gcs import upload_tokenized_data, upload_tokenizer
         upload_tokenizer(TOKENIZER_DIR)
         upload_tokenized_data(CACHE_DIR)
     except Exception as e:
