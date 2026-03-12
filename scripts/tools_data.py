@@ -563,13 +563,18 @@ def _answer_uses_valid_params(ex):
 
 
 def _deduplicate(dataset):
-    """Remove duplicate queries, keeping the first occurrence."""
+    """Remove duplicates by (query, tools) pair, keeping the first occurrence.
+
+    Same query with different tool sets is kept — those are distinct examples.
+    Same query with same tools but different answers (e.g. from different LLMs)
+    is deduplicated since the model only needs one answer per (query, tools) pair.
+    """
     seen = set()
     keep = []
     for i in range(len(dataset)):
-        q = dataset[i]["query"]
-        if q not in seen:
-            seen.add(q)
+        key = (dataset[i]["query"], dataset[i]["tools"])
+        if key not in seen:
+            seen.add(key)
             keep.append(i)
     if len(keep) == len(dataset):
         return dataset
