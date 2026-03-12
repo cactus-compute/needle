@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from .data import get_batches, get_tokenizer, load_tool_calls, prepare_tool_call_pairs, load_tool_call_audio, load_example_with_audio
+from .data import get_batches, get_tokenizer, load_tool_calls, prepare_tool_call_pairs, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN
 from .model import (
     EncoderDecoderTransformer,
     TransformerConfig,
@@ -168,35 +168,48 @@ def compute_wer(hypotheses, references):
     return total_edits / max(total_ref_words, 1)
 
 
-def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=512):
+def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN):
     """Generate tool-call predictions and compute structured metrics."""
     import json
-    from .run import generate
+    from .run import generate_batch
     from .data import load_tool_calls
 
     ds = load_tool_calls("validation", max_samples=num_samples)
 
+    # Batch-generate all predictions at once
+    queries = [ex["query"] for ex in ds]
+    tools_list = [ex["tools"] for ex in ds]
+    all_preds = generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=max_gen_len, max_enc_len=max_enc_len)
+
     total = 0
     exact_match = 0
-    tp_names = 0  # predicted name in reference
-    fp_names = 0  # predicted name not in reference
-    fn_names = 0  # reference name not predicted
+    tp_names = 0
+    fp_names = 0
+    fn_names = 0
     tp_calls = 0
     fp_calls = 0
     fn_calls = 0
     json_parse_errors = 0
     empty_ref = 0
     empty_pred = 0
-
+    args_correct = 0
+    args_total = 0
+    halluc_params = 0
+    total_pred_params = 0
+    missing_params = 0
+    total_ref_params = 0
+    correct_values = 0
+    matched_params = 0
     samples = []
 
-    for i, ex in enumerate(ds):
-        ref_text = ex["answers"]
+    def call_key(c):
+        if not isinstance(c, dict):
+            return None
+        return json.dumps({"name": c.get("name"), "arguments": c.get("arguments")}, sort_keys=True)
 
-        pred_text = generate(
-            model, params, tokenizer, ex["query"],
-            tools=ex["tools"], max_gen_len=max_gen_len, seed=i, stream=False,
-        ).strip()
+    for i, (ex, pred_text) in enumerate(zip(ds, all_preds)):
+        ref_text = ex["answers"]
+        pred_text = pred_text.strip()
 
         try:
             ref_calls = json.loads(ref_text)
@@ -223,26 +236,54 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
         if json.dumps(pred_calls, sort_keys=True) == json.dumps(ref_calls, sort_keys=True):
             exact_match += 1
 
-        ref_names = [c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c]
-        pred_names = [c["name"] for c in pred_calls if isinstance(c, dict) and "name" in c]
-        ref_name_set = set(ref_names)
-        pred_name_set = set(pred_names)
+        ref_name_set = {c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c}
+        pred_name_set = {c["name"] for c in pred_calls if isinstance(c, dict) and "name" in c}
         tp_names += len(pred_name_set & ref_name_set)
         fp_names += len(pred_name_set - ref_name_set)
         fn_names += len(ref_name_set - pred_name_set)
 
-        def call_key(c):
-            if not isinstance(c, dict):
-                return None
-            return json.dumps({"name": c.get("name"), "arguments": c.get("arguments")}, sort_keys=True)
-
-        ref_keys = set(call_key(c) for c in ref_calls)
-        pred_keys = set(call_key(c) for c in pred_calls)
-        ref_keys.discard(None)
-        pred_keys.discard(None)
+        ref_keys = {call_key(c) for c in ref_calls} - {None}
+        pred_keys = {call_key(c) for c in pred_calls} - {None}
         tp_calls += len(pred_keys & ref_keys)
         fp_calls += len(pred_keys - ref_keys)
         fn_calls += len(ref_keys - pred_keys)
+
+        ref_by_name = {}
+        for c in ref_calls:
+            if isinstance(c, dict) and "name" in c:
+                ref_by_name.setdefault(c["name"], []).append(c.get("arguments", {}))
+        for c in pred_calls:
+            if isinstance(c, dict) and "name" in c and c["name"] in ref_by_name:
+                args_total += 1
+                pa = json.dumps(c.get("arguments", {}), sort_keys=True)
+                if any(pa == json.dumps(ra, sort_keys=True) for ra in ref_by_name[c["name"]]):
+                    args_correct += 1
+
+        try:
+            tool_defs = json.loads(ex["tools"])
+            tool_param_map = {t["name"]: set((t.get("parameters") or {}).keys()) for t in tool_defs if isinstance(t, dict) and "name" in t}
+        except (json.JSONDecodeError, TypeError):
+            tool_param_map = {}
+        for c in pred_calls:
+            if not isinstance(c, dict) or "name" not in c:
+                continue
+            cname = c["name"]
+            if cname not in tool_param_map:
+                continue
+            schema_keys = tool_param_map[cname]
+            p_keys = set((c.get("arguments") or {}).keys())
+            total_pred_params += len(p_keys)
+            halluc_params += len(p_keys - schema_keys)
+            if cname in ref_by_name:
+                ref_args = ref_by_name[cname][0]
+                r_keys = set((ref_args if isinstance(ref_args, dict) else {}).keys())
+                total_ref_params += len(r_keys)
+                missing_params += len(r_keys - p_keys)
+                m_keys = p_keys & r_keys
+                matched_params += len(m_keys)
+                for k in m_keys:
+                    if json.dumps(c.get("arguments", {})[k], sort_keys=True) == json.dumps(ref_args[k], sort_keys=True):
+                        correct_values += 1
 
     name_precision = tp_names / max(tp_names + fp_names, 1)
     name_recall = tp_names / max(tp_names + fn_names, 1)
@@ -259,107 +300,10 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
         "name_precision": name_precision,
         "name_recall": name_recall,
         "name_f1": name_f1,
-        "call_precision": call_precision,
-        "call_recall": call_recall,
-        "call_f1": call_f1,
-        "empty_ref_pct": empty_ref / max(total, 1),
-        "empty_pred_pct": empty_pred / max(total, 1),
-        "samples": samples,
-    }
-
-
-def benchmark_voice_tool_calls(model, params, tokenizer, num_samples=100, max_gen_len=512):
-    """Generate tool-call predictions from audio and compute structured metrics."""
-    import json
-    from .run import generate_from_audio
-
-    indices = load_tool_call_audio("validation", max_samples=num_samples)
-
-    total = 0
-    exact_match = 0
-    tp_names = 0
-    fp_names = 0
-    fn_names = 0
-    tp_calls = 0
-    fp_calls = 0
-    fn_calls = 0
-    json_parse_errors = 0
-    empty_ref = 0
-    empty_pred = 0
-    samples = []
-
-    for i, ds_idx in enumerate(indices):
-        pair = load_example_with_audio(ds_idx)
-        if pair["audio_array"] is None:
-            continue
-        ref_text = pair["answers"]
-
-        pred_text = generate_from_audio(
-            model, params, tokenizer, pair["audio_array"], sr=pair["sampling_rate"],
-            tools=pair["tools"], max_gen_len=max_gen_len, seed=i, stream=False,
-        ).strip()
-
-        try:
-            ref_calls = json.loads(ref_text)
-        except (json.JSONDecodeError, TypeError):
-            ref_calls = []
-
-        try:
-            pred_calls = json.loads(pred_text)
-            if not isinstance(pred_calls, list):
-                pred_calls = [pred_calls] if isinstance(pred_calls, dict) else []
-        except (json.JSONDecodeError, TypeError):
-            json_parse_errors += 1
-            pred_calls = []
-
-        total += 1
-        if i < 10:
-            samples.append((pair["query"][:80], ref_text[:120], pred_text[:120]))
-
-        if len(ref_calls) == 0:
-            empty_ref += 1
-        if len(pred_calls) == 0:
-            empty_pred += 1
-
-        if json.dumps(pred_calls, sort_keys=True) == json.dumps(ref_calls, sort_keys=True):
-            exact_match += 1
-
-        ref_names = [c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c]
-        pred_names = [c["name"] for c in pred_calls if isinstance(c, dict) and "name" in c]
-        ref_name_set = set(ref_names)
-        pred_name_set = set(pred_names)
-        tp_names += len(pred_name_set & ref_name_set)
-        fp_names += len(pred_name_set - ref_name_set)
-        fn_names += len(ref_name_set - pred_name_set)
-
-        def call_key(c):
-            if not isinstance(c, dict):
-                return None
-            return json.dumps({"name": c.get("name"), "arguments": c.get("arguments")}, sort_keys=True)
-
-        ref_keys = set(call_key(c) for c in ref_calls)
-        pred_keys = set(call_key(c) for c in pred_calls)
-        ref_keys.discard(None)
-        pred_keys.discard(None)
-        tp_calls += len(pred_keys & ref_keys)
-        fp_calls += len(pred_keys - ref_keys)
-        fn_calls += len(ref_keys - pred_keys)
-
-    name_precision = tp_names / max(tp_names + fp_names, 1)
-    name_recall = tp_names / max(tp_names + fn_names, 1)
-    name_f1 = 2 * name_precision * name_recall / max(name_precision + name_recall, 1e-9)
-
-    call_precision = tp_calls / max(tp_calls + fp_calls, 1)
-    call_recall = tp_calls / max(tp_calls + fn_calls, 1)
-    call_f1 = 2 * call_precision * call_recall / max(call_precision + call_recall, 1e-9)
-
-    return {
-        "num_samples": total,
-        "exact_match": exact_match / max(total, 1),
-        "json_parse_rate": 1.0 - json_parse_errors / max(total, 1),
-        "name_precision": name_precision,
-        "name_recall": name_recall,
-        "name_f1": name_f1,
+        "args_acc": args_correct / max(args_total, 1),
+        "param_haluc": halluc_params / max(total_pred_params, 1),
+        "param_miss": missing_params / max(total_ref_params, 1),
+        "value_acc": correct_values / max(matched_params, 1),
         "call_precision": call_precision,
         "call_recall": call_recall,
         "call_f1": call_f1,
@@ -390,7 +334,7 @@ def main(args):
     tc = None
     if tc_samples > 0:
         print(f"\nevaluating tool-call accuracy ({tc_samples} samples)...")
-        tc = benchmark_tool_calls(model, params, tokenizer, num_samples=tc_samples, max_gen_len=args.max_gen_len)
+        tc = benchmark_tool_calls(model, params, tokenizer, num_samples=tc_samples, max_gen_len=args.max_gen_len, max_enc_len=args.max_enc_len)
 
     print(f"\n  ─────────────────────────────────────")
     print(f"  Tool-Call Metrics")
@@ -403,6 +347,11 @@ def main(args):
         print(f"  Precision        {tc['name_precision']:>10.3f}")
         print(f"  Recall           {tc['name_recall']:>10.3f}")
         print(f"  F1               {tc['name_f1']:>10.3f}")
+        print(f"  ─── Parameter-Level ────────────────")
+        print(f"  Param haluc      {tc['param_haluc']:>10.1%}")
+        print(f"  Param miss       {tc['param_miss']:>10.1%}")
+        print(f"  Value acc        {tc['value_acc']:>10.1%}")
+        print(f"  Args acc         {tc['args_acc']:>10.1%}")
         print(f"  ─── Full Call (name+args) ───────────")
         print(f"  Precision        {tc['call_precision']:>10.3f}")
         print(f"  Recall           {tc['call_recall']:>10.3f}")
@@ -412,30 +361,6 @@ def main(args):
         if tc["samples"]:
             print(f"\n  samples:")
             for query, ref, pred in tc["samples"][:5]:
-                print(f"    Q: {query}")
-                print(f"    R: {ref}")
-                print(f"    P: {pred}")
-                print()
-
-    voice_tc_samples = getattr(args, "voice_tc_samples", 50)
-    if voice_tc_samples > 0:
-        print(f"\nevaluating voice-to-tool-call ({voice_tc_samples} samples)...")
-        vtc = benchmark_voice_tool_calls(model, params, tokenizer, num_samples=voice_tc_samples, max_gen_len=args.max_gen_len)
-        print(f"\n  ─── Voice-Tool-Call Metrics ─────────")
-        print(f"  JSON parse rate  {vtc['json_parse_rate']:>10.1%}")
-        print(f"  Exact match      {vtc['exact_match']:>10.1%}")
-        print(f"  ─── Function Name ───────────────────")
-        print(f"  Precision        {vtc['name_precision']:>10.3f}")
-        print(f"  Recall           {vtc['name_recall']:>10.3f}")
-        print(f"  F1               {vtc['name_f1']:>10.3f}")
-        print(f"  ─── Full Call (name+args) ───────────")
-        print(f"  Precision        {vtc['call_precision']:>10.3f}")
-        print(f"  Recall           {vtc['call_recall']:>10.3f}")
-        print(f"  F1               {vtc['call_f1']:>10.3f}")
-        print(f"  ─────────────────────────────────────")
-        if vtc["samples"]:
-            print(f"\n  samples:")
-            for query, ref, pred in vtc["samples"][:5]:
                 print(f"    Q: {query}")
                 print(f"    R: {ref}")
                 print(f"    P: {pred}")
@@ -453,15 +378,12 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default="checkpoints/checkpoint_epoch3.pkl")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-eval-samples", type=int, default=1000)
-    parser.add_argument("--max-enc-len", type=int, default=256)
-    parser.add_argument("--max-dec-len", type=int, default=1024)
-    parser.add_argument("--max-gen-len", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--max-enc-len", type=int, default=DEFAULT_MAX_ENC_LEN)
+    parser.add_argument("--max-dec-len", type=int, default=DEFAULT_MAX_DEC_LEN)
+    parser.add_argument("--max-gen-len", type=int, default=DEFAULT_MAX_GEN_LEN)
     parser.add_argument("--throughput-runs", type=int, default=10)
     parser.add_argument("--tool-call-samples", type=int, default=200,
                         help="Samples for tool-call accuracy eval (default: 200)")
-    parser.add_argument("--voice-tc-samples", type=int, default=50,
-                        help="Samples for voice-to-tool-call eval (default: 50)")
     return parser.parse_args()
 
 

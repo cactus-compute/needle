@@ -15,8 +15,8 @@
                     └──────┬───────┘                │ Mat loss at factors  │
                           ┌┴──────────┐             │ + INT4 QAT (g=32)    │
                           │  Softmax  │             │ + z-loss + slot div  │
-                          └─────┬─────┘             │ 1:1 text/speech     │
-                    ┌─────┬─────┴─────┬─────┐       │ alternation          │
+                          └─────┬─────┘             │ text-only training   │
+                    ┌─────┬─────┴─────┬─────┐       │                      │
                     │  @E[:d_ff/f] for each │       └──────────┬───────────┘
                     │  f in mat_factors     │                  │
                     └─────┬─────┬─────┬─────┘       ┌──────────┴───────────┐
@@ -39,13 +39,13 @@
   │              │     │└───────────────┘│          ┌──────────┴───────────┐
   │ ┌──────────┐ │     └────────┬────────┘          │ Checkpoint           │
   │ │Pack:     │ │        ┌─────┴─────┐             │  full params, can    │
-  │ │ S←X Attn │ │        │ Embedding │  ← shared   │  export mat slices    │
+  │ │ S←X Attn │ │        │ Embedding │  ← shared   │  export mat slices   │
   │ │ RoPE keys│ │        └─────┬─────┘             └──────────────────────┘
   │ ├──────────┤ │      ┌───────┴───────┐
   │ │Mix:      │ │      │[EOS]<tool_call>│
-  │ │ MLP-Mixer│ │      │ + tools       │
-  │ │ on S     │ │      │ + answer      │
-  │ ├──────────┤ │      └───────────────┘
+  │ │ MLP-Mixer│ │      │ + answer      │
+  │ │ on S     │ │      └───────────────┘
+  │ ├──────────┤ │
   │ │Local:    │ │
   │ │Gated FFN │ │
   │ │ on X     │ │
@@ -69,7 +69,7 @@
     d=512 (default) / 1536 (--full) · GQA · QK-norm
     SentencePiece BPE (8192) · gated dReLU · ZCRMSNorm · RoPE
     strided DW conv · mat factors · INT4 QAT · Muon + AdamW
-    text + speech encoder · <tool_call> task routing
+    text + speech encoder · <tool_call> task routing (speech used in inference only)
 
   Data Pipeline (needle tokenize → needle train)
   ───────────────────────────────────────────────
@@ -77,34 +77,26 @@
   ┌─────────────────────────────────────────────────────────────┐
   │  needle tokenize                                            │
   │                                                             │
-  │  Unified dataset (GCS / local)                              │
+  │  Local dataset (data/tool_calls_unified/)                   │
   │       │                                                     │
-  │       ├──── Text ──────────────── Speech ─────────┐         │
-  │       ▼                                           ▼         │
-  │  ┌──────────────┐                        ┌────────────────┐ │
-  │  │ SentencePiece│                        │ HF Audio col   │ │
-  │  │ BPE tokenize │                        │ decode (16kHz) │ │
-  │  │ (8192 vocab) │                        └───────┬────────┘ │
-  │  └──────┬───────┘                                │          │
-  │         │                                        ▼          │
-  │         ▼                                ┌────────────────┐ │
-  │  ┌──────────────────┐                    │ Log-mel spec   │ │
-  │  │ enc_inputs.npy   │                    │ 80 bins, 25ms  │ │
-  │  │ dec_inputs.npy   │                    │ window, 10ms   │ │
-  │  │ dec_targets.npy  │                    │ hop (~100 f/s) │ │
-  │  │ loss_mask.npy    │                    └───────┬────────┘ │
-  │  │ kept_idx.npy     │                            │          │
-  │  └──────┬───────────┘                            ▼          │
-  │         │                                ┌────────────────┐ │
-  │         │                                │ mels.npy       │ │
-  │         │                                │ (N,T,80) f32   │ │
-  │         │                                │ writable mmap  │ │
-  │         │                                └───────┬────────┘ │
-  │         │                                        │          │
-  │         └────────────┬───────────────────────────┘          │
-  │                      ▼                                      │
-  │               {split}_metadata.json                         │
-  │               .data_cache/ + GCS upload                     │
+  │       ▼                                                     │
+  │  ┌──────────────┐                                           │
+  │  │ SentencePiece│                                           │
+  │  │ BPE tokenize │                                           │
+  │  │ (8192 vocab) │                                           │
+  │  └──────┬───────┘                                           │
+  │         │                                                   │
+  │         ▼                                                   │
+  │  ┌──────────────────┐                                       │
+  │  │ enc_inputs.npy   │                                       │
+  │  │ dec_inputs.npy   │                                       │
+  │  │ dec_targets.npy  │                                       │
+  │  │ loss_mask.npy    │                                       │
+  │  │ kept_idx.npy     │                                       │
+  │  └──────┬───────────┘                                       │
+  │         ▼                                                   │
+  │  {split}_metadata.json                                      │
+  │  .data_cache/                                               │
   └─────────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -112,21 +104,15 @@
   │  needle train                                               │
   │                                                             │
   │  load_prepared_data(mmap=True)                              │
-  │  load_prepared_mels(mmap=True)                              │
   │       │                                                     │
   │       ▼                                                     │
-  │  ┌──────────────────────┐   ┌──────────────────────┐        │
-  │  │ PrefetchIterator     │   │ PrefetchIterator     │        │
-  │  │ text batches (4)     │   │ speech batches (4)   │        │
-  │  │ mmap → per-batch idx │   │ mmap → per-batch idx │        │
-  │  └──────────┬───────────┘   └──────────┬───────────┘        │
-  │             └───────────┬──────────────┘                    │
-  │                         ▼                                   │
-  │                  1:1 text/speech                            │
-  │                  alternation                                │
-  │                                                             │
-  │  ~42MB RAM (8 prefetched batches)                           │
-  │  SpecAugment for speech regularization                      │
+  │  ┌──────────────────────┐                                   │
+  │  │ PrefetchIterator     │                                   │
+  │  │ text batches (4)     │                                   │
+  │  │ mmap → per-batch idx │                                   │
+  │  └──────────┬───────────┘                                   │
+  │             ▼                                               │
+  │  text-only tool-call training                               │
   └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -142,20 +128,19 @@ needle [command]
   ┌───────────────────────────────────────────────────────────────────┐
   │                                                                   │
   │   train                                                           │
-  │     --full                   Use full 1B config (~1.17B params)   │
-  │     --epochs INT             Training epochs (default: 1)         │
+  │     --epochs INT             Training epochs (default: 10)        │
   │     --batch-size INT         Batch size (default: 32)             │
   │     --lr FLOAT               AdamW learning rate (default: 3e-4)  │
   │     --muon-lr FLOAT          Muon learning rate (default: 0.02)   │
   │     --d-model INT            Model dim (default: 512)             │
-  │     --num-heads INT          Attention heads (default: 8)         │
-  │     --num-kv-heads INT       KV heads for GQA (default: num-heads)│
+  │     --num-heads INT          Attention heads (default: 16)        │
+  │     --num-kv-heads INT       KV heads for GQA (default: 8)        │
   │     --num-layers INT         Encoder layers (default: 4)          │
   │     --num-dec-layers INT     Decoder layers (default: 4)          │
-  │     --max-enc-len INT        Max encoder seq len (default: 256)   │
-  │     --max-dec-len INT        Max decoder seq len (default: 1024)  │
+  │     --max-enc-len INT        Max encoder seq len (default: 512)   │
+  │     --max-dec-len INT        Max decoder seq len (default: 512)   │
   │     --max-samples INT        Training samples (default: all)      │
-  │     --mat-factors INT [...]   FFN shrink factors (default: 2 4 8) │
+  │     --mat-factors INT [...]   FFN shrink factors (default: 2 4)   │
   │     --sparsity-ratio FLOAT   Block prune ratio (default: 0.0)     │
   │     --group-size INT         Quant/prune group size (default: 32) │
   │     --prune-interval INT     Steps between mask updates (def: 100)│
@@ -168,18 +153,11 @@ needle [command]
   │     --checkpoint PATH        Resume from checkpoint               │
   │     --checkpoint-dir DIR     Checkpoint directory                 │
   │     --seed INT               Random seed (default: 42)            │
-  │     --no-speech             Disable speech (text-only training)   │
-  │     --max-mel-len INT       Max mel frames (default: 1024)        │
-  │     --n-mels INT            Mel frequency bins (default: 80)      │
-  │     --max-speech-samples INT  Max voice-tool-call samples         │
   │                                                                   │
   │   tokenize                                                        │
   │     --max-samples INT       Limit samples per split (dev/test)    │
-  │     --cleanup               Delete local cache after GCS upload   │
-  │     --n-mels INT            Mel frequency bins (default: 80)      │
-  │     --max-mel-len INT       Max mel frames (default: 1024)        │
-  │     --max-enc-len INT       Max encoder seq len (default: 256)    │
-  │     --max-dec-len INT       Max decoder seq len (default: 1024)   │
+  │     --max-enc-len INT       Max encoder seq len (default: 512)    │
+  │     --max-dec-len INT       Max decoder seq len (default: 512)    │
   │                                                                   │
   │   run                                                             │
   │     --checkpoint PATH       Path to model checkpoint (required)   │
@@ -189,16 +167,15 @@ needle [command]
   │     --max-len INT           Max tokens to generate (default: 512) │
   │     --seed INT              Random seed (default: 0)              │
   │                                                                   │
-  │   test                                                            │
+  │   eval                                                            │
   │     --checkpoint PATH       Path to model checkpoint (required)   │
   │     --batch-size INT        Batch size (default: 32)              │
   │     --max-eval-samples INT  Evaluation samples (default: 1000)    │
-  │     --max-enc-len INT       Max encoder length (default: 256)    │
-  │     --max-dec-len INT       Max decoder length (default: 1024)    │
+  │     --max-enc-len INT       Max encoder length (default: 512)     │
+  │     --max-dec-len INT       Max decoder length (default: 512)     │
   │     --max-gen-len INT       Max generation length (default: 512)  │
   │     --throughput-runs INT   Throughput runs (default: 10)         │
   │     --tool-call-samples INT Tool-call eval samples (default: 200) │
-  │     --voice-tc-samples INT  Voice-TC eval samples (default: 50)  │
   │                                                                   │
   │   evaluate                                                        │
   │     --checkpoint PATH       Path to model checkpoint (required)   │
@@ -236,19 +213,9 @@ needle [command]
   ──────────────────────────────────────────
   Text                Tool-call pairs
                       (query, tools, answers)
-                      from GCS unified dataset
-  Audio               TTS-generated speech
-                      (GCP Cloud TTS voices)
-                      16kHz WAV, HF Audio col
+                      ~57k examples (local)
+                      xlam-60k + glaive-v2
   ──────────────────────────────────────────
-
-  100M params — 10M multimodal triples (5 epochs)
-  ──────────────────────────────────────────
-  Triples          10M (text / voice / image → JSON tool calls)
-  Tokens/triple    ~300 avg (text ~180, voice ~390, image ~336)
-  Total tokens     10M × 300 × 5 epochs ≈ 15B
-  Total FLOPs      6 × 100M × 15B ≈ 9e18
-  MFU (100M)       ~15% → ~138 effective TFLOPS/chip
 
   ┌────────────────────┬──────────┬──────────┬──────────┐
   │                    │  v6e-8   │  v6e-16  │  v6e-32  │
@@ -270,33 +237,6 @@ needle [command]
 - Setup gcloud 3: run `gloud init`, sign in with cactus email, should prompt for project
 - Setup gcloud 4: else, set the project with `gcloud config set project needle-488623`
 - setup gcloud 5: run `gcloud help` and read carefully
-
-## TPU Guide
-
-```
-needle tpu [command]
-
-  ┌───────────────────────────────────────────────────────────────────┐
-  │                                                                   │
-  │   create NAME             Create TPU (auto-finds zone)            │
-  │     --type STR            Accelerator type (default: v6e-8)       │
-  │     --version STR         TPU OS (auto-detected from --type)      │
-  │                                                                   │
-  │   connect NAME            SSH config + first connect (auto-zone)  │
-  │   claude NAME             Install Claude Code on instance         │
-  │                                                                   │
-  │   stop NAME               Stop instance (keeps disk)              │
-  │   start NAME              Restart a stopped instance              │
-  │   delete NAME             Delete instance (prompts confirmation)  │
-  │   list                    List all TPU instances                  │
-  │                                                                   │
-  │     --zone ZONE           Override auto-detected zone (optional)  │
-  │                                                                   │
-  └───────────────────────────────────────────────────────────────────┘
-
-  Quota increases:
-   https://console.cloud.google.com/iam-admin/quotas?project=needle-488623
-```
 
 ## Example Workflow
 
@@ -322,10 +262,14 @@ needle tpu [command]
 5. Install needle (follow instruction to setup wandb)
    source ./setup
 
-6. Use needle as you normally would locally, like training
+6. Login to Hugging Face (required for gated datasets like xlam-60k)
+   huggingface-cli login
+   (paste your HF token — get one at https://huggingface.co/settings/tokens)
+
+7. Use needle as you normally would locally, like training
    needle train --wandb
 
-7. Use tmux for long training runs (survives SSH disconnects)
+8. Use tmux for long training runs (survives SSH disconnects)
    tmux new -s train          # start a named session
    needle train --wandb       # run training inside it
    Ctrl+B, then D             # detach (keeps running)
@@ -333,9 +277,9 @@ needle tpu [command]
 
 --- back on your Mac ---
 
-8. Stop when done (saves disk, stops billing)
+9. Stop when done (saves disk, stops billing)
    needle tpu stop my-experiment
 
-9. (Optional) Delete instance when no longer needed
+10. (Optional) Delete instance when no longer needed
    needle tpu delete my-experiment
 ```

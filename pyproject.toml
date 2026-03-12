@@ -13,6 +13,8 @@ dependencies = [
     "sentencepiece",
     "soundfile",
     "scipy",
+    "gcsfs",
+    "tqdm",
 ]
 
 [project.optional-dependencies]
