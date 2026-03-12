@@ -126,6 +126,19 @@ def _mark_json_key_in_args(s, char_w, key, weight):
             char_w[m.start() + 1:m.start() + 1 + len(key)], weight)
 
 
+def _shuffle_tools_json(tools_str, seed):
+    """Parse tools JSON array, shuffle order deterministically, re-serialize."""
+    try:
+        tools = _json.loads(tools_str)
+    except (ValueError, TypeError):
+        return tools_str
+    if not isinstance(tools, list) or len(tools) <= 1:
+        return tools_str
+    rng = np.random.RandomState(seed)
+    rng.shuffle(tools)
+    return _json.dumps(tools, separators=(",", ":"))
+
+
 def _token_weights_for_answer(answer_str, token_ids, sp_model,
                                w_name=3.0, w_value=2.0, w_key=1.5):
     """Compute per-token loss weights based on JSON structure.
@@ -380,9 +393,9 @@ def _tokenizer_hash():
 
 
 def _cache_key(prefix, n_samples, max_enc_len, max_dec_len,
-               w_name=3.0, w_value=2.0, w_key=1.5):
+               w_name=3.0, w_value=2.0, w_key=1.5, shuffle_tools=True):
     tok_hash = _tokenizer_hash()
-    key = f"{prefix}_{tok_hash}_{n_samples}_{max_enc_len}_{max_dec_len}_{w_name}_{w_value}_{w_key}"
+    key = f"{prefix}_{tok_hash}_{n_samples}_{max_enc_len}_{max_dec_len}_{w_name}_{w_value}_{w_key}_{shuffle_tools}"
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
@@ -411,7 +424,7 @@ def _load_cache_metadata(split):
 
 
 def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_dec_len=DEFAULT_MAX_DEC_LEN,
-                            w_name=3.0, w_value=2.0, w_key=1.5):
+                            w_name=3.0, w_value=2.0, w_key=1.5, shuffle_tools=True):
     """Prepare tool-call encoder-decoder pairs with <tool_call> task token.
 
     Encoder input: [query_tokens..., <tools>, tools_tokens...] truncated to max_enc_len.
@@ -423,7 +436,7 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     """
 
     cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len,
-                          w_name, w_value, w_key)
+                          w_name, w_value, w_key, shuffle_tools)
     cache_path = os.path.join(CACHE_DIR, cache_id)
 
     tc_suffixes = ["_enc.npy", "_dec_in.npy", "_dec_tgt.npy", "_loss_mask.npy", "_kept_idx.npy"]
@@ -449,6 +462,9 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     enc_texts = [ex["query"] for ex in ds]
     tools_texts = [ex["tools"] for ex in ds]
     ans_texts = [ex["answers"] for ex in ds]
+
+    if shuffle_tools:
+        tools_texts = [_shuffle_tools_json(t, seed=i) for i, t in enumerate(tools_texts)]
 
     num_workers = min(os.cpu_count() or 1, 8)
     model_path = TOKENIZER_PREFIX + ".model"

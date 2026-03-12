@@ -15,7 +15,7 @@ def main():
 
     p = sub.add_parser("train", add_help=False)
     p.add_argument("--checkpoint", type=str, default=None)
-    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
@@ -64,6 +64,8 @@ def main():
                    help="Loss weight for argument value tokens (default: 2.0)")
     p.add_argument("--w-key", type=float, default=1.5,
                    help="Loss weight for argument key tokens (default: 1.5)")
+    p.add_argument("--shuffle-tools", action=argparse.BooleanOptionalAction, default=True,
+                   help="Shuffle tool order in encoder input (default: True)")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)

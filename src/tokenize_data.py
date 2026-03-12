@@ -56,12 +56,13 @@ def tokenize(args):
         w_name = getattr(args, "w_name", 3.0)
         w_value = getattr(args, "w_value", 2.0)
         w_key = getattr(args, "w_key", 1.5)
+        shuffle_tools = getattr(args, "shuffle_tools", True)
         _, _, _, _, kept_indices = prepare_tool_call_pairs(
             ds, tokenizer, max_enc_len=max_enc_len, max_dec_len=max_dec_len,
-            w_name=w_name, w_value=w_value, w_key=w_key,
+            w_name=w_name, w_value=w_value, w_key=w_key, shuffle_tools=shuffle_tools,
         )
         text_cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len,
-                                   w_name, w_value, w_key)
+                                   w_name, w_value, w_key, shuffle_tools)
 
         _save_cache_metadata(split, text_cache_id, len(kept_indices),
                              max_enc_len, max_dec_len)
