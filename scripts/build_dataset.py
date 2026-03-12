@@ -13,7 +13,6 @@ import logging
 import os
 import sys
 
-# Redirect HF cache to /dev/shm when RAM is plentiful (before importing datasets)
 _shm = "/dev/shm"
 if os.path.isdir(_shm):
     try:
@@ -21,10 +20,16 @@ if os.path.isdir(_shm):
         if _st.f_bavail * _st.f_frsize >= 200 * 1024**3:
             _hf_cache = os.path.join(_shm, "needle_hf_cache")
             os.makedirs(_hf_cache, exist_ok=True)
-            os.environ.setdefault("HF_HOME", _hf_cache)
             os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(_hf_cache, "datasets"))
     except OSError:
         pass
+
+_token_path = os.path.expanduser("~/.cache/huggingface/token")
+if os.path.isfile(_token_path) and "HF_TOKEN" not in os.environ:
+    with open(_token_path) as _f:
+        _tok = _f.read().strip()
+    if _tok:
+        os.environ["HF_TOKEN"] = _tok
 
 import numpy as np
 
