@@ -183,7 +183,6 @@ def _token_weights_for_answer(answer_str, token_ids, sp_model,
                 v_str = _json.dumps(v) if not isinstance(v, str) else v
                 _mark_json_value(answer_str, char_w, k, v_str, w_value)
 
-    # Map char weights to token weights via SentencePiece pieces
     pieces = sp_model.Encode(answer_str, out_type=str)
     pos = 0
     for i, piece in enumerate(pieces):
@@ -212,7 +211,6 @@ def _load_unified_dataset():
     if _unified_dataset_cache is not None:
         return _unified_dataset_cache
 
-    # Try each candidate path: shm first, then disk
     for path in [_SHM_UNIFIED_DIR, _DISK_UNIFIED_DIR]:
         if os.path.exists(path) and any(
             f.endswith(".arrow") for f in os.listdir(path)
@@ -225,6 +223,17 @@ def _load_unified_dataset():
             except Exception as e:
                 print(f"Warning: failed to load from {path}: {e}")
                 continue
+
+    try:
+        from .gcs import download_raw_data
+        target = _SHM_UNIFIED_DIR if _shm_available() else _DISK_UNIFIED_DIR
+        if download_raw_data(target):
+            ds = load_from_disk(target)
+            print(f"Loaded unified dataset from GCS -> {target} ({len(ds)} rows)")
+            _unified_dataset_cache = _set_audio_backend(ds)
+            return _unified_dataset_cache
+    except Exception as e:
+        print(f"Warning: GCS download failed: {e}")
 
     raise FileNotFoundError(
         f"Unified dataset not found at {_SHM_UNIFIED_DIR} or {_DISK_UNIFIED_DIR}. "
@@ -359,6 +368,12 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
 
 def get_tokenizer(max_samples=None):
     model_path = TOKENIZER_PREFIX + ".model"
+    if not os.path.exists(model_path):
+        try:
+            from .gcs import download_tokenizer
+            download_tokenizer(TOKENIZER_DIR)
+        except Exception:
+            pass
     if not os.path.exists(model_path):
         train_tokenizer(max_samples=max_samples)
     return NeedleTokenizer(model_path)
@@ -774,6 +789,13 @@ def load_prepared_data(split, mmap=False):
     """
     meta = _load_cache_metadata(split)
     if meta is None:
+        try:
+            from .gcs import download_tokenized_data
+            download_tokenized_data(CACHE_DIR)
+            meta = _load_cache_metadata(split)
+        except Exception:
+            pass
+    if meta is None:
         raise FileNotFoundError(
             f"No prepared data found for split '{split}'. Run 'needle tokenize' first."
         )
@@ -781,7 +803,6 @@ def load_prepared_data(split, mmap=False):
     text_cache_id = meta["text_cache_id"]
     cache_path = os.path.join(CACHE_DIR, text_cache_id)
 
-    tc_suffixes = ["_enc.npy", "_dec_in.npy", "_dec_tgt.npy", "_loss_mask.npy", "_kept_idx.npy"]
     if not os.path.exists(cache_path + "_enc.npy"):
         raise FileNotFoundError(
             f"Text cache '{text_cache_id}' not found. Run 'needle tokenize' first."

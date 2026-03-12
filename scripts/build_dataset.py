@@ -72,6 +72,13 @@ def main():
     combined.save_to_disk(args.output)
     logger.info(f"Saved {len(combined)} rows to {args.output}/")
 
+    # Persist to GCS
+    try:
+        from src.gcs import upload_raw_data
+        upload_raw_data(args.output)
+    except Exception as e:
+        logger.warning(f"GCS upload failed (non-fatal): {e}")
+
     print_summary(combined)
 
 
