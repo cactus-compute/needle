@@ -22,9 +22,16 @@ Datasets:
    Large-scale tool-calling dataset. Tool calls extracted from 'messages' column
    (assistant messages with function_call objects), filtered by 'target_tools'.
    Tool schemas converted from OpenAI format to flat format.
+
+4. Team-ACE/ToolACE
+   Synthetic tool-calling dataset (11.3k) with dual-layer verification.
+   Tool definitions in system prompt JSON; calls use bracket notation
+   [func(key=val)]. Grounding filter skipped (pre-verified).
 """
 
+import ast
 import json
+import random
 import re
 from collections import Counter
 
@@ -37,6 +44,9 @@ DATASETS = {
     "toucan-oss": ("Agent-Ark/Toucan-1.5M", "OSS"),
     "toucan-kimi": ("Agent-Ark/Toucan-1.5M", "Kimi-K2"),
     "toucan-qwen": ("Agent-Ark/Toucan-1.5M", "Qwen3"),
+    "toucan-sft": ("Agent-Ark/Toucan-1.5M", "SFT"),
+    "toolace": "Team-ACE/ToolACE",
+    "nemotron-tc": ("nvidia/Nemotron-Agentic-v1", None, "tool_calling"),
 }
 
 
@@ -188,7 +198,7 @@ def convert_toucan(dataset):
         query = (ex.get("question") or "").strip()
         if not query:
             continue
-        tools = _convert_openai_tools(ex.get("available_tools", "[]"))
+        tools = _convert_openai_tools(ex.get("available_tools") or ex.get("tools") or "[]")
         if not tools:
             continue
         tool_names = {t["name"] for t in tools}
@@ -203,12 +213,277 @@ def convert_toucan(dataset):
     return Dataset.from_list(rows)
 
 
+def _extract_toolace_tools(system_text):
+    """Extract JSON tool definitions array from ToolACE system prompt."""
+    start = system_text.find('[{')
+    if start == -1:
+        return []
+    depth = 0
+    for i in range(start, len(system_text)):
+        if system_text[i] == '[':
+            depth += 1
+        elif system_text[i] == ']':
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(system_text[start:i + 1])
+                except json.JSONDecodeError:
+                    return []
+    return []
+
+
+def _split_bracket_args(s, sep=','):
+    """Split on separator respecting nested brackets and quoted strings."""
+    parts = []
+    depth = 0
+    in_str = False
+    str_char = None
+    current = []
+    for i, ch in enumerate(s):
+        if in_str:
+            current.append(ch)
+            if ch == str_char and (i == 0 or s[i - 1] != '\\'):
+                in_str = False
+        elif ch in ('"', "'"):
+            in_str = True
+            str_char = ch
+            current.append(ch)
+        elif ch in ('(', '[', '{'):
+            depth += 1
+            current.append(ch)
+        elif ch in (')', ']', '}'):
+            depth -= 1
+            current.append(ch)
+        elif ch == sep and depth == 0:
+            parts.append(''.join(current))
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append(''.join(current))
+    return parts
+
+
+def _parse_bracket_value(s):
+    """Parse a value string from bracket notation arguments."""
+    s = s.strip()
+    if not s:
+        return s
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    if s == 'True':
+        return True
+    if s == 'False':
+        return False
+    if s in ('None', 'null'):
+        return None
+    try:
+        return ast.literal_eval(s)
+    except (ValueError, SyntaxError):
+        pass
+    return s
+
+
+def _parse_toolace_calls(text, tool_names):
+    """Parse ToolACE bracket notation into tool calls using known names."""
+    text = text.strip()
+    if not text.startswith('[') or not text.endswith(']'):
+        return []
+    inner = text[1:-1].strip()
+    if not inner:
+        return []
+
+    sorted_names = sorted(tool_names, key=len, reverse=True)
+    calls = []
+    pos = 0
+
+    while pos < len(inner):
+        while pos < len(inner) and inner[pos] in (' ', ',', '\n', '\t'):
+            pos += 1
+        if pos >= len(inner):
+            break
+
+        matched = None
+        for name in sorted_names:
+            if inner[pos:pos + len(name)] == name:
+                rest = inner[pos + len(name):].lstrip()
+                if rest and rest[0] == '(':
+                    matched = name
+                    break
+
+        if not matched:
+            break
+
+        pos += len(matched)
+        while pos < len(inner) and inner[pos] == ' ':
+            pos += 1
+        if pos >= len(inner) or inner[pos] != '(':
+            break
+
+        depth = 0
+        in_str = False
+        str_char = None
+        end = pos
+        while end < len(inner):
+            ch = inner[end]
+            if in_str:
+                if ch == str_char and (end == 0 or inner[end - 1] != '\\'):
+                    in_str = False
+            elif ch in ('"', "'"):
+                in_str = True
+                str_char = ch
+            elif ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            end += 1
+
+        args_str = inner[pos + 1:end].strip()
+        arguments = {}
+        if args_str:
+            for pair in _split_bracket_args(args_str, ','):
+                pair = pair.strip()
+                eq = pair.find('=')
+                if eq < 0:
+                    continue
+                key = pair[:eq].strip()
+                val = _parse_bracket_value(pair[eq + 1:])
+                arguments[key] = val
+
+        calls.append({"name": matched, "arguments": arguments})
+        pos = end + 1
+
+    return calls
+
+
+def convert_toolace(dataset):
+    rows = []
+    for ex in dataset:
+        system = ex.get("system", "")
+        convs = ex.get("conversations", [])
+
+        raw_tools = _extract_toolace_tools(system)
+        tools = _convert_openai_tools(raw_tools)
+        if not tools:
+            continue
+
+        tool_names = {t["name"] for t in tools}
+
+        query = None
+        assistant_text = None
+        for msg in convs:
+            role = msg.get("from", "")
+            val = (msg.get("value") or "").strip()
+            if role == "user" and query is None:
+                query = val
+            elif role == "assistant" and assistant_text is None:
+                assistant_text = val
+
+        if not query:
+            continue
+
+        calls = []
+        if assistant_text:
+            calls = _parse_toolace_calls(assistant_text, tool_names)
+
+        rows.append({
+            "query": query,
+            "answers": json.dumps(calls),
+            "tools": json.dumps(tools),
+        })
+    return Dataset.from_list(rows)
+
+
+def _extract_nemotron_calls(messages, tool_names=None):
+    """Extract tool calls from Nemotron messages (OpenAI tool_calls format)."""
+    calls = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+
+        # OpenAI tool_calls format (newer)
+        for tc in (msg.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function", tc)
+            name = fn.get("name", "")
+            if not name:
+                continue
+            if tool_names and name not in tool_names:
+                continue
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
+            calls.append({"name": name, "arguments": args})
+
+        # Fallback: function_call format (older OpenAI)
+        fc = msg.get("function_call")
+        if fc and isinstance(fc, dict):
+            name = fc.get("name", "")
+            if name and (not tool_names or name in tool_names):
+                args = fc.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                if not isinstance(args, dict):
+                    args = {}
+                calls.append({"name": name, "arguments": args})
+
+    return calls
+
+
+def convert_nemotron(dataset):
+    rows = []
+    for ex in dataset:
+        tools_raw = ex.get("tools") or []
+        tools = _convert_openai_tools(tools_raw)
+        if not tools:
+            continue
+
+        tool_names = {t["name"] for t in tools}
+        messages = ex.get("messages") or []
+
+        query = None
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                query = (msg.get("content") or "").strip()
+                break
+
+        if not query:
+            continue
+
+        calls = _extract_nemotron_calls(messages, tool_names)
+        if not calls:
+            continue
+
+        rows.append({
+            "query": query,
+            "answers": json.dumps(calls),
+            "tools": json.dumps(tools),
+        })
+    return Dataset.from_list(rows)
+
+
 CONVERTERS = {
     "xlam-function-calling-60k": convert_xlam,
     "glaive-function-calling": convert_glaive,
     "toucan-oss": convert_toucan,
     "toucan-kimi": convert_toucan,
     "toucan-qwen": convert_toucan,
+    "toucan-sft": convert_toucan,
+    "toolace": convert_toolace,
+    "nemotron-tc": convert_nemotron,
 }
 
 _PLACEHOLDER_VALUES = {
@@ -331,6 +606,10 @@ def _answer_uses_valid_params(ex):
     return True
 
 
+# Sources with their own verification — skip grounding check
+_VERIFIED_SOURCES = {"toolace"}
+
+
 def _deduplicate(dataset):
     """Remove duplicate queries, keeping the first occurrence."""
     seen = set()
@@ -345,32 +624,100 @@ def _deduplicate(dataset):
     return dataset.select(keep)
 
 
+def _augment_irrelevance(dataset, ratio=0.1, seed=42):
+    """Create irrelevance samples by swapping tools with unrelated queries.
+
+    For a fraction of examples with tool calls, replace the available tools
+    with tools from a different example and set the answer to [] (no calls).
+    Ensures no overlap between the query's needed tools and the donor tools.
+    """
+    rng = random.Random(seed)
+
+    all_answers = dataset["answers"]
+    all_tools = dataset["tools"]
+    all_queries = dataset["query"]
+
+    with_calls = []
+    call_names = {}
+    tool_names_by_idx = {}
+
+    for i, ans_str in enumerate(all_answers):
+        try:
+            answers = json.loads(ans_str)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not answers:
+            continue
+        with_calls.append(i)
+        call_names[i] = {c["name"] for c in answers if isinstance(c, dict)}
+        try:
+            tools = json.loads(all_tools[i])
+            tool_names_by_idx[i] = {t["name"] for t in tools if isinstance(t, dict)}
+        except (json.JSONDecodeError, TypeError):
+            tool_names_by_idx[i] = set()
+
+    n_aug = int(len(with_calls) * ratio)
+    selected = rng.sample(with_calls, min(n_aug, len(with_calls)))
+
+    rows = []
+    for idx in selected:
+        orig_call_names = call_names[idx]
+        for _ in range(5):
+            donor = rng.choice(with_calls)
+            if donor == idx:
+                continue
+            # Ensure none of the query's needed tools appear in donor's tool set
+            if not (orig_call_names & tool_names_by_idx.get(donor, set())):
+                rows.append({
+                    "query": all_queries[idx],
+                    "answers": "[]",
+                    "tools": all_tools[donor],
+                    "source": "irrelevance-aug",
+                })
+                break
+
+    if rows:
+        print(f"\nIrrelevance augmentation: {len(rows)} samples "
+              f"({len(rows)/len(dataset)*100:.1f}% of dataset)")
+        return concatenate_datasets([dataset, Dataset.from_list(rows)])
+    return dataset
+
+
 def load_and_combine():
     parts = []
     for name, hf_id in DATASETS.items():
+        split_override = None
         if isinstance(hf_id, tuple):
-            repo, subset = hf_id
-            label = f"{repo} [{subset}]"
+            if len(hf_id) == 3:
+                repo, subset, split_override = hf_id
+            else:
+                repo, subset = hf_id
+            label = f"{repo}" + (f" [{subset}]" if subset else "")
         else:
             repo, subset = hf_id, None
             label = repo
         print(f"\nLoading {name} ({label})...")
         try:
-            ds = load_dataset(repo, subset) if subset else load_dataset(repo)
+            if split_override:
+                raw = load_dataset(repo, subset, split=split_override) if subset else load_dataset(repo, split=split_override)
+            else:
+                ds = load_dataset(repo, subset) if subset else load_dataset(repo)
+                split = "train" if "train" in ds else list(ds.keys())[0]
+                raw = ds[split]
         except Exception as e:
             print(f"  ERROR: {e}")
             continue
 
-        split = "train" if "train" in ds else list(ds.keys())[0]
-        print(f"  Converting to xlam format ({len(ds[split]):,} rows)...")
-        converted = CONVERTERS[name](ds[split])
+        print(f"  Converting to xlam format ({len(raw):,} rows)...")
+        converted = CONVERTERS[name](raw)
         converted = converted.add_column("source", [name] * len(converted))
 
         before = len(converted)
         converted = converted.filter(
             lambda ex: (
                 not _has_placeholder_args(ex["answers"])
-                and _answer_grounded(ex["query"], ex["answers"])
+                and (ex["source"] in _VERIFIED_SOURCES
+                     or _answer_grounded(ex["query"], ex["answers"]))
                 and _answer_calls_valid_tools(ex)
                 and _answer_uses_valid_params(ex)
             ),
@@ -400,6 +747,8 @@ def load_and_combine():
     dedup_dropped = before_dedup - len(combined)
     if dedup_dropped:
         print(f"\nDeduplicated: removed {dedup_dropped} duplicate queries")
+
+    combined = _augment_irrelevance(combined, ratio=0.1, seed=42)
 
     empty_count = sum(1 for ex in combined if json.loads(ex["answers"]) == [])
     print(f"\n{'='*60}")

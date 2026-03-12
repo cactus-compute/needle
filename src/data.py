@@ -126,6 +126,15 @@ def _mark_json_key_in_args(s, char_w, key, weight):
             char_w[m.start() + 1:m.start() + 1 + len(key)], weight)
 
 
+def _count_tool_calls(answers_str):
+    """Count the number of tool calls in an answers JSON string."""
+    try:
+        calls = _json.loads(answers_str)
+    except (ValueError, TypeError):
+        return 0
+    return len(calls) if isinstance(calls, list) else 0
+
+
 def _shuffle_tools_json(tools_str, seed):
     """Parse tools JSON array, shuffle order deterministically, re-serialize."""
     try:
@@ -432,22 +441,25 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     Decoder target: [<tool_call>, answer_tokens..., EOS, PAD...]
     Loss mask: token-level weights based on JSON structure (tool names, arg keys/values).
 
-    Returns (enc_inputs, dec_inputs, dec_targets, loss_mask, kept_indices).
+    Returns (enc_inputs, dec_inputs, dec_targets, loss_mask, kept_indices, tool_counts).
     """
 
     cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len,
                           w_name, w_value, w_key, shuffle_tools)
     cache_path = os.path.join(CACHE_DIR, cache_id)
 
-    tc_suffixes = ["_enc.npy", "_dec_in.npy", "_dec_tgt.npy", "_loss_mask.npy", "_kept_idx.npy"]
+    tc_suffixes = ["_enc.npy", "_dec_in.npy", "_dec_tgt.npy", "_loss_mask.npy", "_kept_idx.npy", "_tool_count.npy"]
 
     def _load_tc_cache():
+        tc_path = cache_path + "_tool_count.npy"
+        tc = np.load(tc_path) if os.path.exists(tc_path) else None
         return (
             np.load(cache_path + "_enc.npy"),
             np.load(cache_path + "_dec_in.npy"),
             np.load(cache_path + "_dec_tgt.npy"),
             np.load(cache_path + "_loss_mask.npy"),
             np.load(cache_path + "_kept_idx.npy"),
+            tc,
         )
 
     if os.path.exists(cache_path + "_enc.npy"):
@@ -462,6 +474,8 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     enc_texts = [ex["query"] for ex in ds]
     tools_texts = [ex["tools"] for ex in ds]
     ans_texts = [ex["answers"] for ex in ds]
+
+    tool_counts = np.array([_count_tool_calls(a) for a in ans_texts], dtype=np.int32)
 
     if shuffle_tools:
         tools_texts = [_shuffle_tools_json(t, seed=i) for i, t in enumerate(tools_texts)]
@@ -552,6 +566,7 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
         dec_inputs = dec_inputs[keep]
         dec_targets = dec_targets[keep]
         loss_mask = loss_mask[keep]
+        tool_counts = tool_counts[keep]
         print(f"  Skipped {skipped} examples (too long for max_dec_len={max_dec_len})")
     else:
         kept_indices = np.arange(n, dtype=np.int64)
@@ -561,14 +576,26 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     np.save(cache_path + "_dec_tgt.npy", dec_targets)
     np.save(cache_path + "_loss_mask.npy", loss_mask)
     np.save(cache_path + "_kept_idx.npy", kept_indices)
+    np.save(cache_path + "_tool_count.npy", tool_counts)
     print(f"Cached {len(enc_inputs):,} tool-call pairs to {CACHE_DIR}/{cache_id}")
 
-    return enc_inputs, dec_inputs, dec_targets, loss_mask, kept_indices
+    return enc_inputs, dec_inputs, dec_targets, loss_mask, kept_indices, tool_counts
 
 
-def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True, loss_mask=None):
+def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True, loss_mask=None, tool_counts=None):
     n = len(enc_inputs)
-    indices = np.random.permutation(n) if shuffle else np.arange(n)
+    if tool_counts is not None:
+        order = np.argsort(tool_counts, kind='stable')
+        for c in np.unique(tool_counts):
+            group = np.where(tool_counts[order] == c)[0]
+            shuffled = order[group].copy()
+            np.random.shuffle(shuffled)
+            order[group] = shuffled
+        indices = order
+    elif shuffle:
+        indices = np.random.permutation(n)
+    else:
+        indices = np.arange(n)
     for i in range(0, n - batch_size + 1, batch_size):
         idx = indices[i : i + batch_size]
         batch = (np.array(enc_inputs[idx]), np.array(dec_inputs[idx]), np.array(dec_targets[idx]))
@@ -761,12 +788,15 @@ def load_prepared_data(split, mmap=False):
         )
 
     mmap_mode = "r" if mmap else None
+    tc_path = cache_path + "_tool_count.npy"
+    tc = np.load(tc_path, mmap_mode=mmap_mode) if os.path.exists(tc_path) else None
     return {
         "enc_inputs": np.load(cache_path + "_enc.npy", mmap_mode=mmap_mode),
         "dec_inputs": np.load(cache_path + "_dec_in.npy", mmap_mode=mmap_mode),
         "dec_targets": np.load(cache_path + "_dec_tgt.npy", mmap_mode=mmap_mode),
         "loss_mask": np.load(cache_path + "_loss_mask.npy", mmap_mode=mmap_mode),
         "kept_indices": np.load(cache_path + "_kept_idx.npy", mmap_mode=mmap_mode),
+        "tool_counts": tc,
     }
 
 

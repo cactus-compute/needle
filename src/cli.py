@@ -16,8 +16,8 @@ def main():
     p = sub.add_parser("train", add_help=False)
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--lr", type=float, default=4.5e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--d-model", type=int, default=768)
     p.add_argument("--num-heads", type=int, default=16)
@@ -43,13 +43,15 @@ def main():
     p.add_argument("--prune-end-frac", type=float, default=0.67,
                    help="Fraction of epoch at which pruning finishes and mask locks (default: 0.67)")
     p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu"])
-    p.add_argument("--num-memory-slots", type=int, default=128)
+    p.add_argument("--num-memory-slots", type=int, default=256)
     p.add_argument("--mat-factors", type=int, nargs="*", default=[2, 4],
                    help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4)")
-    p.add_argument("--mat-shared-input", action="store_true",
-                   help="Each unique input is repeated across all mat widths (default: unique input per width)")
+    p.add_argument("--mat-shared-input", action=argparse.BooleanOptionalAction, default=True,
+                   help="Each unique input is repeated across all mat widths (default: True)")
     p.add_argument("--dropout", type=float, default=0.1,
                    help="Dropout rate for residual connections (default: 0.1)")
+    p.add_argument("--curriculum", action="store_true",
+                   help="Sort batches easy→hard by tool count each epoch")
 
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,

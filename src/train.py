@@ -392,6 +392,7 @@ def train(args):
     dec_inputs = train_data["dec_inputs"]
     dec_targets = train_data["dec_targets"]
     train_loss_mask = train_data["loss_mask"]
+    tool_counts = train_data["tool_counts"]
     val_enc = val_data["enc_inputs"]
     val_dec_in = val_data["dec_inputs"]
     val_dec_tgt = val_data["dec_targets"]
@@ -527,9 +528,11 @@ def train(args):
             epoch_step = 0
 
         text_losses = []
+        _curriculum_tc = tool_counts if getattr(args, "curriculum", False) else None
         text_batch_iter = PrefetchIterator(
             lambda: get_batches(enc_inputs, dec_inputs, dec_targets, unique_batch_size,
-                                loss_mask=train_loss_mask),
+                                loss_mask=train_loss_mask,
+                                tool_counts=_curriculum_tc),
             prefetch=4,
         )
 
