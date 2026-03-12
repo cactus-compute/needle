@@ -13,19 +13,46 @@ import logging
 import os
 import sys
 
+# Redirect HF cache to /dev/shm when RAM is plentiful (before importing datasets)
+_shm = "/dev/shm"
+if os.path.isdir(_shm):
+    try:
+        _st = os.statvfs(_shm)
+        if _st.f_bavail * _st.f_frsize >= 200 * 1024**3:
+            _hf_cache = os.path.join(_shm, "needle_hf_cache")
+            os.makedirs(_hf_cache, exist_ok=True)
+            os.environ.setdefault("HF_HOME", _hf_cache)
+            os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(_hf_cache, "datasets"))
+    except OSError:
+        pass
+
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from tools_data import load_and_combine
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def _default_output():
+    """Use /dev/shm for output when RAM is plentiful."""
+    shm = "/dev/shm"
+    if os.path.isdir(shm):
+        try:
+            st = os.statvfs(shm)
+            if st.f_bavail * st.f_frsize >= 200 * 1024**3:
+                return os.path.join(shm, "needle_data", "tool_calls_unified")
+        except OSError:
+            pass
+    return "data/tool_calls_unified"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build text-only tool-call dataset")
     parser.add_argument("--max-samples", type=int, default=None, help="Max samples to include")
-    parser.add_argument("--output", type=str, default="data/tool_calls_unified", help="Output directory")
+    parser.add_argument("--output", type=str, default=_default_output(), help="Output directory")
     args = parser.parse_args()
 
     logger.info("Loading and combining text datasets...")

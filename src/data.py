@@ -21,26 +21,59 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 _DISK_CACHE_DIR = os.path.join(_PROJECT_ROOT, ".data_cache")
 TOKENIZER_DIR = os.path.join(_PROJECT_ROOT, "tokenizer")
 TOKENIZER_PREFIX = os.path.join(TOKENIZER_DIR, "needle")
-LOCAL_UNIFIED_DIR = os.path.join(_PROJECT_ROOT, "data", "tool_calls_unified")
+_DISK_UNIFIED_DIR = os.path.join(_PROJECT_ROOT, "data", "tool_calls_unified")
+_SHM_UNIFIED_DIR = os.path.join("/dev/shm", "needle_data", "tool_calls_unified")
+
+
+def _pick_unified_dir():
+    """Use /dev/shm for unified dataset when RAM is plentiful, else disk."""
+    # Prefer shm if it exists there already or if we have enough RAM
+    if os.path.isdir(_SHM_UNIFIED_DIR) and any(
+        f.endswith(".arrow") for f in os.listdir(_SHM_UNIFIED_DIR)
+    ):
+        return _SHM_UNIFIED_DIR
+    if _shm_available():
+        return _SHM_UNIFIED_DIR
+    return _DISK_UNIFIED_DIR
+
+
+LOCAL_UNIFIED_DIR = _pick_unified_dir()
 
 _MIN_SHM_BYTES = 200 * 1024**3
 
 
-def _pick_cache_dir():
-    """Use /dev/shm (tmpfs/RAM) when available and large enough, else disk."""
+def _shm_available():
+    """Check if /dev/shm has enough space for RAM-backed storage."""
     shm = "/dev/shm"
     if os.path.isdir(shm):
         try:
             st = os.statvfs(shm)
-            avail = st.f_bavail * st.f_frsize
-            if avail >= _MIN_SHM_BYTES:
-                d = os.path.join(shm, "needle_cache")
-                os.makedirs(d, exist_ok=True)
-                return d
+            return st.f_bavail * st.f_frsize >= _MIN_SHM_BYTES
         except OSError:
             pass
+    return False
+
+
+def _pick_cache_dir():
+    """Use /dev/shm (tmpfs/RAM) when available and large enough, else disk."""
+    if _shm_available():
+        d = os.path.join("/dev/shm", "needle_cache")
+        os.makedirs(d, exist_ok=True)
+        return d
     os.makedirs(_DISK_CACHE_DIR, exist_ok=True)
     return _DISK_CACHE_DIR
+
+
+def _setup_hf_cache():
+    """Point HuggingFace download cache to /dev/shm when RAM is plentiful."""
+    if _shm_available():
+        hf_cache = os.path.join("/dev/shm", "needle_hf_cache")
+        os.makedirs(hf_cache, exist_ok=True)
+        os.environ.setdefault("HF_HOME", hf_cache)
+        os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(hf_cache, "datasets"))
+
+
+_setup_hf_cache()
 
 
 CACHE_DIR = _pick_cache_dir()
@@ -53,12 +86,17 @@ TOOL_CALL_ID = 4
 TRANSCRIBE_ID = 5
 TOOLS_ID = 6
 
+DEFAULT_MAX_ENC_LEN = 1024
+DEFAULT_MAX_DEC_LEN = 512
+DEFAULT_MAX_GEN_LEN = 512
+
 _unified_dataset_cache = None
 
 
 def _load_unified_dataset():
-    """Load the unified dataset from local disk.
+    """Load the unified dataset from /dev/shm or disk.
 
+    Checks /dev/shm first (RAM-backed), then falls back to disk.
     Caches the result in memory after first load.
     Uses soundfile as the audio decoding backend.
     """
@@ -66,22 +104,22 @@ def _load_unified_dataset():
     if _unified_dataset_cache is not None:
         return _unified_dataset_cache
 
-    if os.path.exists(LOCAL_UNIFIED_DIR) and any(
-        f.endswith(".arrow") for f in os.listdir(LOCAL_UNIFIED_DIR)
-    ):
-        try:
-            ds = load_from_disk(LOCAL_UNIFIED_DIR)
-            print(f"Loaded unified dataset from {LOCAL_UNIFIED_DIR} ({len(ds)} rows)")
-            _unified_dataset_cache = _set_audio_backend(ds)
-            return _unified_dataset_cache
-        except Exception as e:
-            raise FileNotFoundError(
-                f"Failed to load dataset from {LOCAL_UNIFIED_DIR}: {e}. "
-                f"Run 'python scripts/build_dataset.py' first."
-            )
+    # Try each candidate path: shm first, then disk
+    for path in [_SHM_UNIFIED_DIR, _DISK_UNIFIED_DIR]:
+        if os.path.exists(path) and any(
+            f.endswith(".arrow") for f in os.listdir(path)
+        ):
+            try:
+                ds = load_from_disk(path)
+                print(f"Loaded unified dataset from {path} ({len(ds)} rows)")
+                _unified_dataset_cache = _set_audio_backend(ds)
+                return _unified_dataset_cache
+            except Exception as e:
+                print(f"Warning: failed to load from {path}: {e}")
+                continue
 
     raise FileNotFoundError(
-        f"Unified dataset not found at {LOCAL_UNIFIED_DIR}. "
+        f"Unified dataset not found at {_SHM_UNIFIED_DIR} or {_DISK_UNIFIED_DIR}. "
         f"Run 'python scripts/build_dataset.py' first."
     )
 
@@ -285,7 +323,7 @@ def _load_cache_metadata(split):
     return None
 
 
-def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=1024, max_dec_len=512):
+def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_dec_len=DEFAULT_MAX_DEC_LEN):
     """Prepare tool-call encoder-decoder pairs with <tool_call> task token.
 
     Encoder input: [query_tokens..., <tools>, tools_tokens...] truncated to max_enc_len.

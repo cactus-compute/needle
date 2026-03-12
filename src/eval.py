@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from .data import get_batches, get_tokenizer, load_tool_calls, prepare_tool_call_pairs
+from .data import get_batches, get_tokenizer, load_tool_calls, prepare_tool_call_pairs, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN
 from .model import (
     EncoderDecoderTransformer,
     TransformerConfig,
@@ -168,7 +168,7 @@ def compute_wer(hypotheses, references):
     return total_edits / max(total_ref_words, 1)
 
 
-def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=512, max_enc_len=512):
+def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN):
     """Generate tool-call predictions and compute structured metrics."""
     import json
     from .run import generate_batch
@@ -378,9 +378,9 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default="checkpoints/checkpoint_epoch3.pkl")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-eval-samples", type=int, default=1000)
-    parser.add_argument("--max-enc-len", type=int, default=256)
-    parser.add_argument("--max-dec-len", type=int, default=1024)
-    parser.add_argument("--max-gen-len", type=int, default=512)
+    parser.add_argument("--max-enc-len", type=int, default=DEFAULT_MAX_ENC_LEN)
+    parser.add_argument("--max-dec-len", type=int, default=DEFAULT_MAX_DEC_LEN)
+    parser.add_argument("--max-gen-len", type=int, default=DEFAULT_MAX_GEN_LEN)
     parser.add_argument("--throughput-runs", type=int, default=10)
     parser.add_argument("--tool-call-samples", type=int, default=200,
                         help="Samples for tool-call accuracy eval (default: 200)")

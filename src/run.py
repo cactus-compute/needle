@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .data import get_tokenizer, compute_mel_spectrogram
+from .data import get_tokenizer, compute_mel_spectrogram, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_GEN_LEN
 from .model import (
     EncoderDecoderTransformer,
     TransformerConfig,
@@ -48,7 +48,7 @@ def load_checkpoint(path):
     return params, config
 
 
-def _build_encoder_input(tokenizer, query, tools, max_enc_len=1024):
+def _build_encoder_input(tokenizer, query, tools, max_enc_len=DEFAULT_MAX_ENC_LEN):
     """Build encoder input: [query..., <tools>, tools...] truncated to max_enc_len."""
     tools_sep_id = tokenizer.tools_token_id
     q_toks = tokenizer.encode(query)
@@ -61,7 +61,7 @@ def _build_encoder_input(tokenizer, query, tools, max_enc_len=1024):
     return q_toks + [tools_sep_id] + t_toks
 
 
-def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, max_enc_len=1024, seed=0, stream=True, task_token_id=None):
+def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, seed=0, stream=True, task_token_id=None):
     """Generate tool-call output.
 
     Encoder: [query_tokens..., <tools>, tools_tokens...] truncated to max_enc_len.
@@ -118,7 +118,7 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=512, max_e
     return tokenizer.decode(generated_tokens)
 
 
-def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=512, max_enc_len=1024):
+def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN):
     """Batch-generate tool-call outputs for multiple examples at once.
 
     Encoder: [query_tokens..., <tools>, tools_tokens...] per example, truncated to max_enc_len.
@@ -194,7 +194,7 @@ def load_audio(path, target_sr=16000):
     return audio, sr
 
 
-def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="[]", max_gen_len=512, seed=0, stream=True):
+def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="[]", max_gen_len=DEFAULT_MAX_GEN_LEN, seed=0, stream=True):
     """Generate tool-call output from audio using the speech encoder pathway.
 
     mel -> encode_speech -> decoder [BOS, <tool_call>, tools_tokens...] -> greedy decode.

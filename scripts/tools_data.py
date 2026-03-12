@@ -17,6 +17,11 @@ Datasets:
    Tool definitions embedded in the system prompt; chat is a flat string with
    USER:/A: role markers and <functioncall> tags. Examples with empty answers
    (answers=[]) are kept so the model learns when NOT to call functions.
+
+3. Agent-Ark/Toucan-1.5M (OSS, Kimi-K2, Qwen3 subsets)
+   Large-scale tool-calling dataset. Tool calls extracted from 'messages' column
+   (assistant messages with function_call objects), filtered by 'target_tools'.
+   Tool schemas converted from OpenAI format to flat format.
 """
 
 import json
@@ -29,6 +34,9 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 DATASETS = {
     "xlam-function-calling-60k": "Salesforce/xlam-function-calling-60k",
     "glaive-function-calling": "glaiveai/glaive-function-calling-v2",
+    "toucan-oss": ("Agent-Ark/Toucan-1.5M", "OSS"),
+    "toucan-kimi": ("Agent-Ark/Toucan-1.5M", "Kimi-K2"),
+    "toucan-qwen": ("Agent-Ark/Toucan-1.5M", "Qwen3"),
 }
 
 
@@ -108,9 +116,99 @@ def _parse_glaive_chat(chat):
     return query, answers
 
 
+def _convert_openai_tools(tools_json):
+    """Convert OpenAI-format tools to flat format.
+
+    OpenAI: [{"type": "function", "function": {"name": ..., "parameters": {"type": "object", "properties": {...}}}}]
+    Flat:   [{"name": ..., "description": ..., "parameters": {"param_name": {"type": ..., "description": ...}}}]
+    """
+    try:
+        tools = json.loads(tools_json) if isinstance(tools_json, str) else tools_json
+    except (json.JSONDecodeError, TypeError):
+        return []
+    flat = []
+    for t in tools:
+        if isinstance(t, dict) and "function" in t:
+            fn = t["function"]
+        elif isinstance(t, dict) and "name" in t:
+            fn = t
+        else:
+            continue
+        params = fn.get("parameters") or {}
+        # Unwrap JSON Schema object wrapper → flat param dict
+        if isinstance(params, dict) and "properties" in params:
+            params = params["properties"]
+        flat.append({
+            "name": fn["name"],
+            "description": fn.get("description", ""),
+            "parameters": params,
+        })
+    return flat
+
+
+def _extract_toucan_calls(messages_json, tool_names=None):
+    """Extract tool calls from Toucan messages.
+
+    Collects all function_call entries from assistant messages.
+    If tool_names is provided, only keeps calls whose name matches an available tool.
+    """
+    try:
+        messages = json.loads(messages_json) if isinstance(messages_json, str) else messages_json
+    except (json.JSONDecodeError, TypeError):
+        return []
+    calls = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        fc = msg.get("function_call")
+        if not fc or not isinstance(fc, dict):
+            continue
+        name = fc.get("name", "")
+        if not name:
+            continue
+        if tool_names is not None and name not in tool_names:
+            continue
+        args = fc.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
+        calls.append({"name": name, "arguments": args})
+    return calls
+
+
+def convert_toucan(dataset):
+    rows = []
+    for ex in dataset:
+        query = (ex.get("question") or "").strip()
+        if not query:
+            continue
+        tools = _convert_openai_tools(ex.get("available_tools", "[]"))
+        if not tools:
+            continue
+        tool_names = {t["name"] for t in tools}
+        calls = _extract_toucan_calls(ex.get("messages", "[]"), tool_names)
+        if not calls:
+            continue
+        rows.append({
+            "query": query,
+            "answers": json.dumps(calls),
+            "tools": json.dumps(tools),
+        })
+    return Dataset.from_list(rows)
+
+
 CONVERTERS = {
     "xlam-function-calling-60k": convert_xlam,
     "glaive-function-calling": convert_glaive,
+    "toucan-oss": convert_toucan,
+    "toucan-kimi": convert_toucan,
+    "toucan-qwen": convert_toucan,
 }
 
 _PLACEHOLDER_VALUES = {
@@ -250,15 +348,22 @@ def _deduplicate(dataset):
 def load_and_combine():
     parts = []
     for name, hf_id in DATASETS.items():
-        print(f"\nLoading {name} ({hf_id})...")
+        if isinstance(hf_id, tuple):
+            repo, subset = hf_id
+            label = f"{repo} [{subset}]"
+        else:
+            repo, subset = hf_id, None
+            label = repo
+        print(f"\nLoading {name} ({label})...")
         try:
-            ds = load_dataset(hf_id)
+            ds = load_dataset(repo, subset) if subset else load_dataset(repo)
         except Exception as e:
             print(f"  ERROR: {e}")
             continue
 
-        print(f"  Converting to xlam format...")
-        converted = CONVERTERS[name](ds["train"])
+        split = "train" if "train" in ds else list(ds.keys())[0]
+        print(f"  Converting to xlam format ({len(ds[split]):,} rows)...")
+        converted = CONVERTERS[name](ds[split])
         converted = converted.add_column("source", [name] * len(converted))
 
         before = len(converted)

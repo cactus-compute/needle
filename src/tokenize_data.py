@@ -13,6 +13,8 @@ import shutil
 
 from .data import (
     CACHE_DIR,
+    DEFAULT_MAX_DEC_LEN,
+    DEFAULT_MAX_ENC_LEN,
     TOKENIZER_DIR,
     _cache_key,
     _save_cache_metadata,
@@ -41,8 +43,8 @@ def tokenize(args):
     tokenizer = get_tokenizer()
 
     print("\n=== Tokenizing text data ===")
-    max_enc_len = getattr(args, "max_enc_len", 1024)
-    max_dec_len = getattr(args, "max_dec_len", 512)
+    max_enc_len = getattr(args, "max_enc_len", DEFAULT_MAX_ENC_LEN)
+    max_dec_len = getattr(args, "max_dec_len", DEFAULT_MAX_DEC_LEN)
 
     for split in ("train", "val"):
         print(f"\n--- {split} split ---")
