@@ -1358,6 +1358,70 @@ def load_prepared_data(split, mmap=False):
     }
 
 
+def prepare_audio_toolcall_val(val_data, n_mels=80, max_mel_len=1024):
+    """Build paired (mel, dec_in, dec_tgt, loss_mask) arrays from the tool-call val set.
+
+    Uses the `audio` field (WAV bytes) as encoder input and the same decoder
+    targets as the text version, restricted to non-empty (non-trivial) examples.
+    Returns None if audio is unavailable for the dataset rows.
+    """
+    import io as _io
+    try:
+        import soundfile as sf
+    except ImportError:
+        return None
+
+    ds = _load_unified_dataset()
+    n_total = len(ds)
+    cut = int(n_total * 0.9)
+    val_rows = ds.select(list(range(cut, n_total)))
+
+    kept_indices = np.array(val_data["kept_indices"])
+    dec_in = np.array(val_data["dec_inputs"])
+    dec_tgt = np.array(val_data["dec_targets"])
+    loss_mask = np.array(val_data["loss_mask"])
+
+    # Filter to non-empty answers only
+    answer_len = loss_mask.sum(axis=1)
+    nonempty = np.where(answer_len >= 4)[0]
+
+    mels = []
+    idxs_kept = []
+    for cache_pos in nonempty:
+        row_in_val = int(kept_indices[cache_pos])
+        row = val_rows[row_in_val]
+        audio_val = row.get("audio") if isinstance(row, dict) else None
+        if audio_val is None:
+            continue
+        raw_bytes = audio_val.get("bytes") if isinstance(audio_val, dict) else audio_val
+        if not raw_bytes:
+            continue
+        try:
+            audio_arr, sr = sf.read(_io.BytesIO(raw_bytes), dtype="float32")
+            if audio_arr.ndim > 1:
+                audio_arr = audio_arr.mean(axis=1)
+            mel = compute_mel_spectrogram(audio_arr, sr=sr, n_mels=n_mels)
+            if mel.shape[0] > max_mel_len:
+                mel = mel[:max_mel_len]
+            elif mel.shape[0] < max_mel_len:
+                mel = np.pad(mel, [(0, max_mel_len - mel.shape[0]), (0, 0)])
+            mels.append(mel)
+            idxs_kept.append(cache_pos)
+        except Exception:
+            continue
+
+    if not mels:
+        return None
+
+    idxs_kept = np.array(idxs_kept)
+    return {
+        "mels": np.stack(mels).astype(np.float32),          # (N, max_mel_len, n_mels)
+        "dec_inputs": dec_in[idxs_kept],
+        "dec_targets": dec_tgt[idxs_kept],
+        "loss_mask": loss_mask[idxs_kept],
+    }
+
+
 def load_prepared_mels(mel_cache_id, mmap=False):
     """Load precomputed mel .npy file(s), optionally memory-mapped.
 
@@ -1560,13 +1624,24 @@ def _list_gcs_paths(prefix):
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
-def _download_gcs_files(uris, dest_dir, chunk_size=64):
+def _download_gcs_files(uris, dest_dir, chunk_size=200, max_workers=32):
+    import concurrent.futures as _cf
     os.makedirs(dest_dir, exist_ok=True)
-    for start in range(0, len(uris), chunk_size):
-        chunk = uris[start:start + chunk_size]
-        if not chunk:
-            continue
-        _run_gcloud(["gcloud", "storage", "cp", *chunk, dest_dir])
+    if not uris:
+        return
+    # gsutil -m cp -I only reads ~2 URIs from stdin on this environment; pass URIs as args instead.
+    # Use parallel invocations for throughput.
+    chunks = [uris[i:i + chunk_size] for i in range(0, len(uris), chunk_size)]
+    def _dl_chunk(chunk):
+        subprocess.run(
+            ["gsutil", "-q", "-m",
+             "-o", "GSUtil:parallel_process_count=1",
+             "-o", "GSUtil:parallel_thread_count=8",
+             "cp"] + list(chunk) + [dest_dir],
+            check=False,
+        )
+    with _cf.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        list(pool.map(_dl_chunk, chunks))
 
 
 def _rsync_gcs_dir(src_dir, dest_dir):
@@ -1786,9 +1861,6 @@ def _ensure_emilia_mels_local(mel_uris, gcs_prefix=EMILIA_SPEECH_GCS_PREFIX, dow
 def prefetch_emilia_mels(mel_uris, gcs_prefix=EMILIA_SPEECH_GCS_PREFIX, use_rsync=False):
     """Mirror Emilia mel .npy files into the local cache."""
     _, mel_dir = _emilia_cache_dirs(gcs_prefix)
-    if use_rsync:
-        _rsync_gcs_dir(f"{gcs_prefix.rstrip('/')}/train/mels", mel_dir)
-        return sum(1 for name in os.listdir(mel_dir) if name.endswith(".npy"))
 
     unique_uris = []
     seen = set()
@@ -1797,7 +1869,38 @@ def prefetch_emilia_mels(mel_uris, gcs_prefix=EMILIA_SPEECH_GCS_PREFIX, use_rsyn
         if uri not in seen:
             seen.add(uri)
             unique_uris.append(uri)
-    _ensure_emilia_mels_local(unique_uris, gcs_prefix=gcs_prefix, download_missing=True)
+
+    print(f"Stage 1 unique mel files selected: {len(unique_uris):,}")
+
+    if use_rsync:
+        print("Stage 1 mel mirror mode: full-rsync")
+        print(f"  target: {mel_dir}")
+        print("  (ignores --max-speech-samples)")
+        _rsync_gcs_dir(f"{gcs_prefix.rstrip('/')}/train/mels", mel_dir)
+        n = sum(1 for name in os.listdir(mel_dir) if name.endswith(".npy"))
+        print(f"Stage 1 local mel cache: {n:,} files after rsync")
+        return n
+
+    print("Stage 1 mel mirror mode: subset-copy")
+    local_files = set(os.listdir(mel_dir))
+    missing = [uri for uri in unique_uris if os.path.basename(uri) not in local_files]
+    n_reused = len(unique_uris) - len(missing)
+    print(f"Stage 1 local mel cache reused: {n_reused:,}")
+    print(f"Stage 1 local mel files to copy: {len(missing):,}")
+
+    if missing:
+        import time as _time
+        t0 = _time.perf_counter()
+        _download_gcs_files(missing, mel_dir)
+        dt = _time.perf_counter() - t0
+        n_copied = sum(
+            1 for uri in missing if os.path.exists(os.path.join(mel_dir, os.path.basename(uri)))
+        )
+        mb = n_copied * 150 / 1024
+        print(f"Stage 1 local mel files copied: {n_copied:,}  ({mb:.0f} MB in {dt:.1f}s, {mb/max(dt,0.01):.1f} MB/s)")
+    else:
+        print("Stage 1 local mel files copied: 0  (all already present)")
+
     return len(unique_uris)
 
 

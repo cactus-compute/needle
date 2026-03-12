@@ -56,6 +56,12 @@ def main():
                    help="Number of mel frequency bins (default: 80)")
     p.add_argument("--max-speech-samples", type=int, default=None,
                    help="Max voice-tool-call training samples (default: all)")
+    p.add_argument("--speech-replay-every", type=int, default=0,
+                   help="Do 1 speech transcription replay step every N text steps (0=disabled)")
+    p.add_argument("--speech-gcs-prefix", type=str,
+                   default="gs://cactus-dataset/speech-datav1/emilia-large")
+    p.add_argument("--reinit-decoder", action="store_true",
+                   help="Reinitialise decoder weights from scratch when loading a checkpoint (keeps encoder)")
 
     p = sub.add_parser("pretrain", add_help=False)
     p.add_argument("--full", action="store_true")
@@ -73,6 +79,8 @@ def main():
     p.add_argument("--max-dec-len", type=int, default=1024)
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--max-speech-samples", type=int, default=None)
+    p.add_argument("--speech-replay-every", type=int, default=0,
+                   help="Do 1 speech transcription replay step every N text steps (0=disabled)")
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])

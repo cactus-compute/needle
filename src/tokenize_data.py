@@ -47,11 +47,22 @@ def _clear_gcs_tokenizer():
 
 
 def _clear_local_caches():
-    """Remove local cache and tokenizer directories."""
-    for d in [CACHE_DIR, TOKENIZER_DIR]:
-        if os.path.exists(d):
-            print(f"Removing {d}/ ...")
-            shutil.rmtree(d)
+    """Remove local tokenizer and text caches, but preserve Emilia mel mirrors."""
+    if os.path.exists(TOKENIZER_DIR):
+        print(f"Removing {TOKENIZER_DIR}/ ...")
+        shutil.rmtree(TOKENIZER_DIR)
+
+    if os.path.exists(CACHE_DIR):
+        for item in sorted(os.listdir(CACHE_DIR)):
+            path = os.path.join(CACHE_DIR, item)
+            if item.startswith("emilia_"):
+                print(f"Preserving {path}/ (Emilia mel mirror)")
+                continue
+            if os.path.isdir(path):
+                print(f"Removing {path}/ ...")
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
 
 
 def tokenize(args):
@@ -84,6 +95,7 @@ def tokenize(args):
     speech_val_ratio = getattr(args, "speech_val_ratio", 0.01)
     speech_max_samples = getattr(args, "max_speech_samples", None) or args.max_samples
     stage1_mel_uris = []
+    stage1_counts = {}
     for split in ("train", "val"):
         rows = load_emilia_speech_metadata(
             split,
@@ -92,6 +104,7 @@ def tokenize(args):
             val_ratio=speech_val_ratio,
             seed=getattr(args, "split_seed", 42),
         )
+        stage1_counts[split] = len(rows)
         prepared = prepare_transcription_pairs(rows, tokenizer, args.max_enc_len, args.max_dec_len)
         cache_id = save_prepared_transcription_data(
             split,
@@ -104,6 +117,7 @@ def tokenize(args):
         )
         stage1_mel_uris.extend(prepared["mel_uris"].tolist())
         print(f"Cached {len(rows):,} Emilia {split} examples ({cache_id})")
+    print(f"Stage 1 Emilia rows selected: {stage1_counts['train']:,} train / {stage1_counts['val']:,} val")
 
     print("\n=== Mirroring Emilia mel files for Stage 1 ===")
     use_rsync = speech_max_samples is None
