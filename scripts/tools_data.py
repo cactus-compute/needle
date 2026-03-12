@@ -520,51 +520,6 @@ def _has_placeholder_args(answers_json):
     return False
 
 
-def _answer_grounded(query, answers_json):
-    """Check that at least one non-trivial argument value appears in the query.
-
-    For examples with function calls, this catches cases where the answer
-    contains hallucinated arguments that have nothing to do with the query.
-    Skips examples with no answers (no-call examples) — those are always kept.
-    Also skips examples where all arguments are booleans/numbers/short enums,
-    since those don't need to be grounded in the query text.
-    """
-    try:
-        answers = json.loads(answers_json)
-    except (json.JSONDecodeError, TypeError):
-        return True
-    if not answers:
-        return True
-
-    query_lower = query.lower()
-    has_string_arg = False
-
-    for call in answers:
-        args = call.get("arguments", {})
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except (json.JSONDecodeError, TypeError):
-                continue
-        if not isinstance(args, dict):
-            continue
-        for val in args.values():
-            if isinstance(val, str) and len(val) >= 3:
-                has_string_arg = True
-                val_lower = val.lower().strip()
-                if val_lower in query_lower:
-                    return True
-                val_words = val_lower.split()
-                if len(val_words) > 1:
-                    matches = sum(1 for w in val_words if len(w) >= 3 and w in query_lower)
-                    if matches >= len(val_words) * 0.5:
-                        return True
-
-    if not has_string_arg:
-        return True
-
-    return False
-
 
 def _answer_calls_valid_tools(ex):
     """Check that every tool called in the answer exists in the tools list."""
@@ -605,9 +560,6 @@ def _answer_uses_valid_params(ex):
             return False
     return True
 
-
-# Sources with their own verification — skip grounding check
-_VERIFIED_SOURCES = {"toolace"}
 
 
 def _deduplicate(dataset):
@@ -716,8 +668,6 @@ def load_and_combine():
         converted = converted.filter(
             lambda ex: (
                 not _has_placeholder_args(ex["answers"])
-                and (ex["source"] in _VERIFIED_SOURCES
-                     or _answer_grounded(ex["query"], ex["answers"]))
                 and _answer_calls_valid_tools(ex)
                 and _answer_uses_valid_params(ex)
             ),
