@@ -391,6 +391,8 @@ class EncoderDecoderTransformer(nn.Module):
 
     def _slot_diversity(self, encoder_out):
         s = encoder_out.astype(jnp.float32)
+        # Normalize to unit sphere so diversity is scale-invariant
+        s = s / (jnp.linalg.norm(s, axis=-1, keepdims=True) + 1e-8)
         gram = jnp.matmul(s, s.transpose(0, 2, 1))
         diag_sq = jnp.sum(jnp.diagonal(gram, axis1=1, axis2=2) ** 2)
         return (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]

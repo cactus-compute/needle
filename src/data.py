@@ -1,8 +1,10 @@
+import csv
 import hashlib
 import json as _json
 import multiprocessing as mp
 import os
 import queue
+import subprocess
 import threading
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
@@ -12,6 +14,7 @@ import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
+import math
 import numpy as np
 from datasets import Audio, load_from_disk
 from tqdm import tqdm
@@ -19,16 +22,21 @@ import sentencepiece as spm
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 _DISK_CACHE_DIR = os.path.join(_PROJECT_ROOT, ".data_cache")
-TOKENIZER_DIR = os.path.join(_PROJECT_ROOT, "tokenizer")
-TOKENIZER_PREFIX = os.path.join(TOKENIZER_DIR, "needle")
-LOCAL_UNIFIED_DIR = os.path.join(_PROJECT_ROOT, "data", "tool_calls_unified")
+_DEFAULT_TOKENIZER_DIR = os.path.join(_PROJECT_ROOT, "tokenizer")
+_DEFAULT_LOCAL_UNIFIED_DIR = os.path.join(_PROJECT_ROOT, "data", "tool_calls_unified")
 GCS_DATASET_PATH = "gs://cactus-dataset/tool_calls"
+EMILIA_SPEECH_GCS_PREFIX = "gs://cactus-dataset/speech-datav1/emilia-large"
 
 _MIN_SHM_BYTES = 200 * 1024**3 
 
 
 def _pick_cache_dir():
     """Use /dev/shm (tmpfs/RAM) when available and large enough, else disk."""
+    env_cache_dir = os.environ.get("NEEDLE_CACHE_DIR")
+    if env_cache_dir:
+        os.makedirs(env_cache_dir, exist_ok=True)
+        return env_cache_dir
+
     shm = "/dev/shm"
     if os.path.isdir(shm):
         try:
@@ -45,6 +53,9 @@ def _pick_cache_dir():
 
 
 CACHE_DIR = _pick_cache_dir()
+TOKENIZER_DIR = os.environ.get("NEEDLE_TOKENIZER_DIR", _DEFAULT_TOKENIZER_DIR)
+TOKENIZER_PREFIX = os.path.join(TOKENIZER_DIR, "needle")
+LOCAL_UNIFIED_DIR = os.environ.get("NEEDLE_LOCAL_UNIFIED_DIR", _DEFAULT_LOCAL_UNIFIED_DIR)
 
 PAD_ID = 0
 EOS_ID = 1
@@ -52,6 +63,43 @@ BOS_ID = 2
 UNK_ID = 3
 TOOL_CALL_ID = 4
 TRANSCRIBE_ID = 5
+
+JSON_LBRACK = "<json_lbrack>"
+JSON_RBRACK = "<json_rbrack>"
+JSON_LBRACE = "<json_lbrace>"
+JSON_RBRACE = "<json_rbrace>"
+JSON_COLON = "<json_colon>"
+JSON_COMMA = "<json_comma>"
+JSON_QUOTE = "<json_quote>"
+JSON_TRUE = "<json_true>"
+JSON_FALSE = "<json_false>"
+JSON_NULL = "<json_null>"
+JSON_KEY_NAME = "<json_key_name>"
+JSON_KEY_PARAMETERS = "<json_key_parameters>"
+JSON_KEY_ARGUMENTS = "<json_key_arguments>"
+
+JSON_SPECIAL_LITERALS = {
+    JSON_LBRACK: "[",
+    JSON_RBRACK: "]",
+    JSON_LBRACE: "{",
+    JSON_RBRACE: "}",
+    JSON_COLON: ":",
+    JSON_COMMA: ",",
+    JSON_QUOTE: '"',
+    JSON_TRUE: "true",
+    JSON_FALSE: "false",
+    JSON_NULL: "null",
+    JSON_KEY_NAME: '"name"',
+    JSON_KEY_PARAMETERS: '"parameters"',
+    JSON_KEY_ARGUMENTS: '"arguments"',
+}
+JSON_SPECIAL_SYMBOLS = tuple(JSON_SPECIAL_LITERALS.keys())
+JSON_KEY_SYMBOLS = {
+    "name": JSON_KEY_NAME,
+    "parameters": JSON_KEY_PARAMETERS,
+    "arguments": JSON_KEY_ARGUMENTS,
+}
+TRAINABLE_SPECIAL_SYMBOLS = ["<tool_call>", "<transcribe>", *JSON_SPECIAL_SYMBOLS]
 
 _unified_dataset_cache = None
 
@@ -102,12 +150,198 @@ def _set_audio_backend(ds):
     return ds
 
 
+def _normalize_tool_schema_spec(tools_text):
+    try:
+        tools = _json.loads(tools_text)
+    except (_json.JSONDecodeError, TypeError):
+        return []
+
+    if not isinstance(tools, list):
+        return []
+
+    normalized = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name", ""))
+        params = tool.get("parameters")
+        if not isinstance(params, dict):
+            params = {}
+        ordered_params = [(str(k), params[k]) for k in params.keys()]
+        normalized.append({"name": name, "parameters": ordered_params})
+    return normalized
+
+
+def _normalize_tool_call_spec(answer_text, tools_text):
+    schema = _normalize_tool_schema_spec(tools_text)
+    param_order = {tool["name"]: [name for name, _ in tool["parameters"]] for tool in schema}
+
+    try:
+        calls = _json.loads(answer_text)
+    except (_json.JSONDecodeError, TypeError):
+        calls = []
+
+    if not isinstance(calls, list):
+        calls = []
+
+    normalized = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        name = str(call.get("name", ""))
+        args = call.get("arguments")
+        if not isinstance(args, dict):
+            args = {}
+        ordered = []
+        seen = set()
+        for arg_name in param_order.get(name, ()):
+            if arg_name in args:
+                ordered.append((arg_name, args[arg_name]))
+                seen.add(arg_name)
+        for arg_name, arg_value in args.items():
+            if arg_name not in seen:
+                ordered.append((str(arg_name), arg_value))
+        normalized.append({"name": name, "arguments": ordered})
+    return normalized
+
+
+def _escape_json_string_content(text):
+    content = _json.dumps(str(text), ensure_ascii=True)[1:-1]
+    content = content.replace('\\"', '\\u0022')
+    content = content.replace("<", "\\u003c").replace(">", "\\u003e")
+    return content
+
+
+def _number_to_text(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return "0"
+        text = format(value, ".15g")
+        if text == "-0":
+            return "0"
+        return text
+    return _json.dumps(value, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+
+
+def _string_segments(text):
+    return [JSON_QUOTE, _escape_json_string_content(text), JSON_QUOTE]
+
+
+def _generic_json_segments(value):
+    if isinstance(value, str):
+        return _string_segments(value)
+    if value is True:
+        return [JSON_TRUE]
+    if value is False:
+        return [JSON_FALSE]
+    if value is None:
+        return [JSON_NULL]
+    if isinstance(value, (int, float)):
+        return [_number_to_text(value)]
+    if isinstance(value, list):
+        segments = [JSON_LBRACK]
+        for i, item in enumerate(value):
+            if i:
+                segments.append(JSON_COMMA)
+            segments.extend(_generic_json_segments(item))
+        segments.append(JSON_RBRACK)
+        return segments
+    if isinstance(value, dict):
+        segments = [JSON_LBRACE]
+        for i, (key, item) in enumerate(value.items()):
+            if i:
+                segments.append(JSON_COMMA)
+            segments.extend(_string_segments(str(key)))
+            segments.append(JSON_COLON)
+            segments.extend(_generic_json_segments(item))
+        segments.append(JSON_RBRACE)
+        return segments
+    return _string_segments(str(value))
+
+
+def _tool_schema_to_segments(tools_text):
+    schema = _normalize_tool_schema_spec(tools_text)
+    segments = [JSON_LBRACK]
+    for i, tool in enumerate(schema):
+        if i:
+            segments.append(JSON_COMMA)
+        segments.append(JSON_LBRACE)
+        segments.extend([JSON_KEY_NAME, JSON_COLON, *_string_segments(tool["name"])])
+        segments.append(JSON_COMMA)
+        segments.extend([JSON_KEY_PARAMETERS, JSON_COLON, JSON_LBRACE])
+        for j, (param_name, param_type) in enumerate(tool["parameters"]):
+            if j:
+                segments.append(JSON_COMMA)
+            segments.extend(_string_segments(param_name))
+            segments.append(JSON_COLON)
+            segments.extend(_generic_json_segments(param_type))
+        segments.extend([JSON_RBRACE, JSON_RBRACE])
+    segments.append(JSON_RBRACK)
+    return segments
+
+
+def _tool_call_to_segments(answer_text, tools_text):
+    calls = _normalize_tool_call_spec(answer_text, tools_text)
+    segments = [JSON_LBRACK]
+    for i, call in enumerate(calls):
+        if i:
+            segments.append(JSON_COMMA)
+        segments.append(JSON_LBRACE)
+        segments.extend([JSON_KEY_NAME, JSON_COLON, *_string_segments(call["name"])])
+        segments.append(JSON_COMMA)
+        segments.extend([JSON_KEY_ARGUMENTS, JSON_COLON, JSON_LBRACE])
+        for j, (arg_name, arg_value) in enumerate(call["arguments"]):
+            if j:
+                segments.append(JSON_COMMA)
+            segments.extend(_string_segments(arg_name))
+            segments.append(JSON_COLON)
+            segments.extend(_generic_json_segments(arg_value))
+        segments.extend([JSON_RBRACE, JSON_RBRACE])
+    segments.append(JSON_RBRACK)
+    return segments
+
+
+def _segments_to_training_text(segments):
+    return " ".join(segments)
+
+
 class NeedleTokenizer:
     """Wrapper around SentencePiece providing the interface the codebase expects."""
 
     def __init__(self, model_path):
         self.sp = spm.SentencePieceProcessor()
         self.sp.Load(model_path)
+        self.json_token_ids = {}
+        for symbol in JSON_SPECIAL_SYMBOLS:
+            piece_id = int(self.sp.PieceToId(symbol))
+            if piece_id < 0 or self.sp.IdToPiece(piece_id) != symbol:
+                raise ValueError(
+                    "Tokenizer is missing structured JSON symbols. "
+                    "Re-run `needle tokenize` to retrain the tokenizer."
+                )
+            self.json_token_ids[symbol] = piece_id
+        self._special_id_to_literal = {
+            self.json_token_ids[symbol]: literal
+            for symbol, literal in JSON_SPECIAL_LITERALS.items()
+        }
+        excluded = {
+            PAD_ID,
+            EOS_ID,
+            BOS_ID,
+            TOOL_CALL_ID,
+            TRANSCRIBE_ID,
+            *self._special_id_to_literal.keys(),
+        }
+        self.regular_token_ids = np.array(
+            [i for i in range(self.sp.GetPieceSize()) if i not in excluded],
+            dtype=np.int32,
+        )
 
     @property
     def pad_token_id(self):
@@ -136,10 +370,59 @@ class NeedleTokenizer:
     def encode(self, text):
         return self.sp.Encode(text, out_type=int)
 
+    def _encode_segments(self, segments):
+        ids = []
+        for segment in segments:
+            token_id = self.json_token_ids.get(segment)
+            if token_id is not None:
+                ids.append(token_id)
+            elif segment:
+                ids.extend(self.sp.Encode(segment, out_type=int))
+        return ids
+
+    def encode_tool_schema(self, tools_text):
+        return self._encode_segments(_tool_schema_to_segments(tools_text))
+
+    def encode_tool_call(self, answer_text, tools_text):
+        return self._encode_segments(_tool_call_to_segments(answer_text, tools_text))
+
+    def encode_json_string_content(self, text):
+        return self.sp.Encode(_escape_json_string_content(text), out_type=int)
+
+    def encode_json_number(self, value):
+        return self.sp.Encode(_number_to_text(value), out_type=int)
+
+    def decode_structured(self, ids):
+        if isinstance(ids, (list, tuple)) and len(ids) > 0 and isinstance(ids[0], (list, tuple, np.ndarray)):
+            return [self.decode_structured(seq) for seq in ids]
+
+        out = []
+        regular = []
+        for token_id in list(ids):
+            token_id = int(token_id)
+            literal = self._special_id_to_literal.get(token_id)
+            if literal is None:
+                regular.append(token_id)
+                continue
+            if regular:
+                out.append(self.sp.Decode(regular))
+                regular = []
+            out.append(literal)
+        if regular:
+            out.append(self.sp.Decode(regular))
+        return "".join(out)
+
     def decode(self, ids):
-        if isinstance(ids, (list, tuple)) and len(ids) > 0 and isinstance(ids[0], (list, tuple)):
-            return [self.sp.Decode(seq) for seq in ids]
-        return self.sp.Decode(list(ids))
+        return self.decode_structured(ids)
+
+    def token_surface(self, token_id):
+        token_id = int(token_id)
+        if token_id in self._special_id_to_literal:
+            return self._special_id_to_literal[token_id]
+        return self.sp.Decode([token_id])
+
+    def quote_token_id(self):
+        return self.json_token_ids[JSON_QUOTE]
 
     def __call__(self, texts, truncation=True, max_length=None, **kwargs):
         all_ids = []
@@ -186,10 +469,17 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
     corpus_path = os.path.join(TOKENIZER_DIR, "corpus.txt")
     with open(corpus_path, "w") as f:
         for example in tqdm(ds, desc="Writing corpus"):
-            for field in ("query", "tools", "answers"):
-                text = example[field].strip()
-                if text:
-                    f.write(text + "\n")
+            query = example["query"].strip()
+            if query:
+                f.write(query + "\n")
+
+            tools_text = _segments_to_training_text(_tool_schema_to_segments(example["tools"]))
+            if tools_text:
+                f.write(tools_text + "\n")
+
+            answers_text = _segments_to_training_text(_tool_call_to_segments(example["answers"], example["tools"]))
+            if answers_text:
+                f.write(answers_text + "\n")
 
     spm.SentencePieceTrainer.Train(
         input=corpus_path,
@@ -200,7 +490,7 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
         eos_id=EOS_ID,
         bos_id=BOS_ID,
         unk_id=UNK_ID,
-        user_defined_symbols=["<tool_call>", "<transcribe>"],
+        user_defined_symbols=TRAINABLE_SPECIAL_SYMBOLS,
         byte_fallback=True,
         normalization_rule_name="identity",
         num_threads=os.cpu_count(),
@@ -303,28 +593,22 @@ def _gcs_download_shards(cache_id, n_shards, shard_suffixes):
     return True
 
 
-def load_tool_calls(split="train", max_samples=None, return_global_indices=False):
+def load_tool_calls(split="train", max_samples=None, return_global_indices=False,
+                    shuffle_before_split=False, shuffle_seed=42):
     """Load tool-calling dataset, splitting 90/10 for train/val.
 
     If return_global_indices is True, also return a numpy array mapping each
     split-local row position back to its row id in the full unified dataset.
     """
     ds = _load_unified_dataset()
-    n = len(ds)
-    if split in ("validation", "val", "test"):
-        start, end = int(n * 0.9), n
-    elif split == "train":
-        start, end = 0, int(n * 0.9)
-    else:
-        start, end = 0, n
-
-    global_indices = np.arange(start, end, dtype=np.int64)
-    ds = ds.select(range(start, end))
-
-    if max_samples:
-        limit = min(max_samples, len(ds))
-        ds = ds.select(range(limit))
-        global_indices = global_indices[:limit]
+    global_indices = _split_global_indices(
+        len(ds),
+        split=split,
+        max_samples=max_samples,
+        shuffle_before_split=shuffle_before_split,
+        shuffle_seed=shuffle_seed,
+    )
+    ds = ds.select(global_indices.tolist())
 
     if return_global_indices:
         return ds, global_indices
@@ -352,8 +636,30 @@ def _mel_cache_key(prefix, n_samples, n_mels, max_mel_len):
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
+def _split_global_indices(n, split="train", max_samples=None,
+                          shuffle_before_split=False, shuffle_seed=42):
+    """Return global row ids for the requested split of the unified dataset."""
+    if shuffle_before_split:
+        indices = np.random.default_rng(shuffle_seed).permutation(n).astype(np.int64)
+    else:
+        indices = np.arange(n, dtype=np.int64)
+
+    cut = int(n * 0.9)
+    if split in ("validation", "val", "test"):
+        indices = indices[cut:]
+    elif split == "train":
+        indices = indices[:cut]
+
+    if max_samples:
+        indices = indices[:min(max_samples, len(indices))]
+
+    return indices
+
+
 def _save_cache_metadata(split, text_cache_id, mel_cache_id, n_samples,
-                         max_enc_len, max_dec_len, n_mels, max_mel_len):
+                         max_enc_len, max_dec_len, n_mels, max_mel_len,
+                         split_max_samples=None, shuffle_before_split=False,
+                         split_seed=42, toucan_cache_path=None):
     """Save metadata JSON for a split, upload to GCS."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     meta = {
@@ -365,6 +671,10 @@ def _save_cache_metadata(split, text_cache_id, mel_cache_id, n_samples,
         "max_dec_len": max_dec_len,
         "n_mels": n_mels,
         "max_mel_len": max_mel_len,
+        "split_max_samples": split_max_samples,
+        "shuffle_before_split": shuffle_before_split,
+        "split_seed": split_seed,
+        "toucan_cache_path": toucan_cache_path,
     }
     meta_path = os.path.join(CACHE_DIR, f"{split}_metadata.json")
     with open(meta_path, "w") as f:
@@ -461,19 +771,17 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=256, max_dec_len=1024, ba
         enc_results = pool.map(_tokenize_chunk, enc_chunks)
     all_enc_tokens = [tok for chunk in enc_results for tok in chunk]
 
-    tools_chunks = [tools_texts[i:i + chunk_size] for i in range(0, len(tools_texts), chunk_size)]
-    print(f"Tokenizing tools ({num_workers} workers)...")
-    with mp.Pool(num_workers, initializer=_init_worker,
-                 initargs=(model_path, max_dec_len - 2)) as pool:
-        tools_results = pool.map(_tokenize_chunk, tools_chunks)
-    all_tools_tokens = [tok for chunk in tools_results for tok in chunk]
+    print("Tokenizing tools (structured JSON)...")
+    all_tools_tokens = [
+        tokenizer.encode_tool_schema(text)[:max_dec_len - 2]
+        for text in tqdm(tools_texts, desc="Encoding tools")
+    ]
 
-    ans_chunks = [ans_texts[i:i + chunk_size] for i in range(0, len(ans_texts), chunk_size)]
-    print(f"Tokenizing answers ({num_workers} workers)...")
-    with mp.Pool(num_workers, initializer=_init_worker,
-                 initargs=(model_path, max_dec_len)) as pool:
-        ans_results = pool.map(_tokenize_chunk, ans_chunks)
-    all_ans_tokens = [tok for chunk in ans_results for tok in chunk]
+    print("Tokenizing answers (structured JSON)...")
+    all_ans_tokens = [
+        tokenizer.encode_tool_call(answer, tools)[:max_dec_len]
+        for answer, tools in tqdm(zip(ans_texts, tools_texts), total=len(ans_texts), desc="Encoding answers")
+    ]
 
     n = len(ds)
 
@@ -632,26 +940,29 @@ def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True, l
         yield batch
 
 
+def get_text_mel_batches(enc_inputs, mel_data, batch_size, shuffle=True):
+    n = len(enc_inputs)
+    indices = np.random.permutation(n) if shuffle else np.arange(n)
+    for i in range(0, n - batch_size + 1, batch_size):
+        idx = indices[i : i + batch_size]
+        yield np.array(enc_inputs[idx]), np.array(mel_data[idx])
 
-def load_tool_call_audio(split="train", max_samples=None):
+
+
+def load_tool_call_audio(split="train", max_samples=None,
+                         shuffle_before_split=False, shuffle_seed=42):
     """Return dataset-global indices for the given split.
 
     Applies the same 90/10 split as load_tool_calls. Audio is NOT loaded into memory.
     """
     ds = _load_unified_dataset()
-    n = len(ds)
-
-    if split in ("validation", "val", "test"):
-        start, end = int(n * 0.9), n
-    elif split == "train":
-        start, end = 0, int(n * 0.9)
-    else:
-        start, end = 0, n
-
-    indices = list(range(start, end))
-    if max_samples:
-        indices = indices[:max_samples]
-    return indices
+    return _split_global_indices(
+        len(ds),
+        split=split,
+        max_samples=max_samples,
+        shuffle_before_split=shuffle_before_split,
+        shuffle_seed=shuffle_seed,
+    ).tolist()
 
 
 _GCS_SHARD_ROWS = 5000
@@ -1019,6 +1330,10 @@ def load_prepared_data(split, mmap=False):
 
         result["kept_indices"] = np.load(cache_path + "_kept_idx.npy", mmap_mode=mmap_mode)
         result["mel_cache_id"] = meta.get("mel_cache_id")
+        result["split_max_samples"] = meta.get("split_max_samples")
+        result["shuffle_before_split"] = meta.get("shuffle_before_split", False)
+        result["split_seed"] = meta.get("split_seed", 42)
+        result["toucan_cache_path"] = meta.get("toucan_cache_path")
         return result
 
     tc_suffixes = ["_enc.npy", "_dec_in.npy", "_dec_tgt.npy", "_loss_mask.npy", "_kept_idx.npy"]
@@ -1036,6 +1351,74 @@ def load_prepared_data(split, mmap=False):
         "loss_mask": np.load(cache_path + "_loss_mask.npy", mmap_mode=mmap_mode),
         "kept_indices": np.load(cache_path + "_kept_idx.npy", mmap_mode=mmap_mode),
         "mel_cache_id": meta.get("mel_cache_id"),
+        "split_max_samples": meta.get("split_max_samples"),
+        "shuffle_before_split": meta.get("shuffle_before_split", False),
+        "split_seed": meta.get("split_seed", 42),
+        "toucan_cache_path": meta.get("toucan_cache_path"),
+    }
+
+
+def prepare_audio_toolcall_val(val_data, n_mels=80, max_mel_len=1024):
+    """Build paired (mel, dec_in, dec_tgt, loss_mask) arrays from the tool-call val set.
+
+    Uses the `audio` field (WAV bytes) as encoder input and the same decoder
+    targets as the text version, restricted to non-empty (non-trivial) examples.
+    Returns None if audio is unavailable for the dataset rows.
+    """
+    import io as _io
+    try:
+        import soundfile as sf
+    except ImportError:
+        return None
+
+    ds = _load_unified_dataset()
+    n_total = len(ds)
+    cut = int(n_total * 0.9)
+    val_rows = ds.select(list(range(cut, n_total)))
+
+    kept_indices = np.array(val_data["kept_indices"])
+    dec_in = np.array(val_data["dec_inputs"])
+    dec_tgt = np.array(val_data["dec_targets"])
+    loss_mask = np.array(val_data["loss_mask"])
+
+    # Filter to non-empty answers only
+    answer_len = loss_mask.sum(axis=1)
+    nonempty = np.where(answer_len >= 4)[0]
+
+    mels = []
+    idxs_kept = []
+    for cache_pos in nonempty:
+        row_in_val = int(kept_indices[cache_pos])
+        row = val_rows[row_in_val]
+        audio_val = row.get("audio") if isinstance(row, dict) else None
+        if audio_val is None:
+            continue
+        raw_bytes = audio_val.get("bytes") if isinstance(audio_val, dict) else audio_val
+        if not raw_bytes:
+            continue
+        try:
+            audio_arr, sr = sf.read(_io.BytesIO(raw_bytes), dtype="float32")
+            if audio_arr.ndim > 1:
+                audio_arr = audio_arr.mean(axis=1)
+            mel = compute_mel_spectrogram(audio_arr, sr=sr, n_mels=n_mels)
+            if mel.shape[0] > max_mel_len:
+                mel = mel[:max_mel_len]
+            elif mel.shape[0] < max_mel_len:
+                mel = np.pad(mel, [(0, max_mel_len - mel.shape[0]), (0, 0)])
+            mels.append(mel)
+            idxs_kept.append(cache_pos)
+        except Exception:
+            continue
+
+    if not mels:
+        return None
+
+    idxs_kept = np.array(idxs_kept)
+    return {
+        "mels": np.stack(mels).astype(np.float32),          # (N, max_mel_len, n_mels)
+        "dec_inputs": dec_in[idxs_kept],
+        "dec_targets": dec_tgt[idxs_kept],
+        "loss_mask": loss_mask[idxs_kept],
     }
 
 
@@ -1214,3 +1597,358 @@ class PrefetchIterator:
 def count_batches(n_samples, batch_size):
     """Return the number of full batches for a dataset of n_samples."""
     return n_samples // batch_size
+
+
+def _gcs_slug(path):
+    return hashlib.md5(path.encode()).hexdigest()[:12]
+
+
+def _emilia_cache_dirs(gcs_prefix):
+    root = os.path.join(CACHE_DIR, f"emilia_{_gcs_slug(gcs_prefix)}")
+    meta_dir = os.path.join(root, "metadata")
+    mel_dir = os.path.join(root, "mels")
+    os.makedirs(meta_dir, exist_ok=True)
+    os.makedirs(mel_dir, exist_ok=True)
+    return meta_dir, mel_dir
+
+
+def _run_gcloud(args):
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "gcloud command failed")
+    return result
+
+
+def _list_gcs_paths(prefix):
+    result = _run_gcloud(["gcloud", "storage", "ls", prefix])
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _download_gcs_files(uris, dest_dir, chunk_size=200, max_workers=32):
+    import concurrent.futures as _cf
+    os.makedirs(dest_dir, exist_ok=True)
+    if not uris:
+        return
+    # gsutil -m cp -I only reads ~2 URIs from stdin on this environment; pass URIs as args instead.
+    # Use parallel invocations for throughput.
+    chunks = [uris[i:i + chunk_size] for i in range(0, len(uris), chunk_size)]
+    def _dl_chunk(chunk):
+        subprocess.run(
+            ["gsutil", "-q", "-m",
+             "-o", "GSUtil:parallel_process_count=1",
+             "-o", "GSUtil:parallel_thread_count=8",
+             "cp"] + list(chunk) + [dest_dir],
+            check=False,
+        )
+    with _cf.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        list(pool.map(_dl_chunk, chunks))
+
+
+def _rsync_gcs_dir(src_dir, dest_dir):
+    os.makedirs(dest_dir, exist_ok=True)
+    _run_gcloud(["gcloud", "storage", "rsync", src_dir, dest_dir, "--recursive"])
+
+
+def _ensure_emilia_metadata_local(gcs_prefix):
+    meta_dir, _ = _emilia_cache_dirs(gcs_prefix)
+    remote_prefix = f"{gcs_prefix.rstrip('/')}/train/metadata/"
+    remote_paths = _list_gcs_paths(remote_prefix)
+    missing = []
+    for uri in remote_paths:
+        local_path = os.path.join(meta_dir, os.path.basename(uri))
+        if not os.path.exists(local_path):
+            missing.append(uri)
+    if missing:
+        _download_gcs_files(missing, meta_dir, chunk_size=32)
+    return [os.path.join(meta_dir, os.path.basename(uri)) for uri in remote_paths]
+
+
+def load_emilia_speech_metadata(split="train", gcs_prefix=EMILIA_SPEECH_GCS_PREFIX,
+                                max_samples=None, val_ratio=0.01, seed=42):
+    """Load Emilia speech metadata rows and create a deterministic train/val split."""
+    if split not in ("train", "val", "validation", "test"):
+        raise ValueError(f"Unsupported split: {split}")
+
+    local_csvs = sorted(_ensure_emilia_metadata_local(gcs_prefix))
+    rows = []
+    for csv_path in local_csvs:
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                transcript = (row.get("transcript") or "").strip()
+                mel_uri = (row.get("mel_gcs_uri") or "").strip()
+                if not transcript or not mel_uri.endswith(".npy"):
+                    continue
+                rows.append(row)
+
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(rows))
+    cut = int(len(rows) * (1.0 - val_ratio))
+    if split == "train":
+        selected = order[:cut]
+    else:
+        selected = order[cut:]
+
+    if max_samples is not None:
+        selected = selected[:min(max_samples, len(selected))]
+
+    return [rows[int(i)] for i in selected]
+
+
+def prepare_transcription_pairs(rows, tokenizer, max_enc_len=256, max_dec_len=1024):
+    """Prepare audio->transcript decoder targets plus transcript text encodings."""
+    pad_id = tokenizer.pad_token_id
+    eos_id = tokenizer.eos_token_id
+    transcribe_id = tokenizer.transcribe_token_id
+
+    n = len(rows)
+    text_inputs = np.full((n, max_enc_len), pad_id, dtype=np.int32)
+    dec_inputs = np.full((n, max_dec_len), pad_id, dtype=np.int32)
+    dec_targets = np.full((n, max_dec_len), pad_id, dtype=np.int32)
+    loss_mask = np.zeros((n, max_dec_len), dtype=np.float32)
+    mel_uris = []
+
+    for i, row in enumerate(rows):
+        transcript = row["transcript"].strip()
+        text_tokens = tokenizer.encode(transcript)[:max_enc_len]
+        if text_tokens:
+            text_inputs[i, :len(text_tokens)] = text_tokens
+
+        dec_tokens = tokenizer.encode(transcript)[:max(0, max_dec_len - 2)]
+        dec_inputs[i, 0] = eos_id
+        dec_inputs[i, 1] = transcribe_id
+        if dec_tokens:
+            dec_inputs[i, 2:2 + len(dec_tokens)] = dec_tokens
+
+        dec_targets[i, 0] = transcribe_id
+        if dec_tokens:
+            dec_targets[i, 1:1 + len(dec_tokens)] = dec_tokens
+        eos_pos = 1 + len(dec_tokens)
+        if eos_pos < max_dec_len:
+            dec_targets[i, eos_pos] = eos_id
+            loss_mask[i, 1:eos_pos + 1] = 1.0
+
+        mel_uris.append(row["mel_gcs_uri"])
+
+    return {
+        "text_inputs": text_inputs,
+        "dec_inputs": dec_inputs,
+        "dec_targets": dec_targets,
+        "loss_mask": loss_mask,
+        "mel_uris": np.array(mel_uris, dtype=object),
+    }
+
+
+def _transcription_cache_key(split, n_samples, max_enc_len, max_dec_len, gcs_prefix, val_ratio):
+    tok_hash = _tokenizer_hash()
+    key = (
+        f"transcribe_{split}_{_gcs_slug(gcs_prefix)}_{tok_hash}_"
+        f"{n_samples}_{max_enc_len}_{max_dec_len}_{val_ratio:.6f}"
+    )
+    return hashlib.md5(key.encode()).hexdigest()[:12]
+
+
+def save_prepared_transcription_data(split, prepared, max_enc_len, max_dec_len,
+                                     gcs_prefix=EMILIA_SPEECH_GCS_PREFIX, val_ratio=0.01,
+                                     split_max_samples=None):
+    """Persist tokenized Emilia transcript targets for Stage 1."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    n_samples = len(prepared["text_inputs"])
+    cache_id = _transcription_cache_key(
+        split, n_samples, max_enc_len, max_dec_len, gcs_prefix, val_ratio
+    )
+    cache_path = os.path.join(CACHE_DIR, cache_id)
+
+    np.save(cache_path + "_text_inputs.npy", prepared["text_inputs"])
+    np.save(cache_path + "_dec_inputs.npy", prepared["dec_inputs"])
+    np.save(cache_path + "_dec_targets.npy", prepared["dec_targets"])
+    np.save(cache_path + "_loss_mask.npy", prepared["loss_mask"])
+    np.save(cache_path + "_mel_uris.npy", np.asarray(prepared["mel_uris"], dtype=np.str_))
+    _gcs_cache_upload(
+        cache_id,
+        ["_text_inputs.npy", "_dec_inputs.npy", "_dec_targets.npy", "_loss_mask.npy", "_mel_uris.npy"],
+    )
+
+    meta = {
+        "split": split,
+        "cache_id": cache_id,
+        "n_samples": n_samples,
+        "max_enc_len": max_enc_len,
+        "max_dec_len": max_dec_len,
+        "speech_gcs_prefix": gcs_prefix,
+        "speech_val_ratio": val_ratio,
+        "split_max_samples": split_max_samples,
+    }
+    meta_path = os.path.join(CACHE_DIR, f"stage1_{split}_metadata.json")
+    with open(meta_path, "w") as f:
+        _json.dump(meta, f)
+    _gcs_cache_upload(f"stage1_{split}_metadata", [".json"])
+    return cache_id
+
+
+def load_prepared_transcription_data(split, max_enc_len, max_dec_len,
+                                     gcs_prefix=EMILIA_SPEECH_GCS_PREFIX, val_ratio=0.01,
+                                     max_samples=None, mmap=False):
+    """Load cached Stage 1 transcription targets if metadata matches."""
+    meta_path = os.path.join(CACHE_DIR, f"stage1_{split}_metadata.json")
+    if not os.path.exists(meta_path):
+        import subprocess
+        subprocess.run(
+            ["gcloud", "storage", "cp", f"{GCS_CACHE_PATH}/stage1_{split}_metadata.json", meta_path],
+            capture_output=True, text=True,
+        )
+    if not os.path.exists(meta_path):
+        return None
+
+    with open(meta_path) as f:
+        meta = _json.load(f)
+
+    if meta.get("speech_gcs_prefix") != gcs_prefix:
+        return None
+    if meta.get("max_enc_len") != max_enc_len or meta.get("max_dec_len") != max_dec_len:
+        return None
+    if abs(float(meta.get("speech_val_ratio", 0.01)) - float(val_ratio)) > 1e-12:
+        return None
+
+    cache_id = meta["cache_id"]
+    cache_path = os.path.join(CACHE_DIR, cache_id)
+    suffixes = [
+        "_text_inputs.npy",
+        "_dec_inputs.npy",
+        "_dec_targets.npy",
+        "_loss_mask.npy",
+        "_mel_uris.npy",
+    ]
+    if not all(os.path.exists(cache_path + suffix) for suffix in suffixes):
+        if not _gcs_cache_download(cache_id, suffixes):
+            return None
+
+    mmap_mode = "r" if mmap else None
+    prepared = {
+        "text_inputs": np.load(cache_path + "_text_inputs.npy", mmap_mode=mmap_mode),
+        "dec_inputs": np.load(cache_path + "_dec_inputs.npy", mmap_mode=mmap_mode),
+        "dec_targets": np.load(cache_path + "_dec_targets.npy", mmap_mode=mmap_mode),
+        "loss_mask": np.load(cache_path + "_loss_mask.npy", mmap_mode=mmap_mode),
+        "mel_uris": np.load(cache_path + "_mel_uris.npy", mmap_mode=mmap_mode),
+    }
+
+    if max_samples is not None:
+        keep = min(max_samples, len(prepared["text_inputs"]))
+        prepared = {key: np.array(value[:keep]) for key, value in prepared.items()}
+
+    return prepared
+
+
+def _ensure_emilia_mels_local(mel_uris, gcs_prefix=EMILIA_SPEECH_GCS_PREFIX, download_missing=True):
+    _, mel_dir = _emilia_cache_dirs(gcs_prefix)
+    missing = []
+    local_paths = []
+    for uri in mel_uris:
+        local_path = os.path.join(mel_dir, os.path.basename(uri))
+        local_paths.append(local_path)
+        if not os.path.exists(local_path):
+            missing.append(uri)
+    if missing and download_missing:
+        _download_gcs_files(missing, mel_dir, chunk_size=32)
+    elif missing:
+        raise FileNotFoundError(
+            f"Missing {len(missing)} local Emilia mel files under {mel_dir}. "
+            "Run 'needle tokenize' to mirror Stage 1 mels locally before pretraining."
+        )
+    return local_paths
+
+
+def prefetch_emilia_mels(mel_uris, gcs_prefix=EMILIA_SPEECH_GCS_PREFIX, use_rsync=False):
+    """Mirror Emilia mel .npy files into the local cache."""
+    _, mel_dir = _emilia_cache_dirs(gcs_prefix)
+
+    unique_uris = []
+    seen = set()
+    for uri in mel_uris:
+        uri = str(uri)
+        if uri not in seen:
+            seen.add(uri)
+            unique_uris.append(uri)
+
+    print(f"Stage 1 unique mel files selected: {len(unique_uris):,}")
+
+    if use_rsync:
+        print("Stage 1 mel mirror mode: full-rsync")
+        print(f"  target: {mel_dir}")
+        print("  (ignores --max-speech-samples)")
+        _rsync_gcs_dir(f"{gcs_prefix.rstrip('/')}/train/mels", mel_dir)
+        n = sum(1 for name in os.listdir(mel_dir) if name.endswith(".npy"))
+        print(f"Stage 1 local mel cache: {n:,} files after rsync")
+        return n
+
+    print("Stage 1 mel mirror mode: subset-copy")
+    local_files = set(os.listdir(mel_dir))
+    missing = [uri for uri in unique_uris if os.path.basename(uri) not in local_files]
+    n_reused = len(unique_uris) - len(missing)
+    print(f"Stage 1 local mel cache reused: {n_reused:,}")
+    print(f"Stage 1 local mel files to copy: {len(missing):,}")
+
+    if missing:
+        import time as _time
+        t0 = _time.perf_counter()
+        _download_gcs_files(missing, mel_dir)
+        dt = _time.perf_counter() - t0
+        n_copied = sum(
+            1 for uri in missing if os.path.exists(os.path.join(mel_dir, os.path.basename(uri)))
+        )
+        mb = n_copied * 150 / 1024
+        print(f"Stage 1 local mel files copied: {n_copied:,}  ({mb:.0f} MB in {dt:.1f}s, {mb/max(dt,0.01):.1f} MB/s)")
+    else:
+        print("Stage 1 local mel files copied: 0  (all already present)")
+
+    return len(unique_uris)
+
+
+def _load_emilia_mel(local_path, n_mels=80, max_mel_len=1024):
+    mel = np.load(local_path)
+    if mel.ndim != 2:
+        raise ValueError(f"Expected 2D mel array, got shape {mel.shape} for {local_path}")
+    if mel.shape[0] == n_mels and mel.shape[1] != n_mels:
+        mel = mel.T
+    elif mel.shape[1] != n_mels:
+        raise ValueError(f"Unexpected mel shape {mel.shape} for {local_path}")
+    mel = mel.astype(np.float32)
+    if mel.shape[0] > max_mel_len:
+        mel = mel[:max_mel_len]
+    elif mel.shape[0] < max_mel_len:
+        mel = np.pad(mel, ((0, max_mel_len - mel.shape[0]), (0, 0)))
+    return mel
+
+
+def get_transcription_batches(prepared, batch_size, max_mel_len=1024, n_mels=80,
+                              gcs_prefix=EMILIA_SPEECH_GCS_PREFIX, shuffle=True,
+                              require_local_mels=False):
+    """Yield batches of cached Emilia mels and transcript targets."""
+    text_inputs = prepared["text_inputs"]
+    dec_inputs = prepared["dec_inputs"]
+    dec_targets = prepared["dec_targets"]
+    loss_mask = prepared["loss_mask"]
+    mel_uris = prepared["mel_uris"]
+
+    n = len(text_inputs)
+    indices = np.random.permutation(n) if shuffle else np.arange(n)
+
+    for i in range(0, n - batch_size + 1, batch_size):
+        idx = indices[i:i + batch_size]
+        batch_uris = [str(mel_uris[j]) for j in idx]
+        local_paths = _ensure_emilia_mels_local(
+            batch_uris,
+            gcs_prefix=gcs_prefix,
+            download_missing=not require_local_mels,
+        )
+        mel_batch = np.stack([
+            _load_emilia_mel(path, n_mels=n_mels, max_mel_len=max_mel_len)
+            for path in local_paths
+        ]).astype(np.float32)
+        yield (
+            mel_batch,
+            np.array(text_inputs[idx]),
+            np.array(dec_inputs[idx]),
+            np.array(dec_targets[idx]),
+            np.array(loss_mask[idx]),
+        )

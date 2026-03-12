@@ -1,369 +1,113 @@
-import argparse
 import math
 import os
-import pickle
 import time
-from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from tqdm import tqdm
 from flax import jax_utils
-from flax.training import train_state
+from tqdm import tqdm
 
 from .data import (
-    get_batches, get_tokenizer, get_speech_batches,
-    load_prepared_data, load_prepared_mels,
-    load_example_with_audio,
-    PrefetchIterator, count_batches,
+    PrefetchIterator, count_batches, get_batches, get_tokenizer, load_prepared_data,
+    prepare_audio_toolcall_val,
 )
-from .model import (
-    EncoderDecoderTransformer,
-    TransformerConfig,
-    make_causal_mask,
-    make_padding_mask,
-    make_mel_padding_mask,
+from .model import EncoderDecoderTransformer, make_causal_mask, make_mel_padding_mask, make_padding_mask
+from .train_utils import (
+    count_params,
+    create_config_from_args,
+    create_train_state,
+    load_checkpoint,
+    quantize_params,
+    save_checkpoint,
+    shard_batch,
+    wsd_schedule,
+    zero_non_decoder_grads,
 )
-
-def _newton_schulz(G, steps=5):
-    """Approximate polar decomposition via Newton-Schulz iteration."""
-    a, b, c = 3.4445, -4.7750, 2.0315
-    orig_dtype = G.dtype
-    G = G.astype(jnp.float32)
-    X = G / (jnp.linalg.norm(G) + 1e-7)
-    transposed = G.shape[0] > G.shape[1]
-    if transposed:
-        X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-    if transposed:
-        X = X.T
-    return X.astype(orig_dtype)
-
-
-class MuonState(NamedTuple):
-    mu: optax.Updates
-
-
-def scale_by_muon(momentum=0.95, ns_steps=5):
-    """Muon gradient transform: orthogonalize 2D+ grads, then Nesterov momentum."""
-
-    def init_fn(params):
-        return MuonState(mu=jax.tree.map(jnp.zeros_like, params))
-
-    def update_fn(updates, state, params=None):
-        del params
-
-        def ortho(g):
-            if g.ndim == 2:
-                return _newton_schulz(g, steps=ns_steps)
-            return g
-
-        ortho_g = jax.tree.map(ortho, updates)
-        new_mu = jax.tree.map(lambda m, g: momentum * m + g, state.mu, ortho_g)
-        new_updates = jax.tree.map(
-            lambda g, m: g + momentum * m, ortho_g, new_mu
-        )
-        return new_updates, MuonState(mu=new_mu)
-
-    return optax.GradientTransformation(init_fn, update_fn)
-
-
-def _param_labels(params):
-    """Label each param: 'muon' for Dense kernels, 'adam' for the rest."""
-
-    def _label(path, leaf):
-        name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
-        if name == "kernel" and leaf.ndim == 2:
-            return "muon"
-        return "adam"
-
-    return jax.tree_util.tree_map_with_path(_label, params)
-
-
-def _wsd_schedule(peak_value, total_steps, warmup_steps, decay_ratio=0.15):
-    """Warmup-Stable-Decay schedule: linear warmup, hold peak, linear decay."""
-    decay_steps = max(1, int(total_steps * decay_ratio))
-    stable_steps = total_steps - warmup_steps - decay_steps
-    return optax.join_schedules(
-        [
-            optax.linear_schedule(0.0, peak_value, warmup_steps),
-            optax.constant_schedule(peak_value),
-            optax.linear_schedule(peak_value, peak_value * 0.1, decay_steps),
-        ],
-        boundaries=[warmup_steps, warmup_steps + stable_steps],
-    )
-
-
-def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_steps):
-    model = EncoderDecoderTransformer(config)
-
-    rng, init_rng = jax.random.split(rng)
-    dummy_src = jnp.ones((1, 128), dtype=jnp.int32)
-    dummy_tgt = jnp.ones((1, 128), dtype=jnp.int32)
-    dummy_mel = jnp.ones((1, 128, config.n_mels), dtype=jnp.float32)
-    variables = model.init(
-        {"params": init_rng},
-        dummy_src,
-        dummy_tgt,
-        dummy_mel,
-        method="init_all",
-    )
-
-    adam_schedule = _wsd_schedule(learning_rate, total_steps, warmup_steps)
-    muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
-
-    muon_opt = optax.chain(
-        scale_by_muon(momentum=0.95, ns_steps=5),
-        optax.add_decayed_weights(weight_decay=0.01),
-        optax.scale_by_schedule(muon_schedule),
-        optax.scale(-1.0),
-    )
-    adam_opt = optax.chain(
-        optax.adamw(adam_schedule, b2=0.95, weight_decay=0.0),
-    )
-
-    tx = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.multi_transform(
-            {"muon": muon_opt, "adam": adam_opt},
-            _param_labels,
-        ),
-    )
-    return train_state.TrainState.create(
-        apply_fn=model.apply,
-        params=variables["params"],
-        tx=tx,
-    )
-
-
-def _fake_quantize_int4(w, group_size=32):
-    """Symmetric group-wise INT4 fake quantization with STE.
-
-    Divides the input dimension (axis 0) into groups of `group_size` elements,
-    each with its own scale factor. Falls back to per-channel if in_features < group_size.
-    """
-    in_feat, out_feat = w.shape
-    gs = min(group_size, in_feat)
-
-    pad = (gs - in_feat % gs) % gs
-    if pad > 0:
-        w_padded = jnp.pad(w, ((0, pad), (0, 0)))
-    else:
-        w_padded = w
-    
-    num_groups = w_padded.shape[0] // gs
-    w_grouped = w_padded.reshape(num_groups, gs, out_feat)
-    
-    scale = jnp.max(jnp.abs(w_grouped), axis=1, keepdims=True) / 7.0
-    scale = jnp.maximum(scale, 1e-8)
-    w_q = jnp.clip(jnp.round(w_grouped / scale), -8, 7) * scale
-    
-    w_q = w_q.reshape(-1, out_feat)[:in_feat]
-    
-    return w + jax.lax.stop_gradient(w_q - w)
-
-
-def _cubic_sparsity_schedule(step, t_start, t_end, s_final):
-    """Cubic sparsity ramp (Zhu & Gupta 2017). Returns target sparsity at *step*."""
-    if step < t_start:
-        return 0.0
-    if step >= t_end:
-        return s_final
-    frac = (step - t_start) / (t_end - t_start)
-    return s_final * (1.0 - (1.0 - frac) ** 3)
-
-
-def _make_prune_mask(params, sparsity, group_size):
-    """Compute block-prune mask entirely on-device (no numpy round-trips).
-
-    Returns binary mask tree matching param shapes and dtypes.
-    """
-    all_scores = []
-    for _, leaf in jax.tree_util.tree_leaves_with_path(params):
-        if leaf.ndim != 2:
-            continue
-        in_feat, out_feat = leaf.shape
-        gs = min(group_size, in_feat)
-        pad = (gs - in_feat % gs) % gs
-        w = jnp.pad(leaf, ((0, pad), (0, 0))) if pad else leaf
-        scores = jnp.sum(jnp.abs(w.reshape(-1, gs, out_feat)), axis=1).ravel()
-        all_scores.append(scores)
-
-    if not all_scores:
-        return jax.tree.map(jnp.ones_like, params)
-
-    threshold = jnp.percentile(jnp.concatenate(all_scores), sparsity * 100)
-
-    def _leaf_mask(path, leaf):
-        if leaf.ndim != 2:
-            return jnp.ones_like(leaf)
-        in_feat, out_feat = leaf.shape
-        gs = min(group_size, in_feat)
-        pad = (gs - in_feat % gs) % gs
-        w = jnp.pad(leaf, ((0, pad), (0, 0))) if pad else leaf
-        w_grouped = w.reshape(-1, gs, out_feat)
-        block_keep = (jnp.sum(jnp.abs(w_grouped), axis=1, keepdims=True) > threshold)
-        return jnp.broadcast_to(block_keep, w_grouped.shape).reshape(-1, out_feat)[:in_feat].astype(leaf.dtype)
-
-    return jax.tree_util.tree_map_with_path(_leaf_mask, params)
-
-
-def _quantize_params(params, group_size=32):
-    """Fake-quantize all Dense kernels in the param tree."""
-    def _maybe_quantize(path, leaf):
-        name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
-        if name == "kernel" and leaf.ndim == 2:
-            return _fake_quantize_int4(leaf, group_size=group_size)
-        return leaf
-    return jax.tree_util.tree_map_with_path(_maybe_quantize, params)
 
 
 _GROUP_SIZE = 32
-_MAT_FACTORS = ()
-_MAT_FF_WIDTHS = () 
-_D_FF = 2048 
 
 
-def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
+def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, rng, loss_mask):
     pad_id = 0
     src_mask = make_padding_mask(src, pad_id)
     tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
     logits, slot_div = state.apply_fn(
-        {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
-        src, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask,
-        ffn_mask=ffn_mask,
+        {"params": quantize_params(params, group_size=_GROUP_SIZE)},
+        src,
+        tgt_in,
+        src_mask=src_mask,
+        tgt_mask=tgt_mask,
         deterministic=False,
         method="forward_masked",
         rngs={"dropout": rng},
     )
     logits_f32 = logits.astype(jnp.float32)
-    mask = loss_mask
-    ce_loss = jnp.sum(
-        optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
-    ) / jnp.maximum(jnp.sum(mask), 1.0)
+    token_loss = optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out)
+    ce_loss = jnp.sum(token_loss * loss_mask) / jnp.maximum(jnp.sum(loss_mask), 1.0)
     z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
     div_loss = 1e-4 * slot_div
     return ce_loss + z_loss + div_loss
 
 
-def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
-    pad_id = 0
-    src_mask = make_mel_padding_mask(mel)
-    tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
-    spec_rng, drop_rng = jax.random.split(rng)
-    logits, slot_div = state.apply_fn(
-        {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
-        mel, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask,
-        ffn_mask=ffn_mask,
-        deterministic=False,
-        method="forward_speech_masked",
-        rngs={"specaugment": spec_rng, "dropout": drop_rng},
-    )
-    logits_f32 = logits.astype(jnp.float32)
-    mask = loss_mask
-    ce_loss = jnp.sum(
-        optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
-    ) / jnp.maximum(jnp.sum(mask), 1.0)
-    z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
-    div_loss = 1e-4 * slot_div
-    return ce_loss + z_loss + div_loss
-
-
-def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
-    """Build (batch, d_ff) prefix mask: batch split equally across widths.
-
-    First 1/N = full width (all ones), remaining 1/N sections = mat widths.
-    """
-    n_widths = 1 + len(mat_ff_widths)  # full + mat widths
-    per_width = batch_size // n_widths
-    arange = jnp.arange(d_ff)
-    rows = [jnp.ones((per_width, d_ff), dtype=jnp.bfloat16)]  # full width
-    for k in mat_ff_widths:
-        rows.append((arange[None, :] < k).astype(jnp.bfloat16).repeat(per_width, axis=0))
-    # Handle remainder (assign to full width)
-    remainder = batch_size - per_width * n_widths
-    if remainder > 0:
-        rows.append(jnp.ones((remainder, d_ff), dtype=jnp.bfloat16))
-    return jnp.concatenate(rows, axis=0)
-
-
-def _train_step_text(state, ema_params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
+def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask, rng, loss_mask):
     ema_decay = 0.999
     loss, grads = jax.value_and_grad(
-        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
+        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, rng, loss_mask)
     )(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
+    grads = zero_non_decoder_grads(grads)
     loss = jax.lax.pmean(loss, axis_name="batch")
     grad_norm = optax.global_norm(grads)
     state = state.apply_gradients(grads=grads)
     ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
-    return state, ema_params, loss, grad_norm
-
-
-def _train_step_text_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask, rng, loss_mask):
-    """Text training step with fused prune mask application."""
-    ema_decay = 0.999
-    loss, grads = jax.value_and_grad(
-        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
-    )(state.params)
-    grads = jax.lax.pmean(grads, axis_name="batch")
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    grad_norm = optax.global_norm(grads)
-    state = state.apply_gradients(grads=grads)
-    masked_params = jax.tree.map(lambda w, m: w * m, state.params, prune_mask)
-    state = state.replace(params=masked_params)
-    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, masked_params)
-    return state, ema_params, loss, grad_norm
-
-
-def _train_step_speech(state, ema_params, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
-    ema_decay = 0.999
-    loss, grads = jax.value_and_grad(
-        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
-    )(state.params)
-    grads = jax.lax.pmean(grads, axis_name="batch")
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    grad_norm = optax.global_norm(grads)
-    state = state.apply_gradients(grads=grads)
-    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
-    return state, ema_params, loss, grad_norm
-
-
-def _train_step_speech_masked(state, ema_params, mel, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask, rng, loss_mask):
-    """Speech training step with fused prune mask application."""
-    ema_decay = 0.999
-    loss, grads = jax.value_and_grad(
-        lambda p: _speech_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
-    )(state.params)
-    grads = jax.lax.pmean(grads, axis_name="batch")
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    grad_norm = optax.global_norm(grads)
-    state = state.apply_gradients(grads=grads)
-    masked_params = jax.tree.map(lambda w, m: w * m, state.params, prune_mask)
-    state = state.replace(params=masked_params)
-    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, masked_params)
     return state, ema_params, loss, grad_norm
 
 
 def _make_p_train_step():
-    return jax.pmap(_train_step_text, axis_name="batch", donate_argnums=(0, 1))
+    return jax.pmap(_train_step, axis_name="batch", donate_argnums=(0, 1))
 
 
-def _make_p_train_step_masked():
-    return jax.pmap(_train_step_text_masked, axis_name="batch", donate_argnums=(0, 1))
+def _speech_replay_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, rng, loss_mask):
+    """Speech transcription loss for decoder-only replay (encoder frozen via zero_non_decoder_grads)."""
+    pad_id = 0
+    src_mask = make_mel_padding_mask(mel)
+    tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+    logits, _ = state.apply_fn(
+        {"params": quantize_params(params, group_size=_GROUP_SIZE)},
+        mel,
+        tgt_in,
+        src_mask=src_mask,
+        tgt_mask=tgt_mask,
+        deterministic=False,
+        method="forward_speech_masked",
+        rngs={"dropout": rng},
+    )
+    logits_f32 = logits.astype(jnp.float32)
+    token_loss = optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out)
+    ce_loss = jnp.sum(token_loss * loss_mask) / jnp.maximum(jnp.sum(loss_mask), 1.0)
+    z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
+    return ce_loss + z_loss
 
 
-def _make_p_train_step_speech():
-    return jax.pmap(_train_step_speech, axis_name="batch", donate_argnums=(0, 1))
+def _speech_replay_step(state, ema_params, mel, tgt_in, tgt_out, causal_mask, rng, loss_mask):
+    ema_decay = 0.999
+    loss, grads = jax.value_and_grad(
+        lambda p: _speech_replay_loss_fn(state, p, mel, tgt_in, tgt_out, causal_mask, rng, loss_mask)
+    )(state.params)
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    grads = zero_non_decoder_grads(grads)
+    loss = jax.lax.pmean(loss, axis_name="batch")
+    grad_norm = optax.global_norm(grads)
+    state = state.apply_gradients(grads=grads)
+    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
+    return state, ema_params, loss, grad_norm
 
 
-def _make_p_train_step_speech_masked():
-    return jax.pmap(_train_step_speech_masked, axis_name="batch", donate_argnums=(0, 1))
+def _make_p_speech_replay_step():
+    return jax.pmap(_speech_replay_step, axis_name="batch", donate_argnums=(0, 1))
 
 
 def _make_val_loss_fn(apply_fn):
@@ -372,107 +116,110 @@ def _make_val_loss_fn(apply_fn):
         pad_id = 0
         src_mask = make_padding_mask(src, pad_id)
         tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
-        logits = apply_fn(
-            {"params": params}, src, tgt_in,
-            src_mask=src_mask, tgt_mask=tgt_mask,
-        )
+        logits = apply_fn({"params": params}, src, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask)
         loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tgt_out)
         return jnp.sum(loss * loss_mask), jnp.sum(loss_mask)
+
     return val_loss_batch
 
 
-def _make_mat_val_loss_fn(apply_fn, ff_width):
-    """Val loss for matryoshka sub-model at given FFN width."""
-    @jax.jit
-    def val_loss_batch(params, src, tgt_in, tgt_out, causal_mask, loss_mask):
-        pad_id = 0
-        src_mask = make_padding_mask(src, pad_id)
-        tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
-        logits, _, mat_logits = apply_fn(
-            {"params": params}, src, tgt_in,
-            src_mask=src_mask, tgt_mask=tgt_mask,
-            mat_ff_widths=(ff_width,),
-            method="forward_with_aux",
-        )
-        trunc_logits = mat_logits[0].astype(jnp.float32)
-        loss = optax.softmax_cross_entropy_with_integer_labels(trunc_logits, tgt_out)
-        return jnp.sum(loss * loss_mask), jnp.sum(loss_mask)
-    return val_loss_batch
+def _evaluate_val_ppl(val_loss_fn, params, val_enc, val_dec_in, val_dec_tgt, val_loss_mask,
+                      batch_size, max_dec_len, max_eval_samples=None):
+    val_causal = make_causal_mask(max_dec_len)
+    total_loss = 0.0
+    total_toks = 0.0
+    seen = 0
+    for batch in get_batches(val_enc, val_dec_in, val_dec_tgt, batch_size, shuffle=False, loss_mask=val_loss_mask):
+        if max_eval_samples is not None and seen >= max_eval_samples:
+            break
+        src, dec_in, dec_tgt, lm = batch
+        vl, vt = val_loss_fn(params, src, dec_in, dec_tgt, val_causal, lm)
+        total_loss += float(vl)
+        total_toks += float(vt)
+        seen += len(src)
+    return float(math.exp(min(total_loss / max(total_toks, 1.0), 20.0)))
+
+
+def _filter_nonempty(val_enc, val_dec_in, val_dec_tgt, val_loss_mask, min_answer_tokens=4):
+    """Return val arrays filtered to examples with at least min_answer_tokens answer tokens."""
+    answer_len = np.array(val_loss_mask).sum(axis=1)
+    mask = answer_len >= min_answer_tokens
+    idx = np.where(mask)[0]
+    return (val_enc[idx], val_dec_in[idx], val_dec_tgt[idx], val_loss_mask[idx])
 
 
 def _make_speech_val_loss_fn(apply_fn):
+    """Val loss using frozen speech encoder path (forward_speech_masked)."""
     @jax.jit
-    def val_loss_batch(params, mel, tgt_in, tgt_out, causal_mask, loss_mask):
+    def speech_val_loss_batch(params, mel, tgt_in, tgt_out, causal_mask, loss_mask):
         pad_id = 0
         src_mask = make_mel_padding_mask(mel)
         tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
-        logits, _, _ = apply_fn(
-            {"params": params}, mel, tgt_in,
-            src_mask=src_mask, tgt_mask=tgt_mask,
+        logits, _ = apply_fn(
+            {"params": params},
+            mel,
+            tgt_in,
+            src_mask=src_mask,
+            tgt_mask=tgt_mask,
             deterministic=True,
-            method="forward_speech_with_aux",
+            method="forward_speech_masked",
         )
         loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tgt_out)
-        mask = loss_mask
-        return jnp.sum(loss * mask), jnp.sum(mask)
-    return val_loss_batch
+        return jnp.sum(loss * loss_mask), jnp.sum(loss_mask)
+
+    return speech_val_loss_batch
 
 
-def _estimate_mat_params(config, matryoshka_factor):
-    """Estimate parameter count of a sub-model at a given matryoshka factor.
+def _evaluate_audio_toolcall_ppl(speech_val_loss_fn, params, audio_val_data,
+                                   batch_size, max_dec_len, max_eval_samples=None):
+    """Evaluate tool-call PPL using audio (mel) encoder input — the correct speech transfer metric.
 
-    matryoshka_factor: how many times smaller the FFN widths are (e.g. 2 = half width).
-    Embedding and attention weights are unchanged.
+    Uses speech query audio (from dataset `audio` field) → memory slots → tool call answer.
+    Same decoder targets as the text val path, so directly comparable.
     """
-    d = config.d_model
-    v = config.vocab_size
-    n_enc = config.num_encoder_layers
-    n_dec = config.num_decoder_layers
-    kv_dim = config.num_kv_heads * (d // config.num_heads)
-    m = config.num_memory_slots
-    d_ff = config.d_ff // matryoshka_factor
+    val_causal = make_causal_mask(max_dec_len)
+    mels = audio_val_data["mels"]
+    dec_in = audio_val_data["dec_inputs"]
+    dec_tgt = audio_val_data["dec_targets"]
+    loss_mask = audio_val_data["loss_mask"]
 
-    emb = v * d
-    attn = d * d + d * kv_dim * 2 + d * d
-    ffn = d * d_ff * 3
-    mixer_token = m * d_ff * 3
-    mixer_channel = d * d_ff * 3
-    enc_block = attn + ffn + mixer_token + mixer_channel
-    dec_block = attn * 2 + ffn
-    total = emb + n_enc * enc_block + n_dec * dec_block
-    return int(total)
-
-
-def shard_batch(batch, num_devices):
-    """Reshape a batch array so leading dim is (num_devices, per_device_batch, ...)."""
-    return batch.reshape(num_devices, -1, *batch.shape[1:])
+    total_loss = 0.0
+    total_toks = 0.0
+    seen = 0
+    n = len(mels)
+    for start in range(0, n, batch_size):
+        if max_eval_samples is not None and seen >= max_eval_samples:
+            break
+        end = min(start + batch_size, n)
+        mel_b = mels[start:end]
+        di_b = dec_in[start:end]
+        dt_b = dec_tgt[start:end]
+        lm_b = loss_mask[start:end]
+        vl, vt = speech_val_loss_fn(params, mel_b, di_b, dt_b, val_causal, lm_b)
+        total_loss += float(vl)
+        total_toks += float(vt)
+        seen += len(mel_b)
+    if total_toks == 0:
+        return None
+    return float(math.exp(min(total_loss / total_toks, 20.0)))
 
 
 def train(args):
-    num_devices = jax.local_device_count()
-    no_speech = getattr(args, "no_speech", False)
-    n_mels = getattr(args, "n_mels", 80)
-    max_mel_len = getattr(args, "max_mel_len", 1024)
+    global _GROUP_SIZE
+    _GROUP_SIZE = getattr(args, "group_size", 32)
 
+    num_devices = jax.local_device_count()
     use_wandb = getattr(args, "wandb", False)
     if use_wandb:
         import wandb
         if wandb.run is None:
-            wandb.init(project="needle-v1", config=vars(args))
+            wandb.init(project="needle-stage2", config=vars(args))
 
-    total_data_steps = 4 if not no_speech else 3
-    step_idx = 0
-
-    step_idx += 1
-    print(f"\n[{step_idx}/{total_data_steps}] Detecting devices...")
-    print(f"      {num_devices} device(s) for data-parallel training")
-
-    step_idx += 1
-    print(f"\n[{step_idx}/{total_data_steps}] Loading tokenizer...")
+    print(f"\n[1/3] Loading tokenizer...")
     tokenizer = get_tokenizer(max_samples=args.max_samples)
+    del tokenizer
 
-    step_idx += 1
-    print(f"\n[{step_idx}/{total_data_steps}] Loading prepared data from disk (mmap)...")
+    print(f"\n[2/3] Loading prepared tool-call data...")
     train_data = load_prepared_data("train", mmap=True)
     val_data = load_prepared_data("val", mmap=True)
     enc_inputs = train_data["enc_inputs"]
@@ -483,593 +230,247 @@ def train(args):
     val_dec_in = val_data["dec_inputs"]
     val_dec_tgt = val_data["dec_targets"]
     val_loss_mask = val_data["loss_mask"]
-    print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val tool-call pairs (memory-mapped)")
+    nonempty_val_enc, nonempty_val_dec_in, nonempty_val_dec_tgt, nonempty_val_loss_mask = \
+        _filter_nonempty(val_enc, val_dec_in, val_dec_tgt, val_loss_mask)
+    if args.max_samples is not None:
+        keep = min(args.max_samples, len(enc_inputs))
+        enc_inputs = enc_inputs[:keep]
+        dec_inputs = dec_inputs[:keep]
+        dec_targets = dec_targets[:keep]
+        train_loss_mask = train_loss_mask[:keep]
+    print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val tool-call pairs "
+          f"({len(nonempty_val_enc):,} non-empty val)")
 
-    train_mels = None
-    val_mels = None
-    if not no_speech:
-        step_idx += 1
-        print(f"\n[{step_idx}/{total_data_steps}] Loading precomputed mel spectrograms (mmap)...")
-        train_mels = load_prepared_mels(train_data["mel_cache_id"], mmap=True)
-        val_mels = load_prepared_mels(val_data["mel_cache_id"], mmap=True)
-        print(f"      {len(train_mels):,} train / {len(val_mels):,} val mel spectrograms (memory-mapped)")
+    # Load audio+tool-call val data for speech transfer eval
+    # (speech query audio → same tool-call targets as text val, measures audio→tool-call PPL)
+    n_mels = getattr(args, "n_mels", 80)
+    max_mel_len = getattr(args, "max_mel_len", 1024)
+    print(f"      Preparing audio+tool-call val data for speech transfer eval...")
+    audio_toolcall_val = prepare_audio_toolcall_val(val_data, n_mels=n_mels, max_mel_len=max_mel_len)
+    if audio_toolcall_val is not None:
+        print(f"      {len(audio_toolcall_val['mels']):,} audio+tool-call val pairs ready")
+    else:
+        print(f"      Audio+tool-call val data unavailable")
 
-    effective_batch_size = args.batch_size * num_devices
-
+    print(f"\n[3/3] Building model...")
     resume_checkpoint = getattr(args, "checkpoint", None)
     if resume_checkpoint:
-        print(f"Resuming from checkpoint: {resume_checkpoint}")
-        with open(resume_checkpoint, "rb") as f:
-            ckpt_data = pickle.load(f)
-        ckpt_params = jax.tree.map(jnp.array, ckpt_data["params"])
-        config = TransformerConfig(**ckpt_data["config"])
-        print(f"  Config: d={config.d_model}, heads={config.num_heads}, layers={config.num_encoder_layers}/{config.num_decoder_layers}")
+        ckpt_params, config, _ = load_checkpoint(resume_checkpoint)
+        print(f"      loaded {resume_checkpoint}")
     else:
-        config = TransformerConfig(
-            d_model=args.d_model,
-            num_heads=args.num_heads,
-            num_kv_heads=getattr(args, "num_kv_heads", None) or args.num_heads,
-            num_encoder_layers=args.num_layers,
-            num_decoder_layers=getattr(args, "num_dec_layers", args.num_layers),
-            d_ff=getattr(args, "d_ff", None) or args.d_model * 4,
-            max_seq_len=max(args.max_enc_len, args.max_dec_len),
-            dtype=args.dtype,
-            activation=getattr(args, "activation", "drelu"),
-            num_memory_slots=getattr(args, "num_memory_slots", 64),
-            n_mels=n_mels,
-            dropout_rate=getattr(args, "dropout", 0.1),
-        )
+        config = create_config_from_args(args, n_mels=getattr(args, "n_mels", 80))
+        ckpt_params = None
 
-    global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF
-    _GROUP_SIZE = getattr(args, "group_size", 32)
-    _D_FF = config.d_ff
-    mat_factors_raw = getattr(args, "mat_factors", None)
-    if mat_factors_raw:
-        _MAT_FACTORS = tuple(f for f in mat_factors_raw if f > 1)
-        _MAT_FF_WIDTHS = tuple(config.d_ff // f for f in _MAT_FACTORS)
-    else:
-        _MAT_FACTORS = ()
-        _MAT_FF_WIDTHS = ()
-    n_widths = 1 + len(_MAT_FF_WIDTHS) if _MAT_FF_WIDTHS else 1
-    p_train_step = _make_p_train_step()
-    p_train_step_masked = _make_p_train_step_masked()
-    p_train_step_speech = _make_p_train_step_speech()
-    p_train_step_speech_masked = _make_p_train_step_speech_masked()
+    effective_batch_size = args.batch_size * num_devices
+    batches_per_epoch = count_batches(len(enc_inputs), effective_batch_size)
+    total_steps = batches_per_epoch * args.epochs
+    warmup_steps = max(1, int(total_steps * args.warmup_ratio))
 
     np.random.seed(args.seed)
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
 
-    mat_shared_input = getattr(args, "mat_shared_input", False)
-    unique_batch_size = effective_batch_size // n_widths if (mat_shared_input and n_widths > 1) else effective_batch_size
-    text_batches_per_epoch = count_batches(len(enc_inputs), unique_batch_size)
-    if not no_speech and train_mels is not None:
-        speech_batches_per_epoch = text_batches_per_epoch
-    else:
-        speech_batches_per_epoch = 0
-    num_batches = text_batches_per_epoch + speech_batches_per_epoch
-    total_steps = num_batches * args.epochs
-    warmup_steps = max(1, int(total_steps * args.warmup_ratio))
-
     scaled_lr = args.lr * num_devices
     muon_lr = getattr(args, "muon_lr", 0.02) * math.sqrt(num_devices)
     state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps)
-    val_loss_fn = _make_val_loss_fn(state.apply_fn)
-    speech_vl_fn = _make_speech_val_loss_fn(state.apply_fn) if not no_speech else None
+    if ckpt_params is not None:
+        if getattr(args, "reinit_decoder", False):
+            # Keep encoder/embedding/mel_proj from checkpoint; reinitialise decoder from scratch.
+            fresh_params = state.params
+            merged = {k: (ckpt_params[k] if k != "decoder" else fresh_params[k])
+                      for k in ckpt_params}
+            state = state.replace(params=merged)
+            print(f"      decoder reinitialised from scratch (encoder weights kept)")
+        else:
+            state = state.replace(params=ckpt_params)
 
-    if resume_checkpoint:
-        state = state.replace(params=ckpt_params)
-        print(f"  Loaded checkpoint params into train state")
+    val_loss_fn = _make_val_loss_fn(state.apply_fn)
+    speech_val_loss_fn = _make_speech_val_loss_fn(state.apply_fn) if audio_toolcall_val is not None else None
+    p_train_step = _make_p_train_step()
+    speech_replay_every = getattr(args, "speech_replay_every", 0)
+    p_speech_replay_step = _make_p_speech_replay_step() if speech_replay_every > 0 else None
 
     ema_params = jax.tree.map(jnp.copy, state.params)
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
 
-    param_count = sum(x.size for x in jax.tree.leaves(jax_utils.unreplicate(state).params))
-    decay_steps = max(1, int(total_steps * 0.15))
-    stable_steps = total_steps - warmup_steps - decay_steps
-
-    print(f"\n  ─────────────────────────────────────")
-    print(f"  Parameters    {param_count:>12,}")
-    print(f"  d_model       {config.d_model:>12}")
-    print(f"  Heads         {config.num_heads:>7} ({config.num_kv_heads} KV)")
-    print(f"  Layers        {config.num_encoder_layers:>7} enc / {config.num_decoder_layers} dec")
-    print(f"  Memory slots  {config.num_memory_slots:>12}")
-    print(f"  Activation    {config.activation:>12}")
-    print(f"  Dtype         {config.dtype:>12}")
-    print(f"  Dropout       {config.dropout_rate:>12}")
-    if not no_speech and train_mels is not None:
-        print(f"  Speech        {speech_batches_per_epoch} batches/epoch")
-        print(f"  n_mels        {n_mels:>12}")
-        print(f"  max_mel_len   {max_mel_len:>12}")
-    else:
-        print(f"  Speech               disabled")
-    print(f"  ─────────────────────────────────────")
-    print(f"  Devices       {num_devices:>12}")
-    print(f"  Batch         {args.batch_size:>7} x {num_devices} = {effective_batch_size}")
-    print(f"  Adam LR       {args.lr:>7} x {num_devices} = {scaled_lr}")
-    print(f"  Muon LR       {args.muon_lr:>7.4f} -> {muon_lr:.4f}")
-    print(f"  Schedule      {warmup_steps}w / {stable_steps}s / {decay_steps}d (WSD)")
-    print(f"  Total steps   {total_steps:>12,}")
-    print(f"  Epochs        {args.epochs:>12}")
-    print(f"  ─────────────────────────────────────\n")
+    param_count = count_params(jax_utils.unreplicate(state).params)
+    print(f"\n  Parameters    {param_count:,}")
+    print(f"  d_model       {config.d_model}")
+    print(f"  Heads         {config.num_heads} ({config.num_kv_heads} KV)")
+    print(f"  Layers        {config.num_encoder_layers} enc / {config.num_decoder_layers} dec")
+    print(f"  Encoder       frozen during Stage 2")
+    print(f"  Batch         {args.batch_size} x {num_devices} = {effective_batch_size}")
+    print(f"  Total steps   {total_steps:,}\n")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    global_step = 0
     causal_mask = jnp.broadcast_to(
         make_causal_mask(args.max_dec_len),
         (num_devices, 1, args.max_dec_len, args.max_dec_len),
     )
+    adam_schedule = wsd_schedule(scaled_lr, total_steps, warmup_steps)
+    muon_schedule = wsd_schedule(muon_lr, total_steps, warmup_steps)
 
-    text_ffn_mask = _make_ffn_mask(args.batch_size, config.d_ff, _MAT_FF_WIDTHS)
-    text_ffn_mask = jnp.broadcast_to(
-        text_ffn_mask[None, :, :],
-        (num_devices, args.batch_size, config.d_ff),
-    )
-    if n_widths > 1:
-        print(f"  Mat factors   {n_widths} (full + {', '.join(str(f)+'x' for f in _MAT_FACTORS)})")
-        if mat_shared_input:
-            print(f"  Mat mode      shared input ({unique_batch_size // num_devices}/dev x {n_widths} repeats)")
-        else:
-            print(f"  Mat mode      unique input ({args.batch_size}/dev, random width)")
-
-    adam_schedule = _wsd_schedule(scaled_lr, total_steps, warmup_steps)
-    muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
-    tokens_per_batch = effective_batch_size * (args.max_enc_len + args.max_dec_len)
-
-    eval_model = EncoderDecoderTransformer(config)
-
+    global_step = 0
     last_val_ppl = None
-    sparsity_ratio = getattr(args, "sparsity_ratio", 0.0)
-    prune_mask = None
-    gradual_sparsify_done = False
+    last_nonempty_ppl = None
+    last_speech_ppl = None
+    best_nonempty_ppl = float("inf")
+    eval_every = getattr(args, "eval_every", 1000)
 
-    prune_interval = getattr(args, "prune_interval", 100)
-    prune_start_frac = getattr(args, "prune_start_frac", 0.33)
-    prune_end_frac = getattr(args, "prune_end_frac", 0.67)
-
-    weight_prune_epoch = 0 if sparsity_ratio > 0 else -1
+    # Speech replay (optional, disabled by default)
+    speech_replay_iter = None
 
     for epoch in range(args.epochs):
-        if epoch == weight_prune_epoch and not gradual_sparsify_done:
-            t_start = int(num_batches * prune_start_frac)
-            t_end = int(num_batches * prune_end_frac)
-            print(f"\nGradual magnitude sparsification: 0% -> {sparsity_ratio*100:.0f}% over epoch {epoch+1} "
-                  f"(steps {t_start}-{t_end}/{num_batches}, interval={prune_interval}, group_size={_GROUP_SIZE})")
-            epoch_step = 0
-
-        text_losses = []
-        speech_losses = []
-        text_batch_iter = PrefetchIterator(
-            lambda: get_batches(enc_inputs, dec_inputs, dec_targets, unique_batch_size,
-                                loss_mask=train_loss_mask),
+        losses = []
+        batch_iter = PrefetchIterator(
+            lambda: get_batches(enc_inputs, dec_inputs, dec_targets, effective_batch_size, loss_mask=train_loss_mask),
             prefetch=4,
         )
+        pbar = tqdm(range(batches_per_epoch), desc=f"Stage 2 Epoch {epoch + 1}/{args.epochs}")
 
-        speech_batch_iter = None
-        if not no_speech and train_mels is not None:
-            speech_batch_iter = PrefetchIterator(
-                lambda: get_speech_batches(train_mels, dec_inputs, dec_targets, unique_batch_size,
-                                           loss_mask=train_loss_mask),
-                prefetch=4,
-            )
+        for _ in pbar:
+            src, tgt_in, tgt_out, lm = next(batch_iter)
+            src_b = shard_batch(src, num_devices)
+            tgt_in_b = shard_batch(tgt_in, num_devices)
+            tgt_out_b = shard_batch(tgt_out, num_devices)
+            lm_b = shard_batch(lm, num_devices)
 
-        steps_this_epoch = text_batches_per_epoch + speech_batches_per_epoch
-        text_idx = 0
-        speech_idx = 0
-        speech_loss_val = None
-        pbar = tqdm(range(steps_this_epoch), desc=f"Epoch {epoch + 1}/{args.epochs}")
-
-        for step_i in pbar:
+            rng, step_rng = jax.random.split(rng)
+            step_rngs = jax.random.split(step_rng, num_devices)
             t0 = time.perf_counter()
+            state, ema_params, loss, grad_norm = p_train_step(
+                state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, step_rngs, lm_b
+            )
+            dt = time.perf_counter() - t0
+            loss_val = float(loss[0])
+            grad_norm_val = float(grad_norm[0])
+            losses.append(loss_val)
+            global_step += 1
 
-            do_speech = (step_i % 2 == 1) and speech_idx < speech_batches_per_epoch
-            do_text = not do_speech and text_idx < text_batches_per_epoch
-            if not do_speech and not do_text:
-                if text_idx < text_batches_per_epoch:
-                    do_text = True
-                elif speech_idx < speech_batches_per_epoch:
-                    do_speech = True
-                else:
-                    break
-
-            step_grad_norm = None
-
-            if do_text:
-                src, tgt_in, tgt_out, lm = next(text_batch_iter)
-                text_idx += 1
-
-                if n_widths > 1 and mat_shared_input:
-                    per_width = args.batch_size // n_widths
-                    def _tile_for_mat(arr):
-                        s = arr.reshape(num_devices, per_width, *arr.shape[1:])
-                        return np.tile(s, (1, n_widths) + (1,) * (arr.ndim - 1))
-                    src_b = _tile_for_mat(src)
-                    tgt_in_b = _tile_for_mat(tgt_in)
-                    tgt_out_b = _tile_for_mat(tgt_out)
-                    lm_b = _tile_for_mat(lm)
-                else:
-                    src_b = shard_batch(src, num_devices)
-                    tgt_in_b = shard_batch(tgt_in, num_devices)
-                    tgt_out_b = shard_batch(tgt_out, num_devices)
-                    lm_b = shard_batch(lm, num_devices)
-
-                rng, text_rng = jax.random.split(rng)
-                text_rngs = jax.random.split(text_rng, num_devices)
-
-                if prune_mask is not None:
-                    state, ema_params, loss, grad_norm = p_train_step_masked(
-                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask, text_ffn_mask, text_rngs, lm_b,
-                    )
-                else:
-                    state, ema_params, loss, grad_norm = p_train_step(
-                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_ffn_mask, text_rngs, lm_b,
-                    )
-
-                text_loss_val = float(loss[0])
-                text_losses.append(text_loss_val)
-                step_grad_norm = float(grad_norm[0])
-                global_step += 1
-
-            else:
-                mel_batch, sp_tgt_in, sp_tgt_out, sp_lm = next(speech_batch_iter)
-                speech_idx += 1
-
-                if n_widths > 1 and mat_shared_input:
-                    per_width = args.batch_size // n_widths
-                    def _tile_sp(arr):
-                        s = arr.reshape(num_devices, per_width, *arr.shape[1:])
-                        return np.tile(s, (1, n_widths) + (1,) * (arr.ndim - 1))
-                    mel_b = _tile_sp(mel_batch)
-                    sp_tgt_in_b = _tile_sp(sp_tgt_in)
-                    sp_tgt_out_b = _tile_sp(sp_tgt_out)
-                    sp_lm_b = _tile_sp(sp_lm)
-                else:
-                    mel_b = shard_batch(mel_batch, num_devices)
+            # Speech replay step (decoder-only, prevents catastrophic forgetting)
+            if (p_speech_replay_step is not None and speech_replay_every > 0
+                    and global_step % speech_replay_every == 0):
+                try:
+                    speech_batch = next(speech_replay_iter)
+                    mel_b, _, sp_tgt_in, sp_tgt_out, sp_lm = speech_batch
+                    mel_b = shard_batch(mel_b, num_devices)
                     sp_tgt_in_b = shard_batch(sp_tgt_in, num_devices)
                     sp_tgt_out_b = shard_batch(sp_tgt_out, num_devices)
                     sp_lm_b = shard_batch(sp_lm, num_devices)
-
-                rng, spec_rng = jax.random.split(rng)
-                spec_rngs = jax.random.split(spec_rng, num_devices)
-
-                if prune_mask is not None:
-                    state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech_masked(
-                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, prune_mask, text_ffn_mask, spec_rngs, sp_lm_b,
+                    rng, sp_rng = jax.random.split(rng)
+                    sp_rngs = jax.random.split(sp_rng, num_devices)
+                    state, ema_params, _, _ = p_speech_replay_step(
+                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, sp_rngs, sp_lm_b
                     )
-                else:
-                    state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech(
-                        state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, text_ffn_mask, spec_rngs, sp_lm_b,
-                    )
-                speech_loss_val = float(sp_loss[0])
-                speech_losses.append(speech_loss_val)
-                step_grad_norm = float(sp_grad_norm[0])
-                text_loss_val = text_losses[-1] if text_losses else float("nan")
-                global_step += 1
+                except StopIteration:
+                    pass
 
-            if epoch == weight_prune_epoch and not gradual_sparsify_done:
-                epoch_step += 1
-                current_sparsity = _cubic_sparsity_schedule(epoch_step, t_start, t_end, sparsity_ratio)
-                if epoch_step >= t_start and epoch_step % prune_interval == 0 and current_sparsity > 0:
-                    ema_unr = jax_utils.unreplicate(ema_params)
-                    mask = _make_prune_mask(ema_unr, current_sparsity, _GROUP_SIZE)
-                    del ema_unr
-                    prune_mask = jax_utils.replicate(mask)
-                    del mask
-
-            dt = time.perf_counter() - t0
-            eval_every = getattr(args, "eval_every", 100)
             if global_step % eval_every == 0 or global_step == total_steps:
-                _eval_params = jax_utils.unreplicate(ema_params)
-                val_causal = make_causal_mask(args.max_dec_len)
-                total_loss, total_toks = 0.0, 0.0
-                for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False, loss_mask=val_loss_mask):
-                    vl, vt = val_loss_fn(_eval_params, vb[0], vb[1], vb[2], val_causal, vb[3])
-                    total_loss += float(vl)
-                    total_toks += float(vt)
-                last_val_ppl = float(math.exp(min(total_loss / max(total_toks, 1), 20)))
+                eval_params = jax_utils.unreplicate(ema_params)
+                last_val_ppl = _evaluate_val_ppl(
+                    val_loss_fn,
+                    eval_params,
+                    val_enc,
+                    val_dec_in,
+                    val_dec_tgt,
+                    val_loss_mask,
+                    args.batch_size,
+                    args.max_dec_len,
+                    max_eval_samples=getattr(args, "max_eval_samples", None),
+                )
+                last_nonempty_ppl = _evaluate_val_ppl(
+                    val_loss_fn,
+                    eval_params,
+                    nonempty_val_enc,
+                    nonempty_val_dec_in,
+                    nonempty_val_dec_tgt,
+                    nonempty_val_loss_mask,
+                    args.batch_size,
+                    args.max_dec_len,
+                    max_eval_samples=getattr(args, "max_eval_samples", None),
+                )
+                if speech_val_loss_fn is not None:
+                    last_speech_ppl = _evaluate_audio_toolcall_ppl(
+                        speech_val_loss_fn,
+                        eval_params,
+                        audio_toolcall_val,
+                        args.batch_size,
+                        max_dec_len=args.max_dec_len,
+                        max_eval_samples=getattr(args, "max_eval_samples", None),
+                    )
+                if last_nonempty_ppl < best_nonempty_ppl:
+                    best_nonempty_ppl = last_nonempty_ppl
+                    best_ckpt = os.path.join(args.checkpoint_dir, f"needle_stage2_{config.num_encoder_layers}_{config.d_model}_best.pkl")
+                    save_checkpoint(best_ckpt, eval_params, config, extra={"stage": "stage2", "step": global_step, "val_ppl": last_val_ppl, "nonempty_val_ppl": best_nonempty_ppl, "speech_ppl": last_speech_ppl})
 
-                del _eval_params
-
-            postfix = {
-                "speech_loss": f"{speech_loss_val:.4f}" if speech_loss_val is not None else "-",
-                "text_loss": f"{text_loss_val:.4f}",
-                "text_ppl": f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?",
-            }
-            if sparsity_ratio > 0:
-                if epoch == weight_prune_epoch and not gradual_sparsify_done:
-                    postfix["sparsification"] = f"{current_sparsity*100:.1f}%"
-                else:
-                    postfix["sparsification"] = "done"
-            pbar.set_postfix(**postfix)
+            pbar.set_postfix(
+                loss=f"{loss_val:.4f}",
+                ppl=f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?",
+                ne_ppl=f"{last_nonempty_ppl:.2f}" if last_nonempty_ppl is not None else "?",
+                aud_ppl=f"{last_speech_ppl:.2f}" if last_speech_ppl is not None else "?",
+            )
 
             if use_wandb:
-                log_dict = {
-                    "train/text_loss": text_loss_val,
-                    "train/grad_norm": step_grad_norm,
-                    "train/adam_lr": float(adam_schedule(global_step)),
-                    "train/muon_lr": float(muon_schedule(global_step)),
-                    "train/tokens_per_sec": tokens_per_batch / dt,
-                    "train/step": global_step,
-                }
-                if speech_loss_val is not None:
-                    log_dict["train/speech_loss"] = speech_loss_val
-                if epoch == weight_prune_epoch and not gradual_sparsify_done:
-                    log_dict["train/scheduled_sparsity"] = current_sparsity
-                if global_step % eval_every == 0 or global_step == total_steps:
-                    log_dict["val/text_ppl"] = last_val_ppl
-                wandb.log(log_dict)
+                wandb.log(
+                    {
+                        "train/loss": loss_val,
+                        "train/grad_norm": grad_norm_val,
+                        "train/adam_lr": float(adam_schedule(global_step)),
+                        "train/muon_lr": float(muon_schedule(global_step)),
+                        "train/tokens_per_sec": effective_batch_size * (args.max_enc_len + args.max_dec_len) / max(dt, 1e-6),
+                        "train/step": global_step,
+                        **({"val/ppl": last_val_ppl, "val/nonempty_ppl": last_nonempty_ppl}
+                           if last_val_ppl is not None and (global_step % eval_every == 0 or global_step == total_steps) else {}),
+                    }
+                )
 
-        text_batch_iter.close()
-        if speech_batch_iter is not None:
-            speech_batch_iter.close()
-
-        if epoch == weight_prune_epoch and not gradual_sparsify_done:
-            gradual_sparsify_done = True
-            if prune_mask is None:
-                ema_unr = jax_utils.unreplicate(ema_params)
-                mask = _make_prune_mask(ema_unr, sparsity_ratio, _GROUP_SIZE)
-                del ema_unr
-                prune_mask = jax_utils.replicate(mask)
-                del mask
-            state = state.replace(
-                params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
-            ema_params = jax.tree.map(lambda w, m: w * m, ema_params, prune_mask)
-            final_pruned = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
-            total_p = sum(x.size for x in jax.tree.leaves(final_pruned))
-            zero_p = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(final_pruned))
-            print(f"\n  Gradual sparsification complete — mask locked.")
-            print(f"  Final sparsity: {zero_p/total_p*100:.2f}% ({zero_p:,}/{total_p:,} near-zero)")
-            del final_pruned
-
-        epoch_avg_loss = sum(text_losses) / len(text_losses) if text_losses else float("nan")
-        final_loss = text_losses[-1] if text_losses else float("nan")
-        final_ppl = math.exp(min(final_loss, 20)) if not math.isnan(final_loss) else float("nan")
+        batch_iter.close()
 
         eval_params = jax_utils.unreplicate(ema_params)
-        val_causal = make_causal_mask(args.max_dec_len)
-
-        q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE)
-        mat_vl_fns = {}
-        if _MAT_FACTORS:
-            _apply_fn = jax_utils.unreplicate(state).apply_fn
-            mat_vl_fns = {f: _make_mat_val_loss_fn(_apply_fn, fw)
-                          for f, fw in zip(_MAT_FACTORS, _MAT_FF_WIDTHS)}
-            del _apply_fn
-
-        full_loss, full_toks = 0.0, 0.0
-        q_loss, q_toks = 0.0, 0.0
-        mat_accum = {f: [0.0, 0.0] for f in _MAT_FACTORS}
-
-        for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size,
-                              shuffle=False, loss_mask=val_loss_mask):
-            src, dec_in, dec_tgt, lm = vb[0], vb[1], vb[2], vb[3]
-            vl, vt = val_loss_fn(eval_params, src, dec_in, dec_tgt, val_causal, lm)
-            full_loss += float(vl); full_toks += float(vt)
-            vl, vt = val_loss_fn(q_params, src, dec_in, dec_tgt, val_causal, lm)
-            q_loss += float(vl); q_toks += float(vt)
-            for f, fn in mat_vl_fns.items():
-                vl, vt = fn(eval_params, src, dec_in, dec_tgt, val_causal, lm)
-                mat_accum[f][0] += float(vl)
-                mat_accum[f][1] += float(vt)
-
-        last_val_ppl = float(math.exp(min(full_loss / max(full_toks, 1), 20)))
-        quant_val_ppl = float(math.exp(min(q_loss / max(q_toks, 1), 20)))
-        del q_params
-
-        mat_results = {}
-        for f in _MAT_FACTORS:
-            avg = mat_accum[f][0] / max(mat_accum[f][1], 1)
-            mat_results[f] = (float(math.exp(min(avg, 20))),
-                              _estimate_mat_params(config, f), config.d_ff // f)
-
-        speech_val_ppl = None
-        if speech_vl_fn is not None and val_mels is not None:
-            sp_total_loss, sp_total_toks = 0.0, 0.0
-            for sp_batch in get_speech_batches(val_mels, val_dec_in, val_dec_tgt, args.batch_size,
-                                               shuffle=False, loss_mask=val_loss_mask):
-                vl, vt = speech_vl_fn(eval_params, sp_batch[0], sp_batch[1], sp_batch[2], val_causal, sp_batch[3])
-                sp_total_loss += float(vl)
-                sp_total_toks += float(vt)
-            speech_val_loss = sp_total_loss / max(sp_total_toks, 1)
-            speech_val_ppl = float(math.exp(min(speech_val_loss, 20)))
-
-        params_np = jax.tree.map(np.array, eval_params)
-        total_params = sum(x.size for x in jax.tree.leaves(params_np))
-        near_zero = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(params_np))
-        sparsity = near_zero / total_params * 100
-
-        ckpt_name = f"needle_{args.num_layers}_{args.d_model}_{global_step}.pkl"
+        val_ppl = _evaluate_val_ppl(
+            val_loss_fn,
+            eval_params,
+            val_enc,
+            val_dec_in,
+            val_dec_tgt,
+            val_loss_mask,
+            args.batch_size,
+            args.max_dec_len,
+            max_eval_samples=getattr(args, "max_eval_samples", None),
+        )
+        nonempty_ppl = _evaluate_val_ppl(
+            val_loss_fn,
+            eval_params,
+            nonempty_val_enc,
+            nonempty_val_dec_in,
+            nonempty_val_dec_tgt,
+            nonempty_val_loss_mask,
+            args.batch_size,
+            args.max_dec_len,
+            max_eval_samples=getattr(args, "max_eval_samples", None),
+        )
+        speech_ppl = None
+        if speech_val_loss_fn is not None:
+            speech_ppl = _evaluate_audio_toolcall_ppl(
+                speech_val_loss_fn,
+                eval_params,
+                audio_toolcall_val,
+                args.batch_size,
+                max_dec_len=args.max_dec_len,
+                max_eval_samples=getattr(args, "max_eval_samples", None),
+            )
+        ckpt_name = f"needle_stage2_{config.num_encoder_layers}_{config.d_model}_{global_step}.pkl"
         ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
-        with open(ckpt_path, "wb") as f:
-            pickle.dump({"params": params_np, "config": config.__dict__}, f)
-        del params_np
+        save_checkpoint(ckpt_path, eval_params, config, extra={"stage": "stage2"})
 
-        from .test import measure_throughput
-        from .run import generate, generate_from_audio
-        tp = measure_throughput(eval_model, eval_params, tokenizer, num_runs=5)
-
-        _val_start = len(enc_inputs)
-        val_kept = val_data["kept_indices"]
-
-        # Pick 5 display samples (shuffled for diversity): 4 with tool calls, 1 without
-        sample_rng = np.random.RandomState(epoch + 7)
-        sample_pool = sample_rng.permutation(len(val_kept))
-        display_with, display_without = [], []
-        for k in sample_pool:
-            if len(display_with) >= 4 and len(display_without) >= 1:
-                break
-            ds_idx = int(val_kept[k]) + _val_start
-            pair = load_example_with_audio(ds_idx)
-            is_empty = pair["answers"].strip() in ("", "[]")
-            if not is_empty and len(display_with) < 4:
-                display_with.append((ds_idx, pair))
-            elif is_empty and len(display_without) < 1:
-                display_without.append((ds_idx, pair))
-        display_pairs = display_with + display_without
-
-        unified_samples = []
-        for i, (ds_idx, pair) in enumerate(display_pairs):
-            text_pred = generate(
-                eval_model, eval_params, tokenizer, pair["query"],
-                tools=pair["tools"], max_gen_len=args.max_dec_len, seed=i, stream=False,
-            ).strip()
-
-            voice_pred = None
-            if not no_speech and pair["audio_array"] is not None:
-                voice_pred = generate_from_audio(
-                    eval_model, eval_params, tokenizer, pair["audio_array"], sr=pair["sampling_rate"],
-                    tools=pair["tools"], max_gen_len=args.max_dec_len, seed=i, stream=False,
-                ).strip()
-
-            unified_samples.append({
-                "query": pair["query"],
-                "tools": pair["tools"],
-                "ref": pair["answers"],
-                "text": text_pred,
-                "voice": voice_pred,
-            })
-
-        import json as _json_mod
-        tc_n, tc_exact, tc_name_tp, tc_name_fp, tc_name_fn = 0, 0, 0, 0, 0
-        tc_call_tp, tc_call_fp, tc_call_fn, tc_parse_err = 0, 0, 0, 0
-        tc_with_n = 25
-        tc_without_n = 5
-        tc_rng = np.random.RandomState(epoch + 42)
-        tc_pool = tc_rng.permutation(len(val_kept))
-        tc_with, tc_without = [], []
-        for k in tc_pool:
-            if len(tc_with) >= tc_with_n and len(tc_without) >= tc_without_n:
-                break
-            ds_idx = int(val_kept[k]) + _val_start
-            pair = load_example_with_audio(ds_idx)
-            ref_text = pair["answers"].strip()
-            is_empty = ref_text in ("", "[]")
-            if not is_empty and len(tc_with) < tc_with_n:
-                tc_with.append((ds_idx, pair))
-            elif is_empty and len(tc_without) < tc_without_n:
-                tc_without.append((ds_idx, pair))
-        tc_eval_pairs = tc_with + tc_without
-
-        def _call_key(c):
-            if not isinstance(c, dict): return None
-            return _json_mod.dumps({"name": c.get("name"), "arguments": c.get("arguments")}, sort_keys=True)
-
-        for i, (ds_idx, pair) in enumerate(tc_eval_pairs):
-            ref_text = pair["answers"].strip()
-            pred_text = generate(
-                eval_model, eval_params, tokenizer, pair["query"],
-                tools=pair["tools"], max_gen_len=args.max_dec_len, seed=ds_idx, stream=False,
-            ).strip()
-            try:
-                ref_calls = _json_mod.loads(ref_text)
-            except (ValueError, TypeError):
-                ref_calls = []
-            try:
-                pred_calls = _json_mod.loads(pred_text)
-                if not isinstance(pred_calls, list):
-                    pred_calls = [pred_calls] if isinstance(pred_calls, dict) else []
-            except (ValueError, TypeError):
-                tc_parse_err += 1
-                pred_calls = []
-            tc_n += 1
-            if _json_mod.dumps(pred_calls, sort_keys=True) == _json_mod.dumps(ref_calls, sort_keys=True):
-                tc_exact += 1
-            ref_names = {c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c}
-            pred_names = {c["name"] for c in pred_calls if isinstance(c, dict) and "name" in c}
-            tc_name_tp += len(pred_names & ref_names)
-            tc_name_fp += len(pred_names - ref_names)
-            tc_name_fn += len(ref_names - pred_names)
-            rk = {_call_key(c) for c in ref_calls} - {None}
-            pk = {_call_key(c) for c in pred_calls} - {None}
-            tc_call_tp += len(pk & rk)
-            tc_call_fp += len(pk - rk)
-            tc_call_fn += len(rk - pk)
-
-        tc_metrics = {}
-        if tc_n > 0:
-            tc_metrics["parse_rate"] = 1.0 - tc_parse_err / tc_n
-            tc_metrics["exact_match"] = tc_exact / tc_n
-            np_ = tc_name_tp + tc_name_fp
-            nr_ = tc_name_tp + tc_name_fn
-            tc_metrics["name_f1"] = 2 * tc_name_tp / max(np_ + nr_, 1)
-            cp_ = tc_call_tp + tc_call_fp
-            cr_ = tc_call_tp + tc_call_fn
-            tc_metrics["call_f1"] = 2 * tc_call_tp / max(cp_ + cr_, 1)
-
-        del eval_params
-
-        final_speech_loss = speech_losses[-1] if speech_losses else None
-        print(f"\n  ─────────────────────────────────────")
-        print(f"  Epoch {epoch + 1}/{args.epochs}")
-        print(f"  ─────────────────────────────────────")
-        print(f"  Text loss      {final_loss:>12.4f}")
-        print(f"  Text val ppl   {last_val_ppl:>12.2f}")
-        if final_speech_loss is not None:
-            print(f"  Speech loss    {final_speech_loss:>12.4f}")
-        if speech_val_ppl is not None:
-            print(f"  Speech val ppl {speech_val_ppl:>12.2f}")
-        print(f"  Quant val ppl  {quant_val_ppl:>12.2f}  (INT4 g{_GROUP_SIZE})")
-        print(f"  Sparsity       {sparsity:>11.2f}%  ({near_zero:,}/{total_params:,})")
-        if mat_results:
-            print(f"  ─────────────────────────────────────")
-            print(f"  Matryoshka sub-models:")
-            print(f"  {'factor':>6}  {'d_ff':>6}  {'val ppl':>10}  {'params':>12}")
-            print(f"  {'1x':>6}  {config.d_ff:>6}  {last_val_ppl:>10.2f}  {total_params:>12,}  (full)")
-            for factor in sorted(mat_results.keys()):
-                mat_ppl, mat_params, ff_w = mat_results[factor]
-                print(f"  {str(factor)+'x':>6}  {ff_w:>6}  {mat_ppl:>10.2f}  {mat_params:>12,}")
-        if tc_metrics:
-            print(f"  ─── Tool-Call Accuracy ({tc_n} samples) ──")
-            print(f"  JSON parse     {tc_metrics['parse_rate']:>10.1%}")
-            print(f"  Exact match    {tc_metrics['exact_match']:>10.1%}")
-            print(f"  Name F1        {tc_metrics['name_f1']:>10.3f}")
-            print(f"  Call F1        {tc_metrics['call_f1']:>10.3f}")
-        print(f"  ─────────────────────────────────────")
-        print(f"  Throughput     {tp['tokens_per_second']:>10.1f} tok/s")
-        print(f"  Latency        {tp['avg_latency_s']:>11.3f}s")
-        if unified_samples:
-            print(f"  ─── Samples ({len(unified_samples)}) ───────────────────")
-            for j, s in enumerate(unified_samples):
-                print(f"  [{j+1}] Query: {s['query'][:120]}")
-                tools_short = s["tools"][:120]
-                if len(s["tools"]) > 120:
-                    tools_short += "..."
-                print(f"      Tools: {tools_short}")
-                print(f"      Ref:   {s['ref'][:200] or '[]'}")
-                print(f"      Text:  {s['text'][:200] or '(empty)'}")
-                if s["voice"] is not None:
-                    print(f"      Voice: {s['voice'][:200] or '(empty)'}")
-                if j < len(unified_samples) - 1:
-                    print()
-        print(f"  ─────────────────────────────────────")
-        print(f"  Checkpoint: {ckpt_path}")
-        print(f"  ─────────────────────────────────────\n")
-
-        if use_wandb:
-            log_dict = {
-                "epoch/text_loss": final_loss,
-                "epoch/text_val_ppl": last_val_ppl,
-                "epoch/quant_val_ppl": quant_val_ppl,
-                "epoch/weight_sparsity": sparsity,
-                "epoch": epoch + 1,
-            }
-            if final_speech_loss is not None:
-                log_dict["epoch/speech_loss"] = final_speech_loss
-            if speech_val_ppl is not None:
-                log_dict["epoch/speech_val_ppl"] = speech_val_ppl
-            for factor, (mat_ppl, mat_params, _) in mat_results.items():
-                log_dict[f"epoch/mat_ppl_{factor}x"] = mat_ppl
-                log_dict[f"epoch/mat_params_{factor}x"] = mat_params
-            if tc_metrics:
-                log_dict["epoch/tc_parse_rate"] = tc_metrics["parse_rate"]
-                log_dict["epoch/tc_exact_match"] = tc_metrics["exact_match"]
-                log_dict["epoch/tc_name_f1"] = tc_metrics["name_f1"]
-                log_dict["epoch/tc_call_f1"] = tc_metrics["call_f1"]
-            wandb.log(log_dict)
+        print(f"\n  Epoch {epoch + 1}/{args.epochs}")
+        print(f"  Train loss     {sum(losses) / max(len(losses), 1):.4f}")
+        print(f"  Val ppl        {val_ppl:.2f}  (all)   {nonempty_ppl:.2f}  (non-empty only)")
+        if speech_ppl is not None:
+            print(f"  Audio val ppl  {speech_ppl:.2f}  (speech query → tool call)")
+        print(f"  Checkpoint     {ckpt_path}\n")
 
     if use_wandb:
         wandb.finish()
-    print("\nTraining complete.")
-
-
+    print("Stage 2 training complete.")

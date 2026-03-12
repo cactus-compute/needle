@@ -49,6 +49,11 @@ fi
 
 source "$VENV_DIR/bin/activate"
 
+export NEEDLE_CACHE_DIR="${NEEDLE_CACHE_DIR:-/dev/shm/needle_cache}"
+export NEEDLE_TOKENIZER_DIR="${NEEDLE_TOKENIZER_DIR:-/dev/shm/needle_tokenizer}"
+export NEEDLE_LOCAL_UNIFIED_DIR="${NEEDLE_LOCAL_UNIFIED_DIR:-/dev/shm/needle_tool_calls_unified}"
+mkdir -p "$NEEDLE_CACHE_DIR" "$NEEDLE_TOKENIZER_DIR" "$NEEDLE_LOCAL_UNIFIED_DIR"
+
 echo "Installing dependencies..."
 pip install --upgrade pip -q
 pip install -e . -q
