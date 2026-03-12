@@ -441,10 +441,7 @@ def train(args):
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
 
-    mat_shared_input = getattr(args, "mat_shared_input", False)
-    unique_batch_size = effective_batch_size // n_widths if (mat_shared_input and n_widths > 1) else effective_batch_size
-   
-    unique_batch_size = (unique_batch_size // num_devices) * num_devices
+    unique_batch_size = (effective_batch_size // num_devices) * num_devices
     text_batches_per_epoch = count_batches(len(enc_inputs), unique_batch_size)
     num_batches = text_batches_per_epoch
     total_steps = num_batches * args.epochs
@@ -492,19 +489,14 @@ def train(args):
         (num_devices, 1, args.max_dec_len, args.max_dec_len),
     )
 
-    per_width = args.batch_size // n_widths if n_widths > 1 else args.batch_size
-    mat_per_device = per_width * n_widths  # actual per-device batch (may < args.batch_size)
-    text_ffn_mask = _make_ffn_mask(mat_per_device, config.d_ff, _MAT_FF_WIDTHS)
+    text_ffn_mask = _make_ffn_mask(args.batch_size, config.d_ff, _MAT_FF_WIDTHS)
     text_ffn_mask = jnp.broadcast_to(
         text_ffn_mask[None, :, :],
-        (num_devices, mat_per_device, config.d_ff),
+        (num_devices, args.batch_size, config.d_ff),
     )
     if n_widths > 1:
         print(f"  Mat factors   {n_widths} (full + {', '.join(str(f)+'x' for f in _MAT_FACTORS)})")
-        if mat_shared_input:
-            print(f"  Mat mode      shared input ({per_width}/dev x {n_widths} repeats)")
-        else:
-            print(f"  Mat mode      unique input ({args.batch_size}/dev, random width)")
+        print(f"  Mat mode      unique input ({args.batch_size}/dev, split by width)")
 
     adam_schedule = _wsd_schedule(scaled_lr, total_steps, warmup_steps)
     muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
@@ -547,19 +539,10 @@ def train(args):
 
             src, tgt_in, tgt_out, lm = next(text_batch_iter)
 
-            if n_widths > 1 and mat_shared_input:
-                def _tile_for_mat(arr):
-                    s = arr.reshape(num_devices, per_width, *arr.shape[1:])
-                    return np.tile(s, (1, n_widths) + (1,) * (arr.ndim - 1))
-                src_b = _tile_for_mat(src)
-                tgt_in_b = _tile_for_mat(tgt_in)
-                tgt_out_b = _tile_for_mat(tgt_out)
-                lm_b = _tile_for_mat(lm)
-            else:
-                src_b = shard_batch(src, num_devices)
-                tgt_in_b = shard_batch(tgt_in, num_devices)
-                tgt_out_b = shard_batch(tgt_out, num_devices)
-                lm_b = shard_batch(lm, num_devices)
+            src_b = shard_batch(src, num_devices)
+            tgt_in_b = shard_batch(tgt_in, num_devices)
+            tgt_out_b = shard_batch(tgt_out, num_devices)
+            lm_b = shard_batch(lm, num_devices)
 
             rng, text_rng = jax.random.split(rng)
             text_rngs = jax.random.split(text_rng, num_devices)
@@ -725,8 +708,8 @@ def train(args):
 
         # Collect all eval examples, then batch-generate everything at once
         import json as _json_mod
-        tc_with_n = 25
-        tc_without_n = 5
+        tc_with_n = 85
+        tc_without_n = 15
         tc_rng = np.random.RandomState(epoch + 42)
         tc_pool = tc_rng.permutation(len(val_kept))
         tc_with, tc_without = [], []

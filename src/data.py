@@ -27,20 +27,6 @@ _DISK_UNIFIED_DIR = os.path.join(_PROJECT_ROOT, "data", "tool_calls_unified")
 _SHM_UNIFIED_DIR = os.path.join("/dev/shm", "needle_data", "tool_calls_unified")
 
 
-def _pick_unified_dir():
-    """Use /dev/shm for unified dataset when RAM is plentiful, else disk."""
-    # Prefer shm if it exists there already or if we have enough RAM
-    if os.path.isdir(_SHM_UNIFIED_DIR) and any(
-        f.endswith(".arrow") for f in os.listdir(_SHM_UNIFIED_DIR)
-    ):
-        return _SHM_UNIFIED_DIR
-    if _shm_available():
-        return _SHM_UNIFIED_DIR
-    return _DISK_UNIFIED_DIR
-
-
-LOCAL_UNIFIED_DIR = _pick_unified_dir()
-
 _MIN_SHM_BYTES = 200 * 1024**3
 
 
@@ -54,6 +40,20 @@ def _shm_available():
         except OSError:
             pass
     return False
+
+
+def _pick_unified_dir():
+    """Use /dev/shm for unified dataset when RAM is plentiful, else disk."""
+    if os.path.isdir(_SHM_UNIFIED_DIR) and any(
+        f.endswith(".arrow") for f in os.listdir(_SHM_UNIFIED_DIR)
+    ):
+        return _SHM_UNIFIED_DIR
+    if _shm_available():
+        return _SHM_UNIFIED_DIR
+    return _DISK_UNIFIED_DIR
+
+
+LOCAL_UNIFIED_DIR = _pick_unified_dir()
 
 
 def _pick_cache_dir():
