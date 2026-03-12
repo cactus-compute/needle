@@ -50,7 +50,7 @@ DATASETS = {
     "toucan-qwen": ("Agent-Ark/Toucan-1.5M", "Qwen3"),
     "toucan-sft": ("Agent-Ark/Toucan-1.5M", "SFT"),
     "toolace": "Team-ACE/ToolACE",
-    "nemotron-tc": ("nvidia/Nemotron-Agentic-v1", None, "tool_calling"),
+    # "nemotron-tc": ("nvidia/Nemotron-Agentic-v1", None, "tool_calling"),
 }
 
 
