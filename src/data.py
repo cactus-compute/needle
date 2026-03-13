@@ -500,24 +500,24 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     chunk_size = max(1, len(enc_texts) // (num_workers * 4))
 
     enc_chunks = [enc_texts[i:i + chunk_size] for i in range(0, len(enc_texts), chunk_size)]
-    print(f"Tokenizing encoder inputs ({num_workers} workers)...")
     with mp.Pool(num_workers, initializer=_init_worker,
                  initargs=(model_path, max_enc_len)) as pool:
-        enc_results = pool.map(_tokenize_chunk, enc_chunks)
+        enc_results = list(tqdm(pool.imap(_tokenize_chunk, enc_chunks),
+                                total=len(enc_chunks), desc="Tokenizing queries"))
     all_enc_tokens = [tok for chunk in enc_results for tok in chunk]
 
     tools_chunks = [tools_texts[i:i + chunk_size] for i in range(0, len(tools_texts), chunk_size)]
-    print(f"Tokenizing tools ({num_workers} workers)...")
     with mp.Pool(num_workers, initializer=_init_worker,
                  initargs=(model_path, max_enc_len)) as pool:
-        tools_results = pool.map(_tokenize_chunk, tools_chunks)
+        tools_results = list(tqdm(pool.imap(_tokenize_chunk, tools_chunks),
+                                  total=len(tools_chunks), desc="Tokenizing tools"))
     all_tools_tokens = [tok for chunk in tools_results for tok in chunk]
 
     ans_chunks = [ans_texts[i:i + chunk_size] for i in range(0, len(ans_texts), chunk_size)]
-    print(f"Tokenizing answers ({num_workers} workers)...")
     with mp.Pool(num_workers, initializer=_init_worker,
                  initargs=(model_path, max_dec_len)) as pool:
-        ans_results = pool.map(_tokenize_chunk, ans_chunks)
+        ans_results = list(tqdm(pool.imap(_tokenize_chunk, ans_chunks),
+                                total=len(ans_chunks), desc="Tokenizing answers"))
     all_ans_tokens = [tok for chunk in ans_results for tok in chunk]
 
     n = len(ds)
@@ -568,7 +568,7 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     loss_mask = np.zeros((n, max_dec_len), dtype=np.float32)
 
     skipped = 0
-    for i in range(n):
+    for i in tqdm(range(n), desc="Building pairs"):
         if not _fill_sample(i, all_enc_tokens[i], all_tools_tokens[i],
                             all_ans_tokens[i], ans_texts[i], enc_inputs,
                             dec_inputs, dec_targets, loss_mask):
