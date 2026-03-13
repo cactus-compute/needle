@@ -356,7 +356,7 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
         user_defined_symbols=["<tool_call>", "<transcribe>", "<tools>"],
         byte_fallback=True,
         normalization_rule_name="identity",
-        num_threads=os.cpu_count(),
+        num_threads=min(20, max(1, (os.cpu_count() or 1) // 4)),
         train_extremely_large_corpus=False,
         minloglevel=2,
     )
@@ -495,7 +495,7 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     if shuffle_tools:
         tools_texts = [_shuffle_tools_json(t, seed=i) for i, t in enumerate(tools_texts)]
 
-    num_workers = max(1, (os.cpu_count() or 1) // 2)
+    num_workers = min(20, max(1, (os.cpu_count() or 1) // 4))
     model_path = TOKENIZER_PREFIX + ".model"
     chunk_size = max(1, len(enc_texts) // (num_workers * 4))
 

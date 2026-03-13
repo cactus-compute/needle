@@ -39,7 +39,7 @@ from collections import Counter
 
 from datasets import load_dataset, Dataset, concatenate_datasets
 
-_NUM_WORKERS = max(1, (os.cpu_count() or 1) // 2)
+_NUM_WORKERS = min(20, max(1, (os.cpu_count() or 1) // 4))
 
 
 DATASETS = {

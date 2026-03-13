@@ -67,11 +67,8 @@ def tokenize(args):
         _save_cache_metadata(split, text_cache_id, len(kept_indices),
                              max_enc_len, max_dec_len)
 
-    try:
-        from .gcs import upload_tokenized_data, upload_tokenizer
-        upload_tokenizer(TOKENIZER_DIR)
-        upload_tokenized_data(CACHE_DIR)
-    except Exception as e:
-        print(f"[GCS] Upload failed (non-fatal): {e}")
+    from .gcs import upload_tokenized_data, upload_tokenizer
+    upload_tokenizer(TOKENIZER_DIR)
+    upload_tokenized_data(CACHE_DIR)
 
     print("\n=== Tokenization pipeline complete ===")

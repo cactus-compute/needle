@@ -73,11 +73,8 @@ def main():
     logger.info(f"Saved {len(combined)} rows to {args.output}/")
 
     # Persist to GCS
-    try:
-        from src.gcs import upload_raw_data
-        upload_raw_data(args.output)
-    except Exception as e:
-        logger.warning(f"GCS upload failed (non-fatal): {e}")
+    from src.gcs import upload_raw_data
+    upload_raw_data(args.output)
 
     print_summary(combined)
 
