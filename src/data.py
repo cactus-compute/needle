@@ -97,8 +97,8 @@ EOS_ID = 1
 BOS_ID = 2
 UNK_ID = 3
 TOOL_CALL_ID = 4
-TRANSCRIBE_ID = 5
-TOOLS_ID = 6
+TOOLS_ID = 5
+DEFER_ID = 6
 
 DEFAULT_MAX_ENC_LEN = 1024
 DEFAULT_MAX_DEC_LEN = 512
@@ -109,17 +109,15 @@ _unified_dataset_cache = None
 
 def _mark_json_value(s, char_w, key, value_str, weight):
     """Find '"key": "value_str"' or '"key": value_str' in s, mark value chars."""
-    # For string values: "key": "value"
     pattern_str = f'"{_re.escape(key)}"\\s*:\\s*"{_re.escape(value_str)}"'
     for m in _re.finditer(pattern_str, s):
-        # Mark only the value part (inside quotes)
         tail = s[m.start() + len(f'"{key}"'):m.end()]
         val_offset = tail.index(f'"{value_str}"') + 1
         val_start = m.start() + len(f'"{key}"') + val_offset
         val_end = val_start + len(value_str)
         char_w[val_start:val_end] = np.maximum(char_w[val_start:val_end], weight)
         return
-    # For non-string values: "key": 123 or "key": true etc.
+        
     pattern_ns = f'"{_re.escape(key)}"\\s*:\\s*{_re.escape(value_str)}'
     for m in _re.finditer(pattern_ns, s):
         colon_offset = s[m.start():m.end()].index(':')
@@ -287,12 +285,12 @@ class NeedleTokenizer:
         return TOOL_CALL_ID
 
     @property
-    def transcribe_token_id(self):
-        return TRANSCRIBE_ID
-
-    @property
     def tools_token_id(self):
         return TOOLS_ID
+
+    @property
+    def defer_token_id(self):
+        return DEFER_ID
 
     @property
     def vocab_size(self):
@@ -365,7 +363,7 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
         eos_id=EOS_ID,
         bos_id=BOS_ID,
         unk_id=UNK_ID,
-        user_defined_symbols=["<tool_call>", "<transcribe>", "<tools>"],
+        user_defined_symbols=["<tool_call>", "<tools>", "<defer>"],
         byte_fallback=True,
         normalization_rule_name="identity",
         num_threads=min(20, max(1, (os.cpu_count() or 1) // 4)),
@@ -509,9 +507,20 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     tool_call_id = tokenizer.tool_call_token_id
     tools_sep_id = tokenizer.tools_token_id
 
+    defer_id = tokenizer.defer_token_id
+
     enc_texts = [ex["query"] for ex in ds]
     tools_texts = [ex["tools"] for ex in ds]
     ans_texts = [ex["answers"] for ex in ds]
+
+    # Track which samples have empty tools (will use <defer> token instead)
+    empty_tools_mask = []
+    for t in tools_texts:
+        try:
+            parsed = _json.loads(t)
+            empty_tools_mask.append(isinstance(parsed, list) and len(parsed) == 0)
+        except (ValueError, TypeError):
+            empty_tools_mask.append(False)
 
     tool_counts = np.array([_count_tool_calls(a) for a in ans_texts], dtype=np.int32)
 
@@ -545,7 +554,8 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
 
     n = len(ds)
 
-    def _fill_sample(j, e_tok, t_tok, a_tok, ans_text, enc_arr, dec_in_arr, dec_tgt_arr, lm_arr):
+    def _fill_sample(j, e_tok, t_tok, a_tok, ans_text, is_empty_tools,
+                     enc_arr, dec_in_arr, dec_tgt_arr, lm_arr):
         """Fill arrays at position j for one sample. Returns False if skipped."""
         al = len(a_tok)
         # Decoder needs: [EOS, <tool_call>, answer..., EOS] = 2 + al + 1
@@ -553,6 +563,10 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
             return False
 
         # Encoder: [query..., <tools>, tools...] truncated to max_enc_len
+        # For empty tools, use <defer> token instead of tokenized "[]"
+        if is_empty_tools:
+            t_tok = [defer_id]
+
         # Reserve 1 slot for <tools> separator + at least 1 token for tools
         max_query = max_enc_len - 1 - 1  # room for <tools> + at least 1 tools token
         if len(e_tok) > max_query:
@@ -593,8 +607,8 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     skipped = 0
     for i in tqdm(range(n), desc="Building pairs"):
         if not _fill_sample(i, all_enc_tokens[i], all_tools_tokens[i],
-                            all_ans_tokens[i], ans_texts[i], enc_inputs,
-                            dec_inputs, dec_targets, loss_mask):
+                            all_ans_tokens[i], ans_texts[i], empty_tools_mask[i],
+                            enc_inputs, dec_inputs, dec_targets, loss_mask):
             skipped += 1
 
     if skipped > 0:

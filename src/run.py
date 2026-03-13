@@ -91,14 +91,30 @@ def load_checkpoint(path):
 
 
 def _build_encoder_input(tokenizer, query, tools, max_enc_len=DEFAULT_MAX_ENC_LEN):
-    """Build encoder input: [query..., <tools>, tools...] truncated to max_enc_len."""
+    """Build encoder input: [query..., <tools>, tools...] truncated to max_enc_len.
+
+    Empty tools ([]) are replaced with the <defer> token.
+    """
     tools_sep_id = tokenizer.tools_token_id
+    defer_id = tokenizer.defer_token_id
     q_toks = tokenizer.encode(query)
-    t_toks = tokenizer.encode(tools)
-    max_query = max_enc_len - 2 
+
+    # Use <defer> token for empty tools
+    try:
+        parsed = _json.loads(tools)
+        is_empty = isinstance(parsed, list) and len(parsed) == 0
+    except (ValueError, TypeError):
+        is_empty = False
+
+    if is_empty:
+        t_toks = [defer_id]
+    else:
+        t_toks = tokenizer.encode(tools)
+
+    max_query = max_enc_len - 2
     if len(q_toks) > max_query:
         q_toks = q_toks[:max_query]
-    remaining = max_enc_len - len(q_toks) - 1  
+    remaining = max_enc_len - len(q_toks) - 1
     t_toks = t_toks[:remaining]
     return q_toks + [tools_sep_id] + t_toks
 
