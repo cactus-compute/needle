@@ -50,7 +50,7 @@ DATASETS = {
     "toucan-qwen": ("Agent-Ark/Toucan-1.5M", "Qwen3"),
     "toucan-sft": ("Agent-Ark/Toucan-1.5M", "SFT"),
     "toolace": "Team-ACE/ToolACE",
-    # "nemotron-tc": ("nvidia/Nemotron-Agentic-v1", None, "tool_calling"),
+    "nemotron-tc": ("nvidia/Nemotron-Agentic-v1", None, "tool_calling"),
 }
 
 
@@ -675,6 +675,39 @@ def _trim_tools(dataset, max_tools=5, seed=42):
     return Dataset.from_list(rows)
 
 
+def _normalize_tool_names(dataset):
+    """Normalize all tool names to snake_case in both tools and answers fields."""
+    from src.data import to_snake_case
+
+    rows = []
+    for i in range(len(dataset)):
+        ex = dataset[i]
+        try:
+            tools = json.loads(ex["tools"])
+        except (json.JSONDecodeError, TypeError):
+            rows.append(ex)
+            continue
+        try:
+            answers = json.loads(ex["answers"])
+        except (json.JSONDecodeError, TypeError):
+            answers = []
+
+        for t in tools:
+            if isinstance(t, dict) and "name" in t:
+                t["name"] = to_snake_case(t["name"])
+        for a in answers:
+            if isinstance(a, dict) and "name" in a:
+                a["name"] = to_snake_case(a["name"])
+
+        rows.append({
+            "query": ex["query"],
+            "answers": json.dumps(answers),
+            "tools": json.dumps(tools),
+            "source": ex["source"],
+        })
+    return Dataset.from_list(rows)
+
+
 def _augment_irrelevance(dataset, ratio=0.1, seed=42):
     """Create irrelevance samples by swapping tools with unrelated queries.
 
@@ -802,6 +835,9 @@ def load_and_combine():
     before_trim = len(combined)
     combined = _trim_tools(combined, max_tools=5, seed=42)
     print(f"  {before_trim} -> {len(combined)} after tool trimming")
+
+    combined = _normalize_tool_names(combined)
+    print(f"  Normalized tool names to snake_case")
 
     combined = _augment_irrelevance(combined, ratio=0.1, seed=42)
 

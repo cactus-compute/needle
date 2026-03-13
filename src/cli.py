@@ -19,11 +19,11 @@ def main():
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
-    p.add_argument("--d-model", type=int, default=512)
+    p.add_argument("--d-model", type=int, default=768)
     p.add_argument("--num-heads", type=int, default=16)
     p.add_argument("--num-kv-heads", type=int, default=8)
-    p.add_argument("--num-layers", type=int, default=6)
-    p.add_argument("--num-dec-layers", type=int, default=6)
+    p.add_argument("--num-layers", type=int, default=8)
+    p.add_argument("--num-dec-layers", type=int, default=8)
     p.add_argument("--max-enc-len", type=int, default=DEFAULT_MAX_ENC_LEN)
     p.add_argument("--max-dec-len", type=int, default=DEFAULT_MAX_DEC_LEN)
     p.add_argument("--max-samples", type=int, default=None)
@@ -42,8 +42,9 @@ def main():
                    help="Fraction of epoch to train before starting gradual pruning (default: 0.33)")
     p.add_argument("--prune-end-frac", type=float, default=0.67,
                    help="Fraction of epoch at which pruning finishes and mask locks (default: 0.67)")
-    p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu"])
-    p.add_argument("--num-memory-slots", type=int, default=128)
+    p.add_argument("--activation", type=str, default="swiglu", choices=["drelu", "swiglu", "geglu"])
+    p.add_argument("--num-memory-slots", type=int, default=128,
+                   help="(DEPRECATED — ignored, kept for checkpoint compat)")
     p.add_argument("--mat-factors", type=int, nargs="*", default=[2, 4],
                    help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4)")
     p.add_argument("--dropout", type=float, default=0.1,

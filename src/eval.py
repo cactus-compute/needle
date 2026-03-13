@@ -57,12 +57,12 @@ def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is th
     decode_fn = _get_decode_fn(model, max_gen_len)
 
     # Warmup JIT
-    encoder_out = model.apply(
+    encoder_out, enc_mask = model.apply(
         {"params": params}, enc_input, src_mask=src_mask, method="encode"
     )
     dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
     dec_buffer = dec_buffer.at[0, 0].set(eos_id)
-    decode_fn(params, dec_buffer, encoder_out)
+    decode_fn(params, dec_buffer, encoder_out, enc_mask)
 
     tokens_generated = []
     latencies = []
@@ -73,10 +73,10 @@ def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is th
         dec_buffer = dec_buffer.at[0, 0].set(eos_id)
 
         start = time.perf_counter()
-        encoder_out = model.apply(
+        encoder_out, enc_mask = model.apply(
             {"params": params}, enc_input, src_mask=src_mask, method="encode"
         )
-        logits = decode_fn(params, dec_buffer, encoder_out)
+        logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
 
         num_tokens = 0
         for i in range(max_gen_len - 1):
@@ -88,7 +88,7 @@ def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is th
 
             num_tokens += 1
             dec_buffer = dec_buffer.at[0, i + 1].set(next_token)
-            logits = decode_fn(params, dec_buffer, encoder_out)
+            logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
 
         elapsed = time.perf_counter() - start
         tokens_generated.append(num_tokens)
@@ -171,15 +171,14 @@ def compute_wer(hypotheses, references):
 def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN):
     """Generate tool-call predictions and compute structured metrics."""
     import json
-    from .run import generate_batch
-    from .data import load_tool_calls
+    from .run import generate_batch, normalize_tools, restore_tool_names
+    from .data import load_tool_calls, to_snake_case
 
     ds = load_tool_calls("validation", max_samples=num_samples)
 
-    # Batch-generate all predictions at once
     queries = [ex["query"] for ex in ds]
     tools_list = [ex["tools"] for ex in ds]
-    all_preds = generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=max_gen_len, max_enc_len=max_enc_len)
+    all_preds = generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=max_gen_len, max_enc_len=max_enc_len, normalize=True)
 
     total = 0
     exact_match = 0
@@ -215,6 +214,35 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
             ref_calls = json.loads(ref_text)
         except (json.JSONDecodeError, TypeError):
             ref_calls = []
+
+        # Normalize ref tool names to snake_case for consistent comparison
+        for rc in ref_calls:
+            if isinstance(rc, dict) and "name" in rc:
+                rc["name"] = to_snake_case(rc["name"])
+
+        # Normalize pred tool names to snake_case too (restore_tool_names in
+        # generate_batch maps back to originals, but we want snake_case comparison)
+        try:
+            pred_calls_raw = json.loads(pred_text)
+            if isinstance(pred_calls_raw, list):
+                for pc in pred_calls_raw:
+                    if isinstance(pc, dict) and "name" in pc:
+                        pc["name"] = to_snake_case(pc["name"])
+            elif isinstance(pred_calls_raw, dict) and "name" in pred_calls_raw:
+                pred_calls_raw["name"] = to_snake_case(pred_calls_raw["name"])
+            pred_text = json.dumps(pred_calls_raw)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # Also normalize tool definitions for param validation
+        try:
+            tool_defs_raw = json.loads(ex["tools"])
+            for td in tool_defs_raw:
+                if isinstance(td, dict) and "name" in td:
+                    td["name"] = to_snake_case(td["name"])
+            tools_normalized = json.dumps(tool_defs_raw)
+        except (json.JSONDecodeError, TypeError):
+            tools_normalized = ex["tools"]
 
         try:
             pred_calls = json.loads(pred_text)
@@ -260,7 +288,7 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
                     args_correct += 1
 
         try:
-            tool_defs = json.loads(ex["tools"])
+            tool_defs = json.loads(tools_normalized)
             tool_param_map = {t["name"]: set((t.get("parameters") or {}).keys()) for t in tool_defs if isinstance(t, dict) and "name" in t}
         except (json.JSONDecodeError, TypeError):
             tool_param_map = {}

@@ -19,6 +19,18 @@ import sentencepiece as spm
 
 import re as _re
 
+def to_snake_case(name):
+    """Convert camelCase, PascalCase, or dot.notation name to snake_case."""
+    # Replace any non-alphanumeric/underscore characters with underscores
+    s = _re.sub(r'[^a-zA-Z0-9_]+', '_', name)
+    # Insert underscore before uppercase letters that follow lowercase/digits
+    s = _re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
+    # Insert underscore between consecutive uppercase and uppercase+lowercase
+    s = _re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', s)
+    # Collapse multiple underscores and strip edges
+    s = _re.sub(r'_+', '_', s)
+    return s.lower().strip('_')
+
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 _DISK_CACHE_DIR = os.path.join(_PROJECT_ROOT, ".data_cache")
 TOKENIZER_DIR = os.path.join(_PROJECT_ROOT, "tokenizer")

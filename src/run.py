@@ -1,12 +1,14 @@
 import argparse
+import json as _json
 import pickle
+import re as _re
 import sys
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .data import get_tokenizer, compute_mel_spectrogram, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_GEN_LEN
+from .data import get_tokenizer, compute_mel_spectrogram, to_snake_case, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_GEN_LEN
 from .model import (
     EncoderDecoderTransformer,
     TransformerConfig,
@@ -14,6 +16,46 @@ from .model import (
     make_padding_mask,
     make_mel_padding_mask,
 )
+
+
+def normalize_tools(tools_json):
+    """Normalize tool names in a tools JSON string to snake_case.
+
+    Returns (normalized_json, name_map) where name_map maps
+    snake_name -> original_name for reverse mapping.
+    """
+    try:
+        tools = _json.loads(tools_json)
+    except (_json.JSONDecodeError, TypeError):
+        return tools_json, {}
+    name_map = {}
+    for t in tools:
+        if isinstance(t, dict) and "name" in t:
+            orig = t["name"]
+            snake = to_snake_case(orig)
+            name_map[snake] = orig
+            t["name"] = snake
+    return _json.dumps(tools, separators=(",", ":")), name_map
+
+
+def restore_tool_names(pred_text, name_map):
+    """Replace snake_case tool names in model output back to original names."""
+    if not name_map:
+        return pred_text
+    try:
+        calls = _json.loads(pred_text)
+    except (_json.JSONDecodeError, TypeError):
+        # Fallback: string-level replacement, longest names first
+        for snake, orig in sorted(name_map.items(), key=lambda x: len(x[0]), reverse=True):
+            pred_text = pred_text.replace(snake, orig)
+        return pred_text
+    if isinstance(calls, list):
+        for c in calls:
+            if isinstance(c, dict) and "name" in c:
+                c["name"] = name_map.get(c["name"], c["name"])
+    elif isinstance(calls, dict) and "name" in calls:
+        calls["name"] = name_map.get(calls["name"], calls["name"])
+    return _json.dumps(calls, separators=(",", ":"))
 
 
 _decode_fn_cache = {}
@@ -30,10 +72,10 @@ def _get_decode_fn(model, max_gen_len):
         tgt_mask = make_causal_mask(max_gen_len)
 
         @jax.jit
-        def decode_step(params, dec_buffer, encoder_out):
+        def decode_step(params, dec_buffer, encoder_out, cross_mask):
             return model.apply(
                 {"params": params}, dec_buffer, encoder_out,
-                self_mask=tgt_mask, method="decode",
+                self_mask=tgt_mask, cross_mask=cross_mask, method="decode",
             )
 
         _decode_fn_cache[key] = decode_step
@@ -61,12 +103,16 @@ def _build_encoder_input(tokenizer, query, tools, max_enc_len=DEFAULT_MAX_ENC_LE
     return q_toks + [tools_sep_id] + t_toks
 
 
-def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, seed=0, stream=True, task_token_id=None):
+def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, seed=0, stream=True, task_token_id=None, normalize=True):
     """Generate tool-call output.
 
     Encoder: [query_tokens..., <tools>, tools_tokens...] truncated to max_enc_len.
     Decoder: prefilled with [EOS, <tool_call>], then greedy decode.
     """
+    name_map = {}
+    if normalize:
+        tools, name_map = normalize_tools(tools)
+
     enc_tokens = _build_encoder_input(tokenizer, query, tools, max_enc_len)
     enc_input = jnp.array([enc_tokens])
 
@@ -75,7 +121,7 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
     tool_call_id = task_token_id if task_token_id is not None else tokenizer.tool_call_token_id
 
     src_mask = make_padding_mask(enc_input, pad_id)
-    encoder_out = model.apply(
+    encoder_out, enc_mask = model.apply(
         {"params": params}, enc_input, src_mask=src_mask, method="encode"
     )
 
@@ -94,7 +140,7 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
         sys.stdout.write(f"\n")
         sys.stdout.flush()
 
-    logits = decode_fn(params, dec_buffer, encoder_out)
+    logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
 
     for i in range(prefix_len - 1, max_gen_len - 1):
         next_logits = logits[0, i]
@@ -110,15 +156,18 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
             sys.stdout.write(tokenizer.decode([next_token]))
             sys.stdout.flush()
 
-        logits = decode_fn(params, dec_buffer, encoder_out)
+        logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
 
     if stream:
         sys.stdout.write("\n")
 
-    return tokenizer.decode(generated_tokens)
+    result = tokenizer.decode(generated_tokens)
+    if normalize and name_map:
+        result = restore_tool_names(result, name_map)
+    return result
 
 
-def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN):
+def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, normalize=True):
     """Batch-generate tool-call outputs for multiple examples at once.
 
     Encoder: [query_tokens..., <tools>, tools_tokens...] per example, truncated to max_enc_len.
@@ -126,6 +175,15 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
 
     Returns a list of decoded strings, one per example.
     """
+    name_maps = []
+    if normalize:
+        normed_tools = []
+        for t in tools_list:
+            nt, nm = normalize_tools(t)
+            normed_tools.append(nt)
+            name_maps.append(nm)
+        tools_list = normed_tools
+
     B = len(queries)
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
@@ -142,7 +200,7 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
     enc_input = jnp.array(enc_input)
     src_mask = make_padding_mask(enc_input, pad_id)
 
-    encoder_out = model.apply(
+    encoder_out, enc_mask = model.apply(
         {"params": params}, enc_input, src_mask=src_mask, method="encode"
     )
 
@@ -159,7 +217,7 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
     finished = [False] * B
     gen_tokens = [[] for _ in range(B)]
 
-    logits = decode_fn(params, dec_buffer, encoder_out)
+    logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
 
     for pos in range(prefix_len - 1, max_gen_len - 1):
         for i in range(B):
@@ -175,9 +233,12 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
         if all(finished):
             break
 
-        logits = decode_fn(params, dec_buffer, encoder_out)
+        logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
 
-    return [tokenizer.decode(toks) for toks in gen_tokens]
+    results = [tokenizer.decode(toks) for toks in gen_tokens]
+    if normalize and name_maps:
+        results = [restore_tool_names(r, nm) for r, nm in zip(results, name_maps)]
+    return results
 
 
 def load_audio(path, target_sr=16000):
@@ -209,7 +270,7 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
     tool_call_id = tokenizer.tool_call_token_id
 
     src_mask = make_mel_padding_mask(mel_input)
-    encoder_out = model.apply(
+    encoder_out, enc_mask = model.apply(
         {"params": params}, mel_input, src_mask=src_mask, deterministic=True, method="encode_speech"
     )
 
@@ -229,7 +290,7 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
         sys.stdout.write("\n")
         sys.stdout.flush()
 
-    logits = decode_fn(params, dec_buffer, encoder_out)
+    logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
 
     for i in range(prefix_len - 1, max_gen_len - 1):
         next_logits = logits[0, i]
@@ -245,7 +306,7 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
             sys.stdout.write(tokenizer.decode([next_token]))
             sys.stdout.flush()
 
-        logits = decode_fn(params, dec_buffer, encoder_out)
+        logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
 
     if stream:
         sys.stdout.write("\n")

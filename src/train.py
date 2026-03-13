@@ -244,8 +244,7 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rn
         optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
     ) / jnp.maximum(jnp.sum(mask), 1.0)
     z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
-    div_loss = 1e-4 * slot_div
-    return ce_loss + z_loss + div_loss
+    return ce_loss + z_loss
 
 
 
@@ -351,17 +350,16 @@ def _estimate_mat_params(config, matryoshka_factor):
     n_enc = config.num_encoder_layers
     n_dec = config.num_decoder_layers
     kv_dim = config.num_kv_heads * (d // config.num_heads)
-    m = config.num_memory_slots
     d_ff = config.d_ff // matryoshka_factor
 
     emb = v * d
     attn = d * d + d * kv_dim * 2 + d * d
     ffn = d * d_ff * 3
-    mixer_token = m * d_ff * 3
-    mixer_channel = d * d_ff * 3
-    enc_block = attn + ffn + mixer_token + mixer_channel
-    dec_block = attn * 2 + ffn
-    total = emb + n_enc * enc_block + n_dec * dec_block
+    # Encoder: self-attn + FFN per block, plus downsample conv params
+    downsample = d * 4 + d * d  # depthwise conv (kernel=4) + pointwise Dense
+    enc_block = attn + ffn
+    dec_block = attn * 2 + ffn  # self-attn + cross-attn + FFN
+    total = emb + downsample + n_enc * enc_block + n_dec * dec_block
     return int(total)
 
 
@@ -469,7 +467,6 @@ def train(args):
     print(f"  d_model       {config.d_model:>12}")
     print(f"  Heads         {config.num_heads:>7} ({config.num_kv_heads} KV)")
     print(f"  Layers        {config.num_encoder_layers:>7} enc / {config.num_decoder_layers} dec")
-    print(f"  Memory slots  {config.num_memory_slots:>12}")
     print(f"  Activation    {config.activation:>12}")
     print(f"  Dtype         {config.dtype:>12}")
     print(f"  ─────────────────────────────────────")

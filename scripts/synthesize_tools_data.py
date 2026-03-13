@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Synthesize tool-calling data from PleIAs/SYNTH queries via OpenRouter.
+"""Synthesize tool-calling data from multiple query sources via OpenRouter.
 
-Downloads the first parquet shard of PleIAs/SYNTH (~1M diverse multilingual
-queries), then prompts an LLM to generate (tools, answer) pairs for each query.
+Query sources:
+  1. PleIAs/SYNTH parquet shards (~154k queries per shard, 7 shards)
+  2. GCS raw_data — queries extracted from the existing unified tool-calling dataset
+
+Each query is sent to a randomly-selected frontier model to generate
+(tools, answer) pairs, then validated and checkpointed as JSONL.
 
 Usage:
-    python scripts/synthesize_tools_data.py
-    python scripts/synthesize_tools_data.py --max-samples 10000 --model google/gemini-2.5-flash
-    python scripts/synthesize_tools_data.py --resume  # continue from last checkpoint
+    python scripts/synthesize_tools_data.py                          # all sources
+    python scripts/synthesize_tools_data.py --model google/gemini-3.1-flash-lite-preview
+    python scripts/synthesize_tools_data.py --max-shards 1 --max-samples 100
+    python scripts/synthesize_tools_data.py --no-gcs               # skip GCS queries
+    python scripts/synthesize_tools_data.py --resume               # continue from checkpoint
 """
 
 import argparse
@@ -28,10 +34,17 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _OUTPUT_DIR = _PROJECT_ROOT / "data" / "synth_tool_calls"
 _CHECKPOINT_PATH = _OUTPUT_DIR / "checkpoint.jsonl"
-_PARQUET_CACHE = _PROJECT_ROOT / ".data_cache" / "synth_shard0.parquet"
+_PARQUET_CACHE_DIR = _PROJECT_ROOT / ".data_cache"
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "google/gemini-2.5-flash"
+
+MODEL_POOL = [
+    "google/gemini-3.1-flash-lite-preview",
+    # "anthropic/claude-opus-4.6",
+    # "x-ai/grok-4.1-fast",
+    # "openai/gpt-5.3-chat",
+]
+DEFAULT_MODEL = "google/gemini-3.1-flash-lite-preview"
 
 SYSTEM_PROMPT = """\
 You are a synthetic data generator for training a tool-calling AI model.
@@ -39,15 +52,27 @@ You are a synthetic data generator for training a tool-calling AI model.
 Given a user query, you must invent a realistic set of tools (APIs/functions) that \
 could help answer it, then produce the correct tool call(s).
 
+Vary the domain widely — cover areas like software development, data analysis, \
+e-commerce, finance, healthcare, travel, IoT, social media, education, DevOps, legal, \
+HR, and more. Do NOT default to simple personal-assistant tasks.
+
 Rules:
-1. Invent 3-8 tools as JSON. Each tool has: name, description, parameters (dict of param_name -> {type, description}). \
-Only ONE or TWO tools should be relevant; the rest are distractors.
-2. Tool names should be snake_case, realistic API-style (e.g. search_web, get_weather, translate_text).
-3. Produce the answer as a JSON list of tool calls: [{"name": "...", "arguments": {...}}].
-4. If the query genuinely needs no tool, return an empty list [].
-5. Argument values MUST be grounded in the query — do not hallucinate values.
-6. Respond in the SAME LANGUAGE as the query.
-7. Return ONLY valid JSON, no markdown fences, no commentary.
+1. Invent 1-5 tools as JSON. Each tool MUST have: name, description, parameters \
+(dict of param_name -> {type, description, required}). Use realistic parameter types \
+including string, number, boolean, array, object. Include nested objects or arrays \
+where appropriate.
+2. Only ONE or TWO tools should be relevant to the query; the rest are plausible \
+distractors from the SAME domain.
+3. Tool names should be snake_case, realistic API-style, and DIVERSE — avoid repeating \
+common names like search_web or get_weather across samples. Think of specific, \
+domain-appropriate APIs (e.g. query_elasticsearch, run_sql_migration, price_option_chain, \
+schedule_k8s_cronjob, fetch_patient_labs).
+4. Produce the answer as a JSON list of tool calls: [{"name": "...", "arguments": {...}}].
+5. For complex queries, use MULTIPLE tool calls (chained or parallel) where realistic.
+6. If the query genuinely needs no tool, return an empty answer list [].
+7. Argument values MUST be grounded in the query — do not hallucinate values.
+8. Respond in the SAME LANGUAGE as the query.
+9. Return ONLY valid JSON, no markdown fences, no commentary.
 
 Output format (strict JSON object):
 {"tools": [...], "answer": [...]}"""
@@ -55,29 +80,42 @@ Output format (strict JSON object):
 USER_TEMPLATE = "Query: {query}"
 
 
-def download_first_shard(token):
-    """Download the first parquet shard of PleIAs/SYNTH."""
-    if _PARQUET_CACHE.exists():
-        logger.info(f"Using cached shard: {_PARQUET_CACHE}")
-        return _PARQUET_CACHE
+def _discover_shard_urls(token, max_shards=None):
+    """Discover available parquet shard URLs from the HF API."""
+    api_url = "https://huggingface.co/api/datasets/PleIAs/SYNTH/parquet"
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    resp = requests.get(api_url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()  # {"default": {"train": [url, ...]}}
+    urls = data["default"]["train"]
+    if max_shards:
+        urls = urls[:max_shards]
+    logger.info(f"Discovered {len(urls)} parquet shards")
+    return urls
 
-    _PARQUET_CACHE.parent.mkdir(parents=True, exist_ok=True)
 
-    url = (
-        "https://huggingface.co/datasets/PleIAs/SYNTH"
-        "/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet"
-    )
+def download_shard(url, shard_idx, token):
+    """Download a single parquet shard, returning the local path."""
+    cache_path = _PARQUET_CACHE_DIR / f"synth_shard{shard_idx}.parquet"
+    if cache_path.exists():
+        logger.info(f"Using cached shard {shard_idx}: {cache_path}")
+        return cache_path
+
+    _PARQUET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    logger.info(f"Downloading first shard from PleIAs/SYNTH...")
+    logger.info(f"Downloading shard {shard_idx}...")
     resp = requests.get(url, headers=headers, stream=True, timeout=120)
     resp.raise_for_status()
 
     total = int(resp.headers.get("content-length", 0))
     downloaded = 0
-    with open(_PARQUET_CACHE, "wb") as f:
+    with open(cache_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
             f.write(chunk)
             downloaded += len(chunk)
@@ -85,12 +123,12 @@ def download_first_shard(token):
                 pct = downloaded / total * 100
                 print(f"\r  {downloaded / 1e6:.0f}/{total / 1e6:.0f} MB ({pct:.0f}%)", end="", flush=True)
     print()
-    logger.info(f"Saved to {_PARQUET_CACHE}")
-    return _PARQUET_CACHE
+    logger.info(f"Saved shard {shard_idx} to {cache_path}")
+    return cache_path
 
 
-def load_queries(path, max_samples=None):
-    """Load queries from parquet, return list of (synth_id, language, query)."""
+def load_queries_from_parquet(path, max_samples=None):
+    """Load queries from parquet, return list of (sample_id, language, query)."""
     import pyarrow.parquet as pq
 
     logger.info(f"Reading parquet: {path}")
@@ -104,7 +142,6 @@ def load_queries(path, max_samples=None):
 
     samples = list(zip(ids, langs, queries))
 
-    # Shuffle for diversity (don't process in order)
     rng = random.Random(42)
     rng.shuffle(samples)
 
@@ -112,6 +149,48 @@ def load_queries(path, max_samples=None):
         samples = samples[:max_samples]
 
     logger.info(f"  Selected {len(samples):,} samples")
+    return samples
+
+
+def load_queries_from_gcs(max_samples=None):
+    """Download raw_data from GCS and extract queries for re-synthesis.
+
+    Returns list of (sample_id, language, query) tuples, where sample_id
+    is prefixed with 'gcs-' to avoid collisions with PleIAs IDs.
+    """
+    sys.path.insert(0, str(_PROJECT_ROOT))
+    from src.gcs import download_raw_data
+
+    local_dir = _PARQUET_CACHE_DIR / "gcs_raw_data"
+    if not local_dir.exists():
+        logger.info("Downloading raw_data from GCS...")
+        ok = download_raw_data(str(local_dir))
+        if not ok:
+            logger.warning("No raw_data found in GCS, skipping")
+            return []
+    else:
+        logger.info(f"Using cached GCS raw_data: {local_dir}")
+
+    from datasets import load_from_disk
+    ds = load_from_disk(str(local_dir))
+    logger.info(f"Loaded {len(ds):,} rows from GCS raw_data")
+
+    samples = []
+    for i in range(len(ds)):
+        ex = ds[i]
+        query = ex.get("query", "").strip()
+        if not query:
+            continue
+        sample_id = f"gcs-{i}"
+        samples.append((sample_id, "en", query))
+
+    rng = random.Random(42)
+    rng.shuffle(samples)
+
+    if max_samples:
+        samples = samples[:max_samples]
+
+    logger.info(f"  Selected {len(samples):,} GCS queries")
     return samples
 
 
@@ -143,7 +222,7 @@ def call_openrouter(query, api_key, model=DEFAULT_MODEL, max_retries=3):
             {"role": "user", "content": USER_TEMPLATE.format(query=query)},
         ],
         "temperature": 0.7,
-        "max_tokens": 2048,
+        "max_tokens": 4096,
     }
 
     for attempt in range(max_retries):
@@ -153,12 +232,22 @@ def call_openrouter(query, api_key, model=DEFAULT_MODEL, max_retries=3):
             )
             if resp.status_code == 429:
                 wait = min(2 ** attempt * 2, 30)
+                logger.warning(f"[{model}] 429 rate-limited, retrying in {wait}s")
                 time.sleep(wait)
                 continue
-            resp.raise_for_status()
+            if not resp.ok:
+                logger.warning(f"[{model}] HTTP {resp.status_code}: {resp.text[:200]}")
+                if attempt == max_retries - 1:
+                    return None
+                time.sleep(2 ** attempt)
+                continue
             content = resp.json()["choices"][0]["message"]["content"]
-            return _parse_response(content)
+            parsed = _parse_response(content)
+            if parsed is None:
+                logger.warning(f"[{model}] Failed to parse response: {content[:200]}")
+            return parsed
         except (requests.RequestException, KeyError, IndexError) as e:
+            logger.warning(f"[{model}] Request error (attempt {attempt+1}/{max_retries}): {e}")
             if attempt == max_retries - 1:
                 return None
             time.sleep(2 ** attempt)
@@ -168,7 +257,6 @@ def call_openrouter(query, api_key, model=DEFAULT_MODEL, max_retries=3):
 def _parse_response(content):
     """Parse LLM response into (tools, answer) or None."""
     content = content.strip()
-    # Strip markdown fences if present
     if content.startswith("```"):
         content = content.split("\n", 1)[-1]
         if content.endswith("```"):
@@ -191,12 +279,10 @@ def _parse_response(content):
     if not isinstance(answer, list):
         return None
 
-    # Validate tool structure
     for t in tools:
         if not isinstance(t, dict) or "name" not in t:
             return None
 
-    # Validate answer structure
     for a in answer:
         if not isinstance(a, dict) or "name" not in a:
             return None
@@ -206,15 +292,13 @@ def _parse_response(content):
     return tools, answer
 
 
-def _validate_and_format(synth_id, language, query, tools, answer):
+def _validate_and_format(synth_id, language, query, tools, answer, model, source="synth-pleias"):
     """Validate the generated data and return a formatted row or None."""
-    # Check that every called tool exists in the tool list
     tool_names = {t["name"] for t in tools}
     for a in answer:
         if a["name"] not in tool_names:
             return None
 
-    # Check argument keys are valid
     tool_params = {}
     for t in tools:
         params = t.get("parameters") or {}
@@ -234,64 +318,67 @@ def _validate_and_format(synth_id, language, query, tools, answer):
         "query": query,
         "answers": json.dumps(answer),
         "tools": json.dumps(tools),
-        "source": "synth-pleias",
+        "source": source,
+        "model": model,
     }
 
 
-def process_sample(sample, api_key, model):
+def _pick_model(models, rng):
+    """Randomly select a model from the pool."""
+    return rng.choice(models)
+
+
+def process_sample(sample, api_key, models, rng, source_tag="synth-pleias"):
     """Process a single sample: call LLM, validate, return row or None."""
     synth_id, language, query = sample
+    model = _pick_model(models, rng)
     result = call_openrouter(query, api_key, model=model)
     if result is None:
         return None
     tools, answer = result
-    return _validate_and_format(synth_id, language, query, tools, answer)
+    row = _validate_and_format(synth_id, language, query, tools, answer, model, source_tag)
+    if row is None:
+        logger.warning(f"[{model}] Validation failed for synth_id={synth_id}")
+    return row
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Synthesize tool-calling data from PleIAs/SYNTH")
-    parser.add_argument("--max-samples", type=int, default=None,
-                        help="Max queries to process (default: all in shard)")
-    parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
-                        help=f"OpenRouter model (default: {DEFAULT_MODEL})")
-    parser.add_argument("--workers", type=int, default=32,
-                        help="Concurrent API requests (default: 32)")
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume from checkpoint")
-    parser.add_argument("--batch-size", type=int, default=500,
-                        help="Samples between progress logs (default: 500)")
-    args = parser.parse_args()
+def _process_batch(samples, label, batch_idx, api_key, models, args, tqdm, source_tag):
+    """Process a batch of samples, append to checkpoint. Returns (generated, failed)."""
+    logger.info(f"\n{'=' * 60}")
+    logger.info(f"Batch: {label}")
+    logger.info(f"{'=' * 60}")
 
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        print("Error: set OPENROUTER_API_KEY environment variable")
-        sys.exit(1)
-
-    hf_token = os.environ.get("HF_TOKEN")
-    parquet_path = download_first_shard(hf_token)
-    samples = load_queries(parquet_path, max_samples=args.max_samples)
-
-    _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    done_ids = load_checkpoint() if args.resume else set()
-    if not args.resume and _CHECKPOINT_PATH.exists():
-        _CHECKPOINT_PATH.unlink()
-
+    # Always load checkpoint to skip already-completed IDs (even across batches)
+    done_ids = load_checkpoint()
     pending = [s for s in samples if s[0] not in done_ids]
+    if not pending:
+        logger.info("All samples already done, skipping")
+        return 0, 0
     logger.info(f"Processing {len(pending):,} samples ({len(done_ids):,} already done)")
 
     generated = 0
     failed = 0
     out_file = open(_CHECKPOINT_PATH, "a")
+    rng = random.Random(42 + batch_idx)
 
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = {}
             for sample in pending:
-                fut = executor.submit(process_sample, sample, api_key, args.model)
-                futures[fut] = sample[0]  # synth_id
+                fut = executor.submit(
+                    process_sample, sample, api_key, models, rng, source_tag,
+                )
+                futures[fut] = sample[0]
 
-            for i, fut in enumerate(as_completed(futures), 1):
+            pbar = tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=label,
+                unit="sample",
+                dynamic_ncols=True,
+            ) if tqdm else as_completed(futures)
+
+            for i, fut in enumerate(pbar if tqdm else as_completed(futures), 1):
                 try:
                     row = fut.result()
                 except Exception:
@@ -304,31 +391,120 @@ def main():
                 else:
                     failed += 1
 
-                if i % args.batch_size == 0:
-                    out_file.flush()
-                    total = generated + failed
-                    rate = generated / max(total, 1) * 100
-                    logger.info(
-                        f"  [{total:,}/{len(pending):,}] "
-                        f"generated={generated:,} failed={failed:,} "
-                        f"({rate:.0f}% success)"
-                    )
+                if tqdm:
+                    rate = generated / max(generated + failed, 1) * 100
+                    pbar.set_postfix(ok=generated, fail=failed, rate=f"{rate:.0f}%")
+                    if i % args.batch_size == 0:
+                        out_file.flush()
+                else:
+                    if i % args.batch_size == 0:
+                        out_file.flush()
+                        total = generated + failed
+                        rate = generated / max(total, 1) * 100
+                        logger.info(
+                            f"  [{total:,}/{len(pending):,}] "
+                            f"generated={generated:,} failed={failed:,} "
+                            f"({rate:.0f}% success)"
+                        )
+
+            if tqdm:
+                pbar.close()
     except KeyboardInterrupt:
         logger.info("\nInterrupted — progress saved to checkpoint")
     finally:
         out_file.flush()
         out_file.close()
 
-    logger.info(f"\nDone: {generated:,} generated, {failed:,} failed")
-    logger.info(f"Output: {_CHECKPOINT_PATH}")
+    logger.info(f"{label}: {generated:,} generated, {failed:,} failed")
+    return generated, failed
 
-    # Convert checkpoint to HF dataset format
-    if generated > 0:
-        _export_dataset()
+
+def main():
+    parser = argparse.ArgumentParser(description="Synthesize tool-calling data from PleIAs/SYNTH")
+    parser.add_argument("--max-samples", type=int, default=None,
+                        help="Max queries to process (default: all in shard)")
+    parser.add_argument("--models", type=str, nargs="+", default=None,
+                        help=f"OpenRouter models to rotate (default: built-in pool)")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Use a single model instead of the pool")
+    parser.add_argument("--workers", type=int, default=32,
+                        help="Concurrent API requests (default: 32)")
+    parser.add_argument("--max-shards", type=int, default=None,
+                        help="Max parquet shards to process (default: all)")
+    parser.add_argument("--no-gcs", action="store_true",
+                        help="Skip GCS raw_data queries")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from checkpoint")
+    parser.add_argument("--batch-size", type=int, default=500,
+                        help="Samples between progress logs (default: 500)")
+    args = parser.parse_args()
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        print("Error: set OPENROUTER_API_KEY environment variable")
+        sys.exit(1)
+
+    if args.model:
+        models = [args.model]
+    elif args.models:
+        models = args.models
+    else:
+        models = list(MODEL_POOL)
+    logger.info(f"Model pool ({len(models)}): {', '.join(models)}")
+
+    _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Clear checkpoint for fresh runs; --resume keeps existing data
+    if not args.resume and _CHECKPOINT_PATH.exists():
+        _CHECKPOINT_PATH.unlink()
+        logger.info("Cleared previous checkpoint (use --resume to keep)")
+
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        logger.warning("tqdm not installed, falling back to basic progress logging")
+        tqdm = None
+
+    total_generated = 0
+    total_failed = 0
+    batch_idx = 0
+
+    # ── Source 1: GCS raw_data queries ──
+    if not args.no_gcs:
+        gcs_samples = load_queries_from_gcs(max_samples=args.max_samples)
+        if gcs_samples:
+            gen, fail = _process_batch(
+                gcs_samples, "GCS raw_data", batch_idx, api_key, models,
+                args, tqdm, source_tag="synth-gcs",
+            )
+            total_generated += gen
+            total_failed += fail
+            batch_idx += 1
+            if gen > 0:
+                _export_dataset()
+
+    # ── Source 2: PleIAs/SYNTH parquet shards ──
+    hf_token = os.environ.get("HF_TOKEN")
+    shard_urls = _discover_shard_urls(hf_token, max_shards=args.max_shards)
+
+    for shard_idx, shard_url in enumerate(shard_urls):
+        parquet_path = download_shard(shard_url, shard_idx, hf_token)
+        samples = load_queries_from_parquet(parquet_path, max_samples=args.max_samples)
+        gen, fail = _process_batch(
+            samples, f"PleIAs shard {shard_idx}", batch_idx, api_key, models,
+            args, tqdm, source_tag="synth-pleias",
+        )
+        total_generated += gen
+        total_failed += fail
+        batch_idx += 1
+        if gen > 0:
+            _export_dataset()
+
+    logger.info(f"\nAll done: {total_generated:,} generated, {total_failed:,} failed")
 
 
 def _export_dataset():
-    """Convert checkpoint JSONL to the unified format expected by build_dataset.py."""
+    """Convert checkpoint JSONL to the unified format and push to GCS."""
     from datasets import Dataset
 
     rows = []
@@ -341,6 +517,7 @@ def _export_dataset():
                     "answers": row["answers"],
                     "tools": row["tools"],
                     "source": row.get("source", "synth-pleias"),
+                    "model": row.get("model", "unknown"),
                 })
             except (json.JSONDecodeError, KeyError):
                 continue
@@ -352,9 +529,29 @@ def _export_dataset():
     out_path = _OUTPUT_DIR / "dataset"
     ds.save_to_disk(str(out_path))
     logger.info(f"Exported {len(rows):,} examples to {out_path}/")
-    logger.info(
-        "To include in training, add to tools_data.py or merge with unified dataset."
-    )
+
+    # Push to GCS
+    try:
+        sys.path.insert(0, str(_PROJECT_ROOT))
+        from src.gcs import upload_directory
+        gcs_prefix = "synth_tool_calls"
+        upload_directory(str(out_path), gcs_prefix)
+    except Exception as e:
+        logger.warning(f"GCS upload failed: {e}")
+
+    for i, row in enumerate(rows[:10]):
+        try:
+            tools = json.loads(row["tools"])
+            answers = json.loads(row["answers"])
+        except (json.JSONDecodeError, TypeError):
+            tools, answers = [], []
+        called_names = [a["name"] for a in answers if isinstance(a, dict)]
+        print(f"\n{'─' * 60}")
+        print(f"[{i+1}] Query:   {row['query'][:200]}")
+        print(f"    Available tools ({len(tools)}): {', '.join(t.get('name','?') for t in tools)}")
+        print(f"    Called tools ({len(called_names)}):   {', '.join(called_names) or '(none)'}")
+        print(f"    Answers: {row['answers'][:200]}")
+    print(f"{'─' * 60}")
 
 
 if __name__ == "__main__":
