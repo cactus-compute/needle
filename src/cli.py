@@ -50,13 +50,39 @@ def main():
                    help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4)")
     p.add_argument("--dropout", type=float, default=0.1,
                    help="Dropout rate for residual connections (default: 0.1)")
+    p.add_argument("--no-speech", action="store_true", help="Disable speech training (text-only)")
+    p.add_argument("--max-mel-len", type=int, default=1024,
+                   help="Max mel spectrogram frames (default: 1024)")
+    p.add_argument("--n-mels", type=int, default=80,
+                   help="Number of mel frequency bins (default: 80)")
+    p.add_argument("--max-speech-samples", type=int, default=None,
+                   help="Max voice-tool-call training samples (default: all)")
+    p.add_argument("--audio-aug-mode", type=str, default="white", choices=["none", "white", "person", "full"],
+                   help="Speech augmentation mode for precomputed mels: none, white, person, or full (default: white)")
+    p.add_argument("--white-noise-p", type=float, default=0.5,
+                   help="Probability of applying mel-white-noise per sample (default: 0.5)")
+    p.add_argument("--white-noise-min-snr-db", type=float, default=8.0,
+                   help="Minimum white-noise SNR in dB (default: 8.0)")
+    p.add_argument("--white-noise-max-snr-db", type=float, default=30.0,
+                   help="Maximum white-noise SNR in dB (default: 30.0)")
+    p.add_argument("--person-noise-n", type=int, default=10,
+                   help="Number of background speaker clips to mix per sample (default: 10)")
+    p.add_argument("--person-noise-r1", type=float, default=3.0,
+                   help="Minimum distance for person noise sampling (default: 3.0)")
+    p.add_argument("--person-noise-r2", type=float, default=10.0,
+                   help="Maximum distance for person noise sampling (default: 10.0)")
+    p.add_argument("--person-noise-r-ref", type=float, default=1.0,
+                   help="Reference distance used in distance gain computation (default: 1.0)")
+    p.add_argument("--person-noise-min-snr-db", type=float, default=15.0,
+                   help="Minimum target SNR for person noise mixing (default: 15.0)")
+    p.add_argument("--person-noise-max-snr-db", type=float, default=40.0,
+                   help="Maximum target SNR for person noise mixing (default: 40.0)")
     p.add_argument("--curriculum", action="store_true",
                    help="Sort batches easy→hard by tool count each epoch")
     p.add_argument("--contrastive-weight", type=float, default=0.1,
                    help="Weight for CLIP-style contrastive loss (default: 0.1)")
     p.add_argument("--contrastive-dim", type=int, default=128,
                    help="Dimension of contrastive projection head (default: 128)")
-
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,
                    help="Limit samples per split (for dev/test)")
@@ -93,12 +119,6 @@ def main():
     p.add_argument("--tool-call-samples", type=int, default=200,
                    help="Samples for tool-call accuracy eval (default: 200)")
     p.add_argument("--throughput-runs", type=int, default=10)
-
-    p = sub.add_parser("evaluate", add_help=False)
-    p.add_argument("--checkpoint", type=str, required=True)
-    p.add_argument("--benchmarks", type=str, nargs="*",
-                   choices=["wikitext2", "lambada", "hellaswag", "arc_easy"])
-    p.add_argument("--max-samples", type=int, default=500)
 
     p = sub.add_parser("tpu", add_help=False)
     tpu_sub = p.add_subparsers(dest="tpu_action")
@@ -149,9 +169,6 @@ def main():
     elif args.command == "eval":
         from .eval import main as eval_main_fn
         eval_main_fn(args)
-    elif args.command == "evaluate":
-        from .evaluate import main as eval_main
-        eval_main(args)
     elif args.command == "tpu":
         from .tpu import tpu_dispatch
         tpu_dispatch(args)

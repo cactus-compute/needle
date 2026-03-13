@@ -153,6 +153,23 @@ needle [command]
   │     --checkpoint PATH        Resume from checkpoint               │
   │     --checkpoint-dir DIR     Checkpoint directory                 │
   │     --seed INT               Random seed (default: 42)            │
+  │     --no-speech             Disable speech (text-only training)   │
+  │     --max-mel-len INT       Max mel frames (default: 1024)        │
+  │     --n-mels INT            Mel frequency bins (default: 80)      │
+  │     --max-speech-samples INT  Max voice-tool-call samples         │
+  │     --audio-aug-mode STR    none|white|person|full (default:white)│
+  │     --white-noise-p FLOAT   White-noise apply prob (default: 0.5) │
+  │     --white-noise-min-snr-db FLOAT  Min SNR dB (default: 8.0)     │
+  │     --white-noise-max-snr-db FLOAT  Max SNR dB (default: 30.0)    │
+  │     --person-noise-n INT    Bg speaker clips per sample (def: 10) │
+  │     --person-noise-r1 FLOAT Min distance for person noise (3.0)   │
+  │     --person-noise-r2 FLOAT Max distance for person noise (10.0)  │
+  │     --person-noise-r-ref FL Reference distance for gain (1.0)      │
+  │     --person-noise-min-snr-db FL Min target SNR dB (default: 15.0) │
+  │     --person-noise-max-snr-db FL Max target SNR dB (default: 40.0) │
+  │     --curriculum            Sort batches easy->hard each epoch     │
+  │     --contrastive-weight FL Contrastive loss weight (default: 0.1)│
+  │     --contrastive-dim INT   Contrastive head dim (default: 128)   │
   │                                                                   │
   │   tokenize                                                        │
   │     --max-samples INT       Limit samples per split (dev/test)    │
@@ -176,11 +193,6 @@ needle [command]
   │     --max-gen-len INT       Max generation length (default: 512)  │
   │     --throughput-runs INT   Throughput runs (default: 10)         │
   │     --tool-call-samples INT Tool-call eval samples (default: 200) │
-  │                                                                   │
-  │   evaluate                                                        │
-  │     --checkpoint PATH       Path to model checkpoint (required)   │
-  │     --benchmarks [...]      wikitext2 lambada hellaswag arc_easy  │
-  │     --max-samples INT       Samples per benchmark (default: 500)  │
   │                                                                   │
   │   tpu                                                             │
   │     create NAME             Create TPU (auto-finds zone)          │
