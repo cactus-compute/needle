@@ -630,6 +630,51 @@ def _deduplicate(dataset):
     return dataset.select(keep)
 
 
+def _trim_tools(dataset, max_tools=5, seed=42):
+    """Trim tool lists to at most max_tools, keeping called tools.
+
+    For samples with >max_tools available tools, keeps all tools referenced
+    in the answers plus randomly sampled distractors up to max_tools.
+    Samples where the number of called tools alone exceeds max_tools are dropped.
+    """
+    rng = random.Random(seed)
+    rows = []
+    dropped = 0
+    for i in range(len(dataset)):
+        ex = dataset[i]
+        try:
+            tools = json.loads(ex["tools"])
+        except (json.JSONDecodeError, TypeError):
+            tools = []
+        if len(tools) <= max_tools:
+            rows.append(ex)
+            continue
+        try:
+            answers = json.loads(ex["answers"])
+        except (json.JSONDecodeError, TypeError):
+            answers = []
+        called_names = {a["name"] for a in answers if isinstance(a, dict)}
+        called = [t for t in tools if t.get("name") in called_names]
+        if len(called) > max_tools:
+            dropped += 1
+            continue
+        distractors = [t for t in tools if t.get("name") not in called_names]
+        n_distractors = max_tools - len(called)
+        sampled = rng.sample(distractors, min(n_distractors, len(distractors)))
+        trimmed = called + sampled
+        rng.shuffle(trimmed)
+        rows.append({
+            "query": ex["query"],
+            "answers": ex["answers"],
+            "tools": json.dumps(trimmed),
+            "source": ex["source"],
+        })
+    trimmed = len(dataset) - len(rows) - dropped
+    print(f"\nTool trimming (max {max_tools}): "
+          f"trimmed {trimmed + dropped} examples, dropped {dropped}")
+    return Dataset.from_list(rows)
+
+
 def _augment_irrelevance(dataset, ratio=0.1, seed=42):
     """Create irrelevance samples by swapping tools with unrelated queries.
 
@@ -753,6 +798,10 @@ def load_and_combine():
     dedup_dropped = before_dedup - len(combined)
     if dedup_dropped:
         print(f"\nDeduplicated: removed {dedup_dropped} duplicate queries")
+
+    before_trim = len(combined)
+    combined = _trim_tools(combined, max_tools=5, seed=42)
+    print(f"  {before_trim} -> {len(combined)} after tool trimming")
 
     combined = _augment_irrelevance(combined, ratio=0.1, seed=42)
 
