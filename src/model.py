@@ -47,6 +47,7 @@ class TransformerConfig:
     num_memory_slots: int = 64
     n_mels: int = 80
     dropout_rate: float = 0.1
+    contrastive_dim: int = 128
 
     @property
     def jax_dtype(self):
@@ -145,69 +146,39 @@ class FeedForward(nn.Module):
         return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="down_proj")(h)
 
 
-class MLPMixer(nn.Module):
-    """MLP-Mixer operating on fixed-size memory slots (B, M, d)."""
-    num_slots: int
-    d_model: int
-    d_ff: int
-    num_layers: int
-    dtype: jnp.dtype = jnp.bfloat16
-    activation: str = "drelu"
-
-    @nn.compact
-    def __call__(self, s, ffn_mask=None):
-        residual = s
-        s = ZCRMSNorm(dtype=self.dtype, name="token_mix_norm")(s)
-        s = s.transpose(0, 2, 1)
-        s = FeedForward(self.num_slots, self.d_ff, self.num_layers, self.dtype, self.activation, name="token_mix")(s, ffn_mask=ffn_mask)
-        s = s.transpose(0, 2, 1)
-        s = s + residual
-
-        residual = s
-        s = ZCRMSNorm(dtype=self.dtype, name="channel_mix_norm")(s)
-        s = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation, name="channel_mix")(s, ffn_mask=ffn_mask)
-        s = s + residual
-
-        return s
-
-
-class MemoryMixerBlock(nn.Module):
-    """Block 4a: Pack (cross-attn S←X with RoPE on keys) → Mix (MLP-Mixer) → Local Update (MLP)."""
+class EncoderBlock(nn.Module):
+    """Pre-norm self-attention + pre-norm FFN with residual connections."""
     num_heads: int
     num_kv_heads: int
     d_model: int
     d_ff: int
-    num_slots: int
     num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
     dropout_rate: float = 0.0
 
     @nn.compact
-    def __call__(self, x, s, mask=None, rope=None, ffn_mask=None, deterministic=True):
-        s_norm = ZCRMSNorm(dtype=self.dtype, name="pack_s_norm")(s)
-        x_norm = ZCRMSNorm(dtype=self.dtype, name="pack_x_norm")(x)
-        pack_out = MultiHeadAttention(
-            self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype,
-            rope_keys_only=True, name="pack_attn"
-        )(s_norm, x_norm, mask=mask, rope=rope)
-        s = s + nn.Dropout(rate=self.dropout_rate)(pack_out, deterministic=deterministic)
-
-        mix_out = MLPMixer(self.num_slots, self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation, name="mixer")(
-            ZCRMSNorm(dtype=self.dtype, name="mix_norm")(s), ffn_mask=ffn_mask
-        )
-        s = s + nn.Dropout(rate=self.dropout_rate)(mix_out, deterministic=deterministic)
-
+    def __call__(self, x, mask=None, rope=None, ffn_mask=None, deterministic=True):
         residual = x
-        x = ZCRMSNorm(dtype=self.dtype, name="local_norm")(x)
-        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation, name="local_ffn")(x, ffn_mask=ffn_mask)
+        x = ZCRMSNorm(dtype=self.dtype)(x)
+        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
+            x, x, mask=mask, rope=rope
+        )
         x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic) + residual
 
-        return x, s
+        residual = x
+        x = ZCRMSNorm(dtype=self.dtype)(x)
+        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x, ffn_mask=ffn_mask)
+        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic) + residual
+
+        return x
 
 
-class MemoryMixerEncoder(nn.Module):
-    """Encoder using MemoryMixer blocks. Output is the final memory slots S."""
+class Encoder(nn.Module):
+    """Self-attention encoder with stride-2 depthwise-separable downsampling.
+
+    Returns (output, mask) tuple — variable-length output + adjusted padding mask.
+    """
     config: TransformerConfig
 
     @nn.compact
@@ -215,11 +186,6 @@ class MemoryMixerEncoder(nn.Module):
         cfg = self.config
         dt = cfg.jax_dtype
         x = x.astype(dt)
-
-        s_base = self.param("memory_slots", jinit.normal(stddev=0.02), (1, cfg.num_memory_slots, cfg.d_model))
-        x_pool = jnp.mean(x, axis=1)  # (B, d)
-        s_bias = nn.Dense(cfg.d_model, dtype=dt, use_bias=False, kernel_init=jinit.zeros, name="slot_init")(x_pool)
-        s = jnp.broadcast_to(s_base.astype(dt), (x.shape[0], cfg.num_memory_slots, cfg.d_model)) + s_bias[:, None, :]
 
         x = nn.Conv(features=cfg.d_model, kernel_size=(4,), strides=(2,),
                     padding='SAME', feature_group_count=cfg.d_model,
@@ -235,13 +201,13 @@ class MemoryMixerEncoder(nn.Module):
             mask = mask[..., :T_new]
 
         for i in range(cfg.num_encoder_layers):
-            x, s = nn.remat(MemoryMixerBlock, static_argnums=(6,))(
+            x = nn.remat(EncoderBlock, static_argnums=(5,))(
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
-                cfg.num_memory_slots, cfg.total_layers, dt, cfg.activation, cfg.dropout_rate, name=f"block_{i}"
-            )(x, s, mask, rope, ffn_mask, deterministic)
+                cfg.total_layers, dt, cfg.activation, cfg.dropout_rate, name=f"block_{i}"
+            )(x, mask, rope, ffn_mask, deterministic)
 
-        s = ZCRMSNorm(dtype=dt, name="final_norm")(s)
-        return s
+        x = ZCRMSNorm(dtype=dt, name="final_norm")(x)
+        return x, mask
 
 
 class DecoderBlock(nn.Module):
@@ -342,8 +308,13 @@ class EncoderDecoderTransformer(nn.Module):
         self.mel_proj = nn.Dense(self.config.d_model, dtype=self.config.jax_dtype,
                                  use_bias=True, kernel_init=default_init(), name="mel_proj")
         self.spec_augment = SpecAugment()
-        self.encoder = MemoryMixerEncoder(self.config)
+        self.encoder = Encoder(self.config)
         self.decoder = Decoder(self.config)
+        self.contrastive_proj = nn.Dense(
+            self.config.contrastive_dim, dtype=self.config.jax_dtype,
+            use_bias=False, kernel_init=default_init(), name="contrastive_proj",
+        )
+        self.log_temp = self.param("log_temp", jinit.zeros, ())
 
     def _rope(self, seq_len):
         head_dim = self.config.d_model // self.config.num_heads
@@ -364,47 +335,65 @@ class EncoderDecoderTransformer(nn.Module):
         rope = self._rope(x.shape[1])
         return self.encoder(x, mask=src_mask, rope=rope, ffn_mask=ffn_mask, deterministic=deterministic)
 
-    def decode(self, tgt, encoder_out, self_mask=None, deterministic=True):
-        """Decode from encoder memory slots. No cross_mask needed (fixed-size slots)."""
+    def decode(self, tgt, encoder_out, self_mask=None, cross_mask=None, deterministic=True):
+        """Decode from encoder output with cross_mask for variable-length encoder output."""
         x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
-        x = self.decoder(x, encoder_out, self_mask=self_mask, cross_mask=None, rope=rope, deterministic=deterministic)
+        x = self.decoder(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, deterministic=deterministic)
         logits = x.astype(jnp.float32) @ self.embedding.embedding.T
         return logits
 
+    def _mean_pool(self, encoder_out, enc_mask):
+        """Mean-pool encoder output over non-padded positions. Returns (B, d_model)."""
+        if enc_mask is not None:
+            # enc_mask shape: (B, 1, 1, T) -> (B, T)
+            mask_2d = enc_mask[:, 0, 0, :]
+        else:
+            mask_2d = jnp.ones(encoder_out.shape[:2], dtype=encoder_out.dtype)
+        mask_3d = mask_2d[:, :, None].astype(encoder_out.dtype)  # (B, T, 1)
+        summed = jnp.sum(encoder_out * mask_3d, axis=1)  # (B, d_model)
+        counts = jnp.maximum(jnp.sum(mask_2d, axis=1, keepdims=True), 1.0)  # (B, 1)
+        return summed / counts
+
+    def encode_contrastive(self, tokens, deterministic=True):
+        """Encode tokens and project to L2-normalized contrastive space. Returns (B, contrastive_dim)."""
+        src_mask = make_padding_mask(tokens, self.config.pad_token_id)
+        encoder_out, enc_mask = self.encode_text(tokens, src_mask=src_mask, deterministic=deterministic)
+        pooled = self._mean_pool(encoder_out, enc_mask)
+        projected = self.contrastive_proj(pooled)
+        return projected / jnp.maximum(jnp.linalg.norm(projected, axis=-1, keepdims=True), 1e-8)
+
+    def forward_contrastive(self, query_tokens, tool_tokens, deterministic=True):
+        """Encode query and tool tokens, return (q_emb, t_emb, log_temp)."""
+        q_emb = self.encode_contrastive(query_tokens, deterministic=deterministic)
+        t_emb = self.encode_contrastive(tool_tokens, deterministic=deterministic)
+        return q_emb, t_emb, self.log_temp
+
     def __call__(self, src, tgt, src_mask=None, tgt_mask=None):
-        encoder_out = self.encode_text(src, src_mask=src_mask)
-        logits = self.decode(tgt, encoder_out, self_mask=tgt_mask)
+        encoder_out, enc_mask = self.encode_text(src, src_mask=src_mask)
+        logits = self.decode(tgt, encoder_out, self_mask=tgt_mask, cross_mask=enc_mask)
         return logits
 
-    def _run_decoder(self, encoder_out, tgt, tgt_mask=None, ffn_mask=None, deterministic=True):
+    def _run_decoder(self, encoder_out, tgt, tgt_mask=None, cross_mask=None, ffn_mask=None, deterministic=True):
         """Run decoder and return float32 hidden states."""
         x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
-        x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=None, rope=rope, ffn_mask=ffn_mask, deterministic=deterministic)
+        x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=cross_mask, rope=rope, ffn_mask=ffn_mask, deterministic=deterministic)
         return x.astype(jnp.float32)
-
-    def _slot_diversity(self, encoder_out):
-        s = encoder_out.astype(jnp.float32)
-        gram = jnp.matmul(s, s.transpose(0, 2, 1))
-        diag_sq = jnp.sum(jnp.diagonal(gram, axis1=1, axis2=2) ** 2)
-        return (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
 
     def forward_masked(self, src, tgt, src_mask=None, tgt_mask=None, ffn_mask=None, deterministic=True):
         """Single forward with per-batch-item FFN masking. Returns (logits, slot_div)."""
-        encoder_out = self.encode_text(src, src_mask=src_mask, ffn_mask=ffn_mask, deterministic=deterministic)
-        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, ffn_mask=ffn_mask, deterministic=deterministic)
+        encoder_out, enc_mask = self.encode_text(src, src_mask=src_mask, ffn_mask=ffn_mask, deterministic=deterministic)
+        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, cross_mask=enc_mask, ffn_mask=ffn_mask, deterministic=deterministic)
         logits = x_f32 @ self.embedding.embedding.T
-        slot_div = self._slot_diversity(encoder_out)
-        return logits, slot_div
+        return logits, 0.0
 
     def forward_speech_masked(self, mel, tgt, src_mask=None, tgt_mask=None, ffn_mask=None, deterministic=True):
         """Single speech forward with per-batch-item FFN masking. Returns (logits, slot_div)."""
-        encoder_out = self.encode_speech(mel, src_mask=src_mask, ffn_mask=ffn_mask, deterministic=deterministic)
-        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, ffn_mask=ffn_mask, deterministic=deterministic)
+        encoder_out, enc_mask = self.encode_speech(mel, src_mask=src_mask, ffn_mask=ffn_mask, deterministic=deterministic)
+        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, cross_mask=enc_mask, ffn_mask=ffn_mask, deterministic=deterministic)
         logits = x_f32 @ self.embedding.embedding.T
-        slot_div = self._slot_diversity(encoder_out)
-        return logits, slot_div
+        return logits, 0.0
 
     def _make_eval_ffn_mask(self, ff_width, B, dtype):
         """Default prefix FFN mask for eval: first ff_width neurons active."""
@@ -419,50 +408,49 @@ class EncoderDecoderTransformer(nn.Module):
         emb = self.embedding.embedding
         B = src.shape[0]
 
-        encoder_out = self.encode_text(src, src_mask=src_mask)
-        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask)
+        encoder_out, enc_mask = self.encode_text(src, src_mask=src_mask)
+        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, cross_mask=enc_mask)
         logits = x_f32 @ emb.T
-        slot_div = self._slot_diversity(encoder_out)
 
         mat_logits = []
         if mat_ff_widths is not None:
             for ff_w in mat_ff_widths:
                 mask = self._make_eval_ffn_mask(ff_w, B, x_f32.dtype)
-                enc_m = self.encode_text(src, src_mask=src_mask, ffn_mask=mask)
-                x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, ffn_mask=mask)
+                enc_m, enc_m_mask = self.encode_text(src, src_mask=src_mask, ffn_mask=mask)
+                x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, cross_mask=enc_m_mask, ffn_mask=mask)
                 mat_logits.append(x_m @ emb.T)
 
-        return logits, slot_div, mat_logits
+        return logits, 0.0, mat_logits
 
     def forward_speech_with_aux(self, mel, tgt, src_mask=None, tgt_mask=None, mat_ff_widths=None, deterministic=True):
         """Eval-only: separate per-width speech forwards for reporting per-width PPL."""
         emb = self.embedding.embedding
         B = mel.shape[0]
 
-        encoder_out = self.encode_speech(mel, src_mask=src_mask, deterministic=deterministic)
-        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask)
+        encoder_out, enc_mask = self.encode_speech(mel, src_mask=src_mask, deterministic=deterministic)
+        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, cross_mask=enc_mask)
         logits = x_f32 @ emb.T
-        slot_div = self._slot_diversity(encoder_out)
 
         mat_logits = []
         if mat_ff_widths is not None:
             for ff_w in mat_ff_widths:
                 mask = self._make_eval_ffn_mask(ff_w, B, x_f32.dtype)
-                enc_m = self.encode_speech(mel, src_mask=src_mask, ffn_mask=mask, deterministic=deterministic)
-                x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, ffn_mask=mask)
+                enc_m, enc_m_mask = self.encode_speech(mel, src_mask=src_mask, ffn_mask=mask, deterministic=deterministic)
+                x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, cross_mask=enc_m_mask, ffn_mask=mask)
                 mat_logits.append(x_m @ emb.T)
 
-        return logits, slot_div, mat_logits
+        return logits, 0.0, mat_logits
 
     def init_all(self, src, tgt, mel):
         """Dummy forward through both text and speech pathways to initialize all params."""
         src_mask = make_padding_mask(src, self.config.pad_token_id)
         tgt_mask = make_causal_mask(tgt.shape[1]) & make_padding_mask(tgt, self.config.pad_token_id)
-        text_out = self.encode_text(src, src_mask=src_mask)
+        text_out, text_enc_mask = self.encode_text(src, src_mask=src_mask)
         mel_mask = make_mel_padding_mask(mel)
-        speech_out = self.encode_speech(mel, src_mask=mel_mask, deterministic=True)
-        _ = self._run_decoder(text_out, tgt, tgt_mask=tgt_mask)
-        _ = self._run_decoder(speech_out, tgt, tgt_mask=tgt_mask)
+        speech_out, speech_enc_mask = self.encode_speech(mel, src_mask=mel_mask, deterministic=True)
+        _ = self._run_decoder(text_out, tgt, tgt_mask=tgt_mask, cross_mask=text_enc_mask)
+        _ = self._run_decoder(speech_out, tgt, tgt_mask=tgt_mask, cross_mask=speech_enc_mask)
+        _ = self.encode_contrastive(src)
         return jnp.zeros(())
 
 

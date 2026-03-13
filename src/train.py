@@ -1,4 +1,3 @@
-import argparse
 import math
 import os
 import pickle
@@ -16,9 +15,9 @@ from flax.training import train_state
 from .data import (
     get_batches, get_tokenizer, get_speech_batches,
     build_audio_augmenter,
-    load_prepared_data, load_prepared_mels,
-    load_example_with_audio,
+    load_prepared_data, load_prepared_mels, load_tool_calls,
     PrefetchIterator, count_batches,
+    get_contrastive_batches,
 )
 from .model import (
     EncoderDecoderTransformer,
@@ -86,21 +85,21 @@ def _param_labels(params):
     return jax.tree_util.tree_map_with_path(_label, params)
 
 
-def _wsd_schedule(peak_value, total_steps, warmup_steps, decay_ratio=0.15):
-    """Warmup-Stable-Decay schedule: linear warmup, hold peak, linear decay."""
+def _wsd_schedule(peak_value, total_steps, warmup_steps, decay_ratio=0.40):
+    """Warmup-Stable-Decay schedule: linear warmup, hold peak, cosine decay."""
     decay_steps = max(1, int(total_steps * decay_ratio))
     stable_steps = total_steps - warmup_steps - decay_steps
     return optax.join_schedules(
         [
             optax.linear_schedule(0.0, peak_value, warmup_steps),
             optax.constant_schedule(peak_value),
-            optax.linear_schedule(peak_value, peak_value * 0.1, decay_steps),
+            optax.cosine_decay_schedule(peak_value, decay_steps, alpha=0.05),
         ],
         boundaries=[warmup_steps, warmup_steps + stable_steps],
     )
 
 
-def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_steps):
+def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_steps, decay_ratio=0.40):
     model = EncoderDecoderTransformer(config)
 
     rng, init_rng = jax.random.split(rng)
@@ -115,8 +114,8 @@ def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_
         method="init_all",
     )
 
-    adam_schedule = _wsd_schedule(learning_rate, total_steps, warmup_steps)
-    muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
+    adam_schedule = _wsd_schedule(learning_rate, total_steps, warmup_steps, decay_ratio)
+    muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps, decay_ratio)
 
     muon_opt = optax.chain(
         scale_by_muon(momentum=0.95, ns_steps=5),
@@ -226,16 +225,29 @@ def _quantize_params(params, group_size=32):
 
 _GROUP_SIZE = 32
 _MAT_FACTORS = ()
-_MAT_FF_WIDTHS = () 
-_D_FF = 2048 
+_MAT_FF_WIDTHS = ()
+_D_FF = 2048
+_CONTRASTIVE_WEIGHT = 0.1
+
+
+def _clip_contrastive_loss(q_emb, t_emb, log_temp):
+    """CLIP-style symmetric contrastive loss with learnable temperature."""
+    temp = jnp.exp(jnp.clip(log_temp, -jnp.log(100.0), jnp.log(100.0)))
+    logits = q_emb @ t_emb.T / temp  # (B, B)
+    B = logits.shape[0]
+    labels = jnp.arange(B)
+    loss_q = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
+    loss_t = optax.softmax_cross_entropy_with_integer_labels(logits.T, labels)
+    return (jnp.mean(loss_q) + jnp.mean(loss_t)) / 2.0
 
 
 def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
     pad_id = 0
+    q_params = _quantize_params(params, group_size=_GROUP_SIZE)
     src_mask = make_padding_mask(src, pad_id)
     tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
     logits, slot_div = state.apply_fn(
-        {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
+        {"params": q_params},
         src, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask,
         ffn_mask=ffn_mask,
         deterministic=False,
@@ -248,17 +260,17 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rn
         optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
     ) / jnp.maximum(jnp.sum(mask), 1.0)
     z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
-    div_loss = 1e-4 * slot_div
-    return ce_loss + z_loss + div_loss
+    return ce_loss + z_loss
 
 
 def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
     pad_id = 0
+    q_params = _quantize_params(params, group_size=_GROUP_SIZE)
     src_mask = make_mel_padding_mask(mel)
     tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
     spec_rng, drop_rng = jax.random.split(rng)
-    logits, slot_div = state.apply_fn(
-        {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
+    logits, _ = state.apply_fn(
+        {"params": q_params},
         mel, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask,
         ffn_mask=ffn_mask,
         deterministic=False,
@@ -271,8 +283,21 @@ def _speech_loss_fn(state, params, mel, tgt_in, tgt_out, causal_mask, ffn_mask, 
         optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
     ) / jnp.maximum(jnp.sum(mask), 1.0)
     z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
-    div_loss = 1e-4 * slot_div
-    return ce_loss + z_loss + div_loss
+    return ce_loss + z_loss
+
+
+def _contrastive_loss_fn(state, params, query_tokens, tool_tokens, rng):
+    """Compute CLIP contrastive loss on query/tool pairs."""
+    q_params = _quantize_params(params, group_size=_GROUP_SIZE)
+    q_emb, t_emb, log_temp = state.apply_fn(
+        {"params": q_params},
+        query_tokens, tool_tokens,
+        deterministic=False,
+        method="forward_contrastive",
+        rngs={"dropout": rng},
+    )
+    return _clip_contrastive_loss(q_emb, t_emb, log_temp)
+
 
 
 def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
@@ -351,6 +376,22 @@ def _train_step_speech_masked(state, ema_params, mel, tgt_in, tgt_out, causal_ma
     return state, ema_params, loss, grad_norm
 
 
+def _train_step_contrastive(state, ema_params, query_tokens, tool_tokens, rng):
+    """Separate contrastive training step using CLIP loss."""
+    ema_decay = 0.999
+    cl_loss, grads = jax.value_and_grad(
+        lambda p: _contrastive_loss_fn(state, p, query_tokens, tool_tokens, rng)
+    )(state.params)
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    cl_loss = jax.lax.pmean(cl_loss, axis_name="batch")
+    grads = jax.tree.map(lambda g: g * _CONTRASTIVE_WEIGHT, grads)
+    state = state.apply_gradients(grads=grads)
+    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
+    return state, ema_params, cl_loss
+
+
+
+
 def _make_p_train_step():
     return jax.pmap(_train_step_text, axis_name="batch", donate_argnums=(0, 1))
 
@@ -365,6 +406,10 @@ def _make_p_train_step_speech():
 
 def _make_p_train_step_speech_masked():
     return jax.pmap(_train_step_speech_masked, axis_name="batch", donate_argnums=(0, 1))
+
+
+def _make_p_train_step_contrastive():
+    return jax.pmap(_train_step_contrastive, axis_name="batch", donate_argnums=(0, 1))
 
 
 def _make_val_loss_fn(apply_fn):
@@ -414,8 +459,7 @@ def _make_speech_val_loss_fn(apply_fn):
             method="forward_speech_with_aux",
         )
         loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tgt_out)
-        mask = loss_mask
-        return jnp.sum(loss * mask), jnp.sum(mask)
+        return jnp.sum(loss * loss_mask), jnp.sum(loss_mask)
     return val_loss_batch
 
 
@@ -430,17 +474,16 @@ def _estimate_mat_params(config, matryoshka_factor):
     n_enc = config.num_encoder_layers
     n_dec = config.num_decoder_layers
     kv_dim = config.num_kv_heads * (d // config.num_heads)
-    m = config.num_memory_slots
     d_ff = config.d_ff // matryoshka_factor
 
     emb = v * d
     attn = d * d + d * kv_dim * 2 + d * d
     ffn = d * d_ff * 3
-    mixer_token = m * d_ff * 3
-    mixer_channel = d * d_ff * 3
-    enc_block = attn + ffn + mixer_token + mixer_channel
-    dec_block = attn * 2 + ffn
-    total = emb + n_enc * enc_block + n_dec * dec_block
+    # Encoder: self-attn + FFN per block, plus downsample conv params
+    downsample = d * 4 + d * d  # depthwise conv (kernel=4) + pointwise Dense
+    enc_block = attn + ffn
+    dec_block = attn * 2 + ffn  # self-attn + cross-attn + FFN
+    total = emb + downsample + n_enc * enc_block + n_dec * dec_block
     return int(total)
 
 
@@ -480,6 +523,7 @@ def train(args):
     dec_inputs = train_data["dec_inputs"]
     dec_targets = train_data["dec_targets"]
     train_loss_mask = train_data["loss_mask"]
+    tool_counts = train_data["tool_counts"]
     val_enc = val_data["enc_inputs"]
     val_dec_in = val_data["dec_inputs"]
     val_dec_tgt = val_data["dec_targets"]
@@ -518,6 +562,24 @@ def train(args):
             else:
                 print(f"      Speech augmentation: {aug_name}")
 
+    # Contrastive data (optional — graceful if missing)
+    cl_query_tokens = train_data.get("query_only")
+    cl_tool_tokens = train_data.get("tool_individual")
+    cl_tool_ex_idx = train_data.get("tool_ex_idx")
+    cl_tool_is_pos = train_data.get("tool_is_pos")
+    has_contrastive = all(x is not None for x in [cl_query_tokens, cl_tool_tokens, cl_tool_ex_idx, cl_tool_is_pos])
+    if has_contrastive:
+        print(f"      Contrastive: {len(cl_query_tokens):,} queries, {len(cl_tool_tokens):,} tools")
+
+    # Contrastive data (optional — graceful if missing)
+    cl_query_tokens = train_data.get("query_only")
+    cl_tool_tokens = train_data.get("tool_individual")
+    cl_tool_ex_idx = train_data.get("tool_ex_idx")
+    cl_tool_is_pos = train_data.get("tool_is_pos")
+    has_contrastive = all(x is not None for x in [cl_query_tokens, cl_tool_tokens, cl_tool_ex_idx, cl_tool_is_pos])
+    if has_contrastive:
+        print(f"      Contrastive: {len(cl_query_tokens):,} queries, {len(cl_tool_tokens):,} tools")
+
     effective_batch_size = args.batch_size * num_devices
 
     resume_checkpoint = getattr(args, "checkpoint", None)
@@ -542,10 +604,12 @@ def train(args):
             num_memory_slots=getattr(args, "num_memory_slots", 64),
             n_mels=n_mels,
             dropout_rate=getattr(args, "dropout", 0.1),
+            contrastive_dim=getattr(args, "contrastive_dim", 128),
         )
 
-    global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF
+    global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF, _CONTRASTIVE_WEIGHT
     _GROUP_SIZE = getattr(args, "group_size", 32)
+    _CONTRASTIVE_WEIGHT = getattr(args, "contrastive_weight", 0.1)
     _D_FF = config.d_ff
     mat_factors_raw = getattr(args, "mat_factors", None)
     if mat_factors_raw:
@@ -559,13 +623,13 @@ def train(args):
     p_train_step_masked = _make_p_train_step_masked()
     p_train_step_speech = _make_p_train_step_speech()
     p_train_step_speech_masked = _make_p_train_step_speech_masked()
+    p_train_step_contrastive = _make_p_train_step_contrastive()
 
     np.random.seed(args.seed)
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
 
-    mat_shared_input = getattr(args, "mat_shared_input", False)
-    unique_batch_size = effective_batch_size // n_widths if (mat_shared_input and n_widths > 1) else effective_batch_size
+    unique_batch_size = (effective_batch_size // num_devices) * num_devices
     text_batches_per_epoch = count_batches(len(enc_inputs), unique_batch_size)
     if not no_speech and train_mels is not None:
         speech_batches_per_epoch = text_batches_per_epoch
@@ -577,9 +641,10 @@ def train(args):
 
     scaled_lr = args.lr * num_devices
     muon_lr = getattr(args, "muon_lr", 0.02) * math.sqrt(num_devices)
-    state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps)
+    decay_ratio = getattr(args, "decay_ratio", 0.40)
+    state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps, decay_ratio)
     val_loss_fn = _make_val_loss_fn(state.apply_fn)
-    speech_vl_fn = _make_speech_val_loss_fn(state.apply_fn) if not no_speech else None
+    speech_vl_fn = _make_speech_val_loss_fn(state.apply_fn) if speech_batches_per_epoch > 0 else None
 
     if resume_checkpoint:
         state = state.replace(params=ckpt_params)
@@ -590,19 +655,20 @@ def train(args):
     ema_params = jax_utils.replicate(ema_params)
 
     param_count = sum(x.size for x in jax.tree.leaves(jax_utils.unreplicate(state).params))
-    decay_steps = max(1, int(total_steps * 0.15))
+    decay_steps = max(1, int(total_steps * decay_ratio))
     stable_steps = total_steps - warmup_steps - decay_steps
+    best_call_f1 = 0.0
+    best_ckpt_path = None
 
     print(f"\n  ─────────────────────────────────────")
     print(f"  Parameters    {param_count:>12,}")
     print(f"  d_model       {config.d_model:>12}")
     print(f"  Heads         {config.num_heads:>7} ({config.num_kv_heads} KV)")
     print(f"  Layers        {config.num_encoder_layers:>7} enc / {config.num_decoder_layers} dec")
-    print(f"  Memory slots  {config.num_memory_slots:>12}")
     print(f"  Activation    {config.activation:>12}")
     print(f"  Dtype         {config.dtype:>12}")
     print(f"  Dropout       {config.dropout_rate:>12}")
-    if not no_speech and train_mels is not None:
+    if speech_batches_per_epoch > 0:
         print(f"  Speech        {speech_batches_per_epoch} batches/epoch")
         print(f"  n_mels        {n_mels:>12}")
         print(f"  max_mel_len   {max_mel_len:>12}")
@@ -632,13 +698,10 @@ def train(args):
     )
     if n_widths > 1:
         print(f"  Mat factors   {n_widths} (full + {', '.join(str(f)+'x' for f in _MAT_FACTORS)})")
-        if mat_shared_input:
-            print(f"  Mat mode      shared input ({unique_batch_size // num_devices}/dev x {n_widths} repeats)")
-        else:
-            print(f"  Mat mode      unique input ({args.batch_size}/dev, random width)")
+        print(f"  Mat mode      unique input ({args.batch_size}/dev, split by width)")
 
-    adam_schedule = _wsd_schedule(scaled_lr, total_steps, warmup_steps)
-    muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
+    adam_schedule = _wsd_schedule(scaled_lr, total_steps, warmup_steps, decay_ratio)
+    muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps, decay_ratio)
     tokens_per_batch = effective_batch_size * (args.max_enc_len + args.max_dec_len)
 
     eval_model = EncoderDecoderTransformer(config)
@@ -664,17 +727,28 @@ def train(args):
 
         text_losses = []
         speech_losses = []
+        _curriculum_tc = tool_counts if getattr(args, "curriculum", False) else None
         text_batch_iter = PrefetchIterator(
             lambda: get_batches(enc_inputs, dec_inputs, dec_targets, unique_batch_size,
-                                loss_mask=train_loss_mask),
+                                loss_mask=train_loss_mask,
+                                tool_counts=_curriculum_tc),
             prefetch=4,
         )
 
         speech_batch_iter = None
-        if not no_speech and train_mels is not None:
+        if speech_batches_per_epoch > 0:
             speech_batch_iter = PrefetchIterator(
                 lambda: get_speech_batches(train_mels, dec_inputs, dec_targets, unique_batch_size,
                                            loss_mask=train_loss_mask, augmenter=speech_augmenter),
+                prefetch=4,
+            )
+
+        cl_batch_iter = None
+        if has_contrastive and _CONTRASTIVE_WEIGHT > 0:
+            cl_batch_iter = PrefetchIterator(
+                lambda: get_contrastive_batches(
+                    cl_query_tokens, cl_tool_tokens, cl_tool_ex_idx, cl_tool_is_pos,
+                    unique_batch_size),
                 prefetch=4,
             )
 
@@ -703,20 +777,20 @@ def train(args):
                 src, tgt_in, tgt_out, lm = next(text_batch_iter)
                 text_idx += 1
 
-                if n_widths > 1 and mat_shared_input:
-                    per_width = args.batch_size // n_widths
-                    def _tile_for_mat(arr):
-                        s = arr.reshape(num_devices, per_width, *arr.shape[1:])
-                        return np.tile(s, (1, n_widths) + (1,) * (arr.ndim - 1))
-                    src_b = _tile_for_mat(src)
-                    tgt_in_b = _tile_for_mat(tgt_in)
-                    tgt_out_b = _tile_for_mat(tgt_out)
-                    lm_b = _tile_for_mat(lm)
-                else:
-                    src_b = shard_batch(src, num_devices)
-                    tgt_in_b = shard_batch(tgt_in, num_devices)
-                    tgt_out_b = shard_batch(tgt_out, num_devices)
-                    lm_b = shard_batch(lm, num_devices)
+                cl_q_b = None
+                cl_t_b = None
+                if cl_batch_iter is not None:
+                    try:
+                        cl_q, cl_t = next(cl_batch_iter)
+                        cl_q_b = shard_batch(cl_q, num_devices)
+                        cl_t_b = shard_batch(cl_t, num_devices)
+                    except StopIteration:
+                        cl_batch_iter = None
+
+                src_b = shard_batch(src, num_devices)
+                tgt_in_b = shard_batch(tgt_in, num_devices)
+                tgt_out_b = shard_batch(tgt_out, num_devices)
+                lm_b = shard_batch(lm, num_devices)
 
                 rng, text_rng = jax.random.split(rng)
                 text_rngs = jax.random.split(text_rng, num_devices)
@@ -730,29 +804,25 @@ def train(args):
                         state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_ffn_mask, text_rngs, lm_b,
                     )
 
+                if cl_q_b is not None and cl_t_b is not None:
+                    rng, cl_rng = jax.random.split(rng)
+                    cl_rngs = jax.random.split(cl_rng, num_devices)
+                    state, ema_params, cl_loss = p_train_step_contrastive(
+                        state, ema_params, cl_q_b, cl_t_b, cl_rngs,
+                    )
+
                 text_loss_val = float(loss[0])
                 text_losses.append(text_loss_val)
                 step_grad_norm = float(grad_norm[0])
                 global_step += 1
-
             else:
                 mel_batch, sp_tgt_in, sp_tgt_out, sp_lm = next(speech_batch_iter)
                 speech_idx += 1
 
-                if n_widths > 1 and mat_shared_input:
-                    per_width = args.batch_size // n_widths
-                    def _tile_sp(arr):
-                        s = arr.reshape(num_devices, per_width, *arr.shape[1:])
-                        return np.tile(s, (1, n_widths) + (1,) * (arr.ndim - 1))
-                    mel_b = _tile_sp(mel_batch)
-                    sp_tgt_in_b = _tile_sp(sp_tgt_in)
-                    sp_tgt_out_b = _tile_sp(sp_tgt_out)
-                    sp_lm_b = _tile_sp(sp_lm)
-                else:
-                    mel_b = shard_batch(mel_batch, num_devices)
-                    sp_tgt_in_b = shard_batch(sp_tgt_in, num_devices)
-                    sp_tgt_out_b = shard_batch(sp_tgt_out, num_devices)
-                    sp_lm_b = shard_batch(sp_lm, num_devices)
+                mel_b = shard_batch(mel_batch, num_devices)
+                sp_tgt_in_b = shard_batch(sp_tgt_in, num_devices)
+                sp_tgt_out_b = shard_batch(sp_tgt_out, num_devices)
+                sp_lm_b = shard_batch(sp_lm, num_devices)
 
                 rng, spec_rng = jax.random.split(rng)
                 spec_rngs = jax.random.split(spec_rng, num_devices)
@@ -765,6 +835,7 @@ def train(args):
                     state, ema_params, sp_loss, sp_grad_norm = p_train_step_speech(
                         state, ema_params, mel_b, sp_tgt_in_b, sp_tgt_out_b, causal_mask, text_ffn_mask, spec_rngs, sp_lm_b,
                     )
+
                 speech_loss_val = float(sp_loss[0])
                 speech_losses.append(speech_loss_val)
                 step_grad_norm = float(sp_grad_norm[0])
@@ -827,6 +898,8 @@ def train(args):
         text_batch_iter.close()
         if speech_batch_iter is not None:
             speech_batch_iter.close()
+        if cl_batch_iter is not None:
+            cl_batch_iter.close()
 
         if epoch == weight_prune_epoch and not gradual_sparsify_done:
             gradual_sparsify_done = True
@@ -909,44 +982,188 @@ def train(args):
             pickle.dump({"params": params_np, "config": config.__dict__}, f)
         del params_np
 
-        from .test import measure_throughput
-        from .run import generate, generate_from_audio
+        from .eval import measure_throughput
+        from .run import generate_batch
         tp = measure_throughput(eval_model, eval_params, tokenizer, num_runs=5)
 
-        from .data import _load_unified_dataset
-        _ds_full = _load_unified_dataset()
-        _val_start = int(len(_ds_full) * 0.9)
         val_kept = val_data["kept_indices"]
-        n_eval_samples = min(3, len(val_kept))
-        step = max(1, len(val_kept) // n_eval_samples)
-        sample_indices = [val_kept[i * step] for i in range(n_eval_samples)]
-        eval_indices = np.array(sample_indices) + _val_start
+        val_ds = load_tool_calls("val", max_samples=args.max_samples)
+
+        # Pick 5 display samples (shuffled for diversity): 4 with tool calls, 1 without
+        sample_rng = np.random.RandomState(epoch + 7)
+        sample_pool = sample_rng.permutation(len(val_kept))
+        display_with, display_without = [], []
+        for k in sample_pool:
+            if len(display_with) >= 4 and len(display_without) >= 1:
+                break
+            local_idx = int(val_kept[k])
+            ex = val_ds[local_idx]
+            is_empty = ex["answers"].strip() in ("", "[]")
+            if not is_empty and len(display_with) < 4:
+                display_with.append(ex)
+            elif is_empty and len(display_without) < 1:
+                display_without.append(ex)
+        display_pairs = display_with + display_without
+
+        # Collect all eval examples, then batch-generate everything at once
+        import json as _json_mod
+        tc_with_n = 85
+        tc_without_n = 15
+        tc_rng = np.random.RandomState(epoch + 42)
+        tc_pool = tc_rng.permutation(len(val_kept))
+        tc_with, tc_without = [], []
+        for k in tc_pool:
+            if len(tc_with) >= tc_with_n and len(tc_without) >= tc_without_n:
+                break
+            local_idx = int(val_kept[k])
+            ex = val_ds[local_idx]
+            ref_text = ex["answers"].strip()
+            is_empty = ref_text in ("", "[]")
+            if not is_empty and len(tc_with) < tc_with_n:
+                tc_with.append(ex)
+            elif is_empty and len(tc_without) < tc_without_n:
+                tc_without.append(ex)
+        tc_eval_pairs = tc_with + tc_without
+
+        # Batch-generate: display samples + tc eval samples in one pass
+        all_eval_examples = display_pairs + tc_eval_pairs
+        eval_gen_len = min(args.max_dec_len, 512)
+        all_preds = generate_batch(
+            eval_model, eval_params, tokenizer,
+            [ex["query"] for ex in all_eval_examples],
+            [ex["tools"] for ex in all_eval_examples],
+            max_gen_len=eval_gen_len,
+            max_enc_len=args.max_enc_len,
+        )
+
+        display_preds = all_preds[:len(display_pairs)]
+        tc_preds = all_preds[len(display_pairs):]
 
         unified_samples = []
-        for i, ds_idx in enumerate(eval_indices):
-            pair = load_example_with_audio(int(ds_idx))
-            query = pair["query"][:80]
-            ref = pair["answers"][:120]
+        for ex, pred in zip(display_pairs, display_preds):
+            unified_samples.append({
+                "query": ex["query"],
+                "tools": ex["tools"],
+                "ref": ex["answers"],
+                "text": pred.strip(),
+            })
 
-            # Text prediction
-            text_pred = generate(
-                eval_model, eval_params, tokenizer, pair["query"],
-                tools=pair["tools"], max_gen_len=args.max_dec_len, seed=i, stream=False,
-            ).strip()[:120]
+        tc_n, tc_exact, tc_name_tp, tc_name_fp, tc_name_fn = 0, 0, 0, 0, 0
+        tc_call_tp, tc_call_fp, tc_call_fn, tc_parse_err = 0, 0, 0, 0
+        tc_args_correct, tc_args_total = 0, 0
+        tc_halluc_params, tc_total_pred_params = 0, 0
+        tc_missing_params, tc_total_ref_params = 0, 0
+        tc_correct_values, tc_matched_params = 0, 0
 
-            # Voice prediction
-            voice_pred = None
-            if not no_speech and pair["audio_array"] is not None:
-                voice_pred = generate_from_audio(
-                    eval_model, eval_params, tokenizer, pair["audio_array"], sr=pair["sampling_rate"],
-                    tools=pair["tools"], max_gen_len=args.max_dec_len, seed=i, stream=False,
-                ).strip()[:120]
+        def _call_key(c):
+            if not isinstance(c, dict): return None
+            return _json_mod.dumps({"name": c.get("name"), "arguments": c.get("arguments")}, sort_keys=True)
 
-            unified_samples.append((query, ref, text_pred, voice_pred))
+        for ex, pred_text in zip(tc_eval_pairs, tc_preds):
+            ref_text = ex["answers"].strip()
+            pred_text = pred_text.strip()
+            try:
+                ref_calls = _json_mod.loads(ref_text)
+            except (ValueError, TypeError):
+                ref_calls = []
+            try:
+                pred_calls = _json_mod.loads(pred_text)
+                if not isinstance(pred_calls, list):
+                    pred_calls = [pred_calls] if isinstance(pred_calls, dict) else []
+            except (ValueError, TypeError):
+                tc_parse_err += 1
+                pred_calls = []
+            tc_n += 1
+            if _json_mod.dumps(pred_calls, sort_keys=True) == _json_mod.dumps(ref_calls, sort_keys=True):
+                tc_exact += 1
+            ref_names = {c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c}
+            pred_names = {c["name"] for c in pred_calls if isinstance(c, dict) and "name" in c}
+            tc_name_tp += len(pred_names & ref_names)
+            tc_name_fp += len(pred_names - ref_names)
+            tc_name_fn += len(ref_names - pred_names)
+            rk = {_call_key(c) for c in ref_calls} - {None}
+            pk = {_call_key(c) for c in pred_calls} - {None}
+            tc_call_tp += len(pk & rk)
+            tc_call_fp += len(pk - rk)
+            tc_call_fn += len(rk - pk)
+
+            # Argument correctness: for name-matched calls, check if arguments match
+            ref_by_name = {}
+            for c in ref_calls:
+                if isinstance(c, dict) and "name" in c:
+                    ref_by_name.setdefault(c["name"], []).append(c.get("arguments", {}))
+            for c in pred_calls:
+                if isinstance(c, dict) and "name" in c and c["name"] in ref_by_name:
+                    tc_args_total += 1
+                    pred_args = _json_mod.dumps(c.get("arguments", {}), sort_keys=True)
+                    if any(pred_args == _json_mod.dumps(ra, sort_keys=True) for ra in ref_by_name[c["name"]]):
+                        tc_args_correct += 1
+
+            # Parameter-level metrics
+            try:
+                tool_defs = _json_mod.loads(ex["tools"])
+                tool_param_map = {t["name"]: set((t.get("parameters") or {}).keys()) for t in tool_defs if isinstance(t, dict) and "name" in t}
+            except (ValueError, TypeError):
+                tool_param_map = {}
+            for c in pred_calls:
+                if not isinstance(c, dict) or "name" not in c:
+                    continue
+                cname = c["name"]
+                if cname not in tool_param_map:
+                    continue
+                schema_keys = tool_param_map[cname]
+                pred_keys = set((c.get("arguments") or {}).keys())
+                tc_total_pred_params += len(pred_keys)
+                tc_halluc_params += len(pred_keys - schema_keys)
+                # Find matching reference call for missing/value metrics
+                if cname in ref_by_name:
+                    ref_args = ref_by_name[cname][0]
+                    ref_keys = set((ref_args if isinstance(ref_args, dict) else {}).keys())
+                    tc_total_ref_params += len(ref_keys)
+                    tc_missing_params += len(ref_keys - pred_keys)
+                    matched_keys = pred_keys & ref_keys
+                    tc_matched_params += len(matched_keys)
+                    for k in matched_keys:
+                        if _json_mod.dumps(c.get("arguments", {})[k], sort_keys=True) == _json_mod.dumps(ref_args[k], sort_keys=True):
+                            tc_correct_values += 1
+
+        tc_metrics = {}
+        if tc_n > 0:
+            tc_metrics["parse_rate"] = 1.0 - tc_parse_err / tc_n
+            tc_metrics["exact_match"] = tc_exact / tc_n
+            np_ = tc_name_tp + tc_name_fp
+            nr_ = tc_name_tp + tc_name_fn
+            tc_metrics["name_f1"] = 2 * tc_name_tp / max(np_ + nr_, 1)
+            cp_ = tc_call_tp + tc_call_fp
+            cr_ = tc_call_tp + tc_call_fn
+            tc_metrics["call_f1"] = 2 * tc_call_tp / max(cp_ + cr_, 1)
+            tc_metrics["args_acc"] = tc_args_correct / max(tc_args_total, 1)
+            tc_metrics["param_haluc"] = tc_halluc_params / max(tc_total_pred_params, 1)
+            tc_metrics["param_miss"] = tc_missing_params / max(tc_total_ref_params, 1)
+            tc_metrics["value_acc"] = tc_correct_values / max(tc_matched_params, 1)
+
+        # Save best checkpoint based on call_f1
+        if tc_metrics and tc_metrics["call_f1"] > best_call_f1:
+            best_call_f1 = tc_metrics["call_f1"]
+            best_ckpt_path = os.path.join(args.checkpoint_dir, f"needle_{args.num_layers}_{args.d_model}_best.pkl")
+            params_best = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
+            with open(best_ckpt_path, "wb") as f:
+                pickle.dump({"params": params_best, "config": config.__dict__}, f)
+            del params_best
+            print(f"  ** New best call_f1={best_call_f1:.1%} → {best_ckpt_path}")
+
+        # Contrastive retrieval eval
+        retrieval_metrics = None
+        if has_contrastive and _CONTRASTIVE_WEIGHT > 0:
+            from .eval import benchmark_retrieval
+            retrieval_metrics = benchmark_retrieval(
+                eval_model, eval_params, tokenizer,
+                num_samples=min(500, getattr(args, "max_eval_samples", 500)),
+            )
 
         del eval_params
-
         final_speech_loss = speech_losses[-1] if speech_losses else None
+
         print(f"\n  ─────────────────────────────────────")
         print(f"  Epoch {epoch + 1}/{args.epochs}")
         print(f"  ─────────────────────────────────────")
@@ -966,18 +1183,37 @@ def train(args):
             for factor in sorted(mat_results.keys()):
                 mat_ppl, mat_params, ff_w = mat_results[factor]
                 print(f"  {str(factor)+'x':>6}  {ff_w:>6}  {mat_ppl:>10.2f}  {mat_params:>12,}")
+        if tc_metrics:
+            print(f"  ─── Tool-Call Accuracy ({tc_n} samples) ──")
+            print(f"  JSON parse     {tc_metrics['parse_rate']:>10.1%}")
+            print(f"  Name F1        {tc_metrics['name_f1']:>10.1%}")
+            print(f"  Param haluc    {tc_metrics['param_haluc']:>10.1%}")
+            print(f"  Param miss     {tc_metrics['param_miss']:>10.1%}")
+            print(f"  Value acc      {tc_metrics['value_acc']:>10.1%}")
+            print(f"  Args acc       {tc_metrics['args_acc']:>10.1%}")
+            print(f"  Call F1        {tc_metrics['call_f1']:>10.1%}")
+            print(f"  Exact match    {tc_metrics['exact_match']:>10.1%}")
+        if retrieval_metrics and retrieval_metrics["num_queries"] > 0:
+            rm = retrieval_metrics
+            print(f"  ─── Retrieval ({rm['num_queries']} queries) ─────")
+            for k, v in sorted(rm["recall@k"].items()):
+                print(f"  Recall@{k:<3}     {v:>10.1%}")
+            print(f"  MRR            {rm['mrr']:>10.3f}")
         print(f"  ─────────────────────────────────────")
         print(f"  Throughput     {tp['tokens_per_second']:>10.1f} tok/s")
         print(f"  Latency        {tp['avg_latency_s']:>11.3f}s")
         if unified_samples:
-            print(f"  ─── Samples ────────────────────────")
-            for query, ref, text_pred, voice_pred in unified_samples:
-                print(f"  Q: {query}")
-                print(f"  R: {ref}")
-                print(f"  T: {text_pred or '(empty)'}")
-                if voice_pred is not None:
-                    print(f"  V: {voice_pred or '(empty)'}")
-                print()
+            print(f"  ─── Samples ({len(unified_samples)}) ───────────────────")
+            for j, s in enumerate(unified_samples):
+                print(f"  [{j+1}] Query: {s['query'][:120]}")
+                tools_short = s["tools"][:120]
+                if len(s["tools"]) > 120:
+                    tools_short += "..."
+                print(f"      Tools: {tools_short}")
+                print(f"      Ref:   {s['ref'][:200] or '[]'}")
+                print(f"      Text:  {s['text'][:200] or '(empty)'}")
+                if j < len(unified_samples) - 1:
+                    print()
         print(f"  ─────────────────────────────────────")
         print(f"  Checkpoint: {ckpt_path}")
         print(f"  ─────────────────────────────────────\n")
@@ -997,8 +1233,23 @@ def train(args):
             for factor, (mat_ppl, mat_params, _) in mat_results.items():
                 log_dict[f"epoch/mat_ppl_{factor}x"] = mat_ppl
                 log_dict[f"epoch/mat_params_{factor}x"] = mat_params
+            if tc_metrics:
+                log_dict["epoch/tc_parse_rate"] = tc_metrics["parse_rate"]
+                log_dict["epoch/tc_exact_match"] = tc_metrics["exact_match"]
+                log_dict["epoch/tc_name_f1"] = tc_metrics["name_f1"]
+                log_dict["epoch/tc_param_haluc"] = tc_metrics["param_haluc"]
+                log_dict["epoch/tc_param_miss"] = tc_metrics["param_miss"]
+                log_dict["epoch/tc_value_acc"] = tc_metrics["value_acc"]
+                log_dict["epoch/tc_args_acc"] = tc_metrics["args_acc"]
+                log_dict["epoch/tc_call_f1"] = tc_metrics["call_f1"]
+            if retrieval_metrics and retrieval_metrics["num_queries"] > 0:
+                for k, v in retrieval_metrics["recall@k"].items():
+                    log_dict[f"epoch/retrieval_recall@{k}"] = v
+                log_dict["epoch/retrieval_mrr"] = retrieval_metrics["mrr"]
             wandb.log(log_dict)
 
     if use_wandb:
         wandb.finish()
+    if best_ckpt_path:
+        print(f"\nBest checkpoint (call_f1={best_call_f1:.1%}): {best_ckpt_path}")
     print("\nTraining complete.")

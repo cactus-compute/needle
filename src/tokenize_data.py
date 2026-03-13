@@ -1,70 +1,70 @@
 """Standalone tokenization pipeline: train tokenizer and pre-tokenize all data.
 
-Trains the SentencePiece tokenizer and tokenizes train + val splits for both
-text and voice data, caching everything on GCS. Running fresh overwrites all
-existing tokenizer + caches.
+Downloads the synthesized tool-calling dataset from GCS
+(gs://cactus-dataset/synth_tool_calls/), trains the SentencePiece tokenizer,
+and tokenizes train + val splits, caching everything locally.
 
 Usage:
     needle tokenize                         # full run
     needle tokenize --max-samples 1000      # dev/test
-    needle tokenize --cleanup               # delete local cache after GCS upload
 """
 
 import os
 import shutil
-import subprocess
 
 from .data import (
     CACHE_DIR,
-    GCS_CACHE_PATH,
-    GCS_TOKENIZER_PATH,
+    DEFAULT_MAX_DEC_LEN,
+    DEFAULT_MAX_ENC_LEN,
     TOKENIZER_DIR,
     _cache_key,
     _save_cache_metadata,
+    _DISK_UNIFIED_DIR,
+    _SHM_UNIFIED_DIR,
+    _shm_available,
     get_tokenizer,
     load_tool_calls,
-    precompute_mels,
     prepare_tool_call_pairs,
     train_tokenizer,
-    upload_tokenizer_to_gcs,
 )
 
 
-def _clear_gcs_caches():
-    """Remove existing GCS cache and tokenizer files."""
-    for path in [GCS_CACHE_PATH + "/*", GCS_TOKENIZER_PATH + "*"]:
-        print(f"Clearing {path} ...")
-        subprocess.run(
-            ["gcloud", "storage", "rm", "-r", path],
-            capture_output=True, text=True,
-        )
-
-
 def _clear_local_caches():
-    """Remove local .data_cache/ and tokenizer/ directories."""
-    for d in [CACHE_DIR, TOKENIZER_DIR]:
+    """Remove local .data_cache/, tokenizer/, and stale unified dataset directories."""
+    for d in [CACHE_DIR, TOKENIZER_DIR, _DISK_UNIFIED_DIR, _SHM_UNIFIED_DIR]:
         if os.path.exists(d):
             print(f"Removing {d}/ ...")
             shutil.rmtree(d)
 
 
+def _download_synth_dataset():
+    """Download synthesized tool-calling dataset from GCS."""
+    from .gcs import download_synth_data
+
+    target = _SHM_UNIFIED_DIR if _shm_available() else _DISK_UNIFIED_DIR
+    print(f"Downloading synth dataset to {target} ...")
+    if not download_synth_data(target):
+        raise FileNotFoundError(
+            "Synth dataset not found at gs://cactus-dataset/synth_tool_calls/. "
+            "Run 'python scripts/synthesize_tools_data.py' first."
+        )
+
+
 def tokenize(args):
     print("=== Clearing existing caches ===")
-    _clear_gcs_caches()
     _clear_local_caches()
+
+    print("\n=== Downloading synth dataset from GCS ===")
+    _download_synth_dataset()
 
     print("\n=== Training tokenizer ===")
     train_tokenizer(max_samples=args.max_samples, force=True)
-    upload_tokenizer_to_gcs()
 
     tokenizer = get_tokenizer()
 
-    print("\n=== Tokenizing text data + precomputing mels ===")
-    max_enc_len = getattr(args, "max_enc_len", 256)
-    max_dec_len = getattr(args, "max_dec_len", 1024)
-    n_mels = getattr(args, "n_mels", 80)
-    max_mel_len = getattr(args, "max_mel_len", 1024)
-    batch_size = getattr(args, "batch_size", 5000)
+    print("\n=== Tokenizing text data ===")
+    max_enc_len = getattr(args, "max_enc_len", DEFAULT_MAX_ENC_LEN)
+    max_dec_len = getattr(args, "max_dec_len", DEFAULT_MAX_DEC_LEN)
 
     for split in ("train", "val"):
         print(f"\n--- {split} split ---")
@@ -73,23 +73,24 @@ def tokenize(args):
             max_samples=args.max_samples,
             return_global_indices=True,
         )
-        _, _, _, _, kept_indices = prepare_tool_call_pairs(
+        w_name = getattr(args, "w_name", 3.0)
+        w_value = getattr(args, "w_value", 2.0)
+        w_key = getattr(args, "w_key", 1.5)
+        shuffle_tools = getattr(args, "shuffle_tools", True)
+        max_tool_len = getattr(args, "max_tool_len", 256)
+        prepare_tool_call_pairs._max_tool_len = max_tool_len
+        _, _, _, _, kept_indices, _ = prepare_tool_call_pairs(
             ds, tokenizer, max_enc_len=max_enc_len, max_dec_len=max_dec_len,
-            batch_size=batch_size,
+            w_name=w_name, w_value=w_value, w_key=w_key, shuffle_tools=shuffle_tools,
         )
-        text_cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len)
+        text_cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len,
+                                   w_name, w_value, w_key, shuffle_tools)
 
-        mel_cache_id = precompute_mels(
-            global_indices[kept_indices], n_mels=n_mels, max_mel_len=max_mel_len,
-            cache_id_prefix=split, batch_size=batch_size,
-        )
+        _save_cache_metadata(split, text_cache_id, len(kept_indices),
+                             max_enc_len, max_dec_len)
 
-        _save_cache_metadata(split, text_cache_id, mel_cache_id, len(kept_indices),
-                             max_enc_len, max_dec_len, n_mels, max_mel_len)
-
-    if args.cleanup and os.path.exists(CACHE_DIR):
-        print(f"\n=== Cleaning up {CACHE_DIR}/ ===")
-        shutil.rmtree(CACHE_DIR)
-        print("Done.")
+    from .gcs import upload_tokenized_data, upload_tokenizer
+    upload_tokenizer(TOKENIZER_DIR)
+    upload_tokenized_data(CACHE_DIR)
 
     print("\n=== Tokenization pipeline complete ===")

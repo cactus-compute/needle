@@ -13,29 +13,207 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 import numpy as np
-from datasets import Audio, load_from_disk
+from datasets import Audio, Dataset, load_from_disk
 from tqdm import tqdm
 import sentencepiece as spm
 
-CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".data_cache")
-TOKENIZER_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tokenizer")
+import re as _re
+
+def to_snake_case(name):
+    """Convert camelCase, PascalCase, or dot.notation name to snake_case."""
+    # Replace any non-alphanumeric/underscore characters with underscores
+    s = _re.sub(r'[^a-zA-Z0-9_]+', '_', name)
+    # Insert underscore before uppercase letters that follow lowercase/digits
+    s = _re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
+    # Insert underscore between consecutive uppercase and uppercase+lowercase
+    s = _re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', s)
+    # Collapse multiple underscores and strip edges
+    s = _re.sub(r'_+', '_', s)
+    return s.lower().strip('_')
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+_DISK_CACHE_DIR = os.path.join(_PROJECT_ROOT, ".data_cache")
+TOKENIZER_DIR = os.path.join(_PROJECT_ROOT, "tokenizer")
 TOKENIZER_PREFIX = os.path.join(TOKENIZER_DIR, "needle")
-LOCAL_UNIFIED_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "tool_calls_unified")
-GCS_DATASET_PATH = "gs://cactus-dataset/tool_calls"
+_DISK_UNIFIED_DIR = os.path.join(_PROJECT_ROOT, "data", "tool_calls_unified")
+_SHM_UNIFIED_DIR = os.path.join("/dev/shm", "needle_data", "tool_calls_unified")
+
+
+_MIN_SHM_BYTES = 20 * 1024**3
+
+
+def _shm_available():
+    """Check if /dev/shm has enough space for RAM-backed storage."""
+    shm = "/dev/shm"
+    if os.path.isdir(shm):
+        try:
+            st = os.statvfs(shm)
+            return st.f_bavail * st.f_frsize >= _MIN_SHM_BYTES
+        except OSError:
+            pass
+    return False
+
+
+def _pick_unified_dir():
+    """Use /dev/shm for unified dataset when RAM is plentiful, else disk."""
+    if os.path.isdir(_SHM_UNIFIED_DIR) and any(
+        f.endswith(".arrow") for f in os.listdir(_SHM_UNIFIED_DIR)
+    ):
+        return _SHM_UNIFIED_DIR
+    if _shm_available():
+        return _SHM_UNIFIED_DIR
+    return _DISK_UNIFIED_DIR
+
+
+LOCAL_UNIFIED_DIR = _pick_unified_dir()
+
+
+def _pick_cache_dir():
+    """Use /dev/shm (tmpfs/RAM) when available and large enough, else disk."""
+    if _shm_available():
+        d = os.path.join("/dev/shm", "needle_cache")
+        os.makedirs(d, exist_ok=True)
+        return d
+    os.makedirs(_DISK_CACHE_DIR, exist_ok=True)
+    return _DISK_CACHE_DIR
+
+
+def _setup_hf_cache():
+    """Point HuggingFace download cache to /dev/shm when RAM is plentiful."""
+    if _shm_available():
+        hf_cache = os.path.join("/dev/shm", "needle_hf_cache")
+        os.makedirs(hf_cache, exist_ok=True)
+        os.environ.setdefault("HF_HOME", hf_cache)
+        os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(hf_cache, "datasets"))
+
+
+_setup_hf_cache()
+
+
+CACHE_DIR = _pick_cache_dir()
 
 PAD_ID = 0
 EOS_ID = 1
-BOS_ID = 2  # reserved for SentencePiece, unused at runtime (EOS_ID serves as SOS)
+BOS_ID = 2
 UNK_ID = 3
 TOOL_CALL_ID = 4
-TRANSCRIBE_ID = 5
+TOOLS_ID = 5
+DEFER_ID = 6
+
+DEFAULT_MAX_ENC_LEN = 1024
+DEFAULT_MAX_DEC_LEN = 512
+DEFAULT_MAX_GEN_LEN = 512
 
 _unified_dataset_cache = None
 
 
-def _load_unified_dataset():
-    """Load the unified dataset from GCS (via gcsfs) or local fallback.
+def _mark_json_value(s, char_w, key, value_str, weight):
+    """Find '"key": "value_str"' or '"key": value_str' in s, mark value chars."""
+    pattern_str = f'"{_re.escape(key)}"\\s*:\\s*"{_re.escape(value_str)}"'
+    for m in _re.finditer(pattern_str, s):
+        tail = s[m.start() + len(f'"{key}"'):m.end()]
+        val_offset = tail.index(f'"{value_str}"') + 1
+        val_start = m.start() + len(f'"{key}"') + val_offset
+        val_end = val_start + len(value_str)
+        char_w[val_start:val_end] = np.maximum(char_w[val_start:val_end], weight)
+        return
 
+    pattern_ns = f'"{_re.escape(key)}"\\s*:\\s*{_re.escape(value_str)}'
+    for m in _re.finditer(pattern_ns, s):
+        colon_offset = s[m.start():m.end()].index(':')
+        val_start = m.start() + colon_offset + 1
+        while val_start < m.end() and s[val_start] == ' ':
+            val_start += 1
+        val_end = m.end()
+        char_w[val_start:val_end] = np.maximum(char_w[val_start:val_end], weight)
+        return
+
+
+def _mark_json_key_in_args(s, char_w, key, weight):
+    """Mark the argument key string (inside quotes) in the JSON."""
+    for m in _re.finditer(f'"{_re.escape(key)}"\\s*:', s):
+        char_w[m.start() + 1:m.start() + 1 + len(key)] = np.maximum(
+            char_w[m.start() + 1:m.start() + 1 + len(key)], weight)
+
+
+def _count_tool_calls(answers_str):
+    """Count the number of tool calls in an answers JSON string."""
+    try:
+        calls = _json.loads(answers_str)
+    except (ValueError, TypeError):
+        return 0
+    return len(calls) if isinstance(calls, list) else 0
+
+
+def _shuffle_tools_json(tools_str, seed):
+    """Parse tools JSON array, shuffle order deterministically, re-serialize."""
+    try:
+        tools = _json.loads(tools_str)
+    except (ValueError, TypeError):
+        return tools_str
+    if not isinstance(tools, list) or len(tools) <= 1:
+        return tools_str
+    rng = np.random.RandomState(seed)
+    rng.shuffle(tools)
+    return _json.dumps(tools, separators=(",", ":"))
+
+
+def _token_weights_for_answer(answer_str, token_ids, sp_model,
+                               w_name=3.0, w_value=2.0, w_key=1.5):
+    """Compute per-token loss weights based on JSON structure.
+
+    Parses the answer JSON to identify character spans of tool names,
+    argument keys, and argument values, then maps to token-level weights
+    using SentencePiece byte offsets.
+    """
+    n = len(token_ids)
+    weights = np.ones(n, dtype=np.float32)
+
+    try:
+        calls = _json.loads(answer_str)
+    except (ValueError, TypeError):
+        return weights
+
+    if not isinstance(calls, list):
+        return weights
+
+    char_w = np.ones(len(answer_str), dtype=np.float32)
+
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        name = call.get("name", "")
+        if name:
+            _mark_json_value(answer_str, char_w, "name", name, w_name)
+
+        args = call.get("arguments", {})
+        if isinstance(args, dict):
+            for k, v in args.items():
+                _mark_json_key_in_args(answer_str, char_w, k, w_key)
+                v_str = _json.dumps(v) if not isinstance(v, str) else v
+                _mark_json_value(answer_str, char_w, k, v_str, w_value)
+
+    pieces = sp_model.Encode(answer_str, out_type=str)
+    pos = 0
+    for i, piece in enumerate(pieces):
+        if i >= n:
+            break
+        raw = piece.replace('\u2581', ' ')
+        plen = len(raw)
+        if plen > 0 and pos + plen <= len(answer_str):
+            token_w = char_w[pos:pos + plen].max()
+            weights[i] = token_w
+            pos += plen
+        else:
+            pos += max(plen, 1)
+
+    return weights
+
+
+def _load_unified_dataset():
+    """Load the unified dataset from /dev/shm or disk.
+
+    Checks /dev/shm first (RAM-backed), then falls back to disk.
     Caches the result in memory after first load.
     Uses soundfile as the audio decoding backend.
     """
@@ -43,29 +221,33 @@ def _load_unified_dataset():
     if _unified_dataset_cache is not None:
         return _unified_dataset_cache
 
-    if os.path.exists(LOCAL_UNIFIED_DIR) and any(
-        f.endswith(".arrow") for f in os.listdir(LOCAL_UNIFIED_DIR)
-    ):
-        try:
-            ds = load_from_disk(LOCAL_UNIFIED_DIR)
-            print(f"Loaded unified dataset from {LOCAL_UNIFIED_DIR} ({len(ds)} rows)")
-            _unified_dataset_cache = _set_audio_backend(ds)
-            return _unified_dataset_cache
-        except Exception:
-            print(f"Local dataset at {LOCAL_UNIFIED_DIR} is incomplete, trying GCS...")
+    for path in [_SHM_UNIFIED_DIR, _DISK_UNIFIED_DIR]:
+        if os.path.exists(path) and any(
+            f.endswith(".arrow") for f in os.listdir(path)
+        ):
+            try:
+                ds = load_from_disk(path)
+                print(f"Loaded unified dataset from {path} ({len(ds)} rows)")
+                _unified_dataset_cache = _set_audio_backend(ds)
+                return _unified_dataset_cache
+            except Exception as e:
+                print(f"Warning: failed to load from {path}: {e}")
+                continue
 
     try:
-        ds = load_from_disk(GCS_DATASET_PATH)
-        print(f"Loaded unified dataset from GCS ({len(ds)} rows)")
-        _unified_dataset_cache = _set_audio_backend(ds)
-        return _unified_dataset_cache
+        from .gcs import download_synth_data
+        target = _SHM_UNIFIED_DIR if _shm_available() else _DISK_UNIFIED_DIR
+        if download_synth_data(target):
+            ds = load_from_disk(target)
+            print(f"Loaded synth dataset from GCS -> {target} ({len(ds)} rows)")
+            _unified_dataset_cache = _set_audio_backend(ds)
+            return _unified_dataset_cache
     except Exception as e:
-        gcs_err = e
+        print(f"Warning: GCS download failed: {e}")
 
     raise FileNotFoundError(
-        f"Unified dataset not found. Run scripts/build_dataset.py first, "
-        f"or ensure GCS path {GCS_DATASET_PATH} is accessible (pip install gcsfs). "
-        f"GCS error: {gcs_err}"
+        f"Dataset not found at {_SHM_UNIFIED_DIR} or {_DISK_UNIFIED_DIR}. "
+        f"Run 'needle tokenize' or 'python scripts/synthesize_tools_data.py' first."
     )
 
 
@@ -103,8 +285,12 @@ class NeedleTokenizer:
         return TOOL_CALL_ID
 
     @property
-    def transcribe_token_id(self):
-        return TRANSCRIBE_ID
+    def tools_token_id(self):
+        return TOOLS_ID
+
+    @property
+    def defer_token_id(self):
+        return DEFER_ID
 
     @property
     def vocab_size(self):
@@ -177,10 +363,10 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
         eos_id=EOS_ID,
         bos_id=BOS_ID,
         unk_id=UNK_ID,
-        user_defined_symbols=["<tool_call>", "<transcribe>"],
+        user_defined_symbols=["<tool_call>", "<tools>", "<defer>"],
         byte_fallback=True,
         normalization_rule_name="identity",
-        num_threads=os.cpu_count(),
+        num_threads=min(20, max(1, (os.cpu_count() or 1) // 4)),
         train_extremely_large_corpus=False,
         minloglevel=2,
     )
@@ -190,113 +376,47 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
     return model_path
 
 
-GCS_TOKENIZER_PATH = "gs://cactus-dataset/tokenizer/"
-
-
-def upload_tokenizer_to_gcs():
-    """Upload local tokenizer files to GCS."""
-    import subprocess
-    import glob as globmod
-    tok_files = globmod.glob(os.path.join(TOKENIZER_DIR, "*"))
-    if tok_files:
-        subprocess.run(
-            ["gcloud", "storage", "cp"] + tok_files + [GCS_TOKENIZER_PATH],
-            capture_output=True, text=True,
-        )
-        print(f"Uploaded tokenizer to {GCS_TOKENIZER_PATH}")
-
-
 def get_tokenizer(max_samples=None):
     model_path = TOKENIZER_PREFIX + ".model"
     if not os.path.exists(model_path):
-        # Try downloading from GCS first
-        if _download_tokenizer_from_gcs():
-            return NeedleTokenizer(model_path)
+        try:
+            from .gcs import download_tokenizer
+            download_tokenizer(TOKENIZER_DIR)
+        except Exception:
+            pass
+    if not os.path.exists(model_path):
         train_tokenizer(max_samples=max_samples)
     return NeedleTokenizer(model_path)
 
 
-def _download_tokenizer_from_gcs():
-    """Download tokenizer files from GCS. Returns True on success."""
-    import subprocess
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-    result = subprocess.run(
-        ["gcloud", "storage", "cp", "-r", GCS_TOKENIZER_PATH + "*", TOKENIZER_DIR + "/"],
-        capture_output=True, text=True,
-    )
-    model_path = TOKENIZER_PREFIX + ".model"
-    if result.returncode == 0 and os.path.exists(model_path):
-        print(f"Downloaded tokenizer from {GCS_TOKENIZER_PATH}")
-        return True
-    return False
-
-
-GCS_CACHE_PATH = "gs://cactus-dataset/cache"
-
-
-def _gcs_cache_download(cache_id, suffixes):
-    """Try downloading cached files from GCS. Returns True if all found."""
-    import subprocess
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    cache_path = os.path.join(CACHE_DIR, cache_id)
-    srcs = [f"{GCS_CACHE_PATH}/{cache_id}{s}" for s in suffixes]
-    subprocess.run(
-        ["gcloud", "storage", "cp"] + srcs + [CACHE_DIR + "/"],
-        capture_output=True, text=True,
-    )
-    return all(os.path.exists(cache_path + s) for s in suffixes)
-
-
-def _gcs_cache_upload(cache_id, suffixes):
-    """Upload cached files to GCS."""
-    import subprocess
-    cache_path = os.path.join(CACHE_DIR, cache_id)
-    files = [cache_path + s for s in suffixes if os.path.exists(cache_path + s)]
-    if files:
-        subprocess.run(
-            ["gcloud", "storage", "cp"] + files + [GCS_CACHE_PATH + "/"],
-            capture_output=True, text=True,
-        )
-
-
-def _gcs_download_shards(cache_id, n_shards, shard_suffixes):
-    """Download sharded .npy files from GCS. Returns True if all found."""
-    import subprocess
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    srcs = []
-    for suffix in shard_suffixes:
-        for i in range(n_shards):
-            srcs.append(f"{GCS_CACHE_PATH}/{cache_id}{suffix}_{i:05d}.npy")
-    if not srcs:
-        return True
-    subprocess.run(
-        ["gcloud", "storage", "cp"] + srcs + [CACHE_DIR + "/"],
-        capture_output=True, text=True,
-    )
-    for suffix in shard_suffixes:
-        for i in range(n_shards):
-            if not os.path.exists(os.path.join(CACHE_DIR, f"{cache_id}{suffix}_{i:05d}.npy")):
-                return False
-    return True
-
-
 def load_tool_calls(split="train", max_samples=None, return_global_indices=False):
-    """Load tool-calling dataset, splitting 90/10 for train/val.
+    """Load tool-calling dataset with shuffled train/val split.
+
+    Shuffles the full dataset with a fixed seed, then splits:
+      - val: min(5000, 10% of total)
+      - train: everything else
 
     If return_global_indices is True, also return a numpy array mapping each
     split-local row position back to its row id in the full unified dataset.
     """
     ds = _load_unified_dataset()
     n = len(ds)
-    if split in ("validation", "val", "test"):
-        start, end = int(n * 0.9), n
-    elif split == "train":
-        start, end = 0, int(n * 0.9)
-    else:
-        start, end = 0, n
 
-    global_indices = np.arange(start, end, dtype=np.int64)
-    ds = ds.select(range(start, end))
+    rng = np.random.RandomState(42)
+    perm = rng.permutation(n)
+
+    val_size = min(5000, int(n * 0.1))
+    val_indices = perm[:val_size]
+    train_indices = perm[val_size:]
+
+    if split in ("validation", "val", "test"):
+        global_indices = val_indices.astype(np.int64)
+    elif split == "train":
+        global_indices = train_indices.astype(np.int64)
+    else:
+        global_indices = perm.astype(np.int64)
+
+    ds = ds.select(global_indices.tolist())
 
     if max_samples:
         limit = min(max_samples, len(ds))
@@ -317,251 +437,167 @@ def _tokenizer_hash():
     return "none"
 
 
-def _cache_key(prefix, n_samples, max_enc_len, max_dec_len):
+def _cache_key(prefix, n_samples, max_enc_len, max_dec_len,
+               w_name=3.0, w_value=2.0, w_key=1.5, shuffle_tools=True):
     tok_hash = _tokenizer_hash()
-    key = f"{prefix}_{tok_hash}_{n_samples}_{max_enc_len}_{max_dec_len}"
+    key = f"{prefix}_{tok_hash}_{n_samples}_{max_enc_len}_{max_dec_len}_{w_name}_{w_value}_{w_key}_{shuffle_tools}"
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
-def _mel_cache_key(prefix, n_samples, n_mels, max_mel_len):
-    tok_hash = _tokenizer_hash()
-    key = f"mel_{prefix}_{tok_hash}_{n_samples}_{n_mels}_{max_mel_len}"
-    return hashlib.md5(key.encode()).hexdigest()[:12]
-
-
-def _save_cache_metadata(split, text_cache_id, mel_cache_id, n_samples,
-                         max_enc_len, max_dec_len, n_mels, max_mel_len):
-    """Save metadata JSON for a split, upload to GCS."""
+def _save_cache_metadata(split, text_cache_id, n_samples, max_enc_len, max_dec_len):
+    """Save metadata JSON for a split locally."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     meta = {
         "split": split,
         "text_cache_id": text_cache_id,
-        "mel_cache_id": mel_cache_id,
         "n_samples": n_samples,
         "max_enc_len": max_enc_len,
         "max_dec_len": max_dec_len,
-        "n_mels": n_mels,
-        "max_mel_len": max_mel_len,
     }
     meta_path = os.path.join(CACHE_DIR, f"{split}_metadata.json")
     with open(meta_path, "w") as f:
         _json.dump(meta, f)
-    _gcs_cache_upload(f"{split}_metadata", [".json"])
 
 
 def _load_cache_metadata(split):
-    """Load metadata JSON from local or GCS. Returns dict or None."""
+    """Load metadata JSON from local cache. Returns dict or None."""
     meta_path = os.path.join(CACHE_DIR, f"{split}_metadata.json")
-    if os.path.exists(meta_path):
-        with open(meta_path) as f:
-            return _json.load(f)
-   
-    import subprocess
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    gcs_path = f"{GCS_CACHE_PATH}/{split}_metadata.json"
-    subprocess.run(
-        ["gcloud", "storage", "cp", gcs_path, meta_path],
-        capture_output=True, text=True,
-    )
     if os.path.exists(meta_path):
         with open(meta_path) as f:
             return _json.load(f)
     return None
 
 
-def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=256, max_dec_len=1024, batch_size=None):
+def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_dec_len=DEFAULT_MAX_DEC_LEN,
+                            w_name=3.0, w_value=2.0, w_key=1.5, shuffle_tools=True):
     """Prepare tool-call encoder-decoder pairs with <tool_call> task token.
 
-    Encoder input: tokenize(query), truncated to max_enc_len.
-    Decoder input:  [BOS, <tool_call>, tools_tokens..., answer_tokens...]
-    Decoder target: [<tool_call>, tools_tokens..., answer_tokens..., EOS]
-    Loss mask: 1 only on answer + EOS positions (not tools prefix or padding).
+    Encoder input: [query_tokens..., <tools>, tools_tokens...] truncated to max_enc_len.
+    Decoder input:  [EOS, <tool_call>, answer_tokens..., PAD...]
+    Decoder target: [<tool_call>, answer_tokens..., EOS, PAD...]
+    Loss mask: token-level weights based on JSON structure (tool names, arg keys/values).
 
-    When batch_size is set, produces per-batch shard files uploaded to GCS
-    incrementally. Returns (None, None, None, None, kept_indices).
-    When batch_size is None, returns (enc_inputs, dec_inputs, dec_targets,
-    loss_mask, kept_indices) as before.
+    Returns (enc_inputs, dec_inputs, dec_targets, loss_mask, kept_indices, tool_counts).
     """
 
-    cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len)
+    cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len,
+                          w_name, w_value, w_key, shuffle_tools)
     cache_path = os.path.join(CACHE_DIR, cache_id)
 
-    if batch_size is None:
-        tc_suffixes = ["_enc.npy", "_dec_in.npy", "_dec_tgt.npy", "_loss_mask.npy", "_kept_idx.npy"]
+    tc_suffixes = ["_enc.npy", "_dec_in.npy", "_dec_tgt.npy", "_loss_mask.npy", "_kept_idx.npy", "_tool_count.npy"]
 
-        def _load_tc_cache():
-            return (
-                np.load(cache_path + "_enc.npy"),
-                np.load(cache_path + "_dec_in.npy"),
-                np.load(cache_path + "_dec_tgt.npy"),
-                np.load(cache_path + "_loss_mask.npy"),
-                np.load(cache_path + "_kept_idx.npy"),
-            )
+    def _load_tc_cache():
+        tc_path = cache_path + "_tool_count.npy"
+        tc = np.load(tc_path) if os.path.exists(tc_path) else None
+        return (
+            np.load(cache_path + "_enc.npy"),
+            np.load(cache_path + "_dec_in.npy"),
+            np.load(cache_path + "_dec_tgt.npy"),
+            np.load(cache_path + "_loss_mask.npy"),
+            np.load(cache_path + "_kept_idx.npy"),
+            tc,
+        )
 
-        if os.path.exists(cache_path + "_enc.npy"):
-            print(f"Loading cached tool-call data ({cache_id})...")
-            return _load_tc_cache()
-
-        if _gcs_cache_download(cache_id, tc_suffixes):
-            print(f"Downloaded tool-call cache from GCS ({cache_id})...")
-            return _load_tc_cache()
-
-    if batch_size is not None:
-        manifest_path = cache_path + "_manifest.json"
-        if os.path.exists(manifest_path):
-            kept_indices = np.load(cache_path + "_kept_idx.npy")
-            print(f"Loading cached sharded tool-call data ({cache_id})...")
-            return None, None, None, None, kept_indices
-
-        if _gcs_cache_download(cache_id, ["_manifest.json", "_kept_idx.npy"]):
-            if os.path.exists(manifest_path):
-                kept_indices = np.load(cache_path + "_kept_idx.npy")
-                print(f"Downloaded sharded tool-call cache from GCS ({cache_id})...")
-                return None, None, None, None, kept_indices
+    if os.path.exists(cache_path + "_enc.npy"):
+        print(f"Loading cached tool-call data ({cache_id})...")
+        return _load_tc_cache()
 
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
     tool_call_id = tokenizer.tool_call_token_id
+    tools_sep_id = tokenizer.tools_token_id
+
+    defer_id = tokenizer.defer_token_id
 
     enc_texts = [ex["query"] for ex in ds]
     tools_texts = [ex["tools"] for ex in ds]
     ans_texts = [ex["answers"] for ex in ds]
 
-    num_workers = min(os.cpu_count() or 1, 8)
+    # Track which samples have empty tools (will use <defer> token instead)
+    empty_tools_mask = []
+    for t in tools_texts:
+        try:
+            parsed = _json.loads(t)
+            empty_tools_mask.append(isinstance(parsed, list) and len(parsed) == 0)
+        except (ValueError, TypeError):
+            empty_tools_mask.append(False)
+
+    tool_counts = np.array([_count_tool_calls(a) for a in ans_texts], dtype=np.int32)
+
+    if shuffle_tools:
+        tools_texts = [_shuffle_tools_json(t, seed=i) for i, t in enumerate(tools_texts)]
+
+    num_workers = min(20, max(1, (os.cpu_count() or 1) // 4))
     model_path = TOKENIZER_PREFIX + ".model"
     chunk_size = max(1, len(enc_texts) // (num_workers * 4))
 
     enc_chunks = [enc_texts[i:i + chunk_size] for i in range(0, len(enc_texts), chunk_size)]
-    print(f"Tokenizing encoder inputs ({num_workers} workers)...")
     with mp.Pool(num_workers, initializer=_init_worker,
                  initargs=(model_path, max_enc_len)) as pool:
-        enc_results = pool.map(_tokenize_chunk, enc_chunks)
+        enc_results = list(tqdm(pool.imap(_tokenize_chunk, enc_chunks),
+                                total=len(enc_chunks), desc="Tokenizing queries"))
     all_enc_tokens = [tok for chunk in enc_results for tok in chunk]
 
     tools_chunks = [tools_texts[i:i + chunk_size] for i in range(0, len(tools_texts), chunk_size)]
-    print(f"Tokenizing tools ({num_workers} workers)...")
     with mp.Pool(num_workers, initializer=_init_worker,
-                 initargs=(model_path, max_dec_len - 2)) as pool:
-        tools_results = pool.map(_tokenize_chunk, tools_chunks)
+                 initargs=(model_path, max_enc_len)) as pool:
+        tools_results = list(tqdm(pool.imap(_tokenize_chunk, tools_chunks),
+                                  total=len(tools_chunks), desc="Tokenizing tools"))
     all_tools_tokens = [tok for chunk in tools_results for tok in chunk]
 
     ans_chunks = [ans_texts[i:i + chunk_size] for i in range(0, len(ans_texts), chunk_size)]
-    print(f"Tokenizing answers ({num_workers} workers)...")
     with mp.Pool(num_workers, initializer=_init_worker,
                  initargs=(model_path, max_dec_len)) as pool:
-        ans_results = pool.map(_tokenize_chunk, ans_chunks)
+        ans_results = list(tqdm(pool.imap(_tokenize_chunk, ans_chunks),
+                                total=len(ans_chunks), desc="Tokenizing answers"))
     all_ans_tokens = [tok for chunk in ans_results for tok in chunk]
 
     n = len(ds)
 
-    def _fill_sample(j, e_tok, t_tok, a_tok, enc_arr, dec_in_arr, dec_tgt_arr, lm_arr):
+    def _fill_sample(j, e_tok, t_tok, a_tok, ans_text, is_empty_tools,
+                     enc_arr, dec_in_arr, dec_tgt_arr, lm_arr):
         """Fill arrays at position j for one sample. Returns False if skipped."""
-        prefix_len = 2 + len(t_tok)
-        total_dec = prefix_len + len(a_tok) + 1
-        if total_dec > max_dec_len:
-            available_for_tools = max_dec_len - 2 - len(a_tok) - 1
-            if available_for_tools < 1:
-                return False
-            t_tok = t_tok[:available_for_tools]
-            prefix_len = 2 + len(t_tok)
+        al = len(a_tok)
+        # Decoder needs: [EOS, <tool_call>, answer..., EOS] = 2 + al + 1
+        if 2 + al + 1 > max_dec_len:
+            return False
 
-        el = len(e_tok)
-        enc_arr[j, :el] = e_tok
+        # Encoder: [query..., <tools>, tools...] truncated to max_enc_len
+        # For empty tools, use <defer> token instead of tokenized "[]"
+        if is_empty_tools:
+            t_tok = [defer_id]
 
+        # Reserve 1 slot for <tools> separator + at least 1 token for tools
+        max_query = max_enc_len - 1 - 1  # room for <tools> + at least 1 tools token
+        if len(e_tok) > max_query:
+            e_tok = e_tok[:max_query]
+        remaining = max_enc_len - len(e_tok) - 1  # 1 for <tools>
+        t_trunc = t_tok[:remaining]
+
+        enc_seq = e_tok + [tools_sep_id] + t_trunc
+        el = len(enc_seq)
+        enc_arr[j, :el] = enc_seq
+
+        # Decoder input: [EOS, <tool_call>, answer...]
         dec_in_arr[j, 0] = eos_id
         dec_in_arr[j, 1] = tool_call_id
-        tl = len(t_tok)
-        if tl > 0:
-            dec_in_arr[j, 2:2 + tl] = t_tok
-        al = len(a_tok)
         if al > 0:
-            dec_in_arr[j, prefix_len:prefix_len + al] = a_tok
+            dec_in_arr[j, 2:2 + al] = a_tok
 
+        # Decoder target: [<tool_call>, answer..., EOS]
         dec_tgt_arr[j, 0] = tool_call_id
-        if tl > 0:
-            dec_tgt_arr[j, 1:1 + tl] = t_tok
         if al > 0:
-            dec_tgt_arr[j, prefix_len - 1:prefix_len - 1 + al] = a_tok
-        dec_tgt_arr[j, prefix_len - 1 + al] = eos_id
+            dec_tgt_arr[j, 1:1 + al] = a_tok
+        dec_tgt_arr[j, 1 + al] = eos_id
 
-        lm_arr[j, prefix_len - 1:prefix_len - 1 + al + 1] = 1.0
+        # Token-level loss weighting
+        token_weights = _token_weights_for_answer(ans_text, a_tok, tokenizer.sp,
+                                                   w_name=w_name, w_value=w_value, w_key=w_key)
+        lm_arr[j, 1:1 + len(token_weights)] = token_weights
+        lm_arr[j, 1 + al] = 1.0  # EOS stays at baseline weight
         return True
 
     os.makedirs(CACHE_DIR, exist_ok=True)
-
-    if batch_size is not None:
-        all_kept_indices = []
-        shard_counts = []
-        shard_idx = 0
-        total_skipped = 0
-
-        for batch_start in range(0, n, batch_size):
-            batch_end = min(batch_start + batch_size, n)
-            batch_n = batch_end - batch_start
-
-            enc_batch = np.full((batch_n, max_enc_len), pad_id, dtype=np.int32)
-            dec_in_batch = np.full((batch_n, max_dec_len), pad_id, dtype=np.int32)
-            dec_tgt_batch = np.full((batch_n, max_dec_len), pad_id, dtype=np.int32)
-            loss_batch = np.zeros((batch_n, max_dec_len), dtype=np.float32)
-
-            skipped = 0
-            for j in range(batch_n):
-                i = batch_start + j
-                if not _fill_sample(j, all_enc_tokens[i], all_tools_tokens[i],
-                                    all_ans_tokens[i], enc_batch, dec_in_batch,
-                                    dec_tgt_batch, loss_batch):
-                    skipped += 1
-
-            if skipped > 0:
-                keep = enc_batch[:, 0] != pad_id
-                kept_in_batch = np.where(keep)[0]
-                enc_batch = enc_batch[keep]
-                dec_in_batch = dec_in_batch[keep]
-                dec_tgt_batch = dec_tgt_batch[keep]
-                loss_batch = loss_batch[keep]
-                all_kept_indices.extend((batch_start + kept_in_batch).tolist())
-                total_skipped += skipped
-            else:
-                all_kept_indices.extend(range(batch_start, batch_end))
-
-            if len(enc_batch) == 0:
-                continue
-
-            shard_suffixes = []
-            for suffix, arr in [("_enc", enc_batch), ("_dec_in", dec_in_batch),
-                                ("_dec_tgt", dec_tgt_batch), ("_loss_mask", loss_batch)]:
-                shard_suffix = f"{suffix}_{shard_idx:05d}.npy"
-                np.save(os.path.join(CACHE_DIR, f"{cache_id}{shard_suffix}"), arr)
-                shard_suffixes.append(shard_suffix)
-
-            _gcs_cache_upload(cache_id, shard_suffixes)
-            for s in shard_suffixes:
-                fpath = os.path.join(CACHE_DIR, f"{cache_id}{s}")
-                if os.path.exists(fpath):
-                    os.remove(fpath)
-
-            shard_counts.append(len(enc_batch))
-            shard_idx += 1
-
-        if total_skipped > 0:
-            print(f"  Skipped {total_skipped} examples (too long for max_dec_len={max_dec_len})")
-
-        kept_indices = np.array(all_kept_indices, dtype=np.int64)
-        np.save(cache_path + "_kept_idx.npy", kept_indices)
-
-        manifest = {
-            "n_shards": shard_idx,
-            "shard_counts": shard_counts,
-            "total_kept": len(kept_indices),
-        }
-        manifest_path = cache_path + "_manifest.json"
-        with open(manifest_path, "w") as f:
-            _json.dump(manifest, f)
-
-        _gcs_cache_upload(cache_id, ["_manifest.json", "_kept_idx.npy"])
-        print(f"Cached {len(kept_indices):,} tool-call pairs in {shard_idx} shards ({cache_id})")
-
-        return None, None, None, None, kept_indices
 
     enc_inputs = np.full((n, max_enc_len), pad_id, dtype=np.int32)
     dec_inputs = np.full((n, max_dec_len), pad_id, dtype=np.int32)
@@ -569,10 +605,10 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=256, max_dec_len=1024, ba
     loss_mask = np.zeros((n, max_dec_len), dtype=np.float32)
 
     skipped = 0
-    for i in range(n):
+    for i in tqdm(range(n), desc="Building pairs"):
         if not _fill_sample(i, all_enc_tokens[i], all_tools_tokens[i],
-                            all_ans_tokens[i], enc_inputs, dec_inputs,
-                            dec_targets, loss_mask):
+                            all_ans_tokens[i], ans_texts[i], empty_tools_mask[i],
+                            enc_inputs, dec_inputs, dec_targets, loss_mask):
             skipped += 1
 
     if skipped > 0:
@@ -582,6 +618,7 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=256, max_dec_len=1024, ba
         dec_inputs = dec_inputs[keep]
         dec_targets = dec_targets[keep]
         loss_mask = loss_mask[keep]
+        tool_counts = tool_counts[keep]
         print(f"  Skipped {skipped} examples (too long for max_dec_len={max_dec_len})")
     else:
         kept_indices = np.arange(n, dtype=np.int64)
@@ -591,16 +628,142 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=256, max_dec_len=1024, ba
     np.save(cache_path + "_dec_tgt.npy", dec_targets)
     np.save(cache_path + "_loss_mask.npy", loss_mask)
     np.save(cache_path + "_kept_idx.npy", kept_indices)
-    tc_suffixes = ["_enc.npy", "_dec_in.npy", "_dec_tgt.npy", "_loss_mask.npy", "_kept_idx.npy"]
-    _gcs_cache_upload(cache_id, tc_suffixes)
+    np.save(cache_path + "_tool_count.npy", tool_counts)
     print(f"Cached {len(enc_inputs):,} tool-call pairs to {CACHE_DIR}/{cache_id}")
 
-    return enc_inputs, dec_inputs, dec_targets, loss_mask, kept_indices
+    max_tool_len = getattr(prepare_tool_call_pairs, '_max_tool_len', 256)
+    _build_contrastive_arrays(ds, enc_texts, tools_texts, cache_path,
+                              model_path, max_enc_len, max_tool_len,
+                              num_workers, chunk_size, kept_indices)
+
+    return enc_inputs, dec_inputs, dec_targets, loss_mask, kept_indices, tool_counts
 
 
-def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True, loss_mask=None):
+def _build_contrastive_arrays(ds, enc_texts, tools_texts, cache_path,
+                              model_path, max_enc_len, max_tool_len,
+                              num_workers, chunk_size, kept_indices):
+    """Build and save contrastive arrays: query-only tokens + individual tool tokens."""
+    kept_set = set(kept_indices.tolist()) if kept_indices is not None else set(range(len(enc_texts)))
+    kept_queries = [enc_texts[i] for i in range(len(enc_texts)) if i in kept_set]
+
+    q_chunks = [kept_queries[i:i + chunk_size] for i in range(0, len(kept_queries), chunk_size)]
+    with mp.Pool(num_workers, initializer=_init_worker,
+                 initargs=(model_path, max_enc_len)) as pool:
+        q_results = list(tqdm(pool.imap(_tokenize_chunk, q_chunks),
+                              total=len(q_chunks), desc="Tokenizing queries (contrastive)"))
+    query_tokens_list = [tok for chunk in q_results for tok in chunk]
+    n_kept = len(query_tokens_list)
+    query_arr = np.full((n_kept, max_enc_len), PAD_ID, dtype=np.int32)
+    for i, toks in enumerate(query_tokens_list):
+        l = min(len(toks), max_enc_len)
+        query_arr[i, :l] = toks[:l]
+    np.save(cache_path + "_query_only.npy", query_arr)
+
+    # Individual tool tokens + mapping arrays
+    tool_texts_individual = []
+    tool_ex_idx = []
+    tool_is_pos = []
+
+    kept_list = sorted(kept_set)
+    kept_to_local = {g: i for i, g in enumerate(kept_list)}
+
+    for global_i in kept_list:
+        local_i = kept_to_local[global_i]
+        tools_str = tools_texts[global_i]
+        ans_str = ds[global_i]["answers"] if global_i < len(ds) else "[]"
+
+        try:
+            tools = _json.loads(tools_str)
+        except (ValueError, TypeError):
+            tools = []
+        if not isinstance(tools, list):
+            tools = []
+
+        try:
+            calls = _json.loads(ans_str)
+        except (ValueError, TypeError):
+            calls = []
+        pos_names = set()
+        if isinstance(calls, list):
+            for c in calls:
+                if isinstance(c, dict) and "name" in c:
+                    pos_names.add(c["name"])
+
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            tool_str = _json.dumps(tool, separators=(",", ":"))
+            tool_texts_individual.append(tool_str)
+            tool_ex_idx.append(local_i)
+            tool_is_pos.append(tool.get("name", "") in pos_names)
+
+    if tool_texts_individual:
+        t_chunks = [tool_texts_individual[i:i + chunk_size]
+                     for i in range(0, len(tool_texts_individual), chunk_size)]
+        with mp.Pool(num_workers, initializer=_init_worker,
+                     initargs=(model_path, max_tool_len)) as pool:
+            t_results = list(tqdm(pool.imap(_tokenize_chunk, t_chunks),
+                                  total=len(t_chunks), desc="Tokenizing tools (contrastive)"))
+        tool_tokens_list = [tok for chunk in t_results for tok in chunk]
+
+        n_tools = len(tool_tokens_list)
+        tool_arr = np.full((n_tools, max_tool_len), PAD_ID, dtype=np.int32)
+        for i, toks in enumerate(tool_tokens_list):
+            l = min(len(toks), max_tool_len)
+            tool_arr[i, :l] = toks[:l]
+    else:
+        tool_arr = np.zeros((0, max_tool_len), dtype=np.int32)
+
+    np.save(cache_path + "_tool_individual.npy", tool_arr)
+    np.save(cache_path + "_tool_ex_idx.npy", np.array(tool_ex_idx, dtype=np.int32))
+    np.save(cache_path + "_tool_is_pos.npy", np.array(tool_is_pos, dtype=np.bool_))
+    print(f"  Contrastive: {n_kept} queries, {len(tool_ex_idx)} individual tools")
+
+
+def get_contrastive_batches(query_tokens, tool_tokens, tool_ex_idx, tool_is_pos, batch_size):
+    """Yield (query_batch, tool_batch) for CLIP-style contrastive training.
+
+    Each batch: B queries paired with 1 randomly-chosen positive tool each.
+    In-batch negatives provide the contrastive signal.
+    """
+    n_queries = len(query_tokens)
+    pos_map = {}
+    for t_idx in range(len(tool_ex_idx)):
+        if tool_is_pos[t_idx]:
+            pos_map.setdefault(int(tool_ex_idx[t_idx]), []).append(t_idx)
+
+    valid_queries = [i for i in range(n_queries) if i in pos_map]
+    if not valid_queries:
+        return
+
+    indices = np.array(valid_queries)
+    np.random.shuffle(indices)
+
+    for start in range(0, len(indices) - batch_size + 1, batch_size):
+        batch_q_idx = indices[start:start + batch_size]
+        q_batch = np.array(query_tokens[batch_q_idx])
+        t_indices = np.array([
+            pos_map[int(qi)][np.random.randint(len(pos_map[int(qi)]))]
+            for qi in batch_q_idx
+        ])
+        t_batch = np.array(tool_tokens[t_indices])
+        yield q_batch, t_batch
+
+
+def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True, loss_mask=None, tool_counts=None):
     n = len(enc_inputs)
-    indices = np.random.permutation(n) if shuffle else np.arange(n)
+    if tool_counts is not None:
+        order = np.argsort(tool_counts, kind='stable')
+        for c in np.unique(tool_counts):
+            group = np.where(tool_counts[order] == c)[0]
+            shuffled = order[group].copy()
+            np.random.shuffle(shuffled)
+            order[group] = shuffled
+        indices = order
+    elif shuffle:
+        indices = np.random.permutation(n)
+    else:
+        indices = np.arange(n)
     for i in range(0, n - batch_size + 1, batch_size):
         idx = indices[i : i + batch_size]
         batch = (np.array(enc_inputs[idx]), np.array(dec_inputs[idx]), np.array(dec_targets[idx]))
@@ -631,42 +794,34 @@ def load_tool_call_audio(split="train", max_samples=None):
     return indices
 
 
-def load_audio_for_index(idx):
-    """Load and decode audio for a single dataset index.
-
-    Returns (audio_array, sampling_rate) or (None, None) if no audio.
-    """
-    import io
-    import soundfile as sf
-
-    ds = _load_unified_dataset()
-    ex = ds[idx]
-    audio_val = ex.get("audio")
-    if audio_val is None:
-        return None, None
-
-    raw_bytes = None
-    if isinstance(audio_val, dict):
-        raw_bytes = audio_val.get("bytes")
-    elif isinstance(audio_val, bytes):
-        raw_bytes = audio_val
-    if raw_bytes is None:
-        return None, None
-
-    audio_array, sr = sf.read(io.BytesIO(raw_bytes), dtype="float32")
-    if audio_array.ndim > 1:
-        audio_array = audio_array.mean(axis=1)
-    return audio_array.astype(np.float32), sr
-
-
 def load_example_with_audio(idx):
-    """Load a dataset example with decoded audio for eval use.
+    """Load a dataset example by global index.
 
     Returns dict with {query, answers, tools, audio_array, sampling_rate}.
+    Audio fields are None for text-only datasets.
     """
     ds = _load_unified_dataset()
+    if idx < 0 or idx >= len(ds):
+        raise IndexError(f"Index {idx} out of range (dataset has {len(ds)} rows)")
     ex = ds[idx]
-    audio, sr = load_audio_for_index(idx)
+
+    audio, sr = None, None
+    audio_val = ex.get("audio")
+    if audio_val is not None:
+        import io
+        import soundfile as sf
+
+        raw_bytes = None
+        if isinstance(audio_val, dict):
+            raw_bytes = audio_val.get("bytes")
+        elif isinstance(audio_val, bytes):
+            raw_bytes = audio_val
+        if raw_bytes is not None:
+            audio, sr = sf.read(io.BytesIO(raw_bytes), dtype="float32")
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+            audio = audio.astype(np.float32)
+
     return {
         "query": ex["query"],
         "answers": ex["answers"],
@@ -679,7 +834,7 @@ def load_example_with_audio(idx):
 def compute_mel_spectrogram(audio, sr=16000, n_mels=80, n_fft=400, hop_length=160):
     """Compute log-mel spectrogram using numpy/scipy. Returns (T_mel, n_mels) float32.
 
-    25ms window (n_fft=400 at 16kHz), 10ms hop (hop_length=160) → ~100 frames/sec.
+    25ms window (n_fft=400 at 16kHz), 10ms hop (hop_length=160) -> ~100 frames/sec.
     """
     from scipy.signal import windows as scipy_windows
     from scipy.fft import rfft
@@ -719,105 +874,6 @@ def compute_mel_spectrogram(audio, sr=16000, n_mels=80, n_fft=400, hop_length=16
     mel_spec = spectrum @ filterbank.T
     log_mel = np.log(np.maximum(mel_spec, 1e-10))
     return log_mel.astype(np.float32)
-
-
-def precompute_mels(kept_indices, n_mels=80, max_mel_len=1024, cache_id_prefix="", batch_size=None):
-    """Precompute mel spectrograms.
-
-    When batch_size is None: write a single (N, max_mel_len, n_mels) memmap file.
-    When batch_size is set: produce per-batch shard .npy files, upload each to GCS.
-    Returns the cache_id.
-    """
-    n_samples = len(kept_indices)
-    cache_id = _mel_cache_key(cache_id_prefix, n_samples, n_mels, max_mel_len)
-    cache_path = os.path.join(CACHE_DIR, cache_id)
-
-    if batch_size is None:
-        mel_file = cache_path + "_mels.npy"
-
-        if os.path.exists(mel_file):
-            print(f"  Mel cache already exists ({cache_id})")
-            return cache_id
-
-        if _gcs_cache_download(cache_id, ["_mels.npy"]):
-            print(f"  Downloaded mel cache from GCS ({cache_id})")
-            return cache_id
-
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        shape = (n_samples, max_mel_len, n_mels)
-        fp = np.lib.format.open_memmap(mel_file, mode='w+', dtype=np.float32, shape=shape)
-
-        print(f"  Precomputing {n_samples} mel spectrograms (n_mels={n_mels}, max_mel_len={max_mel_len})...")
-        for i, idx in enumerate(tqdm(kept_indices, desc="  Computing mels")):
-            audio, sr = load_audio_for_index(int(idx))
-            if audio is None:
-                continue
-            mel = compute_mel_spectrogram(audio, sr=sr, n_mels=n_mels)
-            if mel.shape[0] > max_mel_len:
-                mel = mel[:max_mel_len]
-            t = mel.shape[0]
-            fp[i, :t, :] = mel
-
-        del fp
-        _gcs_cache_upload(cache_id, ["_mels.npy"])
-        print(f"  Cached mel spectrograms to {CACHE_DIR}/{cache_id}")
-        return cache_id
-
-    manifest_path = cache_path + "_mel_manifest.json"
-
-    if os.path.exists(manifest_path):
-        print(f"  Mel shard cache already exists ({cache_id})")
-        return cache_id
-
-    if _gcs_cache_download(cache_id, ["_mel_manifest.json"]):
-        if os.path.exists(manifest_path):
-            print(f"  Downloaded mel shard manifest from GCS ({cache_id})")
-            return cache_id
-
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    shard_counts = []
-    shard_idx = 0
-
-    print(f"  Precomputing {n_samples} mel spectrograms in shards of {batch_size}...")
-    for batch_start in range(0, n_samples, batch_size):
-        batch_end = min(batch_start + batch_size, n_samples)
-        batch_indices = kept_indices[batch_start:batch_end]
-        batch_n = len(batch_indices)
-
-        mel_batch = np.zeros((batch_n, max_mel_len, n_mels), dtype=np.float32)
-
-        for j, idx in enumerate(tqdm(batch_indices, desc=f"  Shard {shard_idx}", leave=False)):
-            audio, sr = load_audio_for_index(int(idx))
-            if audio is None:
-                continue
-            mel = compute_mel_spectrogram(audio, sr=sr, n_mels=n_mels)
-            if mel.shape[0] > max_mel_len:
-                mel = mel[:max_mel_len]
-            t = mel.shape[0]
-            mel_batch[j, :t, :] = mel
-
-        shard_suffix = f"_mels_{shard_idx:05d}.npy"
-        shard_path = os.path.join(CACHE_DIR, f"{cache_id}{shard_suffix}")
-        np.save(shard_path, mel_batch)
-
-        _gcs_cache_upload(cache_id, [shard_suffix])
-        if os.path.exists(shard_path):
-            os.remove(shard_path)
-
-        shard_counts.append(batch_n)
-        shard_idx += 1
-
-    manifest = {
-        "n_shards": shard_idx,
-        "shard_counts": shard_counts,
-        "total_samples": n_samples,
-    }
-    with open(manifest_path, "w") as f:
-        _json.dump(manifest, f)
-
-    _gcs_cache_upload(cache_id, ["_mel_manifest.json"])
-    print(f"  Cached mel spectrograms in {shard_idx} shards ({cache_id})")
-    return cache_id
 
 
 class ShardedMmapArray:
@@ -878,14 +934,20 @@ class ShardedMmapArray:
 def load_prepared_data(split, mmap=False):
     """Load pre-tokenized .npy files. If mmap=True, returns memory-mapped arrays.
 
-    Supports both single-file and sharded (manifest-based) caches.
-    Tries local cache first, then GCS download. Raises FileNotFoundError
-    if not found (no fallback tokenization — run 'needle tokenize' first).
+    Tries local cache only. Raises FileNotFoundError if not found
+    (run 'needle tokenize' first).
 
     Returns dict with keys: enc_inputs, dec_inputs, dec_targets, loss_mask,
-    kept_indices, mel_cache_id.
+    kept_indices.
     """
     meta = _load_cache_metadata(split)
+    if meta is None:
+        try:
+            from .gcs import download_tokenized_data
+            download_tokenized_data(CACHE_DIR)
+            meta = _load_cache_metadata(split)
+        except Exception:
+            pass
     if meta is None:
         raise FileNotFoundError(
             f"No prepared data found for split '{split}'. Run 'needle tokenize' first."
@@ -893,54 +955,21 @@ def load_prepared_data(split, mmap=False):
 
     text_cache_id = meta["text_cache_id"]
     cache_path = os.path.join(CACHE_DIR, text_cache_id)
-    manifest_path = cache_path + "_manifest.json"
 
-    if not os.path.exists(manifest_path):
-        _gcs_cache_download(text_cache_id, ["_manifest.json"])
-
-    if os.path.exists(manifest_path):
-        with open(manifest_path) as f:
-            manifest = _json.load(f)
-        n_shards = manifest["n_shards"]
-
-        if not os.path.exists(cache_path + "_kept_idx.npy"):
-            _gcs_cache_download(text_cache_id, ["_kept_idx.npy"])
-
-        shard_suffixes = ["_enc", "_dec_in", "_dec_tgt", "_loss_mask"]
-        _gcs_download_shards(text_cache_id, n_shards, shard_suffixes)
-
-        def _shard_paths(suffix):
-            return [os.path.join(CACHE_DIR, f"{text_cache_id}{suffix}_{i:05d}.npy")
-                    for i in range(n_shards)]
-
-        mmap_mode = "r" if mmap else None
-        if mmap:
-            result = {
-                "enc_inputs": ShardedMmapArray(_shard_paths("_enc"), mmap_mode="r"),
-                "dec_inputs": ShardedMmapArray(_shard_paths("_dec_in"), mmap_mode="r"),
-                "dec_targets": ShardedMmapArray(_shard_paths("_dec_tgt"), mmap_mode="r"),
-                "loss_mask": ShardedMmapArray(_shard_paths("_loss_mask"), mmap_mode="r"),
-            }
-        else:
-            result = {
-                "enc_inputs": np.concatenate([np.load(p) for p in _shard_paths("_enc")]),
-                "dec_inputs": np.concatenate([np.load(p) for p in _shard_paths("_dec_in")]),
-                "dec_targets": np.concatenate([np.load(p) for p in _shard_paths("_dec_tgt")]),
-                "loss_mask": np.concatenate([np.load(p) for p in _shard_paths("_loss_mask")]),
-            }
-
-        result["kept_indices"] = np.load(cache_path + "_kept_idx.npy", mmap_mode=mmap_mode)
-        result["mel_cache_id"] = meta.get("mel_cache_id")
-        return result
-
-    tc_suffixes = ["_enc.npy", "_dec_in.npy", "_dec_tgt.npy", "_loss_mask.npy", "_kept_idx.npy"]
     if not os.path.exists(cache_path + "_enc.npy"):
-        if not _gcs_cache_download(text_cache_id, tc_suffixes):
-            raise FileNotFoundError(
-                f"Text cache '{text_cache_id}' not found. Run 'needle tokenize' first."
-            )
+        raise FileNotFoundError(
+            f"Text cache '{text_cache_id}' not found. Run 'needle tokenize' first."
+        )
 
     mmap_mode = "r" if mmap else None
+    tc_path = cache_path + "_tool_count.npy"
+    tc = np.load(tc_path, mmap_mode=mmap_mode) if os.path.exists(tc_path) else None
+    def _load_optional(suffix):
+        p = cache_path + suffix
+        if os.path.exists(p):
+            return np.load(p, mmap_mode=mmap_mode)
+        return None
+
     return {
         "enc_inputs": np.load(cache_path + "_enc.npy", mmap_mode=mmap_mode),
         "dec_inputs": np.load(cache_path + "_dec_in.npy", mmap_mode=mmap_mode),
@@ -948,6 +977,11 @@ def load_prepared_data(split, mmap=False):
         "loss_mask": np.load(cache_path + "_loss_mask.npy", mmap_mode=mmap_mode),
         "kept_indices": np.load(cache_path + "_kept_idx.npy", mmap_mode=mmap_mode),
         "mel_cache_id": meta.get("mel_cache_id"),
+        "tool_counts": tc,
+        "query_only": _load_optional("_query_only.npy"),
+        "tool_individual": _load_optional("_tool_individual.npy"),
+        "tool_ex_idx": _load_optional("_tool_ex_idx.npy"),
+        "tool_is_pos": _load_optional("_tool_is_pos.npy"),
     }
 
 
@@ -1187,8 +1221,6 @@ def get_speech_batches(mel_data, dec_inputs, dec_targets, batch_size,
         if loss_mask is not None:
             batch = batch + (np.array(loss_mask[idx]),)
         yield batch
-
-
 class PrefetchIterator:
     """Generic prefetch wrapper: runs any batch-generating callable in a background thread."""
 
