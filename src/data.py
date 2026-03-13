@@ -513,7 +513,15 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     tools_texts = [ex["tools"] for ex in ds]
     ans_texts = [ex["answers"] for ex in ds]
 
-    # Track which samples have empty tools (will use <defer> token instead)
+    def _compact(s):
+        try:
+            return _json.dumps(_json.loads(s), separators=(",", ":"))
+        except (ValueError, TypeError):
+            return s
+
+    ans_texts = [_compact(a) for a in ans_texts]
+    tools_texts = [_compact(t) for t in tools_texts]
+
     empty_tools_mask = []
     for t in tools_texts:
         try:

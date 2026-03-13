@@ -83,7 +83,7 @@ def _param_labels(params):
     return jax.tree_util.tree_map_with_path(_label, params)
 
 
-def _wsd_schedule(peak_value, total_steps, warmup_steps, decay_ratio=0.40):
+def _wsd_schedule(peak_value, total_steps, warmup_steps, decay_ratio=0.15):
     """Warmup-Stable-Decay schedule: linear warmup, hold peak, cosine decay."""
     decay_steps = max(1, int(total_steps * decay_ratio))
     stable_steps = total_steps - warmup_steps - decay_steps
@@ -97,7 +97,7 @@ def _wsd_schedule(peak_value, total_steps, warmup_steps, decay_ratio=0.40):
     )
 
 
-def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_steps, decay_ratio=0.40):
+def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_steps, decay_ratio=0.15):
     model = EncoderDecoderTransformer(config)
 
     rng, init_rng = jax.random.split(rng)
@@ -504,7 +504,7 @@ def train(args):
 
     scaled_lr = args.lr * num_devices
     muon_lr = getattr(args, "muon_lr", 0.02) * math.sqrt(num_devices)
-    decay_ratio = getattr(args, "decay_ratio", 0.40)
+    decay_ratio = getattr(args, "decay_ratio", 0.15)
     state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps, decay_ratio)
     val_loss_fn = _make_val_loss_fn(state.apply_fn)
 
