@@ -392,22 +392,33 @@ def get_tokenizer(max_samples=None):
 
 
 def load_tool_calls(split="train", max_samples=None, return_global_indices=False):
-    """Load tool-calling dataset, splitting 90/10 for train/val.
+    """Load tool-calling dataset with shuffled train/val split.
+
+    Shuffles the full dataset with a fixed seed, then splits:
+      - val: min(5000, 10% of total)
+      - train: everything else
 
     If return_global_indices is True, also return a numpy array mapping each
     split-local row position back to its row id in the full unified dataset.
     """
     ds = _load_unified_dataset()
     n = len(ds)
-    if split in ("validation", "val", "test"):
-        start, end = int(n * 0.9), n
-    elif split == "train":
-        start, end = 0, int(n * 0.9)
-    else:
-        start, end = 0, n
 
-    global_indices = np.arange(start, end, dtype=np.int64)
-    ds = ds.select(range(start, end))
+    rng = np.random.RandomState(42)
+    perm = rng.permutation(n)
+
+    val_size = min(5000, int(n * 0.1))
+    val_indices = perm[:val_size]
+    train_indices = perm[val_size:]
+
+    if split in ("validation", "val", "test"):
+        global_indices = val_indices.astype(np.int64)
+    elif split == "train":
+        global_indices = train_indices.astype(np.int64)
+    else:
+        global_indices = perm.astype(np.int64)
+
+    ds = ds.select(global_indices.tolist())
 
     if max_samples:
         limit = min(max_samples, len(ds))
