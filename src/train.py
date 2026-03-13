@@ -16,6 +16,7 @@ from .data import (
     get_batches, get_tokenizer,
     load_prepared_data, load_tool_calls,
     PrefetchIterator, count_batches,
+    get_contrastive_batches,
 )
 from .model import (
     EncoderDecoderTransformer,
@@ -82,21 +83,21 @@ def _param_labels(params):
     return jax.tree_util.tree_map_with_path(_label, params)
 
 
-def _wsd_schedule(peak_value, total_steps, warmup_steps, decay_ratio=0.15):
-    """Warmup-Stable-Decay schedule: linear warmup, hold peak, linear decay."""
+def _wsd_schedule(peak_value, total_steps, warmup_steps, decay_ratio=0.40):
+    """Warmup-Stable-Decay schedule: linear warmup, hold peak, cosine decay."""
     decay_steps = max(1, int(total_steps * decay_ratio))
     stable_steps = total_steps - warmup_steps - decay_steps
     return optax.join_schedules(
         [
             optax.linear_schedule(0.0, peak_value, warmup_steps),
             optax.constant_schedule(peak_value),
-            optax.linear_schedule(peak_value, peak_value * 0.1, decay_steps),
+            optax.cosine_decay_schedule(peak_value, decay_steps, alpha=0.05),
         ],
         boundaries=[warmup_steps, warmup_steps + stable_steps],
     )
 
 
-def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_steps):
+def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_steps, decay_ratio=0.40):
     model = EncoderDecoderTransformer(config)
 
     rng, init_rng = jax.random.split(rng)
@@ -111,8 +112,8 @@ def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_
         method="init_all",
     )
 
-    adam_schedule = _wsd_schedule(learning_rate, total_steps, warmup_steps)
-    muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
+    adam_schedule = _wsd_schedule(learning_rate, total_steps, warmup_steps, decay_ratio)
+    muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps, decay_ratio)
 
     muon_opt = optax.chain(
         scale_by_muon(momentum=0.95, ns_steps=5),
@@ -222,16 +223,29 @@ def _quantize_params(params, group_size=32):
 
 _GROUP_SIZE = 32
 _MAT_FACTORS = ()
-_MAT_FF_WIDTHS = () 
-_D_FF = 2048 
+_MAT_FF_WIDTHS = ()
+_D_FF = 2048
+_CONTRASTIVE_WEIGHT = 0.1
+
+
+def _clip_contrastive_loss(q_emb, t_emb, log_temp):
+    """CLIP-style symmetric contrastive loss with learnable temperature."""
+    temp = jnp.exp(jnp.clip(log_temp, -jnp.log(100.0), jnp.log(100.0)))
+    logits = q_emb @ t_emb.T / temp  # (B, B)
+    B = logits.shape[0]
+    labels = jnp.arange(B)
+    loss_q = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
+    loss_t = optax.softmax_cross_entropy_with_integer_labels(logits.T, labels)
+    return (jnp.mean(loss_q) + jnp.mean(loss_t)) / 2.0
 
 
 def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
     pad_id = 0
+    q_params = _quantize_params(params, group_size=_GROUP_SIZE)
     src_mask = make_padding_mask(src, pad_id)
     tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
     logits, slot_div = state.apply_fn(
-        {"params": _quantize_params(params, group_size=_GROUP_SIZE)},
+        {"params": q_params},
         src, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask,
         ffn_mask=ffn_mask,
         deterministic=False,
@@ -245,6 +259,19 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rn
     ) / jnp.maximum(jnp.sum(mask), 1.0)
     z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
     return ce_loss + z_loss
+
+
+def _contrastive_loss_fn(state, params, query_tokens, tool_tokens, rng):
+    """Compute CLIP contrastive loss on query/tool pairs."""
+    q_params = _quantize_params(params, group_size=_GROUP_SIZE)
+    q_emb, t_emb, log_temp = state.apply_fn(
+        {"params": q_params},
+        query_tokens, tool_tokens,
+        deterministic=False,
+        method="forward_contrastive",
+        rngs={"dropout": rng},
+    )
+    return _clip_contrastive_loss(q_emb, t_emb, log_temp)
 
 
 
@@ -295,6 +322,20 @@ def _train_step_text_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask
     return state, ema_params, loss, grad_norm
 
 
+def _train_step_contrastive(state, ema_params, query_tokens, tool_tokens, rng):
+    """Separate contrastive training step using CLIP loss."""
+    ema_decay = 0.999
+    cl_loss, grads = jax.value_and_grad(
+        lambda p: _contrastive_loss_fn(state, p, query_tokens, tool_tokens, rng)
+    )(state.params)
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    cl_loss = jax.lax.pmean(cl_loss, axis_name="batch")
+    grads = jax.tree.map(lambda g: g * _CONTRASTIVE_WEIGHT, grads)
+    state = state.apply_gradients(grads=grads)
+    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
+    return state, ema_params, cl_loss
+
+
 
 
 def _make_p_train_step():
@@ -303,6 +344,10 @@ def _make_p_train_step():
 
 def _make_p_train_step_masked():
     return jax.pmap(_train_step_text_masked, axis_name="batch", donate_argnums=(0, 1))
+
+
+def _make_p_train_step_contrastive():
+    return jax.pmap(_train_step_contrastive, axis_name="batch", donate_argnums=(0, 1))
 
 
 def _make_val_loss_fn(apply_fn):
@@ -397,6 +442,15 @@ def train(args):
     val_loss_mask = val_data["loss_mask"]
     print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val tool-call pairs (memory-mapped)")
 
+    # Contrastive data (optional — graceful if missing)
+    cl_query_tokens = train_data.get("query_only")
+    cl_tool_tokens = train_data.get("tool_individual")
+    cl_tool_ex_idx = train_data.get("tool_ex_idx")
+    cl_tool_is_pos = train_data.get("tool_is_pos")
+    has_contrastive = all(x is not None for x in [cl_query_tokens, cl_tool_tokens, cl_tool_ex_idx, cl_tool_is_pos])
+    if has_contrastive:
+        print(f"      Contrastive: {len(cl_query_tokens):,} queries, {len(cl_tool_tokens):,} tools")
+
     effective_batch_size = args.batch_size * num_devices
 
     resume_checkpoint = getattr(args, "checkpoint", None)
@@ -419,10 +473,12 @@ def train(args):
             dtype=args.dtype,
             activation=getattr(args, "activation", "drelu"),
             num_memory_slots=getattr(args, "num_memory_slots", 64),
+            contrastive_dim=getattr(args, "contrastive_dim", 128),
         )
 
-    global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF
+    global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF, _CONTRASTIVE_WEIGHT
     _GROUP_SIZE = getattr(args, "group_size", 32)
+    _CONTRASTIVE_WEIGHT = getattr(args, "contrastive_weight", 0.1)
     _D_FF = config.d_ff
     mat_factors_raw = getattr(args, "mat_factors", None)
     if mat_factors_raw:
@@ -434,6 +490,7 @@ def train(args):
     n_widths = 1 + len(_MAT_FF_WIDTHS) if _MAT_FF_WIDTHS else 1
     p_train_step = _make_p_train_step()
     p_train_step_masked = _make_p_train_step_masked()
+    p_train_step_contrastive = _make_p_train_step_contrastive()
 
     np.random.seed(args.seed)
     rng = jax.random.PRNGKey(args.seed)
@@ -447,7 +504,8 @@ def train(args):
 
     scaled_lr = args.lr * num_devices
     muon_lr = getattr(args, "muon_lr", 0.02) * math.sqrt(num_devices)
-    state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps)
+    decay_ratio = getattr(args, "decay_ratio", 0.40)
+    state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps, decay_ratio)
     val_loss_fn = _make_val_loss_fn(state.apply_fn)
 
     if resume_checkpoint:
@@ -459,8 +517,10 @@ def train(args):
     ema_params = jax_utils.replicate(ema_params)
 
     param_count = sum(x.size for x in jax.tree.leaves(jax_utils.unreplicate(state).params))
-    decay_steps = max(1, int(total_steps * 0.15))
+    decay_steps = max(1, int(total_steps * decay_ratio))
     stable_steps = total_steps - warmup_steps - decay_steps
+    best_call_f1 = 0.0
+    best_ckpt_path = None
 
     print(f"\n  ─────────────────────────────────────")
     print(f"  Parameters    {param_count:>12,}")
@@ -529,12 +589,33 @@ def train(args):
             prefetch=4,
         )
 
+        # Contrastive batch iterator (cycles through contrastive data alongside text)
+        cl_batch_iter = None
+        if has_contrastive and _CONTRASTIVE_WEIGHT > 0:
+            cl_batch_iter = PrefetchIterator(
+                lambda: get_contrastive_batches(
+                    cl_query_tokens, cl_tool_tokens, cl_tool_ex_idx, cl_tool_is_pos,
+                    unique_batch_size),
+                prefetch=4,
+            )
+
         pbar = tqdm(range(text_batches_per_epoch), desc=f"Epoch {epoch + 1}/{args.epochs}")
 
         for step_i in pbar:
             t0 = time.perf_counter()
 
             src, tgt_in, tgt_out, lm = next(text_batch_iter)
+
+            # Get contrastive batch (may be exhausted before text batches)
+            cl_q_b = None
+            cl_t_b = None
+            if cl_batch_iter is not None:
+                try:
+                    cl_q, cl_t = next(cl_batch_iter)
+                    cl_q_b = shard_batch(cl_q, num_devices)
+                    cl_t_b = shard_batch(cl_t, num_devices)
+                except StopIteration:
+                    cl_batch_iter = None
 
             src_b = shard_batch(src, num_devices)
             tgt_in_b = shard_batch(tgt_in, num_devices)
@@ -551,6 +632,14 @@ def train(args):
             else:
                 state, ema_params, loss, grad_norm = p_train_step(
                     state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_ffn_mask, text_rngs, lm_b,
+                )
+
+            # Separate contrastive step (if data available)
+            if cl_q_b is not None and cl_t_b is not None:
+                rng, cl_rng = jax.random.split(rng)
+                cl_rngs = jax.random.split(cl_rng, num_devices)
+                state, ema_params, cl_loss = p_train_step_contrastive(
+                    state, ema_params, cl_q_b, cl_t_b, cl_rngs,
                 )
 
             text_loss_val = float(loss[0])
@@ -609,6 +698,8 @@ def train(args):
                 wandb.log(log_dict)
 
         text_batch_iter.close()
+        if cl_batch_iter is not None:
+            cl_batch_iter.close()
 
         if epoch == weight_prune_epoch and not gradual_sparsify_done:
             gradual_sparsify_done = True
@@ -840,6 +931,25 @@ def train(args):
             tc_metrics["param_miss"] = tc_missing_params / max(tc_total_ref_params, 1)
             tc_metrics["value_acc"] = tc_correct_values / max(tc_matched_params, 1)
 
+        # Save best checkpoint based on call_f1
+        if tc_metrics and tc_metrics["call_f1"] > best_call_f1:
+            best_call_f1 = tc_metrics["call_f1"]
+            best_ckpt_path = os.path.join(args.checkpoint_dir, f"needle_{args.num_layers}_{args.d_model}_best.pkl")
+            params_best = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
+            with open(best_ckpt_path, "wb") as f:
+                pickle.dump({"params": params_best, "config": config.__dict__}, f)
+            del params_best
+            print(f"  ** New best call_f1={best_call_f1:.1%} → {best_ckpt_path}")
+
+        # Contrastive retrieval eval
+        retrieval_metrics = None
+        if has_contrastive and _CONTRASTIVE_WEIGHT > 0:
+            from .eval import benchmark_retrieval
+            retrieval_metrics = benchmark_retrieval(
+                eval_model, eval_params, tokenizer,
+                num_samples=min(500, getattr(args, "max_eval_samples", 500)),
+            )
+
         del eval_params
 
         print(f"\n  ─────────────────────────────────────")
@@ -867,6 +977,12 @@ def train(args):
             print(f"  Args acc       {tc_metrics['args_acc']:>10.1%}")
             print(f"  Call F1        {tc_metrics['call_f1']:>10.1%}")
             print(f"  Exact match    {tc_metrics['exact_match']:>10.1%}")
+        if retrieval_metrics and retrieval_metrics["num_queries"] > 0:
+            rm = retrieval_metrics
+            print(f"  ─── Retrieval ({rm['num_queries']} queries) ─────")
+            for k, v in sorted(rm["recall@k"].items()):
+                print(f"  Recall@{k:<3}     {v:>10.1%}")
+            print(f"  MRR            {rm['mrr']:>10.3f}")
         print(f"  ─────────────────────────────────────")
         print(f"  Throughput     {tp['tokens_per_second']:>10.1f} tok/s")
         print(f"  Latency        {tp['avg_latency_s']:>11.3f}s")
@@ -906,10 +1022,16 @@ def train(args):
                 log_dict["epoch/tc_value_acc"] = tc_metrics["value_acc"]
                 log_dict["epoch/tc_args_acc"] = tc_metrics["args_acc"]
                 log_dict["epoch/tc_call_f1"] = tc_metrics["call_f1"]
+            if retrieval_metrics and retrieval_metrics["num_queries"] > 0:
+                for k, v in retrieval_metrics["recall@k"].items():
+                    log_dict[f"epoch/retrieval_recall@{k}"] = v
+                log_dict["epoch/retrieval_mrr"] = retrieval_metrics["mrr"]
             wandb.log(log_dict)
 
     if use_wandb:
         wandb.finish()
+    if best_ckpt_path:
+        print(f"\nBest checkpoint (call_f1={best_call_f1:.1%}): {best_ckpt_path}")
     print("\nTraining complete.")
 
 

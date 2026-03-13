@@ -341,6 +341,90 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
     }
 
 
+def benchmark_retrieval(model, params, tokenizer, num_samples=500, max_len=256, ks=(1, 3, 5, 10)):
+    """Benchmark contrastive retrieval: Recall@k and MRR over validation set.
+
+    For each query, ranks all tools from that example by cosine similarity
+    and checks if the positive (called) tools appear in top-k.
+    """
+    import json
+    from .run import encode_for_retrieval
+
+    ds = load_tool_calls("validation", max_samples=num_samples)
+
+    queries = []
+    all_tool_strs = []
+    tool_groups = []  # (start_idx, count, set_of_positive_indices_within_group)
+
+    for ex in ds:
+        query = ex["query"]
+        try:
+            tools = json.loads(ex["tools"])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(tools, list) or len(tools) == 0:
+            continue
+        try:
+            calls = json.loads(ex["answers"])
+        except (ValueError, TypeError):
+            calls = []
+        pos_names = set()
+        if isinstance(calls, list):
+            for c in calls:
+                if isinstance(c, dict) and "name" in c:
+                    pos_names.add(c["name"])
+        if not pos_names:
+            continue
+
+        start = len(all_tool_strs)
+        pos_indices = set()
+        for j, tool in enumerate(tools):
+            if not isinstance(tool, dict):
+                continue
+            all_tool_strs.append(json.dumps(tool, separators=(",", ":")))
+            if tool.get("name", "") in pos_names:
+                pos_indices.add(len(all_tool_strs) - 1 - start)
+
+        if pos_indices:
+            queries.append(query)
+            tool_groups.append((start, len(all_tool_strs) - start, pos_indices))
+
+    if not queries:
+        return {"recall@k": {}, "mrr": 0.0, "num_queries": 0}
+
+    # Encode all queries and tools
+    q_embs = encode_for_retrieval(model, params, tokenizer, queries, max_len=max_len)
+    t_embs = encode_for_retrieval(model, params, tokenizer, all_tool_strs, max_len=max_len)
+
+    max_k = max(ks)
+    recall = {k: 0 for k in ks}
+    mrr_sum = 0.0
+
+    for i, (start, count, pos_set) in enumerate(tool_groups):
+        group_embs = t_embs[start:start + count]  # (count, dim)
+        scores = q_embs[i:i+1] @ group_embs.T  # (1, count)
+        ranked = np.argsort(-scores[0])
+
+        # MRR: reciprocal rank of first positive
+        for rank, idx in enumerate(ranked):
+            if idx in pos_set:
+                mrr_sum += 1.0 / (rank + 1)
+                break
+
+        # Recall@k
+        for k in ks:
+            top_k_set = set(ranked[:k].tolist())
+            if top_k_set & pos_set:
+                recall[k] += 1
+
+    n = len(queries)
+    return {
+        "recall@k": {k: recall[k] / n for k in ks},
+        "mrr": mrr_sum / n,
+        "num_queries": n,
+    }
+
+
 def main(args):
     params, config = load_checkpoint(args.checkpoint)
     model = EncoderDecoderTransformer(config)

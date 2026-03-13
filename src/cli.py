@@ -28,6 +28,7 @@ def main():
     p.add_argument("--max-dec-len", type=int, default=DEFAULT_MAX_DEC_LEN)
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--warmup-ratio", type=float, default=0.1)
+    p.add_argument("--decay-ratio", type=float, default=0.40)
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
@@ -51,6 +52,10 @@ def main():
                    help="Dropout rate for residual connections (default: 0.1)")
     p.add_argument("--curriculum", action="store_true",
                    help="Sort batches easy→hard by tool count each epoch")
+    p.add_argument("--contrastive-weight", type=float, default=0.1,
+                   help="Weight for CLIP-style contrastive loss (default: 0.1)")
+    p.add_argument("--contrastive-dim", type=int, default=128,
+                   help="Dimension of contrastive projection head (default: 128)")
 
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,
@@ -67,6 +72,8 @@ def main():
                    help="Loss weight for argument key tokens (default: 1.5)")
     p.add_argument("--shuffle-tools", action=argparse.BooleanOptionalAction, default=True,
                    help="Shuffle tool order in encoder input (default: True)")
+    p.add_argument("--max-tool-len", type=int, default=256,
+                   help="Max token length for individual tool descriptions (default: 256)")
 
     p = sub.add_parser("run", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)

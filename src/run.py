@@ -387,6 +387,45 @@ def main(args):
         )
 
 
+def encode_for_retrieval(model, params, tokenizer, texts, max_len=256, batch_size=64):
+    """Encode texts into contrastive embeddings for retrieval. Returns (N, contrastive_dim) numpy array."""
+    pad_id = tokenizer.pad_token_id
+    all_embs = []
+
+    for start in range(0, len(texts), batch_size):
+        batch_texts = texts[start:start + batch_size]
+        token_lists = [tokenizer.encode(t)[:max_len] for t in batch_texts]
+        max_t = max(len(toks) for toks in token_lists)
+        tokens = np.full((len(batch_texts), max_t), pad_id, dtype=np.int32)
+        for i, toks in enumerate(token_lists):
+            tokens[i, :len(toks)] = toks
+        embs = model.apply(
+            {"params": params}, jnp.array(tokens),
+            deterministic=True, method="encode_contrastive",
+        )
+        all_embs.append(np.array(embs))
+
+    return np.concatenate(all_embs, axis=0)
+
+
+def retrieve_tools(model, params, tokenizer, query, tool_descriptions, top_k=5, max_len=256):
+    """Retrieve top-k tools by cosine similarity to query.
+
+    Args:
+        query: query string
+        tool_descriptions: list of tool description strings (one per tool)
+        top_k: number of results to return
+
+    Returns:
+        list of (index, score) tuples sorted by descending similarity
+    """
+    q_emb = encode_for_retrieval(model, params, tokenizer, [query], max_len=max_len)
+    t_emb = encode_for_retrieval(model, params, tokenizer, tool_descriptions, max_len=max_len)
+    scores = (q_emb @ t_emb.T)[0]  # (N_tools,)
+    top_indices = np.argsort(-scores)[:top_k]
+    return [(int(idx), float(scores[idx])) for idx in top_indices]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate tool calls with trained transformer")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/checkpoint_epoch3.pkl")

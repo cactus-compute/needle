@@ -47,6 +47,7 @@ class TransformerConfig:
     num_memory_slots: int = 64
     n_mels: int = 80
     dropout_rate: float = 0.1
+    contrastive_dim: int = 128
 
     @property
     def jax_dtype(self):
@@ -309,6 +310,11 @@ class EncoderDecoderTransformer(nn.Module):
         self.spec_augment = SpecAugment()
         self.encoder = Encoder(self.config)
         self.decoder = Decoder(self.config)
+        self.contrastive_proj = nn.Dense(
+            self.config.contrastive_dim, dtype=self.config.jax_dtype,
+            use_bias=False, kernel_init=default_init(), name="contrastive_proj",
+        )
+        self.log_temp = self.param("log_temp", jinit.zeros, ())
 
     def _rope(self, seq_len):
         head_dim = self.config.d_model // self.config.num_heads
@@ -336,6 +342,32 @@ class EncoderDecoderTransformer(nn.Module):
         x = self.decoder(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, deterministic=deterministic)
         logits = x.astype(jnp.float32) @ self.embedding.embedding.T
         return logits
+
+    def _mean_pool(self, encoder_out, enc_mask):
+        """Mean-pool encoder output over non-padded positions. Returns (B, d_model)."""
+        if enc_mask is not None:
+            # enc_mask shape: (B, 1, 1, T) -> (B, T)
+            mask_2d = enc_mask[:, 0, 0, :]
+        else:
+            mask_2d = jnp.ones(encoder_out.shape[:2], dtype=encoder_out.dtype)
+        mask_3d = mask_2d[:, :, None].astype(encoder_out.dtype)  # (B, T, 1)
+        summed = jnp.sum(encoder_out * mask_3d, axis=1)  # (B, d_model)
+        counts = jnp.maximum(jnp.sum(mask_2d, axis=1, keepdims=True), 1.0)  # (B, 1)
+        return summed / counts
+
+    def encode_contrastive(self, tokens, deterministic=True):
+        """Encode tokens and project to L2-normalized contrastive space. Returns (B, contrastive_dim)."""
+        src_mask = make_padding_mask(tokens, self.config.pad_token_id)
+        encoder_out, enc_mask = self.encode_text(tokens, src_mask=src_mask, deterministic=deterministic)
+        pooled = self._mean_pool(encoder_out, enc_mask)
+        projected = self.contrastive_proj(pooled)
+        return projected / jnp.maximum(jnp.linalg.norm(projected, axis=-1, keepdims=True), 1e-8)
+
+    def forward_contrastive(self, query_tokens, tool_tokens, deterministic=True):
+        """Encode query and tool tokens, return (q_emb, t_emb, log_temp)."""
+        q_emb = self.encode_contrastive(query_tokens, deterministic=deterministic)
+        t_emb = self.encode_contrastive(tool_tokens, deterministic=deterministic)
+        return q_emb, t_emb, self.log_temp
 
     def __call__(self, src, tgt, src_mask=None, tgt_mask=None):
         encoder_out, enc_mask = self.encode_text(src, src_mask=src_mask)
@@ -418,6 +450,7 @@ class EncoderDecoderTransformer(nn.Module):
         speech_out, speech_enc_mask = self.encode_speech(mel, src_mask=mel_mask, deterministic=True)
         _ = self._run_decoder(text_out, tgt, tgt_mask=tgt_mask, cross_mask=text_enc_mask)
         _ = self._run_decoder(speech_out, tgt, tgt_mask=tgt_mask, cross_mask=speech_enc_mask)
+        _ = self.encode_contrastive(src)
         return jnp.zeros(())
 
 

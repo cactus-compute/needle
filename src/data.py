@@ -631,7 +631,123 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     np.save(cache_path + "_tool_count.npy", tool_counts)
     print(f"Cached {len(enc_inputs):,} tool-call pairs to {CACHE_DIR}/{cache_id}")
 
+    max_tool_len = getattr(prepare_tool_call_pairs, '_max_tool_len', 256)
+    _build_contrastive_arrays(ds, enc_texts, tools_texts, cache_path,
+                              model_path, max_enc_len, max_tool_len,
+                              num_workers, chunk_size, kept_indices)
+
     return enc_inputs, dec_inputs, dec_targets, loss_mask, kept_indices, tool_counts
+
+
+def _build_contrastive_arrays(ds, enc_texts, tools_texts, cache_path,
+                              model_path, max_enc_len, max_tool_len,
+                              num_workers, chunk_size, kept_indices):
+    """Build and save contrastive arrays: query-only tokens + individual tool tokens."""
+    kept_set = set(kept_indices.tolist()) if kept_indices is not None else set(range(len(enc_texts)))
+    kept_queries = [enc_texts[i] for i in range(len(enc_texts)) if i in kept_set]
+
+    q_chunks = [kept_queries[i:i + chunk_size] for i in range(0, len(kept_queries), chunk_size)]
+    with mp.Pool(num_workers, initializer=_init_worker,
+                 initargs=(model_path, max_enc_len)) as pool:
+        q_results = list(tqdm(pool.imap(_tokenize_chunk, q_chunks),
+                              total=len(q_chunks), desc="Tokenizing queries (contrastive)"))
+    query_tokens_list = [tok for chunk in q_results for tok in chunk]
+    n_kept = len(query_tokens_list)
+    query_arr = np.full((n_kept, max_enc_len), PAD_ID, dtype=np.int32)
+    for i, toks in enumerate(query_tokens_list):
+        l = min(len(toks), max_enc_len)
+        query_arr[i, :l] = toks[:l]
+    np.save(cache_path + "_query_only.npy", query_arr)
+
+    # Individual tool tokens + mapping arrays
+    tool_texts_individual = []
+    tool_ex_idx = []
+    tool_is_pos = []
+
+    kept_list = sorted(kept_set)
+    kept_to_local = {g: i for i, g in enumerate(kept_list)}
+
+    for global_i in kept_list:
+        local_i = kept_to_local[global_i]
+        tools_str = tools_texts[global_i]
+        ans_str = ds[global_i]["answers"] if global_i < len(ds) else "[]"
+
+        try:
+            tools = _json.loads(tools_str)
+        except (ValueError, TypeError):
+            tools = []
+        if not isinstance(tools, list):
+            tools = []
+
+        try:
+            calls = _json.loads(ans_str)
+        except (ValueError, TypeError):
+            calls = []
+        pos_names = set()
+        if isinstance(calls, list):
+            for c in calls:
+                if isinstance(c, dict) and "name" in c:
+                    pos_names.add(c["name"])
+
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            tool_str = _json.dumps(tool, separators=(",", ":"))
+            tool_texts_individual.append(tool_str)
+            tool_ex_idx.append(local_i)
+            tool_is_pos.append(tool.get("name", "") in pos_names)
+
+    if tool_texts_individual:
+        t_chunks = [tool_texts_individual[i:i + chunk_size]
+                     for i in range(0, len(tool_texts_individual), chunk_size)]
+        with mp.Pool(num_workers, initializer=_init_worker,
+                     initargs=(model_path, max_tool_len)) as pool:
+            t_results = list(tqdm(pool.imap(_tokenize_chunk, t_chunks),
+                                  total=len(t_chunks), desc="Tokenizing tools (contrastive)"))
+        tool_tokens_list = [tok for chunk in t_results for tok in chunk]
+
+        n_tools = len(tool_tokens_list)
+        tool_arr = np.full((n_tools, max_tool_len), PAD_ID, dtype=np.int32)
+        for i, toks in enumerate(tool_tokens_list):
+            l = min(len(toks), max_tool_len)
+            tool_arr[i, :l] = toks[:l]
+    else:
+        tool_arr = np.zeros((0, max_tool_len), dtype=np.int32)
+
+    np.save(cache_path + "_tool_individual.npy", tool_arr)
+    np.save(cache_path + "_tool_ex_idx.npy", np.array(tool_ex_idx, dtype=np.int32))
+    np.save(cache_path + "_tool_is_pos.npy", np.array(tool_is_pos, dtype=np.bool_))
+    print(f"  Contrastive: {n_kept} queries, {len(tool_ex_idx)} individual tools")
+
+
+def get_contrastive_batches(query_tokens, tool_tokens, tool_ex_idx, tool_is_pos, batch_size):
+    """Yield (query_batch, tool_batch) for CLIP-style contrastive training.
+
+    Each batch: B queries paired with 1 randomly-chosen positive tool each.
+    In-batch negatives provide the contrastive signal.
+    """
+    n_queries = len(query_tokens)
+    pos_map = {}
+    for t_idx in range(len(tool_ex_idx)):
+        if tool_is_pos[t_idx]:
+            pos_map.setdefault(int(tool_ex_idx[t_idx]), []).append(t_idx)
+
+    valid_queries = [i for i in range(n_queries) if i in pos_map]
+    if not valid_queries:
+        return
+
+    indices = np.array(valid_queries)
+    np.random.shuffle(indices)
+
+    for start in range(0, len(indices) - batch_size + 1, batch_size):
+        batch_q_idx = indices[start:start + batch_size]
+        q_batch = np.array(query_tokens[batch_q_idx])
+        t_indices = np.array([
+            pos_map[int(qi)][np.random.randint(len(pos_map[int(qi)]))]
+            for qi in batch_q_idx
+        ])
+        t_batch = np.array(tool_tokens[t_indices])
+        yield q_batch, t_batch
 
 
 def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True, loss_mask=None, tool_counts=None):
@@ -848,6 +964,12 @@ def load_prepared_data(split, mmap=False):
     mmap_mode = "r" if mmap else None
     tc_path = cache_path + "_tool_count.npy"
     tc = np.load(tc_path, mmap_mode=mmap_mode) if os.path.exists(tc_path) else None
+    def _load_optional(suffix):
+        p = cache_path + suffix
+        if os.path.exists(p):
+            return np.load(p, mmap_mode=mmap_mode)
+        return None
+
     return {
         "enc_inputs": np.load(cache_path + "_enc.npy", mmap_mode=mmap_mode),
         "dec_inputs": np.load(cache_path + "_dec_in.npy", mmap_mode=mmap_mode),
@@ -855,6 +977,10 @@ def load_prepared_data(split, mmap=False):
         "loss_mask": np.load(cache_path + "_loss_mask.npy", mmap_mode=mmap_mode),
         "kept_indices": np.load(cache_path + "_kept_idx.npy", mmap_mode=mmap_mode),
         "tool_counts": tc,
+        "query_only": _load_optional("_query_only.npy"),
+        "tool_individual": _load_optional("_tool_individual.npy"),
+        "tool_ex_idx": _load_optional("_tool_ex_idx.npy"),
+        "tool_is_pos": _load_optional("_tool_is_pos.npy"),
     }
 
 
