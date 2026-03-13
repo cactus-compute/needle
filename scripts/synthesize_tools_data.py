@@ -342,13 +342,13 @@ def process_sample(sample, api_key, models, rng, source_tag="synth-pleias"):
     return row
 
 
-def _process_batch(samples, label, batch_idx, api_key, models, args, tqdm, source_tag):
+def _process_batch(samples, label, batch_idx, api_key, models, args, tqdm, source_tag,
+                    since_last_upload):
     """Process a batch of samples, append to checkpoint. Returns (generated, failed)."""
     logger.info(f"\n{'=' * 60}")
     logger.info(f"Batch: {label}")
     logger.info(f"{'=' * 60}")
 
-    # Always load checkpoint to skip already-completed IDs (even across batches)
     done_ids = load_checkpoint()
     pending = [s for s in samples if s[0] not in done_ids]
     if not pending:
@@ -388,6 +388,7 @@ def _process_batch(samples, label, batch_idx, api_key, models, args, tqdm, sourc
                 if row is not None:
                     out_file.write(json.dumps(row) + "\n")
                     generated += 1
+                    since_last_upload[0] += 1
                 else:
                     failed += 1
 
@@ -406,6 +407,11 @@ def _process_batch(samples, label, batch_idx, api_key, models, args, tqdm, sourc
                             f"generated={generated:,} failed={failed:,} "
                             f"({rate:.0f}% success)"
                         )
+
+                if since_last_upload[0] >= args.upload_every:
+                    out_file.flush()
+                    _export_dataset()
+                    since_last_upload[0] = 0
 
             if tqdm:
                 pbar.close()
@@ -437,6 +443,8 @@ def main():
                         help="Resume from checkpoint")
     parser.add_argument("--batch-size", type=int, default=500,
                         help="Samples between progress logs (default: 500)")
+    parser.add_argument("--upload-every", type=int, default=1000,
+                        help="Upload to GCS every N successful generations (default: 1000)")
     args = parser.parse_args()
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -454,7 +462,6 @@ def main():
 
     _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Clear checkpoint for fresh runs; --resume keeps existing data
     if not args.resume and _CHECKPOINT_PATH.exists():
         _CHECKPOINT_PATH.unlink()
         logger.info("Cleared previous checkpoint (use --resume to keep)")
@@ -468,22 +475,20 @@ def main():
     total_generated = 0
     total_failed = 0
     batch_idx = 0
+    since_last_upload = [0]  
 
-    # ── Source 1: GCS raw_data queries ──
     if not args.no_gcs:
         gcs_samples = load_queries_from_gcs(max_samples=args.max_samples)
         if gcs_samples:
             gen, fail = _process_batch(
                 gcs_samples, "GCS raw_data", batch_idx, api_key, models,
                 args, tqdm, source_tag="synth-gcs",
+                since_last_upload=since_last_upload,
             )
             total_generated += gen
             total_failed += fail
             batch_idx += 1
-            if gen > 0:
-                _export_dataset()
 
-    # ── Source 2: PleIAs/SYNTH parquet shards ──
     hf_token = os.environ.get("HF_TOKEN")
     shard_urls = _discover_shard_urls(hf_token, max_shards=args.max_shards)
 
@@ -493,12 +498,14 @@ def main():
         gen, fail = _process_batch(
             samples, f"PleIAs shard {shard_idx}", batch_idx, api_key, models,
             args, tqdm, source_tag="synth-pleias",
+            since_last_upload=since_last_upload,
         )
         total_generated += gen
         total_failed += fail
         batch_idx += 1
-        if gen > 0:
-            _export_dataset()
+
+    if since_last_upload[0] > 0:
+        _export_dataset()
 
     logger.info(f"\nAll done: {total_generated:,} generated, {total_failed:,} failed")
 
@@ -530,7 +537,6 @@ def _export_dataset():
     ds.save_to_disk(str(out_path))
     logger.info(f"Exported {len(rows):,} examples to {out_path}/")
 
-    # Push to GCS
     try:
         sys.path.insert(0, str(_PROJECT_ROOT))
         from src.gcs import upload_directory
