@@ -1,7 +1,7 @@
 """GCS sync utilities for persisting datasets to gs://cactus-dataset.
 
 Uploads and downloads three artifact types:
-  - raw_data/          unified HuggingFace dataset (.arrow files)
+  - synth_tool_calls/  synthesized tool-calling dataset (.arrow files)
   - tokenized_data/    pre-tokenized .npy arrays + metadata JSONs
   - tokenizer/         SentencePiece model + vocab
 
@@ -13,7 +13,7 @@ import subprocess
 
 BUCKET = "cactus-dataset"
 
-_RAW_DATA_PREFIX = "raw_data"
+_SYNTH_DATA_PREFIX = "synth_tool_calls"
 _TOKENIZED_DATA_PREFIX = "tokenized_data"
 _TOKENIZER_PREFIX = "tokenizer"
 
@@ -53,14 +53,9 @@ def download_directory(gcs_prefix, local_dir):
 # ── Convenience wrappers ──
 
 
-def upload_raw_data(local_dir):
-    """Upload unified dataset to GCS."""
-    upload_directory(local_dir, _RAW_DATA_PREFIX)
-
-
-def download_raw_data(local_dir):
-    """Download unified dataset from GCS. Returns True if successful."""
-    return download_directory(_RAW_DATA_PREFIX, local_dir)
+def download_synth_data(local_dir):
+    """Download synthesized tool-calling dataset from GCS. Returns True if successful."""
+    return download_directory(_SYNTH_DATA_PREFIX, local_dir)
 
 
 def upload_tokenized_data(cache_dir):

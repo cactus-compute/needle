@@ -1,7 +1,8 @@
 """Standalone tokenization pipeline: train tokenizer and pre-tokenize all data.
 
-Trains the SentencePiece tokenizer and tokenizes train + val splits,
-caching everything locally.
+Downloads the synthesized tool-calling dataset from GCS
+(gs://cactus-dataset/synth_tool_calls/), trains the SentencePiece tokenizer,
+and tokenizes train + val splits, caching everything locally.
 
 Usage:
     needle tokenize                         # full run
@@ -18,6 +19,9 @@ from .data import (
     TOKENIZER_DIR,
     _cache_key,
     _save_cache_metadata,
+    _DISK_UNIFIED_DIR,
+    _SHM_UNIFIED_DIR,
+    _shm_available,
     get_tokenizer,
     load_tool_calls,
     prepare_tool_call_pairs,
@@ -26,16 +30,32 @@ from .data import (
 
 
 def _clear_local_caches():
-    """Remove local .data_cache/ and tokenizer/ directories."""
-    for d in [CACHE_DIR, TOKENIZER_DIR]:
+    """Remove local .data_cache/, tokenizer/, and stale unified dataset directories."""
+    for d in [CACHE_DIR, TOKENIZER_DIR, _DISK_UNIFIED_DIR, _SHM_UNIFIED_DIR]:
         if os.path.exists(d):
             print(f"Removing {d}/ ...")
             shutil.rmtree(d)
 
 
+def _download_synth_dataset():
+    """Download synthesized tool-calling dataset from GCS."""
+    from .gcs import download_synth_data
+
+    target = _SHM_UNIFIED_DIR if _shm_available() else _DISK_UNIFIED_DIR
+    print(f"Downloading synth dataset to {target} ...")
+    if not download_synth_data(target):
+        raise FileNotFoundError(
+            "Synth dataset not found at gs://cactus-dataset/synth_tool_calls/. "
+            "Run 'python scripts/synthesize_tools_data.py' first."
+        )
+
+
 def tokenize(args):
     print("=== Clearing existing caches ===")
     _clear_local_caches()
+
+    print("\n=== Downloading synth dataset from GCS ===")
+    _download_synth_dataset()
 
     print("\n=== Training tokenizer ===")
     train_tokenizer(max_samples=args.max_samples, force=True)

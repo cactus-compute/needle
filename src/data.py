@@ -39,7 +39,7 @@ _DISK_UNIFIED_DIR = os.path.join(_PROJECT_ROOT, "data", "tool_calls_unified")
 _SHM_UNIFIED_DIR = os.path.join("/dev/shm", "needle_data", "tool_calls_unified")
 
 
-_MIN_SHM_BYTES = 200 * 1024**3
+_MIN_SHM_BYTES = 20 * 1024**3
 
 
 def _shm_available():
@@ -237,19 +237,19 @@ def _load_unified_dataset():
                 continue
 
     try:
-        from .gcs import download_raw_data
+        from .gcs import download_synth_data
         target = _SHM_UNIFIED_DIR if _shm_available() else _DISK_UNIFIED_DIR
-        if download_raw_data(target):
+        if download_synth_data(target):
             ds = load_from_disk(target)
-            print(f"Loaded unified dataset from GCS -> {target} ({len(ds)} rows)")
+            print(f"Loaded synth dataset from GCS -> {target} ({len(ds)} rows)")
             _unified_dataset_cache = _set_audio_backend(ds)
             return _unified_dataset_cache
     except Exception as e:
         print(f"Warning: GCS download failed: {e}")
 
     raise FileNotFoundError(
-        f"Unified dataset not found at {_SHM_UNIFIED_DIR} or {_DISK_UNIFIED_DIR}. "
-        f"Run 'python scripts/build_dataset.py' first."
+        f"Dataset not found at {_SHM_UNIFIED_DIR} or {_DISK_UNIFIED_DIR}. "
+        f"Run 'needle tokenize' or 'python scripts/synthesize_tools_data.py' first."
     )
 
 

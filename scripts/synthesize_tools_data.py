@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
-"""Synthesize tool-calling data from multiple query sources via OpenRouter.
-
-Query sources:
-  1. PleIAs/SYNTH parquet shards (~154k queries per shard, 7 shards)
-  2. GCS raw_data — queries extracted from the existing unified tool-calling dataset
+"""Synthesize tool-calling data from PleIAs/SYNTH via OpenRouter.
 
 Each query is sent to a randomly-selected frontier model to generate
 (tools, answer) pairs, then validated and checkpointed as JSONL.
 
 Usage:
-    python scripts/synthesize_tools_data.py                          # all sources
+    python scripts/synthesize_tools_data.py
     python scripts/synthesize_tools_data.py --model google/gemini-3.1-flash-lite-preview
     python scripts/synthesize_tools_data.py --max-shards 1 --max-samples 100
-    python scripts/synthesize_tools_data.py --no-gcs               # skip GCS queries
     python scripts/synthesize_tools_data.py --resume               # continue from checkpoint
 """
 
@@ -149,48 +144,6 @@ def load_queries_from_parquet(path, max_samples=None):
         samples = samples[:max_samples]
 
     logger.info(f"  Selected {len(samples):,} samples")
-    return samples
-
-
-def load_queries_from_gcs(max_samples=None):
-    """Download raw_data from GCS and extract queries for re-synthesis.
-
-    Returns list of (sample_id, language, query) tuples, where sample_id
-    is prefixed with 'gcs-' to avoid collisions with PleIAs IDs.
-    """
-    sys.path.insert(0, str(_PROJECT_ROOT))
-    from src.gcs import download_raw_data
-
-    local_dir = _PARQUET_CACHE_DIR / "gcs_raw_data"
-    if not local_dir.exists():
-        logger.info("Downloading raw_data from GCS...")
-        ok = download_raw_data(str(local_dir))
-        if not ok:
-            logger.warning("No raw_data found in GCS, skipping")
-            return []
-    else:
-        logger.info(f"Using cached GCS raw_data: {local_dir}")
-
-    from datasets import load_from_disk
-    ds = load_from_disk(str(local_dir))
-    logger.info(f"Loaded {len(ds):,} rows from GCS raw_data")
-
-    samples = []
-    for i in range(len(ds)):
-        ex = ds[i]
-        query = ex.get("query", "").strip()
-        if not query:
-            continue
-        sample_id = f"gcs-{i}"
-        samples.append((sample_id, "en", query))
-
-    rng = random.Random(42)
-    rng.shuffle(samples)
-
-    if max_samples:
-        samples = samples[:max_samples]
-
-    logger.info(f"  Selected {len(samples):,} GCS queries")
     return samples
 
 
@@ -437,8 +390,6 @@ def main():
                         help="Concurrent API requests (default: 32)")
     parser.add_argument("--max-shards", type=int, default=None,
                         help="Max parquet shards to process (default: all)")
-    parser.add_argument("--no-gcs", action="store_true",
-                        help="Skip GCS raw_data queries")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from checkpoint")
     parser.add_argument("--batch-size", type=int, default=500,
@@ -475,19 +426,7 @@ def main():
     total_generated = 0
     total_failed = 0
     batch_idx = 0
-    since_last_upload = [0]  
-
-    if not args.no_gcs:
-        gcs_samples = load_queries_from_gcs(max_samples=args.max_samples)
-        if gcs_samples:
-            gen, fail = _process_batch(
-                gcs_samples, "GCS raw_data", batch_idx, api_key, models,
-                args, tqdm, source_tag="synth-gcs",
-                since_last_upload=since_last_upload,
-            )
-            total_generated += gen
-            total_failed += fail
-            batch_idx += 1
+    since_last_upload = [0]
 
     hf_token = os.environ.get("HF_TOKEN")
     shard_urls = _discover_shard_urls(hf_token, max_shards=args.max_shards)
