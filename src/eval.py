@@ -256,12 +256,16 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
         if i < 10:
             samples.append((ex["query"][:80], ref_text[:120], pred_text[:120]))
 
-        if len(ref_calls) == 0:
+        ref_is_defer = ref_text.strip() in ("", "[]", "<defer>")
+        pred_is_defer = pred_text.strip() in ("", "[]", "<defer>")
+        if ref_is_defer:
             empty_ref += 1
-        if len(pred_calls) == 0:
+        if pred_is_defer:
             empty_pred += 1
 
-        if json.dumps(pred_calls, sort_keys=True) == json.dumps(ref_calls, sort_keys=True):
+        if ref_is_defer and pred_is_defer:
+            exact_match += 1
+        elif not ref_is_defer and not pred_is_defer and json.dumps(pred_calls, sort_keys=True) == json.dumps(ref_calls, sort_keys=True):
             exact_match += 1
 
         ref_name_set = {c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c}
@@ -469,7 +473,7 @@ def main(args):
         print(f"  Recall           {tc['call_recall']:>10.3f}")
         print(f"  F1               {tc['call_f1']:>10.3f}")
         print(f"  ─────────────────────────────────────")
-        print(f"  Empty ref/pred   {tc['empty_ref_pct']:.1%} / {tc['empty_pred_pct']:.1%}")
+        print(f"  Defer ref/pred   {tc['empty_ref_pct']:.1%} / {tc['empty_pred_pct']:.1%}")
         if tc["samples"]:
             print(f"\n  samples:")
             for query, ref, pred in tc["samples"][:5]:

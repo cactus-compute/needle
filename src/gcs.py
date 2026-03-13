@@ -13,6 +13,7 @@ import subprocess
 
 BUCKET = "cactus-dataset"
 
+_RAW_DATA_PREFIX = "raw_data"
 _SYNTH_DATA_PREFIX = "synth_tool_calls"
 _TOKENIZED_DATA_PREFIX = "tokenized_data"
 _TOKENIZER_PREFIX = "tokenizer"
@@ -51,6 +52,16 @@ def download_directory(gcs_prefix, local_dir):
 
 
 # ── Convenience wrappers ──
+
+
+def upload_raw_data(local_dir):
+    """Upload raw tool-calling dataset to GCS."""
+    upload_directory(local_dir, _RAW_DATA_PREFIX)
+
+
+def download_raw_data(local_dir):
+    """Download raw tool-calling dataset from GCS. Returns True if successful."""
+    return download_directory(_RAW_DATA_PREFIX, local_dir)
 
 
 def download_synth_data(local_dir):

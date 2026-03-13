@@ -123,7 +123,8 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
     """Generate tool-call output.
 
     Encoder: [query_tokens..., <tools>, tools_tokens...] truncated to max_enc_len.
-    Decoder: prefilled with [EOS, <tool_call>], then greedy decode.
+    Decoder: prefilled with [EOS], model predicts <tool_call> or <defer> first.
+    If <defer> is predicted, returns "<defer>" (task routed to cloud model).
     """
     name_map = {}
     if normalize:
@@ -134,19 +135,15 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
 
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
-    tool_call_id = task_token_id if task_token_id is not None else tokenizer.tool_call_token_id
+    defer_id = tokenizer.defer_token_id
 
     src_mask = make_padding_mask(enc_input, pad_id)
     encoder_out, enc_mask = model.apply(
         {"params": params}, enc_input, src_mask=src_mask, method="encode"
     )
 
-    prefix = [eos_id, tool_call_id]
-    prefix_len = 2
-
     dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
     dec_buffer = dec_buffer.at[0, 0].set(eos_id)
-    dec_buffer = dec_buffer.at[0, 1].set(tool_call_id)
 
     decode_fn = _get_decode_fn(model, max_gen_len)
 
@@ -158,12 +155,18 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
 
     logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
 
-    for i in range(prefix_len - 1, max_gen_len - 1):
+    for i in range(0, max_gen_len - 1):
         next_logits = logits[0, i]
         next_token = int(jnp.argmax(next_logits))
 
         if next_token == eos_id:
             break
+
+        # If model predicts <defer> as first token, route to cloud
+        if next_token == defer_id and i == 0:
+            if stream:
+                sys.stdout.write("<defer>\n")
+            return "<defer>"
 
         generated_tokens.append(next_token)
         dec_buffer = dec_buffer.at[0, i + 1].set(next_token)
@@ -178,6 +181,9 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
         sys.stdout.write("\n")
 
     result = tokenizer.decode(generated_tokens)
+    # Strip leading <tool_call> token text from output if present
+    if result.startswith("<tool_call>"):
+        result = result[len("<tool_call>"):]
     if normalize and name_map:
         result = restore_tool_names(result, name_map)
     return result
@@ -187,7 +193,7 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
     """Batch-generate tool-call outputs for multiple examples at once.
 
     Encoder: [query_tokens..., <tools>, tools_tokens...] per example, truncated to max_enc_len.
-    Decoder: uniform prefix [EOS, <tool_call>] for all examples.
+    Decoder: prefilled with [EOS], model predicts <tool_call> or <defer> first.
 
     Returns a list of decoded strings, one per example.
     """
@@ -203,7 +209,7 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
     B = len(queries)
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
-    tool_call_id = tokenizer.tool_call_token_id
+    defer_id = tokenizer.defer_token_id
 
     # --- Encode: [query..., <tools>, tools...] per example, truncated ---
     enc_token_lists = []
@@ -220,28 +226,32 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
         {"params": params}, enc_input, src_mask=src_mask, method="encode"
     )
 
-    # --- Decoder prefix: uniform [EOS, <tool_call>] (prefix_len=2) ---
-    prefix_len = 2
+    # --- Decoder prefix: [EOS] only, model chooses <tool_call> or <defer> ---
     dec_buffer = np.full((B, max_gen_len), pad_id, dtype=np.int32)
     dec_buffer[:, 0] = eos_id
-    dec_buffer[:, 1] = tool_call_id
     dec_buffer = jnp.array(dec_buffer)
 
     decode_fn = _get_decode_fn(model, max_gen_len)
 
     # --- Autoregressive decoding ---
     finished = [False] * B
+    deferred = [False] * B
     gen_tokens = [[] for _ in range(B)]
 
     logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
 
-    for pos in range(prefix_len - 1, max_gen_len - 1):
+    for pos in range(0, max_gen_len - 1):
         for i in range(B):
             if finished[i]:
                 continue
             next_token = int(jnp.argmax(logits[i, pos]))
             if next_token == eos_id:
                 finished[i] = True
+                continue
+            # <defer> as first token means no tool call
+            if next_token == defer_id and pos == 0:
+                finished[i] = True
+                deferred[i] = True
                 continue
             gen_tokens[i].append(next_token)
             dec_buffer = dec_buffer.at[i, pos + 1].set(next_token)
@@ -251,7 +261,15 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
 
         logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
 
-    results = [tokenizer.decode(toks) for toks in gen_tokens]
+    results = []
+    for i in range(B):
+        if deferred[i]:
+            results.append("<defer>")
+        else:
+            text = tokenizer.decode(gen_tokens[i])
+            if text.startswith("<tool_call>"):
+                text = text[len("<tool_call>"):]
+            results.append(text)
     if normalize and name_maps:
         results = [restore_tool_names(r, nm) for r, nm in zip(results, name_maps)]
     return results

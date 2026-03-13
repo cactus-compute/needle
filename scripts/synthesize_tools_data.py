@@ -276,6 +276,39 @@ def _validate_and_format(synth_id, language, query, tools, answer, model, source
     }
 
 
+def load_queries_from_gcs(max_samples=None):
+    """Pull raw_data from GCS bucket and extract queries for synthesis."""
+    sys.path.insert(0, str(_PROJECT_ROOT))
+    from src.gcs import download_directory
+
+    local_dir = _PARQUET_CACHE_DIR / "raw_data"
+    if not (local_dir / "dataset_info.json").exists():
+        ok = download_directory("raw_data", str(local_dir))
+        if not ok:
+            logger.warning("No raw_data found in GCS, skipping")
+            return []
+
+    from datasets import load_from_disk
+    ds = load_from_disk(str(local_dir))
+    logger.info(f"Loaded {len(ds):,} raw_data queries from GCS")
+
+    samples = []
+    for i, ex in enumerate(ds):
+        synth_id = f"gcs-{i}"
+        query = ex.get("query", "")
+        if not query or len(query.strip()) < 10:
+            continue
+        samples.append((synth_id, "en", query))
+
+    rng = random.Random(43)
+    rng.shuffle(samples)
+    if max_samples:
+        samples = samples[:max_samples]
+
+    logger.info(f"  Selected {len(samples):,} GCS queries")
+    return samples
+
+
 def _pick_model(models, rng):
     """Randomly select a model from the pool."""
     return rng.choice(models)
@@ -428,6 +461,19 @@ def main():
     batch_idx = 0
     since_last_upload = [0]
 
+    # ── GCS raw_data queries ──
+    gcs_samples = load_queries_from_gcs(max_samples=args.max_samples)
+    if gcs_samples:
+        gen, fail = _process_batch(
+            gcs_samples, "GCS raw_data", batch_idx, api_key, models,
+            args, tqdm, source_tag="synth-gcs",
+            since_last_upload=since_last_upload,
+        )
+        total_generated += gen
+        total_failed += fail
+        batch_idx += 1
+
+    # ── PleIAs/SYNTH parquet shards ──
     hf_token = os.environ.get("HF_TOKEN")
     shard_urls = _discover_shard_urls(hf_token, max_shards=args.max_shards)
 

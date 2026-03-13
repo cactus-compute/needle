@@ -787,10 +787,10 @@ def train(args):
                 break
             local_idx = int(val_kept[k])
             ex = val_ds[local_idx]
-            is_empty = ex["answers"].strip() in ("", "[]")
-            if not is_empty and len(display_with) < 4:
+            is_defer = ex["answers"].strip() in ("", "[]", "<defer>")
+            if not is_defer and len(display_with) < 4:
                 display_with.append(ex)
-            elif is_empty and len(display_without) < 1:
+            elif is_defer and len(display_without) < 1:
                 display_without.append(ex)
         display_pairs = display_with + display_without
 
@@ -807,10 +807,10 @@ def train(args):
             local_idx = int(val_kept[k])
             ex = val_ds[local_idx]
             ref_text = ex["answers"].strip()
-            is_empty = ref_text in ("", "[]")
-            if not is_empty and len(tc_with) < tc_with_n:
+            is_defer = ref_text in ("", "[]", "<defer>")
+            if not is_defer and len(tc_with) < tc_with_n:
                 tc_with.append(ex)
-            elif is_empty and len(tc_without) < tc_without_n:
+            elif is_defer and len(tc_without) < tc_without_n:
                 tc_without.append(ex)
         tc_eval_pairs = tc_with + tc_without
 
@@ -830,10 +830,13 @@ def train(args):
 
         unified_samples = []
         for ex, pred in zip(display_pairs, display_preds):
+            ref = ex["answers"].strip()
+            if ref in ("", "[]"):
+                ref = "<defer>"
             unified_samples.append({
                 "query": ex["query"],
                 "tools": ex["tools"],
-                "ref": ex["answers"],
+                "ref": ref,
                 "text": pred.strip(),
             })
 
@@ -851,19 +854,23 @@ def train(args):
         for ex, pred_text in zip(tc_eval_pairs, tc_preds):
             ref_text = ex["answers"].strip()
             pred_text = pred_text.strip()
+            ref_is_defer = ref_text in ("", "[]")
+            pred_is_defer = pred_text in ("<defer>", "[]", "")
             try:
-                ref_calls = _json_mod.loads(ref_text)
+                ref_calls = _json_mod.loads(ref_text) if not ref_is_defer else []
             except (ValueError, TypeError):
                 ref_calls = []
             try:
-                pred_calls = _json_mod.loads(pred_text)
+                pred_calls = _json_mod.loads(pred_text) if not pred_is_defer else []
                 if not isinstance(pred_calls, list):
                     pred_calls = [pred_calls] if isinstance(pred_calls, dict) else []
             except (ValueError, TypeError):
                 tc_parse_err += 1
                 pred_calls = []
             tc_n += 1
-            if _json_mod.dumps(pred_calls, sort_keys=True) == _json_mod.dumps(ref_calls, sort_keys=True):
+            if ref_is_defer and pred_is_defer:
+                tc_exact += 1
+            elif not ref_is_defer and not pred_is_defer and _json_mod.dumps(pred_calls, sort_keys=True) == _json_mod.dumps(ref_calls, sort_keys=True):
                 tc_exact += 1
             ref_names = {c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c}
             pred_names = {c["name"] for c in pred_calls if isinstance(c, dict) and "name" in c}
@@ -994,7 +1001,7 @@ def train(args):
                 if len(s["tools"]) > 120:
                     tools_short += "..."
                 print(f"      Tools: {tools_short}")
-                print(f"      Ref:   {s['ref'][:200] or '[]'}")
+                print(f"      Ref:   {s['ref'][:200] or '<defer>'}")
                 print(f"      Text:  {s['text'][:200] or '(empty)'}")
                 if j < len(unified_samples) - 1:
                     print()
