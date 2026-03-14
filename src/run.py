@@ -91,25 +91,10 @@ def load_checkpoint(path):
 
 
 def _build_encoder_input(tokenizer, query, tools, max_enc_len=DEFAULT_MAX_ENC_LEN):
-    """Build encoder input: [query..., <tools>, tools...] truncated to max_enc_len.
-
-    Empty tools ([]) are replaced with the <defer> token.
-    """
+    """Build encoder input: [query..., <tools>, tools...] truncated to max_enc_len."""
     tools_sep_id = tokenizer.tools_token_id
-    defer_id = tokenizer.defer_token_id
     q_toks = tokenizer.encode(query)
-
-    # Use <defer> token for empty tools
-    try:
-        parsed = _json.loads(tools)
-        is_empty = isinstance(parsed, list) and len(parsed) == 0
-    except (ValueError, TypeError):
-        is_empty = False
-
-    if is_empty:
-        t_toks = [defer_id]
-    else:
-        t_toks = tokenizer.encode(tools)
+    t_toks = tokenizer.encode(tools)
 
     max_query = max_enc_len - 2
     if len(q_toks) > max_query:
@@ -123,8 +108,7 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
     """Generate tool-call output.
 
     Encoder: [query_tokens..., <tools>, tools_tokens...] truncated to max_enc_len.
-    Decoder: prefilled with [EOS], model predicts <tool_call> or <defer> first.
-    If <defer> is predicted, returns "<defer>" (task routed to cloud model).
+    Decoder: prefilled with [EOS], model predicts <tool_call> first, then answer tokens.
     """
     name_map = {}
     if normalize:
@@ -135,7 +119,6 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
 
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
-    defer_id = tokenizer.defer_token_id
 
     src_mask = make_padding_mask(enc_input, pad_id)
     encoder_out, enc_mask = model.apply(
@@ -162,12 +145,6 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
         if next_token == eos_id:
             break
 
-        # If model predicts <defer> as first token, route to cloud
-        if next_token == defer_id and i == 0:
-            if stream:
-                sys.stdout.write("<defer>\n")
-            return "<defer>"
-
         generated_tokens.append(next_token)
         dec_buffer = dec_buffer.at[0, i + 1].set(next_token)
 
@@ -193,7 +170,7 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
     """Batch-generate tool-call outputs for multiple examples at once.
 
     Encoder: [query_tokens..., <tools>, tools_tokens...] per example, truncated to max_enc_len.
-    Decoder: prefilled with [EOS], model predicts <tool_call> or <defer> first.
+    Decoder: prefilled with [EOS], model predicts <tool_call> first, then answer tokens.
 
     Returns a list of decoded strings, one per example.
     """
@@ -209,7 +186,6 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
     B = len(queries)
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
-    defer_id = tokenizer.defer_token_id
 
     # --- Encode: [query..., <tools>, tools...] per example, truncated ---
     enc_token_lists = []
@@ -226,16 +202,13 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
         {"params": params}, enc_input, src_mask=src_mask, method="encode"
     )
 
-    # --- Decoder prefix: [EOS] only, model chooses <tool_call> or <defer> ---
     dec_buffer = np.full((B, max_gen_len), pad_id, dtype=np.int32)
     dec_buffer[:, 0] = eos_id
     dec_buffer = jnp.array(dec_buffer)
 
     decode_fn = _get_decode_fn(model, max_gen_len)
 
-    # --- Autoregressive decoding ---
     finished = [False] * B
-    deferred = [False] * B
     gen_tokens = [[] for _ in range(B)]
 
     logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
@@ -248,11 +221,6 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
             if next_token == eos_id:
                 finished[i] = True
                 continue
-            # <defer> as first token means no tool call
-            if next_token == defer_id and pos == 0:
-                finished[i] = True
-                deferred[i] = True
-                continue
             gen_tokens[i].append(next_token)
             dec_buffer = dec_buffer.at[i, pos + 1].set(next_token)
 
@@ -263,13 +231,10 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
 
     results = []
     for i in range(B):
-        if deferred[i]:
-            results.append("<defer>")
-        else:
-            text = tokenizer.decode(gen_tokens[i])
-            if text.startswith("<tool_call>"):
-                text = text[len("<tool_call>"):]
-            results.append(text)
+        text = tokenizer.decode(gen_tokens[i])
+        if text.startswith("<tool_call>"):
+            text = text[len("<tool_call>"):]
+        results.append(text)
     if normalize and name_maps:
         results = [restore_tool_names(r, nm) for r, nm in zip(results, name_maps)]
     return results

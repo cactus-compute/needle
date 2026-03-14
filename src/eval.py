@@ -256,16 +256,16 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
         if i < 10:
             samples.append((ex["query"][:80], ref_text[:120], pred_text[:120]))
 
-        ref_is_defer = ref_text.strip() in ("", "[]", "<defer>")
-        pred_is_defer = pred_text.strip() in ("", "[]", "<defer>")
-        if ref_is_defer:
+        ref_is_empty = ref_text.strip() in ("", "[]")
+        pred_is_empty = pred_text.strip() in ("", "[]")
+        if ref_is_empty:
             empty_ref += 1
-        if pred_is_defer:
+        if pred_is_empty:
             empty_pred += 1
 
-        if ref_is_defer and pred_is_defer:
+        if ref_is_empty and pred_is_empty:
             exact_match += 1
-        elif not ref_is_defer and not pred_is_defer and json.dumps(pred_calls, sort_keys=True) == json.dumps(ref_calls, sort_keys=True):
+        elif not ref_is_empty and not pred_is_empty and json.dumps(pred_calls, sort_keys=True) == json.dumps(ref_calls, sort_keys=True):
             exact_match += 1
 
         ref_name_set = {c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c}

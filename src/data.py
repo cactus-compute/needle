@@ -98,7 +98,6 @@ BOS_ID = 2
 UNK_ID = 3
 TOOL_CALL_ID = 4
 TOOLS_ID = 5
-DEFER_ID = 6
 
 DEFAULT_MAX_ENC_LEN = 1024
 DEFAULT_MAX_DEC_LEN = 512
@@ -289,10 +288,6 @@ class NeedleTokenizer:
         return TOOLS_ID
 
     @property
-    def defer_token_id(self):
-        return DEFER_ID
-
-    @property
     def vocab_size(self):
         return self.sp.GetPieceSize()
 
@@ -418,6 +413,11 @@ def load_tool_calls(split="train", max_samples=None, return_global_indices=False
 
     ds = ds.select(global_indices.tolist())
 
+    # Normalize <defer> / empty answers to []
+    ds = ds.map(lambda ex: {
+        "answers": "[]" if ex["answers"].strip() in ("", "<defer>") else ex["answers"]
+    })
+
     if max_samples:
         limit = min(max_samples, len(ds))
         ds = ds.select(range(limit))
@@ -507,8 +507,6 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     tool_call_id = tokenizer.tool_call_token_id
     tools_sep_id = tokenizer.tools_token_id
 
-    defer_id = tokenizer.defer_token_id
-
     enc_texts = [ex["query"] for ex in ds]
     tools_texts = [ex["tools"] for ex in ds]
     ans_texts = [ex["answers"] for ex in ds]
@@ -520,15 +518,9 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
             return s
 
     ans_texts = [_compact(a) for a in ans_texts]
+    # Normalize any remaining <defer> or empty answers to []
+    ans_texts = ["[]" if a.strip() in ("", "<defer>") else a for a in ans_texts]
     tools_texts = [_compact(t) for t in tools_texts]
-
-    empty_tools_mask = []
-    for t in tools_texts:
-        try:
-            parsed = _json.loads(t)
-            empty_tools_mask.append(isinstance(parsed, list) and len(parsed) == 0)
-        except (ValueError, TypeError):
-            empty_tools_mask.append(False)
 
     tool_counts = np.array([_count_tool_calls(a) for a in ans_texts], dtype=np.int32)
 
@@ -562,21 +554,10 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
 
     n = len(ds)
 
-    # Track which samples have empty answers (no tool calls to make)
-    empty_ans_mask = []
-    for a in ans_texts:
-        stripped = a.strip()
-        empty_ans_mask.append(stripped in ("", "[]"))
-
-    def _fill_sample(j, e_tok, t_tok, a_tok, ans_text, is_empty_tools, is_empty_ans,
+    def _fill_sample(j, e_tok, t_tok, a_tok, ans_text,
                      enc_arr, dec_in_arr, dec_tgt_arr, lm_arr):
         """Fill arrays at position j for one sample. Returns False if skipped."""
         # Encoder: [query..., <tools>, tools...] truncated to max_enc_len
-        # For empty tools, use <defer> token instead of tokenized "[]"
-        if is_empty_tools:
-            t_tok = [defer_id]
-
-        # Reserve 1 slot for <tools> separator + at least 1 token for tools
         max_query = max_enc_len - 1 - 1  # room for <tools> + at least 1 tools token
         if len(e_tok) > max_query:
             e_tok = e_tok[:max_query]
@@ -587,37 +568,29 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
         el = len(enc_seq)
         enc_arr[j, :el] = enc_seq
 
-        if is_empty_ans:
-            # Empty answer: decoder input [EOS, <defer>], target [<defer>, EOS]
-            dec_in_arr[j, 0] = eos_id
-            dec_in_arr[j, 1] = defer_id
-            dec_tgt_arr[j, 0] = defer_id
-            dec_tgt_arr[j, 1] = eos_id
-            lm_arr[j, 0] = 3.0  # High weight on <defer> prediction
-            lm_arr[j, 1] = 1.0  # EOS
-        else:
-            al = len(a_tok)
-            # Decoder needs: [EOS, <tool_call>, answer..., EOS] = 2 + al + 1
-            if 2 + al + 1 > max_dec_len:
-                return False
+        al = len(a_tok)
+        # Decoder needs: [EOS, <tool_call>, answer..., EOS] = 2 + al + 1
+        if 2 + al + 1 > max_dec_len:
+            return False
 
-            # Decoder input: [EOS, <tool_call>, answer...]
-            dec_in_arr[j, 0] = eos_id
-            dec_in_arr[j, 1] = tool_call_id
-            if al > 0:
-                dec_in_arr[j, 2:2 + al] = a_tok
+        # Decoder input: [EOS, <tool_call>, answer...]
+        dec_in_arr[j, 0] = eos_id
+        dec_in_arr[j, 1] = tool_call_id
+        if al > 0:
+            dec_in_arr[j, 2:2 + al] = a_tok
 
-            # Decoder target: [<tool_call>, answer..., EOS]
-            dec_tgt_arr[j, 0] = tool_call_id
-            if al > 0:
-                dec_tgt_arr[j, 1:1 + al] = a_tok
-            dec_tgt_arr[j, 1 + al] = eos_id
+        # Decoder target: [<tool_call>, answer..., EOS]
+        dec_tgt_arr[j, 0] = tool_call_id
+        if al > 0:
+            dec_tgt_arr[j, 1:1 + al] = a_tok
+        dec_tgt_arr[j, 1 + al] = eos_id
 
-            # Token-level loss weighting
-            token_weights = _token_weights_for_answer(ans_text, a_tok, tokenizer.sp,
-                                                       w_name=w_name, w_value=w_value, w_key=w_key)
-            lm_arr[j, 1:1 + len(token_weights)] = token_weights
-            lm_arr[j, 1 + al] = 1.0  # EOS stays at baseline weight
+        # Token-level loss weighting
+        lm_arr[j, 0] = 1.0  # <tool_call> prediction
+        token_weights = _token_weights_for_answer(ans_text, a_tok, tokenizer.sp,
+                                                   w_name=w_name, w_value=w_value, w_key=w_key)
+        lm_arr[j, 1:1 + len(token_weights)] = token_weights
+        lm_arr[j, 1 + al] = 1.0  # EOS stays at baseline weight
         return True
 
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -630,8 +603,7 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     skipped = 0
     for i in tqdm(range(n), desc="Building pairs"):
         if not _fill_sample(i, all_enc_tokens[i], all_tools_tokens[i],
-                            all_ans_tokens[i], ans_texts[i], empty_tools_mask[i],
-                            empty_ans_mask[i],
+                            all_ans_tokens[i], ans_texts[i],
                             enc_inputs, dec_inputs, dec_targets, loss_mask):
             skipped += 1
 

@@ -21,6 +21,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import itertools
+
 import requests
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -35,9 +37,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 MODEL_POOL = [
     "google/gemini-3.1-flash-lite-preview",
-    # "anthropic/claude-opus-4.6",
-    # "x-ai/grok-4.1-fast",
-    # "openai/gpt-5.3-chat",
+    "google/gemini-3-flash-preview",
 ]
 DEFAULT_MODEL = "google/gemini-3.1-flash-lite-preview"
 
@@ -309,15 +309,24 @@ def load_queries_from_gcs(max_samples=None):
     return samples
 
 
-def _pick_model(models, rng):
-    """Randomly select a model from the pool."""
-    return rng.choice(models)
+class _KeyModelRotator:
+    """Thread-safe round-robin across (api_key, model) pairs."""
+
+    def __init__(self, api_keys, models):
+        pairs = [(k, m) for k in api_keys for m in models]
+        self._cycle = itertools.cycle(pairs)
+        import threading
+        self._lock = threading.Lock()
+
+    def next(self):
+        with self._lock:
+            return next(self._cycle)
 
 
-def process_sample(sample, api_key, models, rng, source_tag="synth-pleias"):
+def process_sample(sample, rotator, source_tag="synth-pleias"):
     """Process a single sample: call LLM, validate, return row or None."""
     synth_id, language, query = sample
-    model = _pick_model(models, rng)
+    api_key, model = rotator.next()
     result = call_openrouter(query, api_key, model=model)
     if result is None:
         return None
@@ -328,7 +337,7 @@ def process_sample(sample, api_key, models, rng, source_tag="synth-pleias"):
     return row
 
 
-def _process_batch(samples, label, batch_idx, api_key, models, args, tqdm, source_tag,
+def _process_batch(samples, label, batch_idx, rotator, args, tqdm, source_tag,
                     since_last_upload):
     """Process a batch of samples, append to checkpoint. Returns (generated, failed)."""
     logger.info(f"\n{'=' * 60}")
@@ -345,14 +354,13 @@ def _process_batch(samples, label, batch_idx, api_key, models, args, tqdm, sourc
     generated = 0
     failed = 0
     out_file = open(_CHECKPOINT_PATH, "a")
-    rng = random.Random(42 + batch_idx)
 
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = {}
             for sample in pending:
                 fut = executor.submit(
-                    process_sample, sample, api_key, models, rng, source_tag,
+                    process_sample, sample, rotator, source_tag,
                 )
                 futures[fut] = sample[0]
 
@@ -419,8 +427,8 @@ def main():
                         help=f"OpenRouter models to rotate (default: built-in pool)")
     parser.add_argument("--model", type=str, default=None,
                         help="Use a single model instead of the pool")
-    parser.add_argument("--workers", type=int, default=32,
-                        help="Concurrent API requests (default: 32)")
+    parser.add_argument("--workers", type=int, default=128,
+                        help="Concurrent API requests (default: 128)")
     parser.add_argument("--max-shards", type=int, default=None,
                         help="Max parquet shards to process (default: all)")
     parser.add_argument("--resume", action="store_true",
@@ -431,10 +439,12 @@ def main():
                         help="Upload to GCS every N successful generations (default: 1000)")
     args = parser.parse_args()
 
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        print("Error: set OPENROUTER_API_KEY environment variable")
+    raw_keys = os.environ.get("OPENROUTER_API_KEY", "")
+    api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+    if not api_keys:
+        print("Error: set OPENROUTER_API_KEY environment variable (comma-separated for multiple)")
         sys.exit(1)
+    logger.info(f"API keys: {len(api_keys)}")
 
     if args.model:
         models = [args.model]
@@ -443,6 +453,9 @@ def main():
     else:
         models = list(MODEL_POOL)
     logger.info(f"Model pool ({len(models)}): {', '.join(models)}")
+    logger.info(f"Key x Model pairs: {len(api_keys) * len(models)} (each gets its own rate limit)")
+
+    rotator = _KeyModelRotator(api_keys, models)
 
     _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -461,11 +474,10 @@ def main():
     batch_idx = 0
     since_last_upload = [0]
 
-    # ── GCS raw_data queries ──
     gcs_samples = load_queries_from_gcs(max_samples=args.max_samples)
     if gcs_samples:
         gen, fail = _process_batch(
-            gcs_samples, "GCS raw_data", batch_idx, api_key, models,
+            gcs_samples, "GCS raw_data", batch_idx, rotator,
             args, tqdm, source_tag="synth-gcs",
             since_last_upload=since_last_upload,
         )
@@ -473,7 +485,6 @@ def main():
         total_failed += fail
         batch_idx += 1
 
-    # ── PleIAs/SYNTH parquet shards ──
     hf_token = os.environ.get("HF_TOKEN")
     shard_urls = _discover_shard_urls(hf_token, max_shards=args.max_shards)
 
@@ -481,7 +492,7 @@ def main():
         parquet_path = download_shard(shard_url, shard_idx, hf_token)
         samples = load_queries_from_parquet(parquet_path, max_samples=args.max_samples)
         gen, fail = _process_batch(
-            samples, f"PleIAs shard {shard_idx}", batch_idx, api_key, models,
+            samples, f"PleIAs shard {shard_idx}", batch_idx, rotator,
             args, tqdm, source_tag="synth-pleias",
             since_last_upload=since_last_upload,
         )
