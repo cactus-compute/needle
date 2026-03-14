@@ -882,7 +882,7 @@ def train(args):
 
         _pc_keys = ("n", "exact", "name_tp", "name_fp", "name_fn",
                      "call_tp", "call_fp", "call_fn", "parse_err")
-        per_count = {t: {k: 0 for k in _pc_keys} for t in range(6)}
+        per_count = {t: {k: 0 for k in _pc_keys} for t in range(4)}
 
         def _call_key(c):
             if not isinstance(c, dict): return None
@@ -891,7 +891,7 @@ def train(args):
         for ex, pred_text in zip(tc_eval_pairs, tc_preds):
             try:
                 tool_defs = _json_mod.loads(ex["tools"])
-                num_tools = min(len(tool_defs), 5)
+                num_tools = min(len(tool_defs), 3)
             except (ValueError, TypeError):
                 tool_defs = []
                 num_tools = 0
@@ -1036,11 +1036,11 @@ def train(args):
             print(f"  Call F1        {tc_metrics['call_f1']:>10.1%}")
             print(f"  Exact match    {tc_metrics['exact_match']:>10.1%}")
             # Per-tool-count breakdown table
-            has_any_pc = any(per_count[t]["n"] > 0 for t in range(6))
+            has_any_pc = any(per_count[t]["n"] > 0 for t in range(4))
             if has_any_pc:
                 print(f"  ─── Tool-Call Accuracy by #Tools ───")
                 print(f"  {'#tools':>6}  {'n':>4}  {'name_f1':>8}  {'nTP':>4} {'nFP':>4} {'nFN':>4}  {'call_f1':>8}  {'cTP':>4} {'cFP':>4} {'cFN':>4}  {'exact':>6}  {'parse':>6}")
-                for t in range(6):
+                for t in range(4):
                     d = per_count[t]
                     if d["n"] == 0:
                         continue
@@ -1099,7 +1099,7 @@ def train(args):
                 log_dict["epoch/tc_args_acc"] = tc_metrics["args_acc"]
                 log_dict["epoch/tc_call_f1"] = tc_metrics["call_f1"]
                 
-                for t in range(6):
+                for t in range(4):
                     d = per_count[t]
                     if d["n"] == 0:
                         continue

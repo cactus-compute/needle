@@ -52,7 +52,7 @@ e-commerce, finance, healthcare, travel, IoT, social media, education, DevOps, l
 HR, and more. Do NOT default to simple personal-assistant tasks.
 
 Rules:
-1. Invent 1-5 tools as JSON. Each tool MUST have: name, description, parameters \
+1. Invent 0-3 tools as JSON. Each tool MUST have: name, description, parameters \
 (dict of param_name -> {type, description, required}). Use realistic parameter types \
 including string, number, boolean, array, object. Include nested objects or arrays \
 where appropriate.

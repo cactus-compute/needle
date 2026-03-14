@@ -358,7 +358,7 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
         eos_id=EOS_ID,
         bos_id=BOS_ID,
         unk_id=UNK_ID,
-        user_defined_symbols=["<tool_call>", "<tools>", "<defer>"],
+        user_defined_symbols=["<tool_call>", "<tools>"],
         byte_fallback=True,
         normalization_rule_name="identity",
         num_threads=min(20, max(1, (os.cpu_count() or 1) // 4)),
@@ -412,11 +412,6 @@ def load_tool_calls(split="train", max_samples=None, return_global_indices=False
         global_indices = perm.astype(np.int64)
 
     ds = ds.select(global_indices.tolist())
-
-    # Normalize <defer> / empty answers to []
-    ds = ds.map(lambda ex: {
-        "answers": "[]" if ex["answers"].strip() in ("", "<defer>") else ex["answers"]
-    })
 
     if max_samples:
         limit = min(max_samples, len(ds))
@@ -518,8 +513,6 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
             return s
 
     ans_texts = [_compact(a) for a in ans_texts]
-    # Normalize any remaining <defer> or empty answers to []
-    ans_texts = ["[]" if a.strip() in ("", "<defer>") else a for a in ans_texts]
     tools_texts = [_compact(t) for t in tools_texts]
 
     tool_counts = np.array([_count_tool_calls(a) for a in ans_texts], dtype=np.int32)
