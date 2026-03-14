@@ -880,11 +880,23 @@ def train(args):
         tc_missing_params, tc_total_ref_params = 0, 0
         tc_correct_values, tc_matched_params = 0, 0
 
+        _pc_keys = ("n", "exact", "name_tp", "name_fp", "name_fn",
+                     "call_tp", "call_fp", "call_fn", "parse_err")
+        per_count = {t: {k: 0 for k in _pc_keys} for t in range(6)}
+
         def _call_key(c):
             if not isinstance(c, dict): return None
             return _json_mod.dumps({"name": c.get("name"), "arguments": c.get("arguments")}, sort_keys=True)
 
         for ex, pred_text in zip(tc_eval_pairs, tc_preds):
+            try:
+                tool_defs = _json_mod.loads(ex["tools"])
+                num_tools = min(len(tool_defs), 5)
+            except (ValueError, TypeError):
+                tool_defs = []
+                num_tools = 0
+            pc = per_count[num_tools]
+
             ref_text = ex["answers"].strip()
             pred_text = pred_text.strip()
             ref_is_empty = ref_text in ("", "[]")
@@ -899,22 +911,32 @@ def train(args):
                     pred_calls = [pred_calls] if isinstance(pred_calls, dict) else []
             except (ValueError, TypeError):
                 tc_parse_err += 1
+                pc["parse_err"] += 1
                 pred_calls = []
             tc_n += 1
+            pc["n"] += 1
             if ref_is_empty and pred_is_empty:
                 tc_exact += 1
+                pc["exact"] += 1
             elif not ref_is_empty and not pred_is_empty and _json_mod.dumps(pred_calls, sort_keys=True) == _json_mod.dumps(ref_calls, sort_keys=True):
                 tc_exact += 1
+                pc["exact"] += 1
             ref_names = {c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c}
             pred_names = {c["name"] for c in pred_calls if isinstance(c, dict) and "name" in c}
             tc_name_tp += len(pred_names & ref_names)
             tc_name_fp += len(pred_names - ref_names)
             tc_name_fn += len(ref_names - pred_names)
+            pc["name_tp"] += len(pred_names & ref_names)
+            pc["name_fp"] += len(pred_names - ref_names)
+            pc["name_fn"] += len(ref_names - pred_names)
             rk = {_call_key(c) for c in ref_calls} - {None}
             pk = {_call_key(c) for c in pred_calls} - {None}
             tc_call_tp += len(pk & rk)
             tc_call_fp += len(pk - rk)
             tc_call_fn += len(rk - pk)
+            pc["call_tp"] += len(pk & rk)
+            pc["call_fp"] += len(pk - rk)
+            pc["call_fn"] += len(rk - pk)
 
             # Argument correctness: for name-matched calls, check if arguments match
             ref_by_name = {}
@@ -928,12 +950,8 @@ def train(args):
                     if any(pred_args == _json_mod.dumps(ra, sort_keys=True) for ra in ref_by_name[c["name"]]):
                         tc_args_correct += 1
 
-            # Parameter-level metrics
-            try:
-                tool_defs = _json_mod.loads(ex["tools"])
-                tool_param_map = {t["name"]: set((t.get("parameters") or {}).keys()) for t in tool_defs if isinstance(t, dict) and "name" in t}
-            except (ValueError, TypeError):
-                tool_param_map = {}
+            # Parameter-level metrics (tool_defs already parsed above)
+            tool_param_map = {t["name"]: set((t.get("parameters") or {}).keys()) for t in tool_defs if isinstance(t, dict) and "name" in t}
             for c in pred_calls:
                 if not isinstance(c, dict) or "name" not in c:
                     continue
@@ -1017,6 +1035,24 @@ def train(args):
             print(f"  Args acc       {tc_metrics['args_acc']:>10.1%}")
             print(f"  Call F1        {tc_metrics['call_f1']:>10.1%}")
             print(f"  Exact match    {tc_metrics['exact_match']:>10.1%}")
+            # Per-tool-count breakdown table
+            has_any_pc = any(per_count[t]["n"] > 0 for t in range(6))
+            if has_any_pc:
+                print(f"  ─── Tool-Call Accuracy by #Tools ───")
+                print(f"  {'#tools':>6}  {'n':>4}  {'name_f1':>8}  {'nTP':>4} {'nFP':>4} {'nFN':>4}  {'call_f1':>8}  {'cTP':>4} {'cFP':>4} {'cFN':>4}  {'exact':>6}  {'parse':>6}")
+                for t in range(6):
+                    d = per_count[t]
+                    if d["n"] == 0:
+                        continue
+                    np_ = d["name_tp"] + d["name_fp"]
+                    nr_ = d["name_tp"] + d["name_fn"]
+                    nf1 = 2 * d["name_tp"] / max(np_ + nr_, 1)
+                    cp_ = d["call_tp"] + d["call_fp"]
+                    cr_ = d["call_tp"] + d["call_fn"]
+                    cf1 = 2 * d["call_tp"] / max(cp_ + cr_, 1)
+                    ex_ = d["exact"] / d["n"]
+                    pr_ = 1.0 - d["parse_err"] / d["n"]
+                    print(f"  {t:>6}  {d['n']:>4}  {nf1:>7.1%}  {d['name_tp']:>4} {d['name_fp']:>4} {d['name_fn']:>4}  {cf1:>7.1%}  {d['call_tp']:>4} {d['call_fp']:>4} {d['call_fn']:>4}  {ex_:>5.1%}  {pr_:>5.1%}")
         if retrieval_metrics and retrieval_metrics["num_queries"] > 0:
             rm = retrieval_metrics
             print(f"  ─── Retrieval ({rm['num_queries']} queries) ─────")
@@ -1062,6 +1098,28 @@ def train(args):
                 log_dict["epoch/tc_value_acc"] = tc_metrics["value_acc"]
                 log_dict["epoch/tc_args_acc"] = tc_metrics["args_acc"]
                 log_dict["epoch/tc_call_f1"] = tc_metrics["call_f1"]
+                
+                for t in range(6):
+                    d = per_count[t]
+                    if d["n"] == 0:
+                        continue
+                    np_ = d["name_tp"] + d["name_fp"]
+                    nr_ = d["name_tp"] + d["name_fn"]
+                    nf1 = 2 * d["name_tp"] / max(np_ + nr_, 1)
+                    cp_ = d["call_tp"] + d["call_fp"]
+                    cr_ = d["call_tp"] + d["call_fn"]
+                    cf1 = 2 * d["call_tp"] / max(cp_ + cr_, 1)
+                    log_dict[f"epoch/tc_name_f1_{t}t"] = nf1
+                    log_dict[f"epoch/tc_name_tp_{t}t"] = d["name_tp"]
+                    log_dict[f"epoch/tc_name_fp_{t}t"] = d["name_fp"]
+                    log_dict[f"epoch/tc_name_fn_{t}t"] = d["name_fn"]
+                    log_dict[f"epoch/tc_call_f1_{t}t"] = cf1
+                    log_dict[f"epoch/tc_call_tp_{t}t"] = d["call_tp"]
+                    log_dict[f"epoch/tc_call_fp_{t}t"] = d["call_fp"]
+                    log_dict[f"epoch/tc_call_fn_{t}t"] = d["call_fn"]
+                    log_dict[f"epoch/tc_exact_{t}t"] = d["exact"] / d["n"]
+                    log_dict[f"epoch/tc_parse_{t}t"] = 1.0 - d["parse_err"] / d["n"]
+                    log_dict[f"epoch/tc_n_{t}t"] = d["n"]
             if retrieval_metrics and retrieval_metrics["num_queries"] > 0:
                 for k, v in retrieval_metrics["recall@k"].items():
                     log_dict[f"epoch/retrieval_recall@{k}"] = v
