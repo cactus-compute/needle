@@ -322,18 +322,40 @@ def _train_step_text_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask
     return state, ema_params, loss, grad_norm
 
 
-def _train_step_contrastive(state, ema_params, query_tokens, tool_tokens, rng):
-    """Separate contrastive training step using CLIP loss."""
+def _train_step_fused(state, ema_params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask, query_tokens, tool_tokens, cl_rng):
+    """Fused text + contrastive training step — single backward pass & optimizer step."""
     ema_decay = 0.999
-    cl_loss, grads = jax.value_and_grad(
-        lambda p: _contrastive_loss_fn(state, p, query_tokens, tool_tokens, rng)
-    )(state.params)
+    def combined_loss(p):
+        text_loss = _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
+        cl_loss = _contrastive_loss_fn(state, p, query_tokens, tool_tokens, cl_rng)
+        return text_loss + _CONTRASTIVE_WEIGHT * cl_loss, text_loss
+    (loss, text_loss), grads = jax.value_and_grad(combined_loss, has_aux=True)(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
-    cl_loss = jax.lax.pmean(cl_loss, axis_name="batch")
-    grads = jax.tree.map(lambda g: g * _CONTRASTIVE_WEIGHT, grads)
+    text_loss = jax.lax.pmean(text_loss, axis_name="batch")
+    grad_norm = optax.global_norm(grads)
     state = state.apply_gradients(grads=grads)
     ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
-    return state, ema_params, cl_loss
+    return state, ema_params, text_loss, grad_norm
+
+
+def _train_step_fused_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask, rng, loss_mask, query_tokens, tool_tokens, cl_rng):
+    """Fused text + contrastive training step with prune mask application."""
+    ema_decay = 0.999
+    
+    def combined_loss(p):
+        text_loss = _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
+        cl_loss = _contrastive_loss_fn(state, p, query_tokens, tool_tokens, cl_rng)
+        return text_loss + _CONTRASTIVE_WEIGHT * cl_loss, text_loss
+    
+    (loss, text_loss), grads = jax.value_and_grad(combined_loss, has_aux=True)(state.params)
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    text_loss = jax.lax.pmean(text_loss, axis_name="batch")
+    grad_norm = optax.global_norm(grads)
+    state = state.apply_gradients(grads=grads)
+    masked_params = jax.tree.map(lambda w, m: w * m, state.params, prune_mask)
+    state = state.replace(params=masked_params)
+    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, masked_params)
+    return state, ema_params, text_loss, grad_norm
 
 
 
@@ -346,8 +368,12 @@ def _make_p_train_step_masked():
     return jax.pmap(_train_step_text_masked, axis_name="batch", donate_argnums=(0, 1))
 
 
-def _make_p_train_step_contrastive():
-    return jax.pmap(_train_step_contrastive, axis_name="batch", donate_argnums=(0, 1))
+def _make_p_train_step_fused():
+    return jax.pmap(_train_step_fused, axis_name="batch", donate_argnums=(0, 1))
+
+
+def _make_p_train_step_fused_masked():
+    return jax.pmap(_train_step_fused_masked, axis_name="batch", donate_argnums=(0, 1))
 
 
 def _make_val_loss_fn(apply_fn):
@@ -490,7 +516,8 @@ def train(args):
     n_widths = 1 + len(_MAT_FF_WIDTHS) if _MAT_FF_WIDTHS else 1
     p_train_step = _make_p_train_step()
     p_train_step_masked = _make_p_train_step_masked()
-    p_train_step_contrastive = _make_p_train_step_contrastive()
+    p_train_step_fused = _make_p_train_step_fused()
+    p_train_step_fused_masked = _make_p_train_step_fused_masked()
 
     np.random.seed(args.seed)
     rng = jax.random.PRNGKey(args.seed)
@@ -625,22 +652,28 @@ def train(args):
             rng, text_rng = jax.random.split(rng)
             text_rngs = jax.random.split(text_rng, num_devices)
 
-            if prune_mask is not None:
-                state, ema_params, loss, grad_norm = p_train_step_masked(
-                    state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask, text_ffn_mask, text_rngs, lm_b,
-                )
-            else:
-                state, ema_params, loss, grad_norm = p_train_step(
-                    state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_ffn_mask, text_rngs, lm_b,
-                )
-
-            # Separate contrastive step (if data available)
             if cl_q_b is not None and cl_t_b is not None:
+                # Fused text + contrastive: single backward pass & optimizer step
                 rng, cl_rng = jax.random.split(rng)
                 cl_rngs = jax.random.split(cl_rng, num_devices)
-                state, ema_params, cl_loss = p_train_step_contrastive(
-                    state, ema_params, cl_q_b, cl_t_b, cl_rngs,
-                )
+                if prune_mask is not None:
+                    state, ema_params, loss, grad_norm = p_train_step_fused_masked(
+                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask, text_ffn_mask, text_rngs, lm_b, cl_q_b, cl_t_b, cl_rngs,
+                    )
+                else:
+                    state, ema_params, loss, grad_norm = p_train_step_fused(
+                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_ffn_mask, text_rngs, lm_b, cl_q_b, cl_t_b, cl_rngs,
+                    )
+            else:
+                # Text-only step (no contrastive data this iteration)
+                if prune_mask is not None:
+                    state, ema_params, loss, grad_norm = p_train_step_masked(
+                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask, text_ffn_mask, text_rngs, lm_b,
+                    )
+                else:
+                    state, ema_params, loss, grad_norm = p_train_step(
+                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_ffn_mask, text_rngs, lm_b,
+                    )
 
             text_loss_val = float(loss[0])
             text_losses.append(text_loss_val)

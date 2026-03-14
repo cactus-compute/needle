@@ -37,7 +37,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 MODEL_POOL = [
     "google/gemini-3.1-flash-lite-preview",
-    "google/gemini-3-flash-preview",
+    "google/gemini-2.5-flash-lite",
 ]
 DEFAULT_MODEL = "google/gemini-3.1-flash-lite-preview"
 
