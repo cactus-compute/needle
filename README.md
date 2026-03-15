@@ -13,11 +13,11 @@
                     ┌──────────────┐
                     │  Tool Call   │                ┌──────────────────────┐
                     └──────┬───────┘                │ Mat loss at factors  │
-                          ┌┴──────────┐             │ + INT4 QAT (g=32)    │
-                          │  Softmax  │             │ + z-loss + slot div  │
-                          └─────┬─────┘             │ text-only training   │
-                    ┌─────┬─────┴─────┬─────┐       │                      │
-                    │  @E[:d_ff/f] for each │       └──────────┬───────────┘
+                          ┌┴──────────┐             │ + INT4 QAT (g=32)   │
+                          │  Softmax  │             │ + z-loss             │
+                          └─────┬─────┘             │ + contrastive loss   │
+                    ┌─────┬─────┴─────┬─────┐       │ + token-level wt    │
+                    │  @E[:d_ff/f] for each │       └──────────┬──────────┘
                     │  f in mat_factors     │                  │
                     └─────┬─────┬─────┬─────┘       ┌──────────┴───────────┐
                           ┌─────┴─────┐             │ Grad clip (norm 1.0) │
@@ -32,28 +32,25 @@
                        ││ Masked Self   ││          │  mask every N steps  │
                        ││ Attn + RoPE   ││          └──────────┬───────────┘
                        │├───────────────┤│                     │
-  ┌──────────────┐  S  ││   Cross       ││          ┌──────────┴───────────┐
-  │ MemoryMixer  │────────▶ Attention   ││          │ EMA params (β=0.999) │
+  ┌──────────────┐     ││   Cross       ││          ┌──────────┴───────────┐
+  │ Self-Attn    │────────▶ Attention   ││          │ EMA params (β=0.999) │
   │ Encoder      │     │├───────────────┤│          └──────────┬───────────┘
   │  x N_enc     │     ││  Gated FFN    ││                     │
   │              │     │└───────────────┘│          ┌──────────┴───────────┐
   │ ┌──────────┐ │     └────────┬────────┘          │ Checkpoint           │
-  │ │Pack:     │ │        ┌─────┴─────┐             │  full params, can    │
-  │ │ S←X Attn │ │        │ Embedding │  ← shared   │  export mat slices   │
-  │ │ RoPE keys│ │        └─────┬─────┘             └──────────────────────┘
+  │ │Self Attn │ │        ┌─────┴─────┐             │  full params, can    │
+  │ │ + RoPE   │ │        │ Embedding │  ← shared   │  export mat slices   │
+  │ │ GQA      │ │        └─────┬─────┘             └──────────────────────┘
   │ ├──────────┤ │      ┌───────┴───────┐
-  │ │Mix:      │ │      │[EOS]<tool_call>│
-  │ │ MLP-Mixer│ │      │ + answer      │
-  │ │ on S     │ │      └───────────────┘
-  │ ├──────────┤ │
-  │ │Local:    │ │
-  │ │Gated FFN │ │
-  │ │ on X     │ │
+  │ │Gated FFN │ │      │[EOS]<tool_call>│
+  │ │ SwiGLU   │ │      │ + answer      │
+  │ ├──────────┤ │      └───────────────┘
+  │ │ZCRMSNorm │ │
+  │ │ Pre-norm │ │
   │ └──────────┘ │
   │              │
-  │  Slot Init   │  learnable + input-dependent
   │  DW Conv ↓2  │  stride-2 depthwise-separable
-  │  S ∈ (M, d)  │
+  │  + Pointwise │  downsamples seq before encoder
   └──────┬───────┘
          │
     ┌────┴──────┐    ┌──────────────┐
@@ -66,10 +63,11 @@
     │  query    │    │  waveform    │
     └───────────┘    └──────────────┘
 
-    d=512 (default) / 1536 (--full) · GQA · QK-norm
-    SentencePiece BPE (8192) · gated dReLU · ZCRMSNorm · RoPE
+    d=512 · 8 enc / 8 dec layers · GQA (8H / 4KV) · QK-norm
+    SentencePiece BPE (8192) · SwiGLU · ZCRMSNorm · RoPE
     strided DW conv · mat factors · INT4 QAT · Muon + AdamW
-    text + speech encoder · <tool_call> task routing (speech used in inference only)
+    text + speech encoder · <tool_call> task routing
+    CLIP contrastive retrieval · token-level loss weighting
 
   Data Pipeline (needle tokenize → needle train)
   ───────────────────────────────────────────────
@@ -77,26 +75,30 @@
   ┌─────────────────────────────────────────────────────────────┐
   │  needle tokenize                                            │
   │                                                             │
-  │  Local dataset (data/tool_calls_unified/)                   │
+  │  GCS download (gs://cactus-dataset/tool_calls/)             │
+  │       │                                                     │
+  │       ▼                                                     │
+  │  Unified dataset (.arrow)                                   │
   │       │                                                     │
   │       ▼                                                     │
   │  ┌──────────────┐                                           │
-  │  │ SentencePiece│                                           │
-  │  │ BPE tokenize │                                           │
-  │  │ (8192 vocab) │                                           │
+  │  │ SentencePiece│  trains tokenizer from corpus             │
+  │  │ BPE tokenize │  special: <tool_call> <tools>             │
+  │  │ (8192 vocab) │  byte_fallback, identity normalization    │
   │  └──────┬───────┘                                           │
   │         │                                                   │
   │         ▼                                                   │
-  │  ┌──────────────────┐                                       │
-  │  │ enc_inputs.npy   │                                       │
-  │  │ dec_inputs.npy   │                                       │
-  │  │ dec_targets.npy  │                                       │
-  │  │ loss_mask.npy    │                                       │
-  │  │ kept_idx.npy     │                                       │
-  │  └──────┬───────────┘                                       │
+  │  ┌───────────────────────┐   ┌───────────────────────┐      │
+  │  │ enc_inputs.npy        │   │ query_only.npy        │      │
+  │  │ dec_inputs.npy        │   │ tool_individual.npy   │      │
+  │  │ dec_targets.npy       │   │ tool_ex_idx.npy       │      │
+  │  │ loss_mask.npy         │   │ tool_is_pos.npy       │      │
+  │  │ kept_idx.npy          │   │  (contrastive arrays) │      │
+  │  │ tool_count.npy        │   └───────────────────────┘      │
+  │  └──────┬────────────────┘                                  │
   │         ▼                                                   │
-  │  {split}_metadata.json                                      │
-  │  .data_cache/                                               │
+  │  {split}_metadata.json → .data_cache/                       │
+  │  uploads tokenizer + arrays to GCS                          │
   └─────────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -106,13 +108,13 @@
   │  load_prepared_data(mmap=True)                              │
   │       │                                                     │
   │       ▼                                                     │
-  │  ┌──────────────────────┐                                   │
-  │  │ PrefetchIterator     │                                   │
-  │  │ text batches (4)     │                                   │
-  │  │ mmap → per-batch idx │                                   │
-  │  └──────────┬───────────┘                                   │
-  │             ▼                                               │
-  │  text-only tool-call training                               │
+  │  ┌──────────────────────┐   ┌──────────────────────┐        │
+  │  │ PrefetchIterator     │   │ Contrastive batches  │        │
+  │  │ text batches (4)     │   │ query-tool pairs     │        │
+  │  │ mmap → per-batch idx │   │ CLIP in-batch neg    │        │
+  │  └──────────┬───────────┘   └──────────┬───────────┘        │
+  │             ▼                          ▼                    │
+  │  text + contrastive tool-call training (jax.pmap)           │
   └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -133,66 +135,79 @@ needle [command]
   │     --lr FLOAT               AdamW learning rate (default: 3e-4)  │
   │     --muon-lr FLOAT          Muon learning rate (default: 0.02)   │
   │     --d-model INT            Model dim (default: 512)             │
-  │     --num-heads INT          Attention heads (default: 16)        │
-  │     --num-kv-heads INT       KV heads for GQA (default: 8)        │
-  │     --num-layers INT         Encoder layers (default: 4)          │
-  │     --num-dec-layers INT     Decoder layers (default: 4)          │
-  │     --max-enc-len INT        Max encoder seq len (default: 512)   │
+  │     --num-heads INT          Attention heads (default: 8)         │
+  │     --num-kv-heads INT       KV heads for GQA (default: 4)        │
+  │     --num-layers INT         Encoder layers (default: 8)          │
+  │     --num-dec-layers INT     Decoder layers (default: 8)          │
+  │     --max-enc-len INT        Max encoder seq len (default: 1024)  │
   │     --max-dec-len INT        Max decoder seq len (default: 512)   │
   │     --max-samples INT        Training samples (default: all)      │
-  │     --mat-factors INT [...]   FFN shrink factors (default: 2 4)   │
+  │     --mat-factors INT [...]  FFN shrink factors (default: 2 4)    │
   │     --sparsity-ratio FLOAT   Block prune ratio (default: 0.0)     │
   │     --group-size INT         Quant/prune group size (default: 32) │
   │     --prune-interval INT     Steps between mask updates (def: 100)│
   │     --prune-start-frac FL    Start pruning at frac (def: 0.33)    │
   │     --prune-end-frac FL      Lock mask at this frac (def: 0.67)   │
-  │     --activation STR         drelu|swiglu|geglu (default: drelu)  │
+  │     --activation STR         swiglu|drelu|geglu (default: swiglu) │
   │     --warmup-ratio FLOAT     LR warmup ratio (default: 0.05)      │
+  │     --decay-ratio FLOAT      LR cosine decay ratio (default: 0.05)│
+  │     --dropout FLOAT          Dropout rate (default: 0.1)          │
   │     --eval-every INT         Val eval interval (default: 1000)    │
+  │     --max-eval-samples INT   Val samples limit (default: 5000)    │
+  │     --contrastive-weight FL  CLIP loss weight (default: 0.1)      │
+  │     --contrastive-dim INT    Projection dim (default: 128)        │
+  │     --curriculum             Sort batches easy→hard by tool count │
   │     --wandb                  Enable W&B logging                   │
   │     --checkpoint PATH        Resume from checkpoint               │
   │     --checkpoint-dir DIR     Checkpoint directory                 │
+  │     --dtype STR              float32|bfloat16 (default: bfloat16) │
   │     --seed INT               Random seed (default: 42)            │
   │                                                                   │
   │   tokenize                                                        │
-  │     --max-samples INT       Limit samples per split (dev/test)    │
-  │     --max-enc-len INT       Max encoder seq len (default: 512)    │
-  │     --max-dec-len INT       Max decoder seq len (default: 512)    │
+  │     --max-samples INT        Limit samples per split (dev/test)   │
+  │     --max-enc-len INT        Max encoder seq len (default: 1024)  │
+  │     --max-dec-len INT        Max decoder seq len (default: 512)   │
+  │     --w-name FLOAT           Loss weight: tool names (def: 3.0)   │
+  │     --w-value FLOAT          Loss weight: arg values (def: 2.0)   │
+  │     --w-key FLOAT            Loss weight: arg keys (def: 1.5)     │
+  │     --shuffle-tools          Shuffle tool order (default: on)     │
+  │     --no-shuffle-tools       Disable tool shuffling               │
+  │     --max-tool-len INT       Max tool desc tokens (default: 256)  │
   │                                                                   │
   │   run                                                             │
-  │     --checkpoint PATH       Path to model checkpoint (required)   │
-  │     --query STR             Query text for tool-call generation   │
-  │     --tools STR             Tools JSON for tool-call generation   │
-  │     --audio PATH [...]      Audio files for voice-to-tool-call    │
-  │     --max-len INT           Max tokens to generate (default: 512) │
-  │     --seed INT              Random seed (default: 0)              │
+  │     --checkpoint PATH        Path to model checkpoint (required)  │
+  │     --query STR              Query text for tool-call generation  │
+  │     --tools STR              Tools JSON for tool-call generation  │
+  │     --audio PATH [...]       Audio files for voice-to-tool-call   │
+  │     --max-len INT            Max tokens to generate (default: 512)│
+  │     --seed INT               Random seed (default: 0)             │
   │                                                                   │
   │   eval                                                            │
-  │     --checkpoint PATH       Path to model checkpoint (required)   │
-  │     --batch-size INT        Batch size (default: 32)              │
-  │     --max-eval-samples INT  Evaluation samples (default: 1000)    │
-  │     --max-enc-len INT       Max encoder length (default: 512)     │
-  │     --max-dec-len INT       Max decoder length (default: 512)     │
-  │     --max-gen-len INT       Max generation length (default: 512)  │
-  │     --throughput-runs INT   Throughput runs (default: 10)         │
-  │     --tool-call-samples INT Tool-call eval samples (default: 200) │
+  │     --checkpoint PATH        Path to model checkpoint (required)  │
+  │     --batch-size INT         Batch size (default: 32)             │
+  │     --max-eval-samples INT   Evaluation samples (default: 5000)   │
+  │     --max-enc-len INT        Max encoder length (default: 1024)   │
+  │     --max-dec-len INT        Max decoder length (default: 512)    │
+  │     --max-gen-len INT        Max generation length (default: 512) │
+  │     --throughput-runs INT    Throughput runs (default: 10)        │
+  │     --tool-call-samples INT  Tool-call eval samples (default: 200)│
   │                                                                   │
   │   evaluate                                                        │
-  │     --checkpoint PATH       Path to model checkpoint (required)   │
-  │     --benchmarks [...]      wikitext2 lambada hellaswag arc_easy  │
-  │     --max-samples INT       Samples per benchmark (default: 500)  │
+  │     --checkpoint PATH        Path to model checkpoint (required)  │
+  │     --benchmarks [...]       wikitext2 lambada hellaswag arc_easy │
+  │     --max-samples INT        Samples per benchmark (default: 500) │
   │                                                                   │
   │   tpu                                                             │
-  │     create NAME             Create TPU (auto-finds zone)          │
-  │       --type STR            Accelerator (default: v6e-8)          │
-  │       --version STR         TPU OS (auto-detected from --type)    │
-  │     connect NAME            SSH config + connect (auto-zone)      │
-  │     claude NAME             Install Claude Code on instance       │
-  │     stop NAME               Stop instance (auto-zone)             │
-  │     start NAME              Start stopped instance (auto-zone)    │
-  │     delete NAME             Delete instance (auto-zone)           │
-  │     list                    List all TPU instances                │
-  │       --zone ZONE           Override auto-detected zone           │
+  │     create NAME              Create TPU (auto-finds zone)         │
+  │       --type STR             Accelerator (default: v6e-8)         │
+  │       --version STR          TPU OS (auto-detected from --type)   │
+  │     connect NAME             SSH config + connect (auto-zone)     │
+  │     claude NAME              Install Claude Code on instance      │
+  │     stop NAME                Stop instance (auto-zone)            │
+  │     start NAME               Start stopped instance (auto-zone)   │
+  │     delete NAME              Delete instance (auto-zone)          │
+  │     list                     List all TPU instances               │
+  │       --zone ZONE            Override auto-detected zone          │
   │                                                                   │
   └───────────────────────────────────────────────────────────────────┘
 ```
@@ -211,10 +226,10 @@ needle [command]
 
   Dataset
   ──────────────────────────────────────────
-  Text                Tool-call pairs
+  Text                2M Tool-call pairs
                       (query, tools, answers)
-                      ~57k examples (local)
-                      xlam-60k + glaive-v2
+                      synthesized from GCS
+                      gs://cactus-dataset/
   ──────────────────────────────────────────
 
   ┌────────────────────┬──────────┬──────────┬──────────┐
@@ -224,9 +239,9 @@ needle [command]
   │ Total HBM          │ 256 GB   │ 512 GB   │ 1024 GB  │
   │ Scaling eff.       │ 0.9×     │ 0.8×     │ 0.7×     │
   │ Eff. TFLOPS        │ 994      │ 1,766    │ 3,091    │
-  │ Est. time          │ ~2.5h    │ ~1.4h    │ ~49min   │
+  │ Est. time          │ ~88h     │ ~49h     │ ~29h     │
   │ On-demand $/hr     │ $21.60   │ $43.20   │ $86.40   │
-  │ Est. total cost    │ ~$54     │ ~$61     │ ~$71     │
+  │ Est. total cost    │ ~$1,900  │ ~$2,120  │ ~$2,510  │
   └────────────────────┴──────────┴──────────┴──────────┘
 ```
 
