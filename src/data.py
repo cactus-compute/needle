@@ -234,19 +234,21 @@ def _load_unified_dataset():
                 continue
 
     try:
-        from .gcs import download_synth_data
+        from datasets import load_dataset as _hf_load
+        print("Downloading dataset from HuggingFace (Cactus-Compute/tool-calls)...")
+        ds = _hf_load("Cactus-Compute/tool-calls", split="train", token=True)
         target = _SHM_UNIFIED_DIR if _shm_available() else _DISK_UNIFIED_DIR
-        if download_synth_data(target):
-            ds = load_from_disk(target)
-            print(f"Loaded synth dataset from GCS -> {target} ({len(ds)} rows)")
-            _unified_dataset_cache = _set_audio_backend(ds)
-            return _unified_dataset_cache
+        os.makedirs(target, exist_ok=True)
+        ds.save_to_disk(target)
+        print(f"Loaded from HuggingFace -> {target} ({len(ds)} rows)")
+        _unified_dataset_cache = _set_audio_backend(ds)
+        return _unified_dataset_cache
     except Exception as e:
-        print(f"Warning: GCS download failed: {e}")
+        print(f"Warning: HuggingFace download failed: {e}")
 
     raise FileNotFoundError(
         f"Dataset not found at {_SHM_UNIFIED_DIR} or {_DISK_UNIFIED_DIR}. "
-        f"Run 'needle tokenize' or 'python scripts/synthesize_tools_data.py' first."
+        f"Run 'needle tokenize' or 'python scripts/push_to_hf.py' first."
     )
 
 
@@ -371,12 +373,50 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
     return model_path
 
 
+_HF_TOKENIZED_REPO = "Cactus-Compute/tool-calls-tokenized"
+
+
+def _download_tokenized_from_hf():
+    """Download tokenized .npy files from HuggingFace Hub into CACHE_DIR."""
+    from huggingface_hub import snapshot_download
+
+    local = snapshot_download(
+        _HF_TOKENIZED_REPO,
+        repo_type="dataset",
+        allow_patterns="tokenized_data/*",
+        token=True,
+    )
+    src = os.path.join(local, "tokenized_data")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    for fname in os.listdir(src):
+        dst = os.path.join(CACHE_DIR, fname)
+        if not os.path.exists(dst):
+            os.symlink(os.path.join(src, fname), dst)
+
+
+def _download_tokenizer_from_hf():
+    """Download tokenizer files from HuggingFace Hub into TOKENIZER_DIR."""
+    from huggingface_hub import snapshot_download
+
+    local = snapshot_download(
+        _HF_TOKENIZED_REPO,
+        repo_type="dataset",
+        allow_patterns="tokenizer/*",
+        token=True,
+    )
+    src = os.path.join(local, "tokenizer")
+    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+    for fname in os.listdir(src):
+        dst = os.path.join(TOKENIZER_DIR, fname)
+        if not os.path.exists(dst):
+            os.symlink(os.path.join(src, fname), dst)
+
+
 def get_tokenizer(max_samples=None):
     model_path = TOKENIZER_PREFIX + ".model"
     if not os.path.exists(model_path):
         try:
-            from .gcs import download_tokenizer
-            download_tokenizer(TOKENIZER_DIR)
+            _download_tokenizer_from_hf()
         except Exception:
             pass
     if not os.path.exists(model_path):
@@ -648,7 +688,6 @@ def _build_contrastive_arrays(ds, enc_texts, tools_texts, cache_path,
         query_arr[i, :l] = toks[:l]
     np.save(cache_path + "_query_only.npy", query_arr)
 
-    # Individual tool tokens + mapping arrays
     tool_texts_individual = []
     tool_ex_idx = []
     tool_is_pos = []
@@ -932,8 +971,7 @@ def load_prepared_data(split, mmap=False):
     meta = _load_cache_metadata(split)
     if meta is None:
         try:
-            from .gcs import download_tokenized_data
-            download_tokenized_data(CACHE_DIR)
+            _download_tokenized_from_hf()
             meta = _load_cache_metadata(split)
         except Exception:
             pass

@@ -255,6 +255,30 @@ class EncoderBlock(nn.Module):
         return x
 
 
+class _EncoderScanBody(nn.Module):
+    """Wraps EncoderBlock for nn.scan: carry = (x, mask, rope, ffn_mask)."""
+    num_heads: int
+    num_kv_heads: int
+    d_model: int
+    d_ff: int
+    num_layers: int
+    dtype: jnp.dtype = jnp.bfloat16
+    activation: str = "drelu"
+    dropout_rate: float = 0.0
+    conv_kernel_size: int = 0
+    deterministic: bool = True
+
+    @nn.compact
+    def __call__(self, carry, _):
+        x, mask, rope, ffn_mask = carry
+        x = EncoderBlock(
+            self.num_heads, self.num_kv_heads, self.d_model, self.d_ff,
+            self.num_layers, self.dtype, self.activation, self.dropout_rate,
+            self.conv_kernel_size,
+        )(x, mask, rope, ffn_mask, self.deterministic)
+        return (x, mask, rope, ffn_mask), None
+
+
 class Encoder(nn.Module):
     """Self-attention encoder. Returns (output, mask) tuple."""
     config: TransformerConfig
@@ -265,12 +289,17 @@ class Encoder(nn.Module):
         dt = cfg.jax_dtype
         x = x.astype(dt)
 
-        for i in range(cfg.num_encoder_layers):
-            x = nn.remat(EncoderBlock, static_argnums=(5,))(
-                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
-                cfg.total_layers, dt, cfg.activation, cfg.dropout_rate,
-                cfg.conv_kernel_size, name=f"block_{i}"
-            )(x, mask, rope, ffn_mask, deterministic)
+        ScanBlock = nn.scan(
+            nn.remat(_EncoderScanBody),
+            variable_axes={"params": 0},
+            split_rngs={"params": True, "dropout": True},
+            length=cfg.num_encoder_layers,
+        )
+        (x, _, _, _), _ = ScanBlock(
+            cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
+            cfg.total_layers, dt, cfg.activation, cfg.dropout_rate,
+            cfg.conv_kernel_size, deterministic, name="layers",
+        )((x, mask, rope, ffn_mask), None)
 
         x = ZCRMSNorm(dtype=dt, name="final_norm")(x)
         return x, mask
@@ -311,6 +340,28 @@ class DecoderBlock(nn.Module):
 
 
 
+class _DecoderScanBody(nn.Module):
+    """Wraps DecoderBlock for nn.scan: carry = (x, encoder_out, self_mask, cross_mask, rope, ffn_mask)."""
+    num_heads: int
+    num_kv_heads: int
+    d_model: int
+    d_ff: int
+    num_layers: int
+    dtype: jnp.dtype = jnp.bfloat16
+    activation: str = "drelu"
+    dropout_rate: float = 0.0
+    deterministic: bool = True
+
+    @nn.compact
+    def __call__(self, carry, _):
+        x, encoder_out, self_mask, cross_mask, rope, ffn_mask = carry
+        x = DecoderBlock(
+            self.num_heads, self.num_kv_heads, self.d_model, self.d_ff,
+            self.num_layers, self.dtype, self.activation, self.dropout_rate,
+        )(x, encoder_out, self_mask, cross_mask, rope, ffn_mask, self.deterministic)
+        return (x, encoder_out, self_mask, cross_mask, rope, ffn_mask), None
+
+
 class Decoder(nn.Module):
     config: TransformerConfig
 
@@ -320,10 +371,17 @@ class Decoder(nn.Module):
         dt = cfg.jax_dtype
         x = x.astype(dt)
 
-        for i in range(cfg.num_decoder_layers):
-            x = nn.remat(DecoderBlock, static_argnums=(7,))(
-                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation, cfg.dropout_rate, name=f"block_{i}"
-            )(x, encoder_out, self_mask, cross_mask, rope, ffn_mask, deterministic)
+        ScanBlock = nn.scan(
+            nn.remat(_DecoderScanBody),
+            variable_axes={"params": 0},
+            split_rngs={"params": True, "dropout": True},
+            length=cfg.num_decoder_layers,
+        )
+        (x, _, _, _, _, _), _ = ScanBlock(
+            cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
+            cfg.total_layers, dt, cfg.activation, cfg.dropout_rate,
+            deterministic, name="layers",
+        )((x, encoder_out, self_mask, cross_mask, rope, ffn_mask), None)
 
         x = ZCRMSNorm(dtype=dt)(x)
         return x

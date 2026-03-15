@@ -57,6 +57,8 @@ def scale_by_muon(momentum=0.95, ns_steps=5):
         del params
 
         def ortho(g):
+            if g.ndim == 3:
+                return jax.vmap(_newton_schulz, in_axes=(0,))(g)
             if g.ndim == 2:
                 return _newton_schulz(g, steps=ns_steps)
             return g
@@ -76,7 +78,7 @@ def _param_labels(params):
 
     def _label(path, leaf):
         name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
-        if name == "kernel" and leaf.ndim == 2:
+        if name == "kernel" and leaf.ndim in (2, 3):
             return "muon"
         return "adam"
 
@@ -180,17 +182,25 @@ def _make_prune_mask(params, sparsity, group_size):
     """Compute block-prune mask entirely on-device (no numpy round-trips).
 
     Returns binary mask tree matching param shapes and dtypes.
+    Handles both 2D (in, out) and 3D (num_layers, in, out) kernels from nn.scan.
     """
     all_scores = []
     for _, leaf in jax.tree_util.tree_leaves_with_path(params):
-        if leaf.ndim != 2:
-            continue
-        in_feat, out_feat = leaf.shape
-        gs = min(group_size, in_feat)
-        pad = (gs - in_feat % gs) % gs
-        w = jnp.pad(leaf, ((0, pad), (0, 0))) if pad else leaf
-        scores = jnp.sum(jnp.abs(w.reshape(-1, gs, out_feat)), axis=1).ravel()
-        all_scores.append(scores)
+        if leaf.ndim == 2:
+            in_feat, out_feat = leaf.shape
+            gs = min(group_size, in_feat)
+            pad = (gs - in_feat % gs) % gs
+            w = jnp.pad(leaf, ((0, pad), (0, 0))) if pad else leaf
+            scores = jnp.sum(jnp.abs(w.reshape(-1, gs, out_feat)), axis=1).ravel()
+            all_scores.append(scores)
+        elif leaf.ndim == 3:
+            num_layers, in_feat, out_feat = leaf.shape
+            gs = min(group_size, in_feat)
+            pad = (gs - in_feat % gs) % gs
+            for li in range(num_layers):
+                w = jnp.pad(leaf[li], ((0, pad), (0, 0))) if pad else leaf[li]
+                scores = jnp.sum(jnp.abs(w.reshape(-1, gs, out_feat)), axis=1).ravel()
+                all_scores.append(scores)
 
     if not all_scores:
         return jax.tree.map(jnp.ones_like, params)
@@ -198,6 +208,18 @@ def _make_prune_mask(params, sparsity, group_size):
     threshold = jnp.percentile(jnp.concatenate(all_scores), sparsity * 100)
 
     def _leaf_mask(path, leaf):
+        if leaf.ndim == 3:
+            num_layers, in_feat, out_feat = leaf.shape
+            gs = min(group_size, in_feat)
+            pad = (gs - in_feat % gs) % gs
+            masks = []
+            for li in range(num_layers):
+                w = jnp.pad(leaf[li], ((0, pad), (0, 0))) if pad else leaf[li]
+                w_grouped = w.reshape(-1, gs, out_feat)
+                block_keep = (jnp.sum(jnp.abs(w_grouped), axis=1, keepdims=True) > threshold)
+                m = jnp.broadcast_to(block_keep, w_grouped.shape).reshape(-1, out_feat)[:in_feat]
+                masks.append(m)
+            return jnp.stack(masks, axis=0).astype(leaf.dtype)
         if leaf.ndim != 2:
             return jnp.ones_like(leaf)
         in_feat, out_feat = leaf.shape
@@ -215,6 +237,8 @@ def _quantize_params(params, group_size=32):
     """Fake-quantize all Dense kernels in the param tree."""
     def _maybe_quantize(path, leaf):
         name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
+        if name == "kernel" and leaf.ndim == 3:
+            return jax.vmap(_fake_quantize_int4, in_axes=(0,))(leaf)
         if name == "kernel" and leaf.ndim == 2:
             return _fake_quantize_int4(leaf, group_size=group_size)
         return leaf
@@ -239,9 +263,14 @@ def _clip_contrastive_loss(q_emb, t_emb, log_temp):
     return (jnp.mean(loss_q) + jnp.mean(loss_t)) / 2.0
 
 
-def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
+def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask, do_quantize):
     pad_id = 0
-    q_params = _quantize_params(params, group_size=_GROUP_SIZE)
+    q_params = jax.lax.cond(
+        do_quantize,
+        lambda p: _quantize_params(p, group_size=_GROUP_SIZE),
+        lambda p: p,
+        params,
+    )
     src_mask = make_padding_mask(src, pad_id)
     tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
     logits, slot_div = state.apply_fn(
@@ -261,9 +290,14 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rn
     return ce_loss + z_loss
 
 
-def _contrastive_loss_fn(state, params, query_tokens, tool_tokens, rng):
+def _contrastive_loss_fn(state, params, query_tokens, tool_tokens, rng, do_quantize):
     """Compute CLIP contrastive loss on query/tool pairs."""
-    q_params = _quantize_params(params, group_size=_GROUP_SIZE)
+    q_params = jax.lax.cond(
+        do_quantize,
+        lambda p: _quantize_params(p, group_size=_GROUP_SIZE),
+        lambda p: p,
+        params,
+    )
     q_emb, t_emb, log_temp = state.apply_fn(
         {"params": q_params},
         query_tokens, tool_tokens,
@@ -293,87 +327,36 @@ def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
     return jnp.concatenate(rows, axis=0)
 
 
-def _train_step_text(state, ema_params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask):
+def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask, rng, loss_mask, query_tokens, tool_tokens, cl_rng, do_quantize, do_contrastive, do_prune):
+    """Unified train step with boolean flags for contrastive loss and pruning."""
     ema_decay = 0.999
-    loss, grads = jax.value_and_grad(
-        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
-    )(state.params)
-    grads = jax.lax.pmean(grads, axis_name="batch")
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    grad_norm = optax.global_norm(grads)
-    state = state.apply_gradients(grads=grads)
-    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
-    return state, ema_params, loss, grad_norm
 
-
-def _train_step_text_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask, rng, loss_mask):
-    """Text training step with fused prune mask application."""
-    ema_decay = 0.999
-    loss, grads = jax.value_and_grad(
-        lambda p: _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
-    )(state.params)
-    grads = jax.lax.pmean(grads, axis_name="batch")
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    grad_norm = optax.global_norm(grads)
-    state = state.apply_gradients(grads=grads)
-    masked_params = jax.tree.map(lambda w, m: w * m, state.params, prune_mask)
-    state = state.replace(params=masked_params)
-    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, masked_params)
-    return state, ema_params, loss, grad_norm
-
-
-def _train_step_fused(state, ema_params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask, query_tokens, tool_tokens, cl_rng):
-    """Fused text + contrastive training step — single backward pass & optimizer step."""
-    ema_decay = 0.999
     def combined_loss(p):
-        text_loss = _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
-        cl_loss = _contrastive_loss_fn(state, p, query_tokens, tool_tokens, cl_rng)
+        text_loss = _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask, do_quantize)
+        cl_loss = jax.lax.cond(
+            do_contrastive,
+            lambda: _contrastive_loss_fn(state, p, query_tokens, tool_tokens, cl_rng, do_quantize),
+            lambda: 0.0,
+        )
         return text_loss + _CONTRASTIVE_WEIGHT * cl_loss, text_loss
+
     (loss, text_loss), grads = jax.value_and_grad(combined_loss, has_aux=True)(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")
     text_loss = jax.lax.pmean(text_loss, axis_name="batch")
     grad_norm = optax.global_norm(grads)
     state = state.apply_gradients(grads=grads)
-    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, state.params)
+    new_params = jax.lax.cond(
+        do_prune,
+        lambda: jax.tree.map(lambda w, m: w * m, state.params, prune_mask),
+        lambda: state.params,
+    )
+    state = state.replace(params=new_params)
+    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, new_params)
     return state, ema_params, text_loss, grad_norm
-
-
-def _train_step_fused_masked(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask, rng, loss_mask, query_tokens, tool_tokens, cl_rng):
-    """Fused text + contrastive training step with prune mask application."""
-    ema_decay = 0.999
-    
-    def combined_loss(p):
-        text_loss = _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask)
-        cl_loss = _contrastive_loss_fn(state, p, query_tokens, tool_tokens, cl_rng)
-        return text_loss + _CONTRASTIVE_WEIGHT * cl_loss, text_loss
-    
-    (loss, text_loss), grads = jax.value_and_grad(combined_loss, has_aux=True)(state.params)
-    grads = jax.lax.pmean(grads, axis_name="batch")
-    text_loss = jax.lax.pmean(text_loss, axis_name="batch")
-    grad_norm = optax.global_norm(grads)
-    state = state.apply_gradients(grads=grads)
-    masked_params = jax.tree.map(lambda w, m: w * m, state.params, prune_mask)
-    state = state.replace(params=masked_params)
-    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, masked_params)
-    return state, ema_params, text_loss, grad_norm
-
-
 
 
 def _make_p_train_step():
-    return jax.pmap(_train_step_text, axis_name="batch", donate_argnums=(0, 1))
-
-
-def _make_p_train_step_masked():
-    return jax.pmap(_train_step_text_masked, axis_name="batch", donate_argnums=(0, 1))
-
-
-def _make_p_train_step_fused():
-    return jax.pmap(_train_step_fused, axis_name="batch", donate_argnums=(0, 1))
-
-
-def _make_p_train_step_fused_masked():
-    return jax.pmap(_train_step_fused_masked, axis_name="batch", donate_argnums=(0, 1))
+    return jax.pmap(_train_step, axis_name="batch", donate_argnums=(0, 1))
 
 
 def _make_val_loss_fn(apply_fn):
@@ -521,9 +504,6 @@ def train(args):
         _MAT_FF_WIDTHS = ()
     n_widths = 1 + len(_MAT_FF_WIDTHS) if _MAT_FF_WIDTHS else 1
     p_train_step = _make_p_train_step()
-    p_train_step_masked = _make_p_train_step_masked()
-    p_train_step_fused = _make_p_train_step_fused()
-    p_train_step_fused_masked = _make_p_train_step_fused_masked()
 
     np.random.seed(args.seed)
     rng = jax.random.PRNGKey(args.seed)
@@ -598,6 +578,13 @@ def train(args):
     sparsity_ratio = getattr(args, "sparsity_ratio", 0.0)
     prune_mask = None
     gradual_sparsify_done = False
+    # Dummy all-ones prune mask (replicated) — used when pruning is inactive
+    _unrep_params = jax_utils.unreplicate(state).params
+    dummy_prune_mask = jax_utils.replicate(jax.tree.map(jnp.ones_like, _unrep_params))
+    del _unrep_params
+    # Dummy contrastive arrays — used when contrastive is inactive
+    dummy_cl_tokens = jnp.zeros((num_devices, args.batch_size, 128), dtype=jnp.int32)
+    dummy_cl_rng = jax.random.split(jax.random.PRNGKey(0), num_devices)
 
     prune_interval = getattr(args, "prune_interval", 100)
     prune_start_frac = getattr(args, "prune_start_frac", 0.33)
@@ -647,36 +634,30 @@ def train(args):
             rng, text_rng = jax.random.split(rng)
             text_rngs = jax.random.split(text_rng, num_devices)
 
+            do_qat = jnp.broadcast_to(jnp.array(global_step % 100 == 0), (num_devices,))
+
             do_contrastive = cl_batch_iter is not None and global_step % 100 == 0
+            cl_q_b, cl_t_b, cl_rngs = dummy_cl_tokens, dummy_cl_tokens, dummy_cl_rng
             if do_contrastive:
                 try:
                     cl_q, cl_t = next(cl_batch_iter)
                     cl_q_b = shard_batch(cl_q, num_devices)
                     cl_t_b = shard_batch(cl_t, num_devices)
+                    rng, cl_rng = jax.random.split(rng)
+                    cl_rngs = jax.random.split(cl_rng, num_devices)
                 except StopIteration:
                     cl_batch_iter = None
                     do_contrastive = False
 
-            if do_contrastive:
-                rng, cl_rng = jax.random.split(rng)
-                cl_rngs = jax.random.split(cl_rng, num_devices)
-                if prune_mask is not None:
-                    state, ema_params, loss, grad_norm = p_train_step_fused_masked(
-                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask, text_ffn_mask, text_rngs, lm_b, cl_q_b, cl_t_b, cl_rngs,
-                    )
-                else:
-                    state, ema_params, loss, grad_norm = p_train_step_fused(
-                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_ffn_mask, text_rngs, lm_b, cl_q_b, cl_t_b, cl_rngs,
-                    )
-            else:
-                if prune_mask is not None:
-                    state, ema_params, loss, grad_norm = p_train_step_masked(
-                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask, text_ffn_mask, text_rngs, lm_b,
-                    )
-                else:
-                    state, ema_params, loss, grad_norm = p_train_step(
-                        state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_ffn_mask, text_rngs, lm_b,
-                    )
+            do_cl = jnp.broadcast_to(jnp.array(do_contrastive), (num_devices,))
+            do_prune = jnp.broadcast_to(jnp.array(prune_mask is not None), (num_devices,))
+            cur_prune_mask = prune_mask if prune_mask is not None else dummy_prune_mask
+
+            state, ema_params, loss, grad_norm = p_train_step(
+                state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask,
+                cur_prune_mask, text_ffn_mask, text_rngs, lm_b,
+                cl_q_b, cl_t_b, cl_rngs, do_qat, do_cl, do_prune,
+            )
 
             text_loss_val = float(loss[0])
             text_losses.append(text_loss_val)

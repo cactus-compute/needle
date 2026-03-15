@@ -38,7 +38,7 @@ def export_submodel(checkpoint_path, factor, output_path):
 
     def slice_leaf(key_path, leaf):
         arr = np.asarray(leaf)
-        if arr.ndim != 2:
+        if arr.ndim not in (2, 3):
             return arr
 
         parent_name = None
@@ -51,13 +51,22 @@ def export_submodel(checkpoint_path, factor, output_path):
         if parent_name is None:
             return arr
 
-        rows, cols = arr.shape
-        if parent_name in ("gate_proj", "up_proj"):
-            if cols == d_ff:
-                return arr[:, :d_ff_new]
-        elif parent_name == "down_proj":
-            if rows == d_ff:
-                return arr[:d_ff_new, :]
+        if arr.ndim == 2:
+            rows, cols = arr.shape
+            if parent_name in ("gate_proj", "up_proj"):
+                if cols == d_ff:
+                    return arr[:, :d_ff_new]
+            elif parent_name == "down_proj":
+                if rows == d_ff:
+                    return arr[:d_ff_new, :]
+        elif arr.ndim == 3:
+            _, rows, cols = arr.shape
+            if parent_name in ("gate_proj", "up_proj"):
+                if cols == d_ff:
+                    return arr[:, :, :d_ff_new]
+            elif parent_name == "down_proj":
+                if rows == d_ff:
+                    return arr[:, :d_ff_new, :]
 
         return arr
 

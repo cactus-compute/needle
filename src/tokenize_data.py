@@ -1,8 +1,8 @@
 """Standalone tokenization pipeline: train tokenizer and pre-tokenize all data.
 
-Downloads the synthesized tool-calling dataset from GCS
-(gs://cactus-dataset/synth_tool_calls/), trains the SentencePiece tokenizer,
-and tokenizes train + val splits, caching everything locally.
+Downloads the tool-calling dataset from HuggingFace (Cactus-Compute/tool-calls),
+trains the SentencePiece tokenizer, and tokenizes train + val splits,
+caching everything locally.
 
 Usage:
     needle tokenize                         # full run
@@ -29,6 +29,36 @@ from .data import (
 )
 
 
+_HF_TOKENIZED_REPO = "Cactus-Compute/tool-calls-tokenized"
+
+
+def _push_to_hf(cache_dir, tokenizer_dir):
+    """Upload tokenized data and tokenizer to HuggingFace Hub."""
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    api.create_repo(_HF_TOKENIZED_REPO, repo_type="dataset", private=True, exist_ok=True)
+
+    print(f"Uploading tokenized data to {_HF_TOKENIZED_REPO} ...")
+    api.upload_folder(
+        folder_path=cache_dir,
+        repo_id=_HF_TOKENIZED_REPO,
+        repo_type="dataset",
+        path_in_repo="tokenized_data",
+        allow_patterns=["*.npy", "*.json"],
+    )
+
+    print(f"Uploading tokenizer to {_HF_TOKENIZED_REPO} ...")
+    api.upload_folder(
+        folder_path=tokenizer_dir,
+        repo_id=_HF_TOKENIZED_REPO,
+        repo_type="dataset",
+        path_in_repo="tokenizer",
+        allow_patterns=["*.model", "*.vocab"],
+    )
+    print("HuggingFace upload complete.")
+
+
 def _clear_local_caches():
     """Remove local .data_cache/, tokenizer/, and stale unified dataset directories."""
     for d in [CACHE_DIR, TOKENIZER_DIR, _DISK_UNIFIED_DIR, _SHM_UNIFIED_DIR]:
@@ -38,23 +68,29 @@ def _clear_local_caches():
 
 
 def _download_synth_dataset():
-    """Download synthesized tool-calling dataset from GCS."""
-    from .gcs import download_synth_data
+    """Download synthesized tool-calling dataset from HuggingFace."""
+    from datasets import load_dataset
 
     target = _SHM_UNIFIED_DIR if _shm_available() else _DISK_UNIFIED_DIR
-    print(f"Downloading synth dataset to {target} ...")
-    if not download_synth_data(target):
+    print(f"Downloading dataset from HuggingFace (Cactus-Compute/tool-calls)...")
+    try:
+        ds = load_dataset("Cactus-Compute/tool-calls", split="train", token=True)
+    except Exception as e:
         raise FileNotFoundError(
-            "Synth dataset not found at gs://cactus-dataset/synth_tool_calls/. "
-            "Run 'python scripts/synthesize_tools_data.py' first."
+            f"Dataset not found on HuggingFace (Cactus-Compute/tool-calls): {e}\n"
+            "Run 'python scripts/push_to_hf.py' first."
         )
+    import os
+    os.makedirs(target, exist_ok=True)
+    ds.save_to_disk(target)
+    print(f"Saved {len(ds):,} rows to {target}")
 
 
 def tokenize(args):
     print("=== Clearing existing caches ===")
     _clear_local_caches()
 
-    print("\n=== Downloading synth dataset from GCS ===")
+    print("\n=== Downloading dataset from HuggingFace ===")
     _download_synth_dataset()
 
     print("\n=== Training tokenizer ===")
@@ -89,8 +125,6 @@ def tokenize(args):
         _save_cache_metadata(split, text_cache_id, len(kept_indices),
                              max_enc_len, max_dec_len)
 
-    from .gcs import upload_tokenized_data, upload_tokenizer
-    upload_tokenizer(TOKENIZER_DIR)
-    upload_tokenized_data(CACHE_DIR)
+    _push_to_hf(CACHE_DIR, TOKENIZER_DIR)
 
     print("\n=== Tokenization pipeline complete ===")
