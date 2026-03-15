@@ -633,17 +633,6 @@ def train(args):
 
             src, tgt_in, tgt_out, lm = next(text_batch_iter)
 
-            # Get contrastive batch (may be exhausted before text batches)
-            cl_q_b = None
-            cl_t_b = None
-            if cl_batch_iter is not None:
-                try:
-                    cl_q, cl_t = next(cl_batch_iter)
-                    cl_q_b = shard_batch(cl_q, num_devices)
-                    cl_t_b = shard_batch(cl_t, num_devices)
-                except StopIteration:
-                    cl_batch_iter = None
-
             src_b = shard_batch(src, num_devices)
             tgt_in_b = shard_batch(tgt_in, num_devices)
             tgt_out_b = shard_batch(tgt_out, num_devices)
@@ -652,8 +641,17 @@ def train(args):
             rng, text_rng = jax.random.split(rng)
             text_rngs = jax.random.split(text_rng, num_devices)
 
-            if cl_q_b is not None and cl_t_b is not None:
-                # Fused text + contrastive: single backward pass & optimizer step
+            do_contrastive = cl_batch_iter is not None and global_step % 100 == 0
+            if do_contrastive:
+                try:
+                    cl_q, cl_t = next(cl_batch_iter)
+                    cl_q_b = shard_batch(cl_q, num_devices)
+                    cl_t_b = shard_batch(cl_t, num_devices)
+                except StopIteration:
+                    cl_batch_iter = None
+                    do_contrastive = False
+
+            if do_contrastive:
                 rng, cl_rng = jax.random.split(rng)
                 cl_rngs = jax.random.split(cl_rng, num_devices)
                 if prune_mask is not None:
@@ -665,7 +663,6 @@ def train(args):
                         state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, text_ffn_mask, text_rngs, lm_b, cl_q_b, cl_t_b, cl_rngs,
                     )
             else:
-                # Text-only step (no contrastive data this iteration)
                 if prune_mask is not None:
                     state, ema_params, loss, grad_norm = p_train_step_masked(
                         state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask, prune_mask, text_ffn_mask, text_rngs, lm_b,
@@ -827,25 +824,12 @@ def train(args):
                 display_without.append(ex)
         display_pairs = display_with + display_without
 
-        # Collect all eval examples, then batch-generate everything at once
+        # Collect eval examples (random sample, up to 500)
         import json as _json_mod
-        tc_with_n = 85
-        tc_without_n = 15
+        tc_eval_n = 500
         tc_rng = np.random.RandomState(epoch + 42)
-        tc_pool = tc_rng.permutation(len(val_kept))
-        tc_with, tc_without = [], []
-        for k in tc_pool:
-            if len(tc_with) >= tc_with_n and len(tc_without) >= tc_without_n:
-                break
-            local_idx = int(val_kept[k])
-            ex = val_ds[local_idx]
-            ref_text = ex["answers"].strip()
-            is_empty = ref_text in ("", "[]")
-            if not is_empty and len(tc_with) < tc_with_n:
-                tc_with.append(ex)
-            elif is_empty and len(tc_without) < tc_without_n:
-                tc_without.append(ex)
-        tc_eval_pairs = tc_with + tc_without
+        tc_pool = tc_rng.permutation(len(val_kept))[:tc_eval_n]
+        tc_eval_pairs = [val_ds[int(val_kept[k])] for k in tc_pool]
 
         # Batch-generate: display samples + tc eval samples in one pass
         all_eval_examples = display_pairs + tc_eval_pairs
@@ -938,7 +922,6 @@ def train(args):
             pc["call_fp"] += len(pk - rk)
             pc["call_fn"] += len(rk - pk)
 
-            # Argument correctness: for name-matched calls, check if arguments match
             ref_by_name = {}
             for c in ref_calls:
                 if isinstance(c, dict) and "name" in c:
@@ -950,7 +933,6 @@ def train(args):
                     if any(pred_args == _json_mod.dumps(ra, sort_keys=True) for ra in ref_by_name[c["name"]]):
                         tc_args_correct += 1
 
-            # Parameter-level metrics (tool_defs already parsed above)
             tool_param_map = {t["name"]: set((t.get("parameters") or {}).keys()) for t in tool_defs if isinstance(t, dict) and "name" in t}
             for c in pred_calls:
                 if not isinstance(c, dict) or "name" not in c:
@@ -962,7 +944,6 @@ def train(args):
                 pred_keys = set((c.get("arguments") or {}).keys())
                 tc_total_pred_params += len(pred_keys)
                 tc_halluc_params += len(pred_keys - schema_keys)
-                # Find matching reference call for missing/value metrics
                 if cname in ref_by_name:
                     ref_args = ref_by_name[cname][0]
                     ref_keys = set((ref_args if isinstance(ref_args, dict) else {}).keys())
@@ -989,7 +970,6 @@ def train(args):
             tc_metrics["param_miss"] = tc_missing_params / max(tc_total_ref_params, 1)
             tc_metrics["value_acc"] = tc_correct_values / max(tc_matched_params, 1)
 
-        # Save best checkpoint based on call_f1
         if tc_metrics and tc_metrics["call_f1"] > best_call_f1:
             best_call_f1 = tc_metrics["call_f1"]
             best_ckpt_path = os.path.join(args.checkpoint_dir, f"needle_{args.num_layers}_{args.d_model}_best.pkl")
@@ -999,7 +979,6 @@ def train(args):
             del params_best
             print(f"  ** New best call_f1={best_call_f1:.1%} → {best_ckpt_path}")
 
-        # Contrastive retrieval eval
         retrieval_metrics = None
         if has_contrastive and _CONTRASTIVE_WEIGHT > 0:
             from .eval import benchmark_retrieval
