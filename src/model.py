@@ -48,6 +48,7 @@ class TransformerConfig:
     n_mels: int = 80
     dropout_rate: float = 0.1
     contrastive_dim: int = 128
+    conv_kernel_size: int = 0
 
     @property
     def jax_dtype(self):
@@ -142,8 +143,80 @@ class FeedForward(nn.Module):
         else:  # drelu
             h = nn.relu(gate) * nn.relu(up)
         if ffn_mask is not None:
-            h = h * ffn_mask[:, None, :]  # (batch, 1, d_ff)
+            h = h * ffn_mask[:, None, :] 
         return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="down_proj")(h)
+
+
+class SpeechSubsampling(nn.Module):
+    """FastConformer-style 8x depthwise-separable convolutional subsampling.
+
+    Input: (B, T, n_mels) raw mel spectrogram.
+    Output: (B, T//8, d_model) subsampled features.
+
+    Architecture (3 stages of stride-2 = 8x total):
+      Conv2D(1 -> C, k=3, s=2) + ReLU
+      DW-Conv2D(C, k=3, s=2) + PW-Conv2D(C -> C, k=1) + ReLU
+      DW-Conv2D(C, k=3, s=2) + PW-Conv2D(C -> C, k=1) + ReLU
+      Reshape(C * F') + Linear -> d_model
+    """
+    d_model: int
+    conv_channels: int = 256
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, mel):
+        x = mel[..., None] 
+
+        x = nn.Conv(features=self.conv_channels, kernel_size=(3, 3), strides=(2, 2),
+                     padding='SAME', dtype=self.dtype, use_bias=False, name="conv1")(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(features=self.conv_channels, kernel_size=(3, 3), strides=(2, 2),
+                     padding='SAME', feature_group_count=self.conv_channels,
+                     dtype=self.dtype, use_bias=False, name="dw_conv2")(x)
+        x = nn.Conv(features=self.conv_channels, kernel_size=(1, 1),
+                     dtype=self.dtype, use_bias=False, name="pw_conv2")(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(features=self.conv_channels, kernel_size=(3, 3), strides=(2, 2),
+                     padding='SAME', feature_group_count=self.conv_channels,
+                     dtype=self.dtype, use_bias=False, name="dw_conv3")(x)
+        x = nn.Conv(features=self.conv_channels, kernel_size=(1, 1),
+                     dtype=self.dtype, use_bias=False, name="pw_conv3")(x)
+        x = nn.relu(x)
+
+        B, T, F, C = x.shape
+        x = x.reshape(B, T, F * C)
+        x = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False,
+                      kernel_init=default_init(), name="out_proj")(x)
+        return x
+
+
+class ConvModule(nn.Module):
+    """Conformer-style convolution module: pointwise up -> GLU -> depthwise conv -> norm -> pointwise down."""
+    d_model: int
+    kernel_size: int
+    num_layers: int
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, x):
+        
+        x = nn.Dense(self.d_model * 2, dtype=self.dtype, use_bias=False,
+                      kernel_init=default_init(), name="pw_up")(x)
+        
+        x1, x2 = jnp.split(x, 2, axis=-1)
+        x = x1 * nn.sigmoid(x2)
+        
+        x = nn.Conv(features=self.d_model, kernel_size=(self.kernel_size,),
+                     padding='SAME', feature_group_count=self.d_model,
+                     dtype=self.dtype, use_bias=False, name="dw_conv")(x)
+
+        x = ZCRMSNorm(dtype=self.dtype, name="conv_norm")(x)
+        
+        x = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False,
+                      kernel_init=residual_init(self.num_layers), name="pw_down")(x)
+        return x
 
 
 class EncoderBlock(nn.Module):
@@ -156,6 +229,7 @@ class EncoderBlock(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
     dropout_rate: float = 0.0
+    conv_kernel_size: int = 0
 
     @nn.compact
     def __call__(self, x, mask=None, rope=None, ffn_mask=None, deterministic=True):
@@ -166,6 +240,13 @@ class EncoderBlock(nn.Module):
         )
         x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic) + residual
 
+        if self.conv_kernel_size > 0:
+            residual = x
+            x = ZCRMSNorm(dtype=self.dtype)(x)
+            x = ConvModule(self.d_model, self.conv_kernel_size, self.num_layers,
+                           self.dtype, name="conv_module")(x)
+            x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic) + residual
+
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
         x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x, ffn_mask=ffn_mask)
@@ -175,10 +256,7 @@ class EncoderBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    """Self-attention encoder with stride-2 depthwise-separable downsampling.
-
-    Returns (output, mask) tuple — variable-length output + adjusted padding mask.
-    """
+    """Self-attention encoder. Returns (output, mask) tuple."""
     config: TransformerConfig
 
     @nn.compact
@@ -187,23 +265,11 @@ class Encoder(nn.Module):
         dt = cfg.jax_dtype
         x = x.astype(dt)
 
-        x = nn.Conv(features=cfg.d_model, kernel_size=(4,), strides=(2,),
-                    padding='SAME', feature_group_count=cfg.d_model,
-                    dtype=dt, use_bias=False, name="downsample_dw")(x)
-        x = nn.Dense(cfg.d_model, dtype=dt, use_bias=False,
-                     kernel_init=default_init(), name="downsample_pw")(x)
-
-        if mask is not None:
-            T_new = x.shape[1]
-            if mask.shape[-1] % 2:
-                mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 0), (0, 1)))
-            mask = mask.reshape(mask.shape[0], 1, 1, -1, 2).any(axis=-1)
-            mask = mask[..., :T_new]
-
         for i in range(cfg.num_encoder_layers):
             x = nn.remat(EncoderBlock, static_argnums=(5,))(
                 cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
-                cfg.total_layers, dt, cfg.activation, cfg.dropout_rate, name=f"block_{i}"
+                cfg.total_layers, dt, cfg.activation, cfg.dropout_rate,
+                cfg.conv_kernel_size, name=f"block_{i}"
             )(x, mask, rope, ffn_mask, deterministic)
 
         x = ZCRMSNorm(dtype=dt, name="final_norm")(x)
@@ -272,14 +338,15 @@ class SpecAugment(nn.Module):
 
     @nn.compact
     def __call__(self, mel, deterministic=True):
+
         if deterministic:
             return mel
-        # mel: (B, T, F)
+            
         B, T, F = mel.shape
         rng = self.make_rng('specaugment')
 
         x = mel
-        # Time masking
+        
         for i in range(self.num_time_masks):
             rng, k1, k2 = jax.random.split(rng, 3)
             width = jax.random.randint(k1, (), 0, jnp.minimum(self.max_time_width, T))
@@ -287,7 +354,6 @@ class SpecAugment(nn.Module):
             time_mask = (jnp.arange(T) >= start) & (jnp.arange(T) < start + width)
             x = x * (1.0 - time_mask[None, :, None].astype(x.dtype))
 
-        # Frequency masking
         for i in range(self.num_freq_masks):
             rng, k1, k2 = jax.random.split(rng, 3)
             width = jax.random.randint(k1, (), 0, jnp.minimum(self.max_freq_width, F))
@@ -305,9 +371,9 @@ class EncoderDecoderTransformer(nn.Module):
     def setup(self):
         self.embedding = nn.Embed(self.config.vocab_size, self.config.d_model, embedding_init=jinit.normal(stddev=0.02))
         self.embed_scale = math.sqrt(self.config.d_model)
-        self.mel_proj = nn.Dense(self.config.d_model, dtype=self.config.jax_dtype,
-                                 use_bias=True, kernel_init=default_init(), name="mel_proj")
         self.spec_augment = SpecAugment()
+        self.speech_subsample = SpeechSubsampling(
+            self.config.d_model, dtype=self.config.jax_dtype, name="speech_subsample")
         self.encoder = Encoder(self.config)
         self.decoder = Decoder(self.config)
         self.contrastive_proj = nn.Dense(
@@ -331,7 +397,17 @@ class EncoderDecoderTransformer(nn.Module):
 
     def encode_speech(self, mel, src_mask=None, ffn_mask=None, deterministic=True):
         mel = self.spec_augment(mel, deterministic=deterministic)
-        x = self.mel_proj(mel) * self.embed_scale
+        # FastConformer-style 8x subsampling: (B, T, 80) -> (B, T//8, d_model)
+        x = self.speech_subsample(mel) * self.embed_scale
+        if src_mask is not None:
+            T_new = x.shape[1]
+            # Downsample mask by 8x: group frames and keep valid if any in group
+            T_mask = src_mask.shape[-1]
+            pad_needed = (8 - T_mask % 8) % 8
+            if pad_needed > 0:
+                src_mask = jnp.pad(src_mask, ((0, 0), (0, 0), (0, 0), (0, pad_needed)))
+            src_mask = src_mask.reshape(src_mask.shape[0], 1, 1, -1, 8).any(axis=-1)
+            src_mask = src_mask[..., :T_new]
         rope = self._rope(x.shape[1])
         return self.encoder(x, mask=src_mask, rope=rope, ffn_mask=ffn_mask, deterministic=deterministic)
 
@@ -346,13 +422,12 @@ class EncoderDecoderTransformer(nn.Module):
     def _mean_pool(self, encoder_out, enc_mask):
         """Mean-pool encoder output over non-padded positions. Returns (B, d_model)."""
         if enc_mask is not None:
-            # enc_mask shape: (B, 1, 1, T) -> (B, T)
             mask_2d = enc_mask[:, 0, 0, :]
         else:
             mask_2d = jnp.ones(encoder_out.shape[:2], dtype=encoder_out.dtype)
-        mask_3d = mask_2d[:, :, None].astype(encoder_out.dtype)  # (B, T, 1)
-        summed = jnp.sum(encoder_out * mask_3d, axis=1)  # (B, d_model)
-        counts = jnp.maximum(jnp.sum(mask_2d, axis=1, keepdims=True), 1.0)  # (B, 1)
+        mask_3d = mask_2d[:, :, None].astype(encoder_out.dtype) 
+        summed = jnp.sum(encoder_out * mask_3d, axis=1) 
+        counts = jnp.maximum(jnp.sum(mask_2d, axis=1, keepdims=True), 1.0)
         return summed / counts
 
     def encode_contrastive(self, tokens, deterministic=True):
@@ -466,5 +541,5 @@ def make_padding_mask(tokens, pad_token_id):
 
 def make_mel_padding_mask(mel):
     """Create padding mask from mel spectrogram: non-zero frames are valid."""
-    mask = jnp.any(mel != 0, axis=-1)  # (B, T)
-    return mask[:, None, None, :]  # (B, 1, 1, T)
+    mask = jnp.any(mel != 0, axis=-1)  
+    return mask[:, None, None, :] 

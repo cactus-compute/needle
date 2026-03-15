@@ -20,11 +20,19 @@ _TOKENIZER_PREFIX = "tokenizer"
 
 
 def upload_directory(local_dir, gcs_prefix):
-    """Upload all files in local_dir to gs://BUCKET/gcs_prefix/."""
+    """Upload all files in local_dir to gs://BUCKET/gcs_prefix/.
+
+    Clears the remote prefix first to avoid stale files from previous uploads.
+    """
     if not os.path.isdir(local_dir):
         print(f"[GCS] Skipping upload: {local_dir} does not exist")
         return
     dest = f"gs://{BUCKET}/{gcs_prefix}/"
+    print(f"[GCS] Clearing {dest} ...")
+    subprocess.run(
+        ["gcloud", "storage", "rm", "-r", dest],
+        capture_output=True, 
+    )
     print(f"[GCS] Uploading {local_dir} -> {dest}")
     subprocess.run(
         ["gcloud", "storage", "cp", "-r", f"{local_dir}/*", dest],

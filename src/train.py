@@ -426,11 +426,17 @@ def _estimate_mat_params(config, matryoshka_factor):
     emb = v * d
     attn = d * d + d * kv_dim * 2 + d * d
     ffn = d * d_ff * 3
-    # Encoder: self-attn + FFN per block, plus downsample conv params
-    downsample = d * 4 + d * d  # depthwise conv (kernel=4) + pointwise Dense
-    enc_block = attn + ffn
-    dec_block = attn * 2 + ffn  # self-attn + cross-attn + FFN
-    total = emb + downsample + n_enc * enc_block + n_dec * dec_block
+    conv = 0
+    if config.conv_kernel_size > 0:
+        K = config.conv_kernel_size
+        conv = d * 2 * d + d * K + d + d * d 
+    C = 256
+    n_mels = getattr(config, "n_mels", 80)
+    freq_out = n_mels // 8
+    speech_sub = (1 * C * 9) + (C * 9 + C * C) + (C * 9 + C * C) + (C * freq_out * d)
+    enc_block = attn + conv + ffn
+    dec_block = attn * 2 + ffn
+    total = emb + speech_sub + n_enc * enc_block + n_dec * dec_block
     return int(total)
 
 
@@ -468,7 +474,6 @@ def train(args):
     val_loss_mask = val_data["loss_mask"]
     print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val tool-call pairs (memory-mapped)")
 
-    # Contrastive data (optional — graceful if missing)
     cl_query_tokens = train_data.get("query_only")
     cl_tool_tokens = train_data.get("tool_individual")
     cl_tool_ex_idx = train_data.get("tool_ex_idx")
@@ -500,6 +505,7 @@ def train(args):
             activation=getattr(args, "activation", "drelu"),
             num_memory_slots=getattr(args, "num_memory_slots", 64),
             contrastive_dim=getattr(args, "contrastive_dim", 128),
+            conv_kernel_size=getattr(args, "conv_kernel_size", 0),
         )
 
     global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF, _CONTRASTIVE_WEIGHT

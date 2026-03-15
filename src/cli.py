@@ -56,6 +56,8 @@ def main():
                    help="Weight for CLIP-style contrastive loss (default: 0.1)")
     p.add_argument("--contrastive-dim", type=int, default=128,
                    help="Dimension of contrastive projection head (default: 128)")
+    p.add_argument("--conv-kernel-size", type=int, default=0,
+                   help="Conformer conv kernel size in encoder (0=disabled, 15=default when enabled)")
 
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,
