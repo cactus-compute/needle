@@ -14,7 +14,7 @@ import subprocess
 BUCKET = "cactus-dataset"
 
 _RAW_DATA_PREFIX = "raw_data"
-_SYNTH_DATA_PREFIX = "synth_tool_calls"
+_SYNTH_DATA_PREFIX = "tool_calls"
 _TOKENIZED_DATA_PREFIX = "tokenized_data"
 _TOKENIZER_PREFIX = "tokenizer"
 
