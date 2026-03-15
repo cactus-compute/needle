@@ -35,62 +35,8 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 _DISK_CACHE_DIR = os.path.join(_PROJECT_ROOT, ".data_cache")
 TOKENIZER_DIR = os.path.join(_PROJECT_ROOT, "tokenizer")
 TOKENIZER_PREFIX = os.path.join(TOKENIZER_DIR, "needle")
-_DISK_UNIFIED_DIR = os.path.join(_PROJECT_ROOT, "data", "tool_calls_unified")
-_SHM_UNIFIED_DIR = os.path.join("/dev/shm", "needle_data", "tool_calls_unified")
-
-
-_MIN_SHM_BYTES = 20 * 1024**3
-
-
-def _shm_available():
-    """Check if /dev/shm has enough space for RAM-backed storage."""
-    shm = "/dev/shm"
-    if os.path.isdir(shm):
-        try:
-            st = os.statvfs(shm)
-            return st.f_bavail * st.f_frsize >= _MIN_SHM_BYTES
-        except OSError:
-            pass
-    return False
-
-
-def _pick_unified_dir():
-    """Use /dev/shm for unified dataset when RAM is plentiful, else disk."""
-    if os.path.isdir(_SHM_UNIFIED_DIR) and any(
-        f.endswith(".arrow") for f in os.listdir(_SHM_UNIFIED_DIR)
-    ):
-        return _SHM_UNIFIED_DIR
-    if _shm_available():
-        return _SHM_UNIFIED_DIR
-    return _DISK_UNIFIED_DIR
-
-
-LOCAL_UNIFIED_DIR = _pick_unified_dir()
-
-
-def _pick_cache_dir():
-    """Use /dev/shm (tmpfs/RAM) when available and large enough, else disk."""
-    if _shm_available():
-        d = os.path.join("/dev/shm", "needle_cache")
-        os.makedirs(d, exist_ok=True)
-        return d
-    os.makedirs(_DISK_CACHE_DIR, exist_ok=True)
-    return _DISK_CACHE_DIR
-
-
-def _setup_hf_cache():
-    """Point HuggingFace download cache to /dev/shm when RAM is plentiful."""
-    if _shm_available():
-        hf_cache = os.path.join("/dev/shm", "needle_hf_cache")
-        os.makedirs(hf_cache, exist_ok=True)
-        os.environ.setdefault("HF_HOME", hf_cache)
-        os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(hf_cache, "datasets"))
-
-
-_setup_hf_cache()
-
-
-CACHE_DIR = _pick_cache_dir()
+LOCAL_UNIFIED_DIR = os.path.join(_PROJECT_ROOT, "data", "tool_calls_unified")
+CACHE_DIR = os.path.join(_PROJECT_ROOT, ".data_cache")
 
 PAD_ID = 0
 EOS_ID = 1
@@ -210,9 +156,8 @@ def _token_weights_for_answer(answer_str, token_ids, sp_model,
 
 
 def _load_unified_dataset():
-    """Load the unified dataset from /dev/shm or disk.
+    """Load the unified dataset from disk.
 
-    Checks /dev/shm first (RAM-backed), then falls back to disk.
     Caches the result in memory after first load.
     Uses soundfile as the audio decoding backend.
     """
@@ -220,35 +165,32 @@ def _load_unified_dataset():
     if _unified_dataset_cache is not None:
         return _unified_dataset_cache
 
-    for path in [_SHM_UNIFIED_DIR, _DISK_UNIFIED_DIR]:
-        if os.path.exists(path) and any(
-            f.endswith(".arrow") for f in os.listdir(path)
-        ):
-            try:
-                ds = load_from_disk(path)
-                print(f"Loaded unified dataset from {path} ({len(ds)} rows)")
-                _unified_dataset_cache = _set_audio_backend(ds)
-                return _unified_dataset_cache
-            except Exception as e:
-                print(f"Warning: failed to load from {path}: {e}")
-                continue
+    if os.path.exists(LOCAL_UNIFIED_DIR) and any(
+        f.endswith(".arrow") for f in os.listdir(LOCAL_UNIFIED_DIR)
+    ):
+        try:
+            ds = load_from_disk(LOCAL_UNIFIED_DIR)
+            print(f"Loaded unified dataset from {LOCAL_UNIFIED_DIR} ({len(ds)} rows)")
+            _unified_dataset_cache = _set_audio_backend(ds)
+            return _unified_dataset_cache
+        except Exception as e:
+            print(f"Warning: failed to load from {LOCAL_UNIFIED_DIR}: {e}")
 
     try:
         from datasets import load_dataset as _hf_load
         print("Downloading dataset from HuggingFace (Cactus-Compute/tool-calls)...")
         ds = _hf_load("Cactus-Compute/tool-calls", split="train", token=True)
-        target = _SHM_UNIFIED_DIR if _shm_available() else _DISK_UNIFIED_DIR
-        os.makedirs(target, exist_ok=True)
-        ds.save_to_disk(target)
-        print(f"Loaded from HuggingFace -> {target} ({len(ds)} rows)")
+        os.makedirs(LOCAL_UNIFIED_DIR, exist_ok=True)
+        ds.save_to_disk(LOCAL_UNIFIED_DIR)
+        print(f"Loaded from HuggingFace -> {LOCAL_UNIFIED_DIR} ({len(ds)} rows)")
         _unified_dataset_cache = _set_audio_backend(ds)
         return _unified_dataset_cache
     except Exception as e:
         print(f"Warning: HuggingFace download failed: {e}")
 
     raise FileNotFoundError(
-        f"Dataset not found at {_SHM_UNIFIED_DIR} or {_DISK_UNIFIED_DIR}. "
-        f"Run 'needle tokenize' or 'python scripts/push_to_hf.py' first."
+        f"Dataset not found at {LOCAL_UNIFIED_DIR}. "
+        f"Run 'needle tokenize' first."
     )
 
 
@@ -344,36 +286,39 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
     print(f"Training SentencePiece BPE tokenizer (vocab_size={vocab_size}, samples={len(ds):,})...")
 
     corpus_path = os.path.join(TOKENIZER_DIR, "corpus.txt")
-    with open(corpus_path, "w") as f:
-        for example in tqdm(ds, desc="Writing corpus"):
-            for field in ("query", "tools", "answers"):
-                text = example[field].strip()
-                if text:
-                    f.write(text + "\n")
+    try:
+        with open(corpus_path, "w") as f:
+            for example in tqdm(ds, desc="Writing corpus"):
+                for field in ("query", "tools", "answers"):
+                    text = example[field].strip()
+                    if text:
+                        f.write(text + "\n")
 
-    spm.SentencePieceTrainer.Train(
-        input=corpus_path,
-        model_prefix=TOKENIZER_PREFIX,
-        vocab_size=vocab_size,
-        model_type="bpe",
-        pad_id=PAD_ID,
-        eos_id=EOS_ID,
-        bos_id=BOS_ID,
-        unk_id=UNK_ID,
-        user_defined_symbols=["<tool_call>", "<tools>"],
-        byte_fallback=True,
-        normalization_rule_name="identity",
-        num_threads=min(20, max(1, (os.cpu_count() or 1) // 4)),
-        train_extremely_large_corpus=False,
-        minloglevel=2,
-    )
-
-    os.remove(corpus_path)
+        spm.SentencePieceTrainer.Train(
+            input=corpus_path,
+            model_prefix=TOKENIZER_PREFIX,
+            vocab_size=vocab_size,
+            model_type="bpe",
+            pad_id=PAD_ID,
+            eos_id=EOS_ID,
+            bos_id=BOS_ID,
+            unk_id=UNK_ID,
+            user_defined_symbols=["<tool_call>", "<tools>"],
+            byte_fallback=True,
+            normalization_rule_name="identity",
+            num_threads=min(20, max(1, (os.cpu_count() or 1) // 4)),
+            train_extremely_large_corpus=False,
+            minloglevel=2,
+        )
+    finally:
+        if os.path.exists(corpus_path):
+            os.remove(corpus_path)
     print(f"Tokenizer saved to {model_path}")
     return model_path
 
 
-_HF_TOKENIZED_REPO = "Cactus-Compute/tool-calls-tokenized"
+_HF_TOKENIZER_REPO = "Cactus-Compute/needle-tokenizer"
+_HF_TOKENIZED_REPO = "Cactus-Compute/tokenized-tool-calls"
 
 
 def _download_tokenized_from_hf():
@@ -383,15 +328,15 @@ def _download_tokenized_from_hf():
     local = snapshot_download(
         _HF_TOKENIZED_REPO,
         repo_type="dataset",
-        allow_patterns="tokenized_data/*",
         token=True,
     )
-    src = os.path.join(local, "tokenized_data")
     os.makedirs(CACHE_DIR, exist_ok=True)
-    for fname in os.listdir(src):
+    for fname in os.listdir(local):
+        if fname.startswith("."):
+            continue
         dst = os.path.join(CACHE_DIR, fname)
         if not os.path.exists(dst):
-            os.symlink(os.path.join(src, fname), dst)
+            os.symlink(os.path.join(local, fname), dst)
 
 
 def _download_tokenizer_from_hf():
@@ -399,17 +344,17 @@ def _download_tokenizer_from_hf():
     from huggingface_hub import snapshot_download
 
     local = snapshot_download(
-        _HF_TOKENIZED_REPO,
+        _HF_TOKENIZER_REPO,
         repo_type="dataset",
-        allow_patterns="tokenizer/*",
         token=True,
     )
-    src = os.path.join(local, "tokenizer")
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
-    for fname in os.listdir(src):
+    for fname in os.listdir(local):
+        if fname.startswith("."):
+            continue
         dst = os.path.join(TOKENIZER_DIR, fname)
         if not os.path.exists(dst):
-            os.symlink(os.path.join(src, fname), dst)
+            os.symlink(os.path.join(local, fname), dst)
 
 
 def get_tokenizer(max_samples=None):

@@ -25,6 +25,33 @@ from .model import (
     make_padding_mask,
 )
 
+_HF_CHECKPOINT_REPO = "Cactus-Compute/needle"
+
+
+def _upload_checkpoint(ckpt_path):
+    """Upload a checkpoint file to HuggingFace Hub in a background thread."""
+    import threading
+
+    def _upload():
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi()
+            api.create_repo(_HF_CHECKPOINT_REPO, repo_type="model", private=True, exist_ok=True)
+            filename = os.path.basename(ckpt_path)
+            print(f"[hf] Uploading {filename} to {_HF_CHECKPOINT_REPO} ...")
+            api.upload_file(
+                path_or_fileobj=ckpt_path,
+                path_in_repo=filename,
+                repo_id=_HF_CHECKPOINT_REPO,
+                repo_type="model",
+            )
+            print(f"[hf] Checkpoint uploaded: {_HF_CHECKPOINT_REPO}/{filename}")
+        except Exception as e:
+            print(f"[hf] Warning: checkpoint upload failed: {e}")
+
+    threading.Thread(target=_upload, daemon=True).start()
+
+
 def _newton_schulz(G, steps=5):
     """Approximate polar decomposition via Newton-Schulz iteration."""
     a, b, c = 3.4445, -4.7750, 2.0315
@@ -965,6 +992,7 @@ def train(args):
                 pickle.dump({"params": params_best, "config": config.__dict__}, f)
             del params_best
             print(f"  ** New best call_f1={best_call_f1:.1%} → {best_ckpt_path}")
+            _upload_checkpoint(best_ckpt_path)
 
         retrieval_metrics = None
         if has_contrastive and _CONTRASTIVE_WEIGHT > 0:

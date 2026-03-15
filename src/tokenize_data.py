@@ -16,12 +16,10 @@ from .data import (
     CACHE_DIR,
     DEFAULT_MAX_DEC_LEN,
     DEFAULT_MAX_ENC_LEN,
+    LOCAL_UNIFIED_DIR,
     TOKENIZER_DIR,
     _cache_key,
     _save_cache_metadata,
-    _DISK_UNIFIED_DIR,
-    _SHM_UNIFIED_DIR,
-    _shm_available,
     get_tokenizer,
     load_tool_calls,
     prepare_tool_call_pairs,
@@ -29,39 +27,40 @@ from .data import (
 )
 
 
-_HF_TOKENIZED_REPO = "Cactus-Compute/tool-calls-tokenized"
+_HF_TOKENIZER_REPO = "Cactus-Compute/needle-tokenizer"
+_HF_TOKENIZED_REPO = "Cactus-Compute/tokenized-tool-calls"
 
 
 def _push_to_hf(cache_dir, tokenizer_dir):
-    """Upload tokenized data and tokenizer to HuggingFace Hub."""
+    """Upload tokenizer and tokenized data to their respective HuggingFace repos."""
     from huggingface_hub import HfApi
 
     api = HfApi()
-    api.create_repo(_HF_TOKENIZED_REPO, repo_type="dataset", private=True, exist_ok=True)
 
+    api.create_repo(_HF_TOKENIZER_REPO, repo_type="dataset", private=True, exist_ok=True)
+    print(f"Uploading tokenizer to {_HF_TOKENIZER_REPO} ...")
+    api.upload_folder(
+        folder_path=tokenizer_dir,
+        repo_id=_HF_TOKENIZER_REPO,
+        repo_type="dataset",
+        allow_patterns=["*.model", "*.vocab"],
+    )
+
+    api.create_repo(_HF_TOKENIZED_REPO, repo_type="dataset", private=True, exist_ok=True)
     print(f"Uploading tokenized data to {_HF_TOKENIZED_REPO} ...")
     api.upload_folder(
         folder_path=cache_dir,
         repo_id=_HF_TOKENIZED_REPO,
         repo_type="dataset",
-        path_in_repo="tokenized_data",
         allow_patterns=["*.npy", "*.json"],
     )
 
-    print(f"Uploading tokenizer to {_HF_TOKENIZED_REPO} ...")
-    api.upload_folder(
-        folder_path=tokenizer_dir,
-        repo_id=_HF_TOKENIZED_REPO,
-        repo_type="dataset",
-        path_in_repo="tokenizer",
-        allow_patterns=["*.model", "*.vocab"],
-    )
     print("HuggingFace upload complete.")
 
 
 def _clear_local_caches():
-    """Remove local .data_cache/, tokenizer/, and stale unified dataset directories."""
-    for d in [CACHE_DIR, TOKENIZER_DIR, _DISK_UNIFIED_DIR, _SHM_UNIFIED_DIR]:
+    """Remove local .data_cache/, tokenizer/, and unified dataset directories."""
+    for d in [CACHE_DIR, TOKENIZER_DIR, LOCAL_UNIFIED_DIR]:
         if os.path.exists(d):
             print(f"Removing {d}/ ...")
             shutil.rmtree(d)
@@ -71,8 +70,7 @@ def _download_synth_dataset():
     """Download synthesized tool-calling dataset from HuggingFace."""
     from datasets import load_dataset
 
-    target = _SHM_UNIFIED_DIR if _shm_available() else _DISK_UNIFIED_DIR
-    print(f"Downloading dataset from HuggingFace (Cactus-Compute/tool-calls)...")
+    print("Downloading dataset from HuggingFace (Cactus-Compute/tool-calls)...")
     try:
         ds = load_dataset("Cactus-Compute/tool-calls", split="train", token=True)
     except Exception as e:
@@ -80,10 +78,9 @@ def _download_synth_dataset():
             f"Dataset not found on HuggingFace (Cactus-Compute/tool-calls): {e}\n"
             "Run 'python scripts/push_to_hf.py' first."
         )
-    import os
-    os.makedirs(target, exist_ok=True)
-    ds.save_to_disk(target)
-    print(f"Saved {len(ds):,} rows to {target}")
+    os.makedirs(LOCAL_UNIFIED_DIR, exist_ok=True)
+    ds.save_to_disk(LOCAL_UNIFIED_DIR)
+    print(f"Saved {len(ds):,} rows to {LOCAL_UNIFIED_DIR}")
 
 
 def tokenize(args):
