@@ -354,9 +354,8 @@ def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
     return jnp.concatenate(rows, axis=0)
 
 
-def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask, rng, loss_mask, query_tokens, tool_tokens, cl_rng, do_quantize, do_contrastive, do_prune):
+def _train_step(state, src, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask, rng, loss_mask, query_tokens, tool_tokens, cl_rng, do_quantize, do_contrastive, do_prune):
     """Unified train step with boolean flags for contrastive loss and pruning."""
-    ema_decay = 0.999
 
     def combined_loss(p):
         text_loss = _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask, do_quantize)
@@ -378,8 +377,7 @@ def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask, prune_mask
         lambda: state.params,
     )
     state = state.replace(params=new_params)
-    ema_params = jax.tree.map(lambda e, p: ema_decay * e + (1 - ema_decay) * p, ema_params, new_params)
-    return state, ema_params, text_loss, grad_norm
+    return state, text_loss, grad_norm
 
 
 def _make_p_train_step():
@@ -552,9 +550,7 @@ def train(args):
         state = state.replace(params=ckpt_params)
         print(f"  Loaded checkpoint params into train state")
 
-    ema_params = jax.tree.map(jnp.copy, state.params)
     state = jax_utils.replicate(state)
-    ema_params = jax_utils.replicate(ema_params)
 
     param_count = sum(x.size for x in jax.tree.leaves(jax_utils.unreplicate(state).params))
     decay_steps = max(1, int(total_steps * decay_ratio))
@@ -680,8 +676,8 @@ def train(args):
             do_prune = jnp.broadcast_to(jnp.array(prune_mask is not None), (num_devices,))
             cur_prune_mask = prune_mask if prune_mask is not None else dummy_prune_mask
 
-            state, ema_params, loss, grad_norm = p_train_step(
-                state, ema_params, src_b, tgt_in_b, tgt_out_b, causal_mask,
+            state, loss, grad_norm = p_train_step(
+                state, src_b, tgt_in_b, tgt_out_b, causal_mask,
                 cur_prune_mask, text_ffn_mask, text_rngs, lm_b,
                 cl_q_b, cl_t_b, cl_rngs, do_qat, do_cl, do_prune,
             )
@@ -695,7 +691,7 @@ def train(args):
                 epoch_step += 1
                 current_sparsity = _cubic_sparsity_schedule(epoch_step, t_start, t_end, sparsity_ratio)
                 if epoch_step >= t_start and epoch_step % prune_interval == 0 and current_sparsity > 0:
-                    ema_unr = jax_utils.unreplicate(ema_params)
+                    ema_unr = jax_utils.unreplicate(state.params)
                     mask = _make_prune_mask(ema_unr, current_sparsity, _GROUP_SIZE)
                     del ema_unr
                     prune_mask = jax_utils.replicate(mask)
@@ -704,7 +700,7 @@ def train(args):
             dt = time.perf_counter() - t0
             eval_every = getattr(args, "eval_every", 100)
             if global_step % eval_every == 0 or global_step == total_steps:
-                _eval_params = jax_utils.unreplicate(ema_params)
+                _eval_params = jax_utils.unreplicate(state).params
                 val_causal = make_causal_mask(args.max_dec_len)
                 total_loss, total_toks = 0.0, 0.0
                 for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False, loss_mask=val_loss_mask):
@@ -748,15 +744,14 @@ def train(args):
         if epoch == weight_prune_epoch and not gradual_sparsify_done:
             gradual_sparsify_done = True
             if prune_mask is None:
-                ema_unr = jax_utils.unreplicate(ema_params)
+                ema_unr = jax_utils.unreplicate(state.params)
                 mask = _make_prune_mask(ema_unr, sparsity_ratio, _GROUP_SIZE)
                 del ema_unr
                 prune_mask = jax_utils.replicate(mask)
                 del mask
             state = state.replace(
                 params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
-            ema_params = jax.tree.map(lambda w, m: w * m, ema_params, prune_mask)
-            final_pruned = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
+            final_pruned = jax.tree.map(np.array, jax_utils.unreplicate(state).params)
             total_p = sum(x.size for x in jax.tree.leaves(final_pruned))
             zero_p = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(final_pruned))
             print(f"\n  Gradual sparsification complete — mask locked.")
@@ -767,7 +762,7 @@ def train(args):
         final_loss = text_losses[-1] if text_losses else float("nan")
         final_ppl = math.exp(min(final_loss, 20)) if not math.isnan(final_loss) else float("nan")
 
-        eval_params = jax_utils.unreplicate(ema_params)
+        eval_params = jax_utils.unreplicate(state).params
         val_causal = make_causal_mask(args.max_dec_len)
 
         q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE)
@@ -987,7 +982,7 @@ def train(args):
         if tc_metrics and tc_metrics["call_f1"] > best_call_f1:
             best_call_f1 = tc_metrics["call_f1"]
             best_ckpt_path = os.path.join(args.checkpoint_dir, f"needle_{args.num_layers}_{args.d_model}_best.pkl")
-            params_best = jax.tree.map(np.array, jax_utils.unreplicate(ema_params))
+            params_best = jax.tree.map(np.array, jax_utils.unreplicate(state).params)
             with open(best_ckpt_path, "wb") as f:
                 pickle.dump({"params": params_best, "config": config.__dict__}, f)
             del params_best
