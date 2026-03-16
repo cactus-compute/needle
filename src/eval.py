@@ -168,7 +168,7 @@ def compute_wer(hypotheses, references):
     return total_edits / max(total_ref_words, 1)
 
 
-def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN):
+def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, constrained=True):
     """Generate tool-call predictions and compute structured metrics."""
     import json
     from .run import generate_batch, normalize_tools, restore_tool_names
@@ -178,7 +178,7 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
 
     queries = [ex["query"] for ex in ds]
     tools_list = [ex["tools"] for ex in ds]
-    all_preds = generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=max_gen_len, max_enc_len=max_enc_len, normalize=True)
+    all_preds = generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=max_gen_len, max_enc_len=max_enc_len, normalize=True, constrained=constrained)
 
     total = 0
     exact_match = 0
@@ -451,7 +451,7 @@ def main(args):
     tc = None
     if tc_samples > 0:
         print(f"\nevaluating tool-call accuracy ({tc_samples} samples)...")
-        tc = benchmark_tool_calls(model, params, tokenizer, num_samples=tc_samples, max_gen_len=args.max_gen_len, max_enc_len=args.max_enc_len)
+        tc = benchmark_tool_calls(model, params, tokenizer, num_samples=tc_samples, max_gen_len=args.max_gen_len, max_enc_len=args.max_enc_len, constrained=not getattr(args, "no_constrained", False))
 
     print(f"\n  ─────────────────────────────────────")
     print(f"  Tool-Call Metrics")

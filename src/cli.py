@@ -20,7 +20,7 @@ def main():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--d-model", type=int, default=512)
-    p.add_argument("--num-heads", type=int, default=8)
+    p.add_argument("--num-heads", type=int, default=4)
     p.add_argument("--num-kv-heads", type=int, default=4)
     p.add_argument("--num-layers", type=int, default=8)
     p.add_argument("--num-dec-layers", type=int, default=8)
@@ -48,8 +48,8 @@ def main():
                    help="(DEPRECATED — ignored, kept for checkpoint compat)")
     p.add_argument("--mat-factors", type=int, nargs="*", default=[2, 4],
                    help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4)")
-    p.add_argument("--dropout", type=float, default=0.1,
-                   help="Dropout rate for residual connections (default: 0.1)")
+    p.add_argument("--dropout", type=float, default=0.0,
+                   help="Dropout rate for residual connections (default: 0.0)")
     p.add_argument("--curriculum", action="store_true",
                    help="Sort batches easy→hard by tool count each epoch")
     p.add_argument("--contrastive-weight", type=float, default=0.1,
@@ -84,6 +84,8 @@ def main():
     p.add_argument("--audio", type=str, nargs="*", help="Audio file paths for voice-to-tool-call")
     p.add_argument("--max-len", type=int, default=512)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--no-constrained", action="store_true",
+                   help="Disable grammar-constrained decoding for tool names/arg keys")
 
     p = sub.add_parser("eval", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
@@ -95,6 +97,8 @@ def main():
     p.add_argument("--tool-call-samples", type=int, default=200,
                    help="Samples for tool-call accuracy eval (default: 200)")
     p.add_argument("--throughput-runs", type=int, default=10)
+    p.add_argument("--no-constrained", action="store_true",
+                   help="Disable grammar-constrained decoding for tool names/arg keys")
 
     p = sub.add_parser("evaluate", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)

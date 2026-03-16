@@ -104,7 +104,7 @@ def _build_encoder_input(tokenizer, query, tools, max_enc_len=DEFAULT_MAX_ENC_LE
     return q_toks + [tools_sep_id] + t_toks
 
 
-def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, seed=0, stream=True, task_token_id=None, normalize=True):
+def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, seed=0, stream=True, task_token_id=None, normalize=True, constrained=True):
     """Generate tool-call output.
 
     Encoder: [query_tokens..., <tools>, tools_tokens...] truncated to max_enc_len.
@@ -132,6 +132,11 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
 
     generated_tokens = []
 
+    constrained_decoder = None
+    if constrained:
+        from .constrained import build_constrained_decoder
+        constrained_decoder = build_constrained_decoder([tools], tokenizer)
+
     if stream:
         sys.stdout.write(f"\n")
         sys.stdout.flush()
@@ -140,7 +145,16 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
 
     for i in range(0, max_gen_len - 1):
         next_logits = logits[0, i]
-        next_token = int(jnp.argmax(next_logits))
+
+        if constrained_decoder and constrained_decoder.is_active(0):
+            logits_np = np.array(next_logits)
+            logits_np = constrained_decoder.constrain_logits(logits_np, 0)
+            next_token = int(np.argmax(logits_np))
+        else:
+            next_token = int(jnp.argmax(next_logits))
+
+        if constrained_decoder:
+            constrained_decoder.update(0, next_token)
 
         if next_token == eos_id:
             break
@@ -166,7 +180,7 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
     return result
 
 
-def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, normalize=True):
+def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, normalize=True, constrained=True):
     """Batch-generate tool-call outputs for multiple examples at once.
 
     Encoder: [query_tokens..., <tools>, tools_tokens...] per example, truncated to max_enc_len.
@@ -211,13 +225,25 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
     finished = [False] * B
     gen_tokens = [[] for _ in range(B)]
 
+    constrained_decoder = None
+    if constrained:
+        from .constrained import build_constrained_decoder
+        constrained_decoder = build_constrained_decoder(tools_list, tokenizer)
+
     logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
 
     for pos in range(0, max_gen_len - 1):
         for i in range(B):
             if finished[i]:
                 continue
-            next_token = int(jnp.argmax(logits[i, pos]))
+            if constrained_decoder and constrained_decoder.is_active(i):
+                logits_np = np.array(logits[i, pos])
+                logits_np = constrained_decoder.constrain_logits(logits_np, i)
+                next_token = int(np.argmax(logits_np))
+            else:
+                next_token = int(jnp.argmax(logits[i, pos]))
+            if constrained_decoder:
+                constrained_decoder.update(i, next_token)
             if next_token == eos_id:
                 finished[i] = True
                 continue
@@ -254,7 +280,7 @@ def load_audio(path, target_sr=16000):
     return audio, sr
 
 
-def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="[]", max_gen_len=DEFAULT_MAX_GEN_LEN, seed=0, stream=True):
+def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="[]", max_gen_len=DEFAULT_MAX_GEN_LEN, seed=0, stream=True, constrained=True):
     """Generate tool-call output from audio using the speech encoder pathway.
 
     mel -> encode_speech -> decoder [BOS, <tool_call>, tools_tokens...] -> greedy decode.
@@ -285,6 +311,11 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
 
     generated_tokens = []
 
+    constrained_decoder = None
+    if constrained:
+        from .constrained import build_constrained_decoder
+        constrained_decoder = build_constrained_decoder([tools], tokenizer)
+
     if stream:
         sys.stdout.write("\n")
         sys.stdout.flush()
@@ -293,7 +324,16 @@ def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="
 
     for i in range(prefix_len - 1, max_gen_len - 1):
         next_logits = logits[0, i]
-        next_token = int(jnp.argmax(next_logits))
+
+        if constrained_decoder and constrained_decoder.is_active(0):
+            logits_np = np.array(next_logits)
+            logits_np = constrained_decoder.constrain_logits(logits_np, 0)
+            next_token = int(np.argmax(logits_np))
+        else:
+            next_token = int(jnp.argmax(next_logits))
+
+        if constrained_decoder:
+            constrained_decoder.update(0, next_token)
 
         if next_token == eos_id:
             break
@@ -323,6 +363,8 @@ def main(args):
     param_count = sum(x.size for x in jax.tree.leaves(params))
     print(f"Model parameters: {param_count:,}")
 
+    use_constrained = not getattr(args, "no_constrained", False)
+
     audio_files = getattr(args, "audio", None)
     if audio_files:
         tools = getattr(args, "tools", None) or "[]"
@@ -340,6 +382,7 @@ def main(args):
                 max_gen_len=args.max_len,
                 seed=args.seed + i,
                 stream=True,
+                constrained=use_constrained,
             )
         return
 
@@ -367,6 +410,7 @@ def main(args):
             max_gen_len=args.max_len,
             seed=args.seed + i,
             stream=True,
+            constrained=use_constrained,
         )
 
 
