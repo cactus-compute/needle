@@ -1,0 +1,267 @@
+Selective Trie-Constrained Decoding for Tool-Call Generation
+=============================================================
+
+## 1. Problem
+
+The model generates JSON tool calls autoregressively. While it learns
+JSON structure well (99-100% parse rate), it can still hallucinate
+invalid function names or argument keys. The valid tool definitions are
+already in the encoder input — we can constrain the decoder to only
+produce valid names/keys at inference time.
+
+
+## 2. Key Insight: Constrain What's Broken, Not What Works
+
+The remaining errors are semantic, not syntactic:
+
+  Error type                  Constrainable?    Frequency
+  ─────────────────────────   ──────────────    ─────────
+  Wrong/hallucinated name     YES (trie)        Common
+  Hallucinated param key      YES (trie)        Common
+  Wrong argument values       NO (open-ended)   Common
+  Missing arguments           NO                Moderate
+  Malformed JSON              NO (already 99%)  Rare
+
+Full grammar approaches (Outlines, llama.cpp GBNF, guidance) enforce
+valid JSON on every token. This adds 10-30% overhead to solve a problem
+that doesn't exist. Our approach only constrains the ~5% of tokens that
+are inside name/key spans.
+
+
+## 3. Architecture
+
+Three components: a character-level trie, a JSON state machine, and
+a token masking layer.
+
+### 3a. Trie
+
+Given tools: get_weather(location, unit), get_stock(symbol)
+
+Name trie:                          Param trie (get_weather):
+
+     (root)                              (root)
+       |                                /     \
+       g                               l       u
+       |                               |       |
+       e                               o       n
+       |                               |       |
+       t                               c       i
+       |                               |       |
+       _                               a       t*
+      / \                              |
+     w   s                             t
+     |   |                             |
+     e   t                             i
+     |   |                             |
+     a   o                             o
+     |   |                             |
+     t   c                             n*
+     |   |
+     h   k*    (* = terminal node)
+     |
+     e
+     |
+     r*
+
+One name trie shared across all tools. One param trie per function,
+built from its parameter keys.
+
+### 3b. JSON State Machine
+
+Tracks position in output to know when to constrain:
+
+  ┌──────┐  "name":"   ┌─────────┐  closing "  ┌──────┐
+  │ FREE │────────────→│ IN_NAME │────────────→│ FREE │
+  └──────┘             └─────────┘             └──────┘
+      │                                            │
+      │  "arguments":{ then {" or ,"               │
+      │                ┌────────────┐  closing "   │
+      └───────────────→│ IN_ARG_KEY │─────────────→┘
+                       └────────────┘
+
+State transitions driven by suffix matching on generated text.
+Tracks nesting depth to avoid false triggers inside nested values.
+Tracks string values with escape handling to avoid false triggers
+inside string content.
+
+### 3c. Token Masking
+
+At each constrained step:
+
+  1. Look up current trie node (root + constrained_buf prefix)
+  2. Gather valid first chars from trie children (+ closing " if terminal)
+  3. For each candidate token (via TokenIndex first-char lookup):
+     - Walk trie char-by-char through token text
+     - If token contains ", check trie node is terminal at that point
+     - Mark as valid or invalid
+  4. Set invalid token logits to -inf
+  5. Fallback: if ALL tokens masked, revert to unconstrained + log warning
+
+Example (IN_NAME state, after consuming "get_"):
+
+  Trie node at "get_" has children: {w, s}
+  Scan TokenIndex for tokens starting with 'w' or 's':
+    "weather" → walk trie: w→e→a→t→h→e→r, all valid     → ALLOW
+    "we"      → walk trie: w→e, valid prefix              → ALLOW
+    "stock"   → walk trie: s→t→o→c→k, terminal            → ALLOW
+    "sun"     → walk trie: s→u, 'u' not child of 's'      → BLOCK
+
+Multi-char token boundary handling:
+  Token "ther\"" (closing quote mid-token):
+    Walk trie for 't','h','e','r' → valid path
+    Hit '"' → check if node is terminal → yes (weather*) → ALLOW
+  Correctly handles BPE tokens that span the name boundary.
+
+
+## 4. Feedback Effect
+
+The corrected token feeds back into the decoder buffer. All subsequent
+generation conditions on the valid name:
+
+  Without constraint:  ..."name":"get_weathr","arguments":{"locaton":...
+                        ~~~~~~~~~~~~ wrong ~~~~~  ~~~~~~~~ wrong ~~~~
+
+  With constraint:     ..."name":"get_weather","arguments":{"location":...
+                        ~~~~~~~~~~~~ forced ~~~~  ~~~~~~~~~ model sees
+                                                   correct name, generates
+                                                   better arguments
+
+This is why in-place correction beats post-processing — the decoder
+sees correct context when generating arguments.
+
+
+## 5. Comparison with Full Grammar Approaches
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  Full grammar (CFG/PDA)                                 │
+  │                                                         │
+  │  Constrains EVERY token: brackets, colons, commas,      │
+  │  string delimiters, value types, nesting, whitespace.   │
+  │  Guarantees syntactically valid JSON always.             │
+  │                                                         │
+  │  Cost: FSM/PDA transition on every token, large state   │
+  │  space, precomputed token masks per state, high memory.  │
+  │  Typical overhead: 10-30% slowdown on all tokens.       │
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  Selective constraint (trie + state machine)            │
+  │                                                         │
+  │  Only constrains tokens inside "name":"___" and         │
+  │  argument key "___" spans. Everything else              │
+  │  (structure, values, punctuation) is unconstrained.     │
+  │                                                         │
+  │  Cost: lightweight state machine tracks JSON position   │
+  │  via suffix matching. Trie walk + token masking only    │
+  │  activates during name/key spans (~5% of tokens).       │
+  │  Zero overhead on remaining ~95% of tokens.             │
+  └─────────────────────────────────────────────────────────┘
+
+Why full grammar is overkill here:
+  - 99-100% JSON parse rate means structure is already learned
+  - Full grammar pays per-token cost for ~0% parse improvement
+  - Can force the model into corners where the most likely valid
+    continuation is nonsensical (distorts value generation)
+
+Why selective works:
+  - Targets the actual failure mode (hallucinated names/keys)
+  - Near-zero cost (only active on ~5% of tokens)
+  - Never distorts value generation
+  - Corrected tokens improve downstream generation via feedback
+
+
+## 6. Implementation Details
+
+  token_strings / TokenIndex: cached per tokenizer (built once)
+  Device-to-host transfer: only when state machine is active
+    (IN_NAME or IN_ARG_KEY); FREE state stays on jnp.argmax
+  Enabled by default; disable with --no-constrained
+
+
+## 7. Experiment Design
+
+All trie experiments use our val set (5000 samples) — clean controlled
+variable where only the decoding mode changes. Exact reference calls
+give precise name_f1, param_halluc, value_acc. Per-tool-count breakdown
+already implemented. Reproducible with a seed.
+
+### Exp 1: Ablation — Constrained vs Unconstrained [MUST-HAVE]
+
+Same checkpoint, same val set, three conditions:
+  (a) Unconstrained (--no-constrained)
+  (b) Name-only constraint (trie on function names, keys unconstrained)
+  (c) Full selective constraint (trie on names + argument keys)
+
+  | Condition   | name_f1 | call_f1 | exact_match | param_halluc | param_miss | value_acc | json_parse |
+
+Expects: name_f1 improves (a→b), param_halluc drops (b→c), json_parse
+unchanged across all three (confirms structure isn't the problem).
+Needs a "names_only" mode flag in ConstrainedDecoder.
+
+### Exp 2: Latency Overhead [MUST-HAVE]
+
+500 samples, wall-clock time and tok/s, three conditions, 3 runs each.
+
+  | Condition   | tok/s    | Overhead |
+
+Also report: % tokens where constraint was active, avg time in
+apply_constraints per constrained token.
+Expects: near-zero overhead because constraints activate on ~5% of tokens.
+
+### Exp 3: Error Analysis — What Constraints Fix [MUST-HAVE]
+
+Run constrained and unconstrained on same 1000 samples. Categorize:
+  (a) Both correct → constraint irrelevant
+  (b) Unconstrained wrong, constrained correct → constraint helped
+  (c) Both wrong (same error) → constraint irrelevant
+  (d) Both wrong (different error) → constraint changed but didn't fix
+  (e) Unconstrained correct, constrained wrong → constraint hurt (should be ~0)
+
+For category (b), sub-classify:
+  - Misspelled function name (get_weathr → get_weather)
+  - Hallucinated function name (fetch_weather → get_weather)
+  - Hallucinated parameter key (city → location)
+  - Misspelled parameter key (locaton → location)
+
+Present as sankey diagram + table of top-10 fixes with before/after.
+Category (e) should be empty — proves constraints are safe.
+
+### Exp 4: Breakdown by Tool Count [STRONG]
+
+Use existing per_count breakdown (1-10 tools per example).
+Grouped bar chart: name_f1 and param_halluc per bucket, constrained vs not.
+
+Expects: more tools → more names to confuse → bigger constraint benefit.
+Shows constraint value scales with schema complexity.
+
+### Exp 5: Downstream Effect — Name Correction Improves Arguments [STRONG]
+
+Focus on examples where unconstrained gets the name wrong.
+Compare value_acc and args_acc when name is wrong vs corrected.
+
+Expects: corrected name → better arguments (feedback effect).
+Justifies in-place correction over post-processing.
+
+### Exp 6: Benefit Across Training Epochs [STRONG]
+
+Checkpoints at epochs 1, 3, 5, 7, 10. Each evaluated with and without.
+Line plot: call_f1 constrained vs unconstrained across epochs.
+
+Expects: biggest delta mid-training ("almost right" phase), positive
+everywhere. Shows constraints are complementary to training.
+
+### Exp 7: Full Grammar Comparison [NICE-TO-HAVE]
+
+Implement Outlines-style full JSON grammar constraint as baseline.
+Three-way comparison: unconstrained, full grammar, selective trie.
+
+Expects: full grammar has ~same call_f1 but much higher overhead.
+Strongest competitive claim but most implementation work.
+
+### Exp 8: Out-of-Distribution Tool Schemas [NICE-TO-HAVE]
+
+Synthetic tools with names/keys not in training data (20-50 examples).
+Constrained vs unconstrained.
+
+Expects: OOD names have highest hallucination rate → biggest delta.
+Shows value for custom/long-tail APIs. Needs manual data creation.

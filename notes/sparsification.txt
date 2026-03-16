@@ -1,0 +1,521 @@
+Group-Aligned Sparsification for Quantized Edge Deployment
+===========================================================
+
+## 1. Problem
+
+Needle targets tiny edge devices (phones, microcontrollers, wearables)
+where memory, compute, and battery are constrained. Two standard
+compression techniques exist independently:
+
+  (a) Quantization: reduce weight precision (FP16 → INT4), 4x memory savings
+  (b) Pruning: zero out weights, skip multiplications, save compute + energy
+
+The problem: these are typically applied independently, with mismatched
+granularity. Standard unstructured pruning zeros individual weights,
+but quantization operates on groups (32 consecutive weights share one
+scale factor). A group with 31 zeros and 1 nonzero still needs its
+full scale factor, full memory, and full compute — the sparsity is
+invisible to the quantization kernel.
+
+
+## 2. Key Insight: Align Pruning Groups with Quantization Groups
+
+If pruning and quantization use the same group structure, an entire
+pruned group becomes a contiguous block of zeros that hardware can
+skip completely:
+
+  Weight matrix W: (in_features, out_features)
+
+  Group-aligned view (group_size=32):
+  ┌────────────────────────────────────────────┐
+  │ group 0:  [w_0, w_1, ..., w_31]   scale_0  │  ← LIVE (has nonzeros)
+  │ group 1:  [0, 0, ..., 0]          scale_1  │  ← DEAD (all zeros)
+  │ group 2:  [w_64, w_65, ..., w_95] scale_2  │  ← LIVE
+  │ group 3:  [0, 0, ..., 0]          scale_3  │  ← DEAD
+  │ ...                                        │
+  └────────────────────────────────────────────┘
+
+  Unstructured sparsity (misaligned):
+  ┌────────────────────────────────────────────┐
+  │ group 0:  [w_0, 0, w_2, 0, ..., 0, w_31]   │  ← half zeros, but
+  │           scale_0 still needed             │     can't skip group
+  │           all 32 multiplications still run │
+  └────────────────────────────────────────────┘
+
+  Group-aligned sparsity:
+  ┌────────────────────────────────────────────┐
+  │ group 1:  [0, 0, 0, 0, ..., 0, 0]          │  ← entire group zero
+  │           scale_1 can be skipped           │     skip 32 MACs
+  │           skip memory load for 32 weights  │     skip scale load
+  │           skip 32 multiplications          │     zero energy
+  └────────────────────────────────────────────┘
+
+When a full group is zero:
+  - Skip loading 32 INT4 weights from memory (16 bytes saved per group)
+  - Skip loading the group scale factor (2 bytes saved)
+  - Skip 32 multiply-accumulate operations
+  - Skip the dequantization step for that group
+  - On battery-powered devices: fewer memory accesses = less energy
+
+The key: our QAT and pruning both use group_size=32. This is not
+coincidence — they are co-designed to produce hardware-friendly
+compressed models.
+
+
+## 3. Architecture
+
+Three components: group-wise magnitude scoring, cubic gradual schedule,
+and mask application.
+
+### 3a. Group-Wise Magnitude Scoring
+
+For each weight matrix, divide the input dimension into groups of 32:
+
+  W ∈ R^{in × out}  →  W_grouped ∈ R^{num_groups × 32 × out}
+
+  Score each group by the L1 norm of its elements:
+
+  score_g = Σ_{i=0}^{31} Σ_{j=0}^{out-1} |W_grouped[g, i, j]|
+
+  This gives one score per group. Groups with low total magnitude
+  contribute least to the output and are pruned first.
+
+Global threshold: all group scores across ALL weight matrices are
+collected and sorted. The threshold is set at the s-th percentile,
+where s is the target sparsity. This means pruning is globally
+balanced — a layer with many unimportant groups loses more than a
+layer with all important groups.
+
+  all_scores = concat([scores from every weight matrix])
+  threshold = percentile(all_scores, sparsity * 100)
+  mask[g] = 1 if score[g] > threshold else 0
+
+Binary mask: the mask has the same shape as the weight matrix.
+All 32 weights in a pruned group are zeroed together.
+
+  mask_grouped[g, :, :] = broadcast(score[g] > threshold)
+  mask = mask_grouped.reshape(in_features, out_features)
+
+### 3b. Handling nn.scan Parameters
+
+nn.scan stacks layer parameters as 3D tensors: (num_layers, in, out).
+Each layer is pruned independently — different layers can have different
+sparsity patterns, but the global threshold is shared.
+
+  For W ∈ R^{num_layers × in × out}:
+    for each layer l:
+      W[l] → group → score → collect into global pool
+    global threshold from all scores across all layers and all matrices
+    for each layer l:
+      W[l] → group → mask using global threshold
+
+This ensures pruning pressure is distributed based on actual weight
+magnitude, not layer position.
+
+
+### 3c. Cubic Gradual Schedule
+
+One-shot pruning (remove 50% of groups instantly) causes irrecoverable
+accuracy loss. Instead, gradually increase sparsity following a cubic
+schedule (Zhu & Gupta 2017):
+
+  s(t) = s_final × (1 - (1 - (t - t_start) / (t_end - t_start))³)
+
+  ┌─────────────────────────────────────────────────┐
+  │  sparsity                                        │
+  │  ▲               s_final ─── ─── ─── ─── ─── ──│
+  │  │                         ╱                     │
+  │  │                       ╱                       │
+  │  │                     ╱  ← fast ramp            │
+  │  │                   ╱                           │
+  │  │                 ╱                             │
+  │  │              _╱  ← slow start                 │
+  │  │           __╱                                 │
+  │  │       ___╱                                    │
+  │  │  ────╱                                        │
+  │  0%─────┬──────────────────┬─────────────→ step  │
+  │       t_start (33%)      t_end (67%)             │
+  └─────────────────────────────────────────────────┘
+
+  Default schedule within pruning epoch:
+    t_start = 33% of epoch steps (first third: no pruning)
+    t_end   = 67% of epoch steps (middle third: gradual pruning)
+    remaining third: mask locked, fine-tune surviving weights
+
+  Mask recomputation: every prune_interval=100 steps during the
+  ramp, recompute the mask at the current sparsity level. Between
+  recomputations, the mask is frozen — weights can recover.
+
+Why cubic (not linear):
+  - Slow start: remove only the most obviously unimportant groups first.
+    The model barely notices.
+  - Fast middle: bulk of pruning happens here, while the model has
+    already adapted to losing some groups.
+  - Slow end: final fine-grained pruning. The remaining groups are
+    closer in importance — take care removing the last few.
+
+After pruning epoch completes:
+  - Mask is permanently locked
+  - All subsequent training respects the mask (w = w * mask after each step)
+  - The model fine-tunes only the surviving weights
+
+
+### 3d. Mask Application in Training Loop
+
+The mask is applied after each gradient update, not during:
+
+  # In _train_step:
+  state = state.apply_gradients(grads=grads)    # update ALL weights
+  new_params = cond(
+      do_prune,
+      lambda: tree_map(lambda w, m: w * m, state.params, prune_mask),
+      lambda: state.params,
+  )
+  state = state.replace(params=new_params)
+
+This is "mask-after-update" (not "mask-before-gradient"). Both are
+used in practice, but mask-after-update has an advantage: the optimizer
+state (momentum, variance estimates) remains valid for pruned weights.
+If we ever want to "un-prune" during the gradual schedule (a group
+recovers importance), the optimizer can immediately use its momentum —
+no cold start.
+
+In practice, during the cubic ramp, groups can be un-pruned: a group
+zeroed at 20% sparsity might survive at 25% sparsity if the global
+threshold shifts. This is a natural consequence of global thresholding
+with recomputation.
+
+
+## 4. Co-Design with INT4 Quantization
+
+### 4a. Shared Group Size
+
+Both QAT and pruning use group_size=32. This is the critical co-design:
+
+  Quantization groups:
+    W_grouped = W.reshape(num_groups, 32, out_features)
+    scale[g] = max(|W_grouped[g]|) / 7   (one scale per group)
+    W_q[g] = clip(round(W_grouped[g] / scale[g]), -8, 7)
+
+  Pruning groups:
+    W_grouped = W.reshape(num_groups, 32, out_features)
+    score[g] = sum(|W_grouped[g]|)
+    mask[g] = score[g] > threshold
+
+  Same reshape. Same groups. The pruned groups are exactly the groups
+  the quantization kernel operates on.
+
+### 4b. Hardware Execution Model
+
+On edge INT4 kernels (ARM NEON, Apple AMX, RISC-V V):
+
+  For each output element y[j]:
+    for each group g in [0, num_groups):
+      if mask[g] == 0:          ← group is pruned
+        continue                 ← skip entirely: no load, no compute
+      load scale[g]             ← 2 bytes
+      load W_q[g, :, j]        ← 16 bytes (32 × 4-bit)
+      dequant = W_q * scale     ← 32 multiplies
+      y[j] += dot(dequant, x[g*32:(g+1)*32])   ← 32 MACs
+    end
+
+  With 50% group sparsity:
+    - 50% fewer memory loads (weights + scales)
+    - 50% fewer multiply-accumulate operations
+    - ~50% less energy (memory access dominates energy on edge)
+    - Model size: 50% fewer groups × (16 bytes weights + 2 bytes scale)
+      = 50% size reduction ON TOP of 4x from INT4
+
+  Combined compression:
+    FP16 baseline:       100% (2 bytes per weight)
+    INT4 only:            25% (0.5 bytes per weight + scale overhead)
+    INT4 + 50% sparse:  ~13% (half the INT4 groups)
+
+    For a 50M parameter model:
+      FP16:              100 MB
+      INT4:               25 MB  (+ ~2 MB scales)
+      INT4 + 50% sparse: ~14 MB
+
+
+### 4c. Why Group Size 32
+
+  - ARM NEON: 128-bit SIMD → 32 INT4 values per register
+  - Apple AMX: operates on blocks that are multiples of 32
+  - CUDA: warp size 32, INT4 tensor cores operate on 32-element groups
+  - RISC-V V: typical VLEN=128+ → 32+ INT4 elements per vector register
+
+Group size 32 means each pruned group corresponds to exactly one
+hardware vector operation that can be skipped. Smaller groups (16)
+waste half the register; larger groups (64) are too coarse for
+fine-grained pruning. 32 is the hardware-natural sweet spot.
+
+
+## 5. Comparison with Other Pruning Approaches
+
+### vs. Unstructured Pruning (SparseGPT, Wanda)
+
+  Unstructured: zeros individual weights anywhere in the matrix.
+  50% unstructured sparsity → every group still has ~half its weights.
+  No group can be skipped. Requires sparse matmul kernels (CSR/CSC),
+  which have poor hardware utilization on edge devices.
+
+  Group-aligned: zeros entire groups. 50% sparsity → 50% of groups
+  are completely empty. Dense matmul kernels skip entire groups.
+  No sparse format overhead. No index storage.
+
+  Accuracy comparison:
+    Unstructured can achieve slightly better accuracy at the same
+    sparsity level (finer granularity → more choices). But the
+    speedup is often zero on real hardware without sparse kernel support.
+
+  Our trade: slightly coarser pruning for guaranteed hardware speedup.
+
+### vs. N:M Structured Sparsity (2:4 on NVIDIA Ampere+)
+
+  N:M sparsity: exactly N zeros in every M consecutive elements.
+  2:4 sparsity on Ampere/Hopper: hardware-native 2x speedup.
+
+  Limitations:
+    - Only available on NVIDIA Ampere+ GPUs (not edge devices)
+    - Fixed 50% sparsity (can't do 30% or 70%)
+    - Fixed pattern (2:4) — no flexibility
+    - Not compatible with INT4 group quantization grouping
+
+  Our approach: works on any hardware with vector instructions.
+  Variable sparsity (0-90%). Compatible with INT4 group quantization.
+  No special hardware required.
+
+### vs. Channel/Filter Pruning
+
+  Channel pruning: removes entire rows/columns of weight matrices.
+  Maximally structured (every output using that channel is affected).
+
+  Limitation: too coarse. Removing an entire channel of d_model=512
+  is a huge capacity hit. For small models, even removing one channel
+  is noticeable.
+
+  Our group pruning: operates at the granularity of 32 input features
+  per output. Much finer than channel pruning. A matrix can lose
+  some groups in one region while keeping others — the pruning
+  pattern adapts to the weight distribution.
+
+
+## 6. Experiment Design
+
+### Exp 1: Group-Aligned vs Unstructured Sparsity [MUST-HAVE]
+
+Setup:
+  - Same model, same training, three pruning modes:
+      (a) Group-aligned (group_size=32, our approach)
+      (b) Unstructured (individual weight magnitude pruning)
+      (c) No pruning (baseline)
+  - Sparsity levels: 0%, 25%, 50%, 70%, 90%
+  - All with QAT (INT4, group_size=32)
+
+Metrics:
+  | Sparsity | Mode          | val_ppl | call_f1 | quant_ppl | actual_speedup |
+  |----------|---------------|---------|---------|-----------|----------------|
+  | 0%       | baseline      |         |         |           | 1.0x           |
+  | 25%      | unstructured  |         |         |           |                |
+  | 25%      | group-aligned |         |         |           |                |
+  | 50%      | unstructured  |         |         |           |                |
+  | 50%      | group-aligned |         |         |           |                |
+  | 70%      | unstructured  |         |         |           |                |
+  | 70%      | group-aligned |         |         |           |                |
+  | 90%      | unstructured  |         |         |           |                |
+  | 90%      | group-aligned |         |         |           |                |
+
+  actual_speedup: measured on target edge device (ARM CPU with NEON)
+
+Hypothesis:
+  - Unstructured has slightly better accuracy at same sparsity (~1-2%)
+  - Group-aligned has MUCH better actual speedup (near-linear with sparsity)
+  - Unstructured has ~1x speedup (no hardware skip support on edge)
+  - Group-aligned at 50% matches unstructured at 50% accuracy but with
+    real 1.8-2x speedup
+  - The quant_ppl gap between aligned/unstructured is small because QAT
+    adapts to both patterns
+
+What this shows:
+  - Group alignment is essential for actual deployment speedup
+  - The small accuracy cost is worth the massive efficiency gain
+  - Unstructured sparsity is a "paper metric" — looks good, no real speedup
+
+
+### Exp 2: Gradual vs One-Shot Pruning [MUST-HAVE]
+
+Setup:
+  - Same target sparsity (50%), three schedules:
+      (a) Gradual cubic (our approach: 0% → 50% over 33%-67% of epoch)
+      (b) One-shot at epoch start (prune to 50% immediately, then train)
+      (c) One-shot at epoch end (train, then prune to 50%)
+  - Same total training budget
+
+Metrics:
+  | Schedule        | val_ppl | call_f1 | name_f1 | value_acc |
+
+  Also: val_ppl convergence curve (how quickly accuracy recovers)
+
+Hypothesis:
+  - Gradual cubic is best (model adapts smoothly)
+  - One-shot at start: worst (massive capacity loss before adaptation)
+  - One-shot at end: middle (full training, then sudden pruning)
+  - Gradual reaches same final quality 30-50% faster than one-shot-start
+
+What this shows:
+  - Gradual pruning is necessary for small models
+  - The cubic schedule is justified (smooth ramp > abrupt cut)
+
+
+### Exp 3: Group Size Sweep [MUST-HAVE]
+
+Setup:
+  - Group sizes: 8, 16, 32, 64, 128
+  - QAT group size always matches pruning group size
+  - 50% target sparsity
+
+Metrics:
+  | group_size | val_ppl | call_f1 | quant_ppl | model_size(MB) | tok/s(edge) |
+  |------------|---------|---------|-----------|----------------|-------------|
+  |          8 |         |         |           |                |             |
+  |         16 |         |         |           |                |             |
+  |         32 |         |         |           |                |             |
+  |         64 |         |         |           |                |             |
+  |        128 |         |         |           |                |             |
+
+Hypothesis:
+  - group_size=8: best accuracy (finest granularity), worst speedup
+    (groups don't fill hardware vectors)
+  - group_size=32: sweet spot (matches hardware vector width)
+  - group_size=128: worst accuracy (too coarse), but fastest per-group
+    skip (fewer groups to iterate)
+  - Quantization overhead (scale storage) is lowest at group_size=128
+    but accuracy suffers
+
+What this shows:
+  - group_size=32 is the right choice (hardware-natural + good accuracy)
+  - Justifies the co-design: QAT and pruning both at 32
+
+
+### Exp 4: Combined Compression Frontier [STRONG]
+
+Setup:
+  - Sweep the sparsity-quantization space:
+      FP16 + {0%, 25%, 50%, 70%} sparsity
+      INT8 + {0%, 25%, 50%, 70%} sparsity
+      INT4 + {0%, 25%, 50%, 70%} sparsity
+  - All with QAT (matched to quantization level)
+  - Report model size, inference speed, and accuracy
+
+Metrics:
+  Plot: model_size(MB) vs call_f1 (Pareto frontier)
+  Plot: tok/s(edge) vs call_f1 (Pareto frontier)
+
+  Annotate each point with (quant_level, sparsity%)
+
+Hypothesis:
+  - INT4 + 50% sparse dominates the Pareto frontier for edge
+  - FP16 + 0% is best accuracy but impractical (too large/slow)
+  - INT4 + 0% is a strong baseline but leaving performance on table
+  - INT4 + 70% pushes into extreme compression with acceptable loss
+
+What this shows:
+  - Quantization and sparsification are complementary (multiplicative compression)
+  - The co-designed approach (shared group_size) maximizes both
+  - Practical deployment recipe: INT4 + 50% sparse ≈ 8x compression
+    with <5% accuracy loss
+
+
+### Exp 5: Energy Measurement on Edge Device [STRONG]
+
+Setup:
+  - Deploy on target edge device (e.g. Raspberry Pi 5, Pixel phone)
+  - Measure per-inference energy (joules) using hardware power monitor
+  - Compare: FP16 baseline, INT4-only, INT4+50% group-sparse
+
+Metrics:
+  | Condition         | Energy(mJ) | Latency(ms) | call_f1 | Model size |
+  |-------------------|------------|-------------|---------|------------|
+  | FP16 baseline     |            |             |         |            |
+  | INT4              |            |             |         |            |
+  | INT4 + 50% sparse |            |             |         |            |
+
+  Also: energy breakdown by component (memory load, compute, other)
+
+Hypothesis:
+  - Memory loads dominate energy on edge (>60% of total)
+  - INT4 + 50% sparse reduces memory energy by ~87% (4x quant × 2x sparse)
+  - Compute energy scales linearly with sparsity (skip zero groups)
+  - Total energy reduction: 5-8x vs FP16 baseline
+
+What this shows:
+  - Group-aligned sparsity directly maps to energy savings
+  - This is the deployment story: same model, 5-8x less energy per inference
+  - Battery life argument for edge devices
+
+
+### Exp 6: Pruning Schedule Ablation [STRONG]
+
+Setup:
+  - Vary pruning schedule parameters:
+      start_frac: {0.1, 0.2, 0.33, 0.5}
+      end_frac:   {0.5, 0.67, 0.8, 0.9}
+      interval:   {10, 50, 100, 500}
+  - 50% target sparsity
+
+Metrics:
+  - Final call_f1 for each combination
+  - Training efficiency: steps to reach 90% of final accuracy
+
+Hypothesis:
+  - start_frac=0.33, end_frac=0.67 (middle third) is near-optimal
+  - Too early start (0.1): model hasn't learned enough to identify
+    unimportant groups
+  - Too late end (0.9): not enough fine-tuning time after pruning
+  - Interval=100 is sufficient (mask doesn't need per-step updates)
+
+What this shows:
+  - The default schedule is well-chosen
+  - Pruning during the "middle" of training is optimal (model has
+    learned structure but still has time to adapt)
+
+
+### Exp 7: Sparsity Pattern Visualization [NICE-TO-HAVE]
+
+Setup:
+  - Visualize the pruning mask at 50% sparsity
+  - Heat maps: which groups survive in each layer
+  - Compare encoder vs decoder patterns
+
+Presentation:
+  - Matrix visualization: rows = input groups, columns = output features
+  - Color: white = pruned, black = kept
+  - One plot per layer type (encoder self-attn, decoder cross-attn, FFN)
+
+Hypothesis:
+  - FFN layers are more prunable than attention projections
+  - Encoder FFN: earlier layers keep more groups (basic features)
+  - Decoder cross-attention: keeps groups aligned with tool-relevant
+    encoder positions
+  - Symmetric pattern in attention Q/K but asymmetric in V/O
+
+What this shows:
+  - The model learns which groups matter
+  - Visual evidence that global thresholding distributes sparsity
+    intelligently across layers
+
+
+### Priority
+
+Must-have (core claims):
+  1. Group-aligned vs unstructured (Exp 1) — proves hardware speedup
+  2. Gradual vs one-shot (Exp 2) — proves schedule necessity
+  3. Group size sweep (Exp 3) — proves group_size=32 choice
+
+Strong additions:
+  4. Combined compression frontier (Exp 4) — deployment Pareto
+  5. Energy measurement (Exp 5) — real-world edge impact
+  6. Schedule ablation (Exp 6) — hyperparameter justification
+
+Nice-to-have:
+  7. Sparsity pattern visualization (Exp 7) — interpretability
