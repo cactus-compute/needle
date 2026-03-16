@@ -132,12 +132,12 @@ def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_
     rng, init_rng = jax.random.split(rng)
     dummy_src = jnp.ones((1, 128), dtype=jnp.int32)
     dummy_tgt = jnp.ones((1, 128), dtype=jnp.int32)
-    dummy_mel = jnp.ones((1, 128, config.n_mels), dtype=jnp.float32)
+    init_args = [dummy_src, dummy_tgt]
+    if config.enable_speech:
+        init_args.append(jnp.ones((1, 128, config.n_mels), dtype=jnp.float32))
     variables = model.init(
         {"params": init_rng},
-        dummy_src,
-        dummy_tgt,
-        dummy_mel,
+        *init_args,
         method="init_all",
     )
 
@@ -438,10 +438,12 @@ def _estimate_mat_params(config, matryoshka_factor):
     if config.conv_kernel_size > 0:
         K = config.conv_kernel_size
         conv = d * 2 * d + d * K + d + d * d 
-    C = 256
-    n_mels = getattr(config, "n_mels", 80)
-    freq_out = n_mels // 8
-    speech_sub = (1 * C * 9) + (C * 9 + C * C) + (C * 9 + C * C) + (C * freq_out * d)
+    speech_sub = 0
+    if getattr(config, "enable_speech", True):
+        C = 256
+        n_mels = getattr(config, "n_mels", 80)
+        freq_out = n_mels // 8
+        speech_sub = (1 * C * 9) + (C * 9 + C * C) + (C * 9 + C * C) + (C * freq_out * d)
     enc_block = attn + conv + ffn
     dec_block = attn * 2 + ffn
     total = emb + speech_sub + n_enc * enc_block + n_dec * dec_block
@@ -482,6 +484,8 @@ def train(args):
     val_loss_mask = val_data["loss_mask"]
     print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val tool-call pairs (memory-mapped)")
 
+    val_ds = load_tool_calls("val", max_samples=args.max_samples)
+
     cl_query_tokens = train_data.get("query_only")
     cl_tool_tokens = train_data.get("tool_individual")
     cl_tool_ex_idx = train_data.get("tool_ex_idx")
@@ -514,6 +518,7 @@ def train(args):
             num_memory_slots=getattr(args, "num_memory_slots", 64),
             contrastive_dim=getattr(args, "contrastive_dim", 128),
             conv_kernel_size=getattr(args, "conv_kernel_size", 0),
+            enable_speech=getattr(args, "enable_speech", False),
         )
 
     global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF, _CONTRASTIVE_WEIGHT
@@ -703,7 +708,9 @@ def train(args):
                 _eval_params = jax_utils.unreplicate(state).params
                 val_causal = make_causal_mask(args.max_dec_len)
                 total_loss, total_toks = 0.0, 0.0
-                for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False, loss_mask=val_loss_mask):
+                _val_n = count_batches(len(val_enc), args.batch_size)
+                for vb in tqdm(get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False, loss_mask=val_loss_mask),
+                               total=_val_n, desc="  val loss", leave=False):
                     vl, vt = val_loss_fn(_eval_params, vb[0], vb[1], vb[2], val_causal, vb[3])
                     total_loss += float(vl)
                     total_toks += float(vt)
@@ -777,8 +784,11 @@ def train(args):
         q_loss, q_toks = 0.0, 0.0
         mat_accum = {f: [0.0, 0.0] for f in _MAT_FACTORS}
 
-        for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size,
-                              shuffle=False, loss_mask=val_loss_mask):
+        _val_n = count_batches(len(val_enc), args.batch_size)
+        _val_bar = tqdm(get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size,
+                              shuffle=False, loss_mask=val_loss_mask),
+                        total=_val_n, desc="  eval val loss", leave=False)
+        for vb in _val_bar:
             src, dec_in, dec_tgt, lm = vb[0], vb[1], vb[2], vb[3]
             vl, vt = val_loss_fn(eval_params, src, dec_in, dec_tgt, val_causal, lm)
             full_loss += float(vl); full_toks += float(vt)
@@ -810,14 +820,10 @@ def train(args):
             pickle.dump({"params": params_np, "config": config.__dict__}, f)
         del params_np
 
-        from .eval import measure_throughput
         from .run import generate_batch
-        tp = measure_throughput(eval_model, eval_params, tokenizer, num_runs=5)
 
         val_kept = val_data["kept_indices"]
-        val_ds = load_tool_calls("val", max_samples=args.max_samples)
 
-        # Pick 5 display samples (shuffled for diversity): 4 with tool calls, 1 without
         sample_rng = np.random.RandomState(epoch + 7)
         sample_pool = sample_rng.permutation(len(val_kept))
         display_with, display_without = [], []
@@ -833,23 +839,32 @@ def train(args):
                 display_without.append(ex)
         display_pairs = display_with + display_without
 
-        # Collect eval examples (random sample, up to 500)
         import json as _json_mod
         tc_eval_n = 500
         tc_rng = np.random.RandomState(epoch + 42)
         tc_pool = tc_rng.permutation(len(val_kept))[:tc_eval_n]
         tc_eval_pairs = [val_ds[int(val_kept[k])] for k in tc_pool]
 
-        # Batch-generate: display samples + tc eval samples in one pass
+        # Batch-generate: display samples + tc eval samples in chunks
         all_eval_examples = display_pairs + tc_eval_pairs
         eval_gen_len = min(args.max_dec_len, 512)
-        all_preds = generate_batch(
-            eval_model, eval_params, tokenizer,
-            [ex["query"] for ex in all_eval_examples],
-            [ex["tools"] for ex in all_eval_examples],
-            max_gen_len=eval_gen_len,
-            max_enc_len=args.max_enc_len,
-        )
+        _EVAL_BATCH = 32
+        _n_chunks = (len(all_eval_examples) + _EVAL_BATCH - 1) // _EVAL_BATCH
+        all_preds = []
+        _gen_t0 = time.perf_counter()
+        for _ei in tqdm(range(0, len(all_eval_examples), _EVAL_BATCH),
+                        total=_n_chunks, desc="  eval generate", leave=False):
+            _chunk = all_eval_examples[_ei:_ei + _EVAL_BATCH]
+            all_preds.extend(generate_batch(
+                eval_model, eval_params, tokenizer,
+                [ex["query"] for ex in _chunk],
+                [ex["tools"] for ex in _chunk],
+                max_gen_len=eval_gen_len,
+                max_enc_len=args.max_enc_len,
+            ))
+        _gen_elapsed = time.perf_counter() - _gen_t0
+        _gen_total_toks = sum(len(tokenizer.encode(p)) for p in all_preds)
+        _gen_tok_per_sec = _gen_total_toks / max(_gen_elapsed, 1e-6)
 
         display_preds = all_preds[:len(display_pairs)]
         tc_preds = all_preds[len(display_pairs):]
@@ -982,10 +997,8 @@ def train(args):
         if tc_metrics and tc_metrics["call_f1"] > best_call_f1:
             best_call_f1 = tc_metrics["call_f1"]
             best_ckpt_path = os.path.join(args.checkpoint_dir, f"needle_{args.num_layers}_{args.d_model}_best.pkl")
-            params_best = jax.tree.map(np.array, jax_utils.unreplicate(state).params)
-            with open(best_ckpt_path, "wb") as f:
-                pickle.dump({"params": params_best, "config": config.__dict__}, f)
-            del params_best
+            import shutil as _shutil
+            _shutil.copy2(ckpt_path, best_ckpt_path)
             print(f"  ** New best call_f1={best_call_f1:.1%} → {best_ckpt_path}")
             _upload_checkpoint(best_ckpt_path)
 
@@ -1049,8 +1062,7 @@ def train(args):
                 print(f"  Recall@{k:<3}     {v:>10.1%}")
             print(f"  MRR            {rm['mrr']:>10.3f}")
         print(f"  ─────────────────────────────────────")
-        print(f"  Throughput     {tp['tokens_per_second']:>10.1f} tok/s")
-        print(f"  Latency        {tp['avg_latency_s']:>11.3f}s")
+        print(f"  Throughput     {_gen_tok_per_sec:>10.1f} tok/s  ({len(all_eval_examples)} samples, {_gen_elapsed:.1f}s)")
         if unified_samples:
             print(f"  ─── Samples ({len(unified_samples)}) ───────────────────")
             for j, s in enumerate(unified_samples):

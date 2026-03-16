@@ -49,6 +49,7 @@ class TransformerConfig:
     dropout_rate: float = 0.1
     contrastive_dim: int = 128
     conv_kernel_size: int = 0
+    enable_speech: bool = False
 
     @property
     def jax_dtype(self):
@@ -429,9 +430,10 @@ class EncoderDecoderTransformer(nn.Module):
     def setup(self):
         self.embedding = nn.Embed(self.config.vocab_size, self.config.d_model, embedding_init=jinit.normal(stddev=0.02))
         self.embed_scale = math.sqrt(self.config.d_model)
-        self.spec_augment = SpecAugment()
-        self.speech_subsample = SpeechSubsampling(
-            self.config.d_model, dtype=self.config.jax_dtype, name="speech_subsample")
+        if self.config.enable_speech:
+            self.spec_augment = SpecAugment()
+            self.speech_subsample = SpeechSubsampling(
+                self.config.d_model, dtype=self.config.jax_dtype, name="speech_subsample")
         self.encoder = Encoder(self.config)
         self.decoder = Decoder(self.config)
         self.contrastive_proj = nn.Dense(
@@ -454,6 +456,7 @@ class EncoderDecoderTransformer(nn.Module):
         return self.encode_text(src, src_mask=src_mask)
 
     def encode_speech(self, mel, src_mask=None, ffn_mask=None, deterministic=True):
+        assert self.config.enable_speech, "Speech is disabled in config"
         mel = self.spec_augment(mel, deterministic=deterministic)
         # FastConformer-style 8x subsampling: (B, T, 80) -> (B, T//8, d_model)
         x = self.speech_subsample(mel) * self.embed_scale
@@ -574,15 +577,16 @@ class EncoderDecoderTransformer(nn.Module):
 
         return logits, 0.0, mat_logits
 
-    def init_all(self, src, tgt, mel):
-        """Dummy forward through both text and speech pathways to initialize all params."""
+    def init_all(self, src, tgt, mel=None):
+        """Dummy forward through text (and optionally speech) pathways to initialize all params."""
         src_mask = make_padding_mask(src, self.config.pad_token_id)
         tgt_mask = make_causal_mask(tgt.shape[1]) & make_padding_mask(tgt, self.config.pad_token_id)
         text_out, text_enc_mask = self.encode_text(src, src_mask=src_mask)
-        mel_mask = make_mel_padding_mask(mel)
-        speech_out, speech_enc_mask = self.encode_speech(mel, src_mask=mel_mask, deterministic=True)
         _ = self._run_decoder(text_out, tgt, tgt_mask=tgt_mask, cross_mask=text_enc_mask)
-        _ = self._run_decoder(speech_out, tgt, tgt_mask=tgt_mask, cross_mask=speech_enc_mask)
+        if self.config.enable_speech and mel is not None:
+            mel_mask = make_mel_padding_mask(mel)
+            speech_out, speech_enc_mask = self.encode_speech(mel, src_mask=mel_mask, deterministic=True)
+            _ = self._run_decoder(speech_out, tgt, tgt_mask=tgt_mask, cross_mask=speech_enc_mask)
         _ = self.encode_contrastive(src)
         return jnp.zeros(())
 
