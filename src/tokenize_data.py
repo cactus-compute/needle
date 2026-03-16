@@ -124,4 +124,8 @@ def tokenize(args):
 
     _push_to_hf(CACHE_DIR, TOKENIZER_DIR)
 
+    if os.path.exists(LOCAL_UNIFIED_DIR):
+        print(f"\n=== Removing raw dataset ({LOCAL_UNIFIED_DIR}) ===")
+        shutil.rmtree(LOCAL_UNIFIED_DIR)
+
     print("\n=== Tokenization pipeline complete ===")
