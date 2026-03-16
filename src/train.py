@@ -809,7 +809,7 @@ def train(args):
             mat_results[f] = (float(math.exp(min(avg, 20))),
                               _estimate_mat_params(config, f), config.d_ff // f)
 
-        params_np = jax.tree.map(np.array, eval_params)
+        params_np = jax.tree.map(lambda x: np.array(x).astype(np.float16), eval_params)
         total_params = sum(x.size for x in jax.tree.leaves(params_np))
         near_zero = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(params_np))
         sparsity = near_zero / total_params * 100
@@ -871,9 +871,10 @@ def train(args):
 
         unified_samples = []
         for ex, pred in zip(display_pairs, display_preds):
-            ref = ex["answers"].strip()
-            if ref == "":
-                ref = "[]"
+            try:
+                ref = _json_mod.dumps(_json_mod.loads(ex["answers"]), separators=(",", ":"))
+            except (ValueError, TypeError):
+                ref = ex["answers"].strip() or "[]"
             unified_samples.append({
                 "query": ex["query"],
                 "tools": ex["tools"],

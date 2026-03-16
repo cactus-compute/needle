@@ -85,7 +85,7 @@ def _get_decode_fn(model, max_gen_len):
 def load_checkpoint(path):
     with open(path, "rb") as f:
         data = pickle.load(f)
-    params = jax.tree.map(jnp.array, data["params"])
+    params = jax.tree.map(lambda x: jnp.array(x, dtype=jnp.bfloat16), data["params"])
     config = TransformerConfig(**data["config"])
     return params, config
 
