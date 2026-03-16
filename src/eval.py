@@ -356,6 +356,8 @@ def benchmark_retrieval(model, params, tokenizer, num_samples=500, max_len=256, 
 
     if ds is None:
         ds = load_tool_calls("validation", max_samples=num_samples)
+    elif num_samples and len(ds) > num_samples:
+        ds = ds.select(range(num_samples))
 
     queries = []
     all_tool_strs = []
