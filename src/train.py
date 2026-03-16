@@ -1008,6 +1008,7 @@ def train(args):
             retrieval_metrics = benchmark_retrieval(
                 eval_model, eval_params, tokenizer,
                 num_samples=min(500, getattr(args, "max_eval_samples", 500)),
+                ds=val_ds,
             )
 
         del eval_params

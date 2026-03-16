@@ -345,7 +345,7 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
     }
 
 
-def benchmark_retrieval(model, params, tokenizer, num_samples=500, max_len=256, ks=(1, 3, 5, 10)):
+def benchmark_retrieval(model, params, tokenizer, num_samples=500, max_len=256, ks=(1, 3, 5, 10), ds=None):
     """Benchmark contrastive retrieval: Recall@k and MRR over validation set.
 
     For each query, ranks all tools from that example by cosine similarity
@@ -354,7 +354,8 @@ def benchmark_retrieval(model, params, tokenizer, num_samples=500, max_len=256, 
     import json
     from .run import encode_for_retrieval
 
-    ds = load_tool_calls("validation", max_samples=num_samples)
+    if ds is None:
+        ds = load_tool_calls("validation", max_samples=num_samples)
 
     queries = []
     all_tool_strs = []
