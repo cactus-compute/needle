@@ -871,31 +871,89 @@ def train(args):
         display_pairs = display_with + display_without
 
         import json as _json_mod
-        tc_eval_n = 500
-        tc_per_bucket = tc_eval_n // 11  # 0..10 tools
+        _STRUCTURED_TYPES = {"integer", "number", "boolean", "float", "int", "bool"}
+        tc_per_bucket = 30
         tc_rng = np.random.RandomState(epoch + 42)
 
-        # Group val indices by tool count for balanced sampling
-        _tc_buckets = {t: [] for t in range(11)}
+        def _classify_sample(ex):
+            """Classify a sample as (arg_type, call_type) for stratified eval.
+
+            arg_type: 'structured', 'semantic', or 'empty'
+            call_type: 'single', 'multi', or 'empty'
+            """
+            try:
+                tools = _json_mod.loads(ex["tools"])
+                answers = _json_mod.loads(ex["answers"])
+            except (ValueError, TypeError):
+                return "empty", "empty"
+            if not answers or not isinstance(answers, list):
+                return "empty", "empty"
+
+            call_type = "single" if len(answers) == 1 else "multi"
+
+            type_map = {}
+            for t in tools:
+                if not isinstance(t, dict) or "name" not in t:
+                    continue
+                for k, v in (t.get("parameters") or {}).items():
+                    ptype = v.get("type", "string") if isinstance(v, dict) else "string"
+                    if not isinstance(ptype, str):
+                        ptype = "string"
+                    type_map[(t["name"], k)] = ptype
+
+            n_struct, n_sem = 0, 0
+            for call in answers:
+                if not isinstance(call, dict):
+                    continue
+                cname = call.get("name")
+                if not isinstance(cname, str):
+                    continue
+                for k in (call.get("arguments") or {}).keys():
+                    if type_map.get((cname, k), "string") in _STRUCTURED_TYPES:
+                        n_struct += 1
+                    else:
+                        n_sem += 1
+            if n_struct + n_sem == 0:
+                return "empty", call_type
+            arg_type = "struct" if n_struct >= n_sem else "semantic"
+            return arg_type, call_type
+
+        # 4 pools: (structured|semantic) × (single|multi), each balanced by tool count
+        _pool_names = ["struct_single", "struct_multi", "semantic_single", "semantic_multi"]
+        _pool_buckets = {name: {t: [] for t in range(11)} for name in _pool_names}
+
         for k in range(len(val_kept)):
             ex = val_ds[int(val_kept[k])]
             try:
-                nc = len(_json_mod.loads(ex["tools"]))
+                nc = min(len(_json_mod.loads(ex["tools"])), 10)
             except (ValueError, TypeError):
                 nc = 0
-            _tc_buckets[min(nc, 10)].append(k)
+            arg_type, call_type = _classify_sample(ex)
+            if arg_type == "empty":
+                continue
+            pool_key = f"{arg_type}_{call_type}"
+            if pool_key in _pool_buckets:
+                _pool_buckets[pool_key][nc].append(k)
 
-        tc_pool = []
-        for t in range(11):
-            bucket = np.array(_tc_buckets[t])
-            if len(bucket) > 0:
-                tc_rng.shuffle(bucket)
-                tc_pool.extend(bucket[:tc_per_bucket].tolist())
-        tc_rng.shuffle(tc_pool)
-        tc_eval_pairs = [val_ds[int(val_kept[k])] for k in tc_pool]
+        def _balanced_sample(buckets, per_bucket, rng):
+            pool = []
+            for t in range(11):
+                b = np.array(buckets[t])
+                if len(b) > 0:
+                    rng.shuffle(b)
+                    pool.extend(b[:per_bucket].tolist())
+            rng.shuffle(pool)
+            return [val_ds[int(val_kept[k])] for k in pool]
 
-        # Batch-generate: display samples + tc eval samples in chunks
-        all_eval_examples = display_pairs + tc_eval_pairs
+        eval_pools = {}
+        for name in _pool_names:
+            eval_pools[name] = _balanced_sample(_pool_buckets[name], tc_per_bucket, tc_rng)
+
+        all_eval_examples = display_pairs
+        _pool_offsets = {}
+        for name in _pool_names:
+            _pool_offsets[name] = len(all_eval_examples)
+            all_eval_examples = all_eval_examples + eval_pools[name]
         eval_gen_len = min(args.max_dec_len, 512)
         _EVAL_BATCH = 32
         _n_chunks = (len(all_eval_examples) + _EVAL_BATCH - 1) // _EVAL_BATCH
@@ -917,7 +975,11 @@ def train(args):
         _gen_tok_per_sec = _gen_total_toks / max(_gen_elapsed, 1e-6)
 
         display_preds = all_preds[:len(display_pairs)]
-        tc_preds = all_preds[len(display_pairs):]
+        pool_preds = {}
+        for name in _pool_names:
+            start = _pool_offsets[name]
+            end = start + len(eval_pools[name])
+            pool_preds[name] = all_preds[start:end]
 
         unified_samples = []
         for ex, pred in zip(display_pairs, display_preds):
@@ -932,156 +994,137 @@ def train(args):
                 "text": pred.strip(),
             })
 
-        tc_n, tc_exact, tc_name_tp, tc_name_fp, tc_name_fn = 0, 0, 0, 0, 0
-        tc_call_tp, tc_call_fp, tc_call_fn, tc_parse_err = 0, 0, 0, 0
-        tc_args_correct, tc_args_total = 0, 0
-        tc_halluc_params, tc_total_pred_params = 0, 0
-        tc_missing_params, tc_total_ref_params = 0, 0
-        tc_correct_values, tc_matched_params = 0, 0
-        tc_struct_correct, tc_struct_total = 0, 0
-        tc_semantic_correct, tc_semantic_total = 0, 0
-
-        _pc_keys = ("n", "exact", "name_tp", "name_fp", "name_fn",
-                     "call_tp", "call_fp", "call_fn", "parse_err")
-        per_count = {t: {k: 0 for k in _pc_keys} for t in range(11)}
-
         def _call_key(c):
             if not isinstance(c, dict): return None
             return _json_mod.dumps({"name": c.get("name"), "arguments": c.get("arguments")}, sort_keys=True)
 
-        for ex, pred_text in zip(tc_eval_pairs, tc_preds):
-            try:
-                tool_defs = _json_mod.loads(ex["tools"])
-                num_tools = min(len(tool_defs), 10)
-            except (ValueError, TypeError):
-                tool_defs = []
-                num_tools = 0
-            pc = per_count[num_tools]
+        _pc_keys = ("n", "exact", "name_tp", "name_fp", "name_fn",
+                     "call_tp", "call_fp", "call_fn", "parse_err")
 
-            ref_text = ex["answers"].strip()
-            pred_text = pred_text.strip()
-            ref_is_empty = ref_text in ("", "[]")
-            pred_is_empty = pred_text in ("[]", "")
-            try:
-                ref_calls = _json_mod.loads(ref_text) if not ref_is_empty else []
-            except (ValueError, TypeError):
-                ref_calls = []
-            try:
-                pred_calls = _json_mod.loads(pred_text) if not pred_is_empty else []
-                if not isinstance(pred_calls, list):
-                    pred_calls = [pred_calls] if isinstance(pred_calls, dict) else []
-            except (ValueError, TypeError):
-                tc_parse_err += 1
-                pc["parse_err"] += 1
-                pred_calls = []
-            tc_n += 1
-            pc["n"] += 1
-            if ref_is_empty and pred_is_empty:
-                tc_exact += 1
-                pc["exact"] += 1
-            elif not ref_is_empty and not pred_is_empty and _json_mod.dumps(pred_calls, sort_keys=True) == _json_mod.dumps(ref_calls, sort_keys=True):
-                tc_exact += 1
-                pc["exact"] += 1
-            ref_names = {c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c}
-            pred_names = {c["name"] for c in pred_calls if isinstance(c, dict) and "name" in c}
-            tc_name_tp += len(pred_names & ref_names)
-            tc_name_fp += len(pred_names - ref_names)
-            tc_name_fn += len(ref_names - pred_names)
-            pc["name_tp"] += len(pred_names & ref_names)
-            pc["name_fp"] += len(pred_names - ref_names)
-            pc["name_fn"] += len(ref_names - pred_names)
-            rk = {_call_key(c) for c in ref_calls} - {None}
-            pk = {_call_key(c) for c in pred_calls} - {None}
-            tc_call_tp += len(pk & rk)
-            tc_call_fp += len(pk - rk)
-            tc_call_fn += len(rk - pk)
-            pc["call_tp"] += len(pk & rk)
-            pc["call_fp"] += len(pk - rk)
-            pc["call_fn"] += len(rk - pk)
+        def _eval_pool(eval_pairs, preds):
+            """Compute tool-call metrics for a pool of (example, prediction) pairs."""
+            m_n, m_exact, m_name_tp, m_name_fp, m_name_fn = 0, 0, 0, 0, 0
+            m_call_tp, m_call_fp, m_call_fn, m_parse_err = 0, 0, 0, 0
+            m_args_correct, m_args_total = 0, 0
+            m_halluc, m_total_pred_params = 0, 0
+            m_missing, m_total_ref_params = 0, 0
+            m_correct_values, m_matched_params = 0, 0
+            m_per_count = {t: {k: 0 for k in _pc_keys} for t in range(11)}
 
-            ref_by_name = {}
-            for c in ref_calls:
-                if isinstance(c, dict) and "name" in c:
-                    ref_by_name.setdefault(c["name"], []).append(c.get("arguments", {}))
-            for c in pred_calls:
-                if isinstance(c, dict) and "name" in c and c["name"] in ref_by_name:
-                    tc_args_total += 1
-                    pred_args = _json_mod.dumps(c.get("arguments", {}), sort_keys=True)
-                    if any(pred_args == _json_mod.dumps(ra, sort_keys=True) for ra in ref_by_name[c["name"]]):
-                        tc_args_correct += 1
+            for ex, pred_text in zip(eval_pairs, preds):
+                try:
+                    tool_defs = _json_mod.loads(ex["tools"])
+                    num_tools = min(len(tool_defs), 10)
+                except (ValueError, TypeError):
+                    tool_defs = []
+                    num_tools = 0
+                pc = m_per_count[num_tools]
 
-            # Build schema: name -> {param_name: type_string}
-            _STRUCTURED_TYPES = {"integer", "number", "boolean", "float", "int", "bool"}
-            tool_param_map = {}
-            tool_param_types = {}
-            for t in tool_defs:
-                if not isinstance(t, dict) or "name" not in t:
-                    continue
-                params = t.get("parameters") or {}
-                tool_param_map[t["name"]] = set(params.keys())
-                tool_param_types[t["name"]] = {
-                    k: v.get("type", "string") if isinstance(v, dict) else "string"
-                    for k, v in params.items()
-                }
+                ref_text = ex["answers"].strip()
+                pred_text = pred_text.strip()
+                ref_is_empty = ref_text in ("", "[]")
+                pred_is_empty = pred_text in ("[]", "")
+                try:
+                    ref_calls = _json_mod.loads(ref_text) if not ref_is_empty else []
+                except (ValueError, TypeError):
+                    ref_calls = []
+                try:
+                    pred_calls = _json_mod.loads(pred_text) if not pred_is_empty else []
+                    if not isinstance(pred_calls, list):
+                        pred_calls = [pred_calls] if isinstance(pred_calls, dict) else []
+                except (ValueError, TypeError):
+                    m_parse_err += 1
+                    pc["parse_err"] += 1
+                    pred_calls = []
+                m_n += 1
+                pc["n"] += 1
+                if ref_is_empty and pred_is_empty:
+                    m_exact += 1
+                    pc["exact"] += 1
+                elif not ref_is_empty and not pred_is_empty and _json_mod.dumps(pred_calls, sort_keys=True) == _json_mod.dumps(ref_calls, sort_keys=True):
+                    m_exact += 1
+                    pc["exact"] += 1
+                ref_names = {c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c}
+                pred_names = {c["name"] for c in pred_calls if isinstance(c, dict) and "name" in c}
+                m_name_tp += len(pred_names & ref_names)
+                m_name_fp += len(pred_names - ref_names)
+                m_name_fn += len(ref_names - pred_names)
+                pc["name_tp"] += len(pred_names & ref_names)
+                pc["name_fp"] += len(pred_names - ref_names)
+                pc["name_fn"] += len(ref_names - pred_names)
+                rk = {_call_key(c) for c in ref_calls} - {None}
+                pk = {_call_key(c) for c in pred_calls} - {None}
+                m_call_tp += len(pk & rk)
+                m_call_fp += len(pk - rk)
+                m_call_fn += len(rk - pk)
+                pc["call_tp"] += len(pk & rk)
+                pc["call_fp"] += len(pk - rk)
+                pc["call_fn"] += len(rk - pk)
 
-            for c in pred_calls:
-                if not isinstance(c, dict) or "name" not in c:
-                    continue
-                cname = c["name"]
-                if cname not in tool_param_map:
-                    continue
-                schema_keys = tool_param_map[cname]
-                pred_keys = set((c.get("arguments") or {}).keys())
-                tc_total_pred_params += len(pred_keys)
-                tc_halluc_params += len(pred_keys - schema_keys)
-                if cname in ref_by_name:
-                    ref_args = ref_by_name[cname][0]
-                    ref_keys = set((ref_args if isinstance(ref_args, dict) else {}).keys())
-                    tc_total_ref_params += len(ref_keys)
-                    tc_missing_params += len(ref_keys - pred_keys)
-                    matched_keys = pred_keys & ref_keys
-                    tc_matched_params += len(matched_keys)
-                    ptypes = tool_param_types.get(cname, {})
-                    for k in matched_keys:
-                        pred_v = _json_mod.dumps(c.get("arguments", {})[k], sort_keys=True)
-                        ref_v = _json_mod.dumps(ref_args[k], sort_keys=True)
-                        is_structured = ptypes.get(k, "string") in _STRUCTURED_TYPES
-                        if is_structured:
-                            tc_struct_total += 1
-                            if pred_v == ref_v:
-                                tc_correct_values += 1
-                                tc_struct_correct += 1
-                        else:
-                            tc_semantic_total += 1
-                            if pred_v == ref_v:
-                                tc_correct_values += 1
-                                tc_semantic_correct += 1
+                ref_by_name = {}
+                for c in ref_calls:
+                    if isinstance(c, dict) and "name" in c:
+                        ref_by_name.setdefault(c["name"], []).append(c.get("arguments", {}))
+                for c in pred_calls:
+                    if isinstance(c, dict) and "name" in c and c["name"] in ref_by_name:
+                        m_args_total += 1
+                        pred_args = _json_mod.dumps(c.get("arguments", {}), sort_keys=True)
+                        if any(pred_args == _json_mod.dumps(ra, sort_keys=True) for ra in ref_by_name[c["name"]]):
+                            m_args_correct += 1
 
-        tc_metrics = {}
-        if tc_n > 0:
-            tc_metrics["parse_rate"] = 1.0 - tc_parse_err / tc_n
-            tc_metrics["exact_match"] = tc_exact / tc_n
-            np_ = tc_name_tp + tc_name_fp
-            nr_ = tc_name_tp + tc_name_fn
-            tc_metrics["name_f1"] = 2 * tc_name_tp / max(np_ + nr_, 1)
-            cp_ = tc_call_tp + tc_call_fp
-            cr_ = tc_call_tp + tc_call_fn
-            tc_metrics["call_f1"] = 2 * tc_call_tp / max(cp_ + cr_, 1)
-            tc_metrics["args_acc"] = tc_args_correct / max(tc_args_total, 1)
-            tc_metrics["param_haluc"] = tc_halluc_params / max(tc_total_pred_params, 1)
-            tc_metrics["param_miss"] = tc_missing_params / max(tc_total_ref_params, 1)
-            tc_metrics["value_acc"] = tc_correct_values / max(tc_matched_params, 1)
-            tc_metrics["struct_acc"] = tc_struct_correct / max(tc_struct_total, 1)
-            tc_metrics["semantic_acc"] = tc_semantic_correct / max(tc_semantic_total, 1)
-            tc_metrics["struct_n"] = tc_struct_total
-            tc_metrics["semantic_n"] = tc_semantic_total
+                tool_param_map = {}
+                for t in tool_defs:
+                    if isinstance(t, dict) and "name" in t:
+                        tool_param_map[t["name"]] = set((t.get("parameters") or {}).keys())
+                for c in pred_calls:
+                    if not isinstance(c, dict) or "name" not in c:
+                        continue
+                    cname = c["name"]
+                    if cname not in tool_param_map:
+                        continue
+                    pred_keys = set((c.get("arguments") or {}).keys())
+                    m_total_pred_params += len(pred_keys)
+                    m_halluc += len(pred_keys - tool_param_map[cname])
+                    if cname in ref_by_name:
+                        ref_args = ref_by_name[cname][0]
+                        ref_keys = set((ref_args if isinstance(ref_args, dict) else {}).keys())
+                        m_total_ref_params += len(ref_keys)
+                        m_missing += len(ref_keys - pred_keys)
+                        matched_keys = pred_keys & ref_keys
+                        m_matched_params += len(matched_keys)
+                        for k in matched_keys:
+                            if _json_mod.dumps(c.get("arguments", {})[k], sort_keys=True) == _json_mod.dumps(ref_args[k], sort_keys=True):
+                                m_correct_values += 1
 
-        if tc_metrics and tc_metrics["call_f1"] > best_call_f1:
-            best_call_f1 = tc_metrics["call_f1"]
+            metrics = {}
+            if m_n > 0:
+                metrics["n"] = m_n
+                metrics["parse_rate"] = 1.0 - m_parse_err / m_n
+                metrics["exact_match"] = m_exact / m_n
+                np_ = m_name_tp + m_name_fp
+                nr_ = m_name_tp + m_name_fn
+                metrics["name_f1"] = 2 * m_name_tp / max(np_ + nr_, 1)
+                cp_ = m_call_tp + m_call_fp
+                cr_ = m_call_tp + m_call_fn
+                metrics["call_f1"] = 2 * m_call_tp / max(cp_ + cr_, 1)
+                metrics["args_acc"] = m_args_correct / max(m_args_total, 1)
+                metrics["param_haluc"] = m_halluc / max(m_total_pred_params, 1)
+                metrics["param_miss"] = m_missing / max(m_total_ref_params, 1)
+                metrics["value_acc"] = m_correct_values / max(m_matched_params, 1)
+            return metrics, m_per_count
+
+        pool_metrics = {}
+        pool_pc = {}
+        for name in _pool_names:
+            pool_metrics[name], pool_pc[name] = _eval_pool(eval_pools[name], pool_preds[name])
+
+        _best_metric = pool_metrics.get("struct_single", {}).get("call_f1", 0)
+        if _best_metric > best_call_f1:
+            best_call_f1 = _best_metric
             best_ckpt_path = os.path.join(args.checkpoint_dir, f"needle_{args.num_layers}_{args.d_model}_best.pkl")
             import shutil as _shutil
             _shutil.copy2(ckpt_path, best_ckpt_path)
-            print(f"  ** New best call_f1={best_call_f1:.1%} → {best_ckpt_path}")
+            print(f"  ** New best struct call_f1={best_call_f1:.1%} → {best_ckpt_path}")
             _upload_checkpoint(best_ckpt_path)
 
         retrieval_metrics = None
@@ -1110,25 +1153,24 @@ def train(args):
             for factor in sorted(mat_results.keys()):
                 mat_ppl, mat_params, ff_w = mat_results[factor]
                 print(f"  {str(factor)+'x':>6}  {ff_w:>6}  {mat_ppl:>10.2f}  {mat_params:>12,}")
-        if tc_metrics:
-            print(f"  ─── Tool-Call Accuracy ({tc_n} samples) ──")
-            print(f"  JSON parse     {tc_metrics['parse_rate']:>10.1%}")
-            print(f"  Name F1        {tc_metrics['name_f1']:>10.1%}")
-            print(f"  Param haluc    {tc_metrics['param_haluc']:>10.1%}")
-            print(f"  Param miss     {tc_metrics['param_miss']:>10.1%}")
-            print(f"  Value acc      {tc_metrics['value_acc']:>10.1%}")
-            print(f"    Structured   {tc_metrics['struct_acc']:>10.1%}  ({tc_metrics['struct_n']} params)")
-            print(f"    Semantic     {tc_metrics['semantic_acc']:>10.1%}  ({tc_metrics['semantic_n']} params)")
-            print(f"  Args acc       {tc_metrics['args_acc']:>10.1%}")
-            print(f"  Call F1        {tc_metrics['call_f1']:>10.1%}")
-            print(f"  Exact match    {tc_metrics['exact_match']:>10.1%}")
-            # Per-tool-count breakdown table
-            has_any_pc = any(per_count[t]["n"] > 0 for t in range(11))
+        def _print_tc_metrics(label, metrics, pc):
+            if not metrics:
+                return
+            n = metrics["n"]
+            print(f"  ─── {label} ({n} samples) ──")
+            print(f"  JSON parse     {metrics['parse_rate']:>10.1%}")
+            print(f"  Name F1        {metrics['name_f1']:>10.1%}")
+            print(f"  Param haluc    {metrics['param_haluc']:>10.1%}")
+            print(f"  Param miss     {metrics['param_miss']:>10.1%}")
+            print(f"  Value acc      {metrics['value_acc']:>10.1%}")
+            print(f"  Args acc       {metrics['args_acc']:>10.1%}")
+            print(f"  Call F1        {metrics['call_f1']:>10.1%}")
+            print(f"  Exact match    {metrics['exact_match']:>10.1%}")
+            has_any_pc = any(pc[t]["n"] > 0 for t in range(11))
             if has_any_pc:
-                print(f"  ─── Tool-Call Accuracy by #Tools ───")
                 print(f"  {'#tools':>6}  {'n':>4}  {'name_f1':>8}  {'nTP':>4} {'nFP':>4} {'nFN':>4}  {'call_f1':>8}  {'cTP':>4} {'cFP':>4} {'cFN':>4}  {'exact':>6}  {'parse':>6}")
                 for t in range(11):
-                    d = per_count[t]
+                    d = pc[t]
                     if d["n"] == 0:
                         continue
                     np_ = d["name_tp"] + d["name_fp"]
@@ -1140,6 +1182,15 @@ def train(args):
                     ex_ = d["exact"] / d["n"]
                     pr_ = 1.0 - d["parse_err"] / d["n"]
                     print(f"  {t:>6}  {d['n']:>4}  {nf1:>7.1%}  {d['name_tp']:>4} {d['name_fp']:>4} {d['name_fn']:>4}  {cf1:>7.1%}  {d['call_tp']:>4} {d['call_fp']:>4} {d['call_fn']:>4}  {ex_:>5.1%}  {pr_:>5.1%}")
+
+        _label_map = {
+            "struct_single": "Structured / Single-Call",
+            "struct_multi": "Structured / Multi-Call",
+            "semantic_single": "Semantic / Single-Call",
+            "semantic_multi": "Semantic / Multi-Call",
+        }
+        for name in _pool_names:
+            _print_tc_metrics(_label_map[name], pool_metrics[name], pool_pc[name])
         if retrieval_metrics and retrieval_metrics["num_queries"] > 0:
             rm = retrieval_metrics
             print(f"  ─── Retrieval ({rm['num_queries']} queries) ─────")
@@ -1175,37 +1226,13 @@ def train(args):
             for factor, (mat_ppl, mat_params, _) in mat_results.items():
                 log_dict[f"epoch/mat_ppl_{factor}x"] = mat_ppl
                 log_dict[f"epoch/mat_params_{factor}x"] = mat_params
-            if tc_metrics:
-                log_dict["epoch/tc_parse_rate"] = tc_metrics["parse_rate"]
-                log_dict["epoch/tc_exact_match"] = tc_metrics["exact_match"]
-                log_dict["epoch/tc_name_f1"] = tc_metrics["name_f1"]
-                log_dict["epoch/tc_param_haluc"] = tc_metrics["param_haluc"]
-                log_dict["epoch/tc_param_miss"] = tc_metrics["param_miss"]
-                log_dict["epoch/tc_value_acc"] = tc_metrics["value_acc"]
-                log_dict["epoch/tc_args_acc"] = tc_metrics["args_acc"]
-                log_dict["epoch/tc_call_f1"] = tc_metrics["call_f1"]
-                
-                for t in range(11):
-                    d = per_count[t]
-                    if d["n"] == 0:
-                        continue
-                    np_ = d["name_tp"] + d["name_fp"]
-                    nr_ = d["name_tp"] + d["name_fn"]
-                    nf1 = 2 * d["name_tp"] / max(np_ + nr_, 1)
-                    cp_ = d["call_tp"] + d["call_fp"]
-                    cr_ = d["call_tp"] + d["call_fn"]
-                    cf1 = 2 * d["call_tp"] / max(cp_ + cr_, 1)
-                    log_dict[f"epoch/tc_name_f1_{t}t"] = nf1
-                    log_dict[f"epoch/tc_name_tp_{t}t"] = d["name_tp"]
-                    log_dict[f"epoch/tc_name_fp_{t}t"] = d["name_fp"]
-                    log_dict[f"epoch/tc_name_fn_{t}t"] = d["name_fn"]
-                    log_dict[f"epoch/tc_call_f1_{t}t"] = cf1
-                    log_dict[f"epoch/tc_call_tp_{t}t"] = d["call_tp"]
-                    log_dict[f"epoch/tc_call_fp_{t}t"] = d["call_fp"]
-                    log_dict[f"epoch/tc_call_fn_{t}t"] = d["call_fn"]
-                    log_dict[f"epoch/tc_exact_{t}t"] = d["exact"] / d["n"]
-                    log_dict[f"epoch/tc_parse_{t}t"] = 1.0 - d["parse_err"] / d["n"]
-                    log_dict[f"epoch/tc_n_{t}t"] = d["n"]
+            for name in _pool_names:
+                m = pool_metrics.get(name)
+                if not m:
+                    continue
+                for k in ("parse_rate", "exact_match", "name_f1", "call_f1",
+                          "args_acc", "param_haluc", "param_miss", "value_acc"):
+                    log_dict[f"epoch/{name}_{k}"] = m[k]
             if retrieval_metrics and retrieval_metrics["num_queries"] > 0:
                 for k, v in retrieval_metrics["recall@k"].items():
                     log_dict[f"epoch/retrieval_recall@{k}"] = v
