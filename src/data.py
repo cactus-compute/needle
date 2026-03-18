@@ -730,11 +730,7 @@ def pack_sequences(cache_path, enc_vl, dec_in_vl, dec_tgt_vl, loss_vl):
     enc_lens = _seq_lens(enc_vl)
     dec_lens = _seq_lens(dec_in_vl)
 
-    # Sort by encoder length descending — first-fit-decreasing
     order = np.argsort(-enc_lens)
-
-    # Vectorized bin packing: numpy arrays for bin capacities
-    # Pre-allocate for worst case (every seq gets its own bin)
     bin_enc_rem = np.empty(n, dtype=np.int32)
     bin_dec_rem = np.empty(n, dtype=np.int32)
     bin_contents = [[] for _ in range(n)]
@@ -744,7 +740,6 @@ def pack_sequences(cache_path, enc_vl, dec_in_vl, dec_tgt_vl, loss_vl):
         el = int(enc_lens[idx])
         dl = int(dec_lens[idx])
 
-        # Vectorized search: find all bins where both enc and dec fit
         if n_bins > 0:
             fits = (bin_enc_rem[:n_bins] >= el) & (bin_dec_rem[:n_bins] >= dl)
             candidates = np.flatnonzero(fits)
@@ -766,7 +761,6 @@ def pack_sequences(cache_path, enc_vl, dec_in_vl, dec_tgt_vl, loss_vl):
     bin_dec_rem = bin_dec_rem[:n_bins]
     bin_contents = bin_contents[:n_bins]
 
-    # Fill packed arrays — parallelized with multiprocessing
     packed_enc = np.zeros((n_bins, max_enc), dtype=np.int16)
     packed_dec_in = np.zeros((n_bins, max_dec), dtype=np.int16)
     packed_dec_tgt = np.zeros((n_bins, max_dec), dtype=np.int16)
