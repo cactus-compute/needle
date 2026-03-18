@@ -872,8 +872,26 @@ def train(args):
 
         import json as _json_mod
         tc_eval_n = 500
+        tc_per_bucket = tc_eval_n // 11  # 0..10 tools
         tc_rng = np.random.RandomState(epoch + 42)
-        tc_pool = tc_rng.permutation(len(val_kept))[:tc_eval_n]
+
+        # Group val indices by tool count for balanced sampling
+        _tc_buckets = {t: [] for t in range(11)}
+        for k in range(len(val_kept)):
+            ex = val_ds[int(val_kept[k])]
+            try:
+                nc = len(_json_mod.loads(ex["tools"]))
+            except (ValueError, TypeError):
+                nc = 0
+            _tc_buckets[min(nc, 10)].append(k)
+
+        tc_pool = []
+        for t in range(11):
+            bucket = np.array(_tc_buckets[t])
+            if len(bucket) > 0:
+                tc_rng.shuffle(bucket)
+                tc_pool.extend(bucket[:tc_per_bucket].tolist())
+        tc_rng.shuffle(tc_pool)
         tc_eval_pairs = [val_ds[int(val_kept[k])] for k in tc_pool]
 
         # Batch-generate: display samples + tc eval samples in chunks
