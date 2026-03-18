@@ -18,10 +18,12 @@ from .data import (
     DEFAULT_MAX_ENC_LEN,
     LOCAL_UNIFIED_DIR,
     TOKENIZER_DIR,
+    VarLenArray,
     _cache_key,
     _save_cache_metadata,
     get_tokenizer,
     load_tool_calls,
+    pack_sequences,
     prepare_tool_call_pairs,
     train_tokenizer,
 )
@@ -119,8 +121,15 @@ def tokenize(args):
         text_cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len,
                                    w_name, w_value, w_key, shuffle_tools)
 
+        cache_path = os.path.join(CACHE_DIR, text_cache_id)
+        enc_vl = VarLenArray.load(cache_path + "_enc", max_enc_len)
+        dec_in_vl = VarLenArray.load(cache_path + "_dec_in", max_dec_len)
+        dec_tgt_vl = VarLenArray.load(cache_path + "_dec_tgt", max_dec_len)
+        loss_vl = VarLenArray.load(cache_path + "_loss", max_dec_len)
+        pack_sequences(cache_path, enc_vl, dec_in_vl, dec_tgt_vl, loss_vl)
+
         _save_cache_metadata(split, text_cache_id, len(kept_indices),
-                             max_enc_len, max_dec_len)
+                             max_enc_len, max_dec_len, max_tool_len)
 
     _push_to_hf(CACHE_DIR, TOKENIZER_DIR)
 

@@ -21,8 +21,9 @@ from .data import (
 from .model import (
     EncoderDecoderTransformer,
     TransformerConfig,
-    make_causal_mask,
-    make_padding_mask,
+    make_packing_mask,
+    make_causal_packing_mask,
+    make_cross_packing_mask,
 )
 
 _HF_CHECKPOINT_REPO = "Cactus-Compute/needle"
@@ -290,19 +291,24 @@ def _clip_contrastive_loss(q_emb, t_emb, log_temp):
     return (jnp.mean(loss_q) + jnp.mean(loss_t)) / 2.0
 
 
-def _text_loss_fn(state, params, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask, do_quantize):
-    pad_id = 0
+def _text_loss_fn(state, params, src, tgt_in, tgt_out, ffn_mask, rng, loss_mask, do_quantize,
+                  enc_seg_ids, dec_seg_ids):
     q_params = jax.lax.cond(
         do_quantize,
         lambda p: _quantize_params(p, group_size=_GROUP_SIZE),
         lambda p: p,
         params,
     )
-    src_mask = make_padding_mask(src, pad_id)
-    tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+    # Segment-aware masks work for both packed and non-packed batches.
+    # Non-packed: seg_id=1 for all non-padding tokens → equivalent to padding mask + causal.
+    # Packed: seg_id=1,2,3... per sub-sequence → block-diagonal attention.
+    src_mask = make_packing_mask(enc_seg_ids)
+    tgt_mask = make_causal_packing_mask(dec_seg_ids)
+    cross_mask = make_cross_packing_mask(enc_seg_ids, dec_seg_ids)
     logits, slot_div = state.apply_fn(
         {"params": q_params},
         src, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask,
+        cross_mask=cross_mask,
         ffn_mask=ffn_mask,
         deterministic=False,
         method="forward_masked",
@@ -354,11 +360,12 @@ def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
     return jnp.concatenate(rows, axis=0)
 
 
-def _train_step(state, src, tgt_in, tgt_out, causal_mask, prune_mask, ffn_mask, rng, loss_mask, query_tokens, tool_tokens, cl_rng, do_quantize, do_contrastive, do_prune):
+def _train_step(state, src, tgt_in, tgt_out, enc_seg_ids, dec_seg_ids, prune_mask, ffn_mask, rng, loss_mask, query_tokens, tool_tokens, cl_rng, do_quantize, do_contrastive, do_prune):
     """Unified train step with boolean flags for contrastive loss and pruning."""
 
     def combined_loss(p):
-        text_loss = _text_loss_fn(state, p, src, tgt_in, tgt_out, causal_mask, ffn_mask, rng, loss_mask, do_quantize)
+        text_loss = _text_loss_fn(state, p, src, tgt_in, tgt_out, ffn_mask, rng, loss_mask, do_quantize,
+                                  enc_seg_ids, dec_seg_ids)
         cl_loss = jax.lax.cond(
             do_contrastive,
             lambda: _contrastive_loss_fn(state, p, query_tokens, tool_tokens, cl_rng, do_quantize),
@@ -386,13 +393,13 @@ def _make_p_train_step():
 
 def _make_val_loss_fn(apply_fn):
     @jax.jit
-    def val_loss_batch(params, src, tgt_in, tgt_out, causal_mask, loss_mask):
-        pad_id = 0
-        src_mask = make_padding_mask(src, pad_id)
-        tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+    def val_loss_batch(params, src, tgt_in, tgt_out, loss_mask, enc_seg_ids, dec_seg_ids):
+        src_mask = make_packing_mask(enc_seg_ids)
+        tgt_mask = make_causal_packing_mask(dec_seg_ids)
+        cross_mask = make_cross_packing_mask(enc_seg_ids, dec_seg_ids)
         logits = apply_fn(
             {"params": params}, src, tgt_in,
-            src_mask=src_mask, tgt_mask=tgt_mask,
+            src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=cross_mask,
         )
         loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tgt_out)
         return jnp.sum(loss * loss_mask), jnp.sum(loss_mask)
@@ -402,13 +409,13 @@ def _make_val_loss_fn(apply_fn):
 def _make_mat_val_loss_fn(apply_fn, ff_width):
     """Val loss for matryoshka sub-model at given FFN width."""
     @jax.jit
-    def val_loss_batch(params, src, tgt_in, tgt_out, causal_mask, loss_mask):
-        pad_id = 0
-        src_mask = make_padding_mask(src, pad_id)
-        tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+    def val_loss_batch(params, src, tgt_in, tgt_out, loss_mask, enc_seg_ids, dec_seg_ids):
+        src_mask = make_packing_mask(enc_seg_ids)
+        tgt_mask = make_causal_packing_mask(dec_seg_ids)
+        cross_mask = make_cross_packing_mask(enc_seg_ids, dec_seg_ids)
         logits, _, mat_logits = apply_fn(
             {"params": params}, src, tgt_in,
-            src_mask=src_mask, tgt_mask=tgt_mask,
+            src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=cross_mask,
             mat_ff_widths=(ff_width,),
             method="forward_with_aux",
         )
@@ -473,16 +480,21 @@ def train(args):
     print(f"\n[3/3] Loading prepared data from disk (mmap)...")
     train_data = load_prepared_data("train", mmap=True)
     val_data = load_prepared_data("val", mmap=True)
-    enc_inputs = train_data["enc_inputs"]
-    dec_inputs = train_data["dec_inputs"]
-    dec_targets = train_data["dec_targets"]
-    train_loss_mask = train_data["loss_mask"]
-    tool_counts = train_data["tool_counts"]
-    val_enc = val_data["enc_inputs"]
-    val_dec_in = val_data["dec_inputs"]
-    val_dec_tgt = val_data["dec_targets"]
-    val_loss_mask = val_data["loss_mask"]
-    print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val tool-call pairs (memory-mapped)")
+
+    enc_inputs = train_data["packed_enc"]
+    dec_inputs = train_data["packed_dec_in"]
+    dec_targets = train_data["packed_dec_tgt"]
+    train_loss_mask = train_data["packed_loss"]
+    train_enc_seg = train_data["packed_enc_seg"]
+    train_dec_seg = train_data["packed_dec_seg"]
+
+    val_enc = val_data["packed_enc"]
+    val_dec_in = val_data["packed_dec_in"]
+    val_dec_tgt = val_data["packed_dec_tgt"]
+    val_loss_mask = val_data["packed_loss"]
+    val_enc_seg = val_data["packed_enc_seg"]
+    val_dec_seg = val_data["packed_dec_seg"]
+    print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val packed bins (memory-mapped)")
 
     val_ds = load_tool_calls("val", max_samples=args.max_samples)
 
@@ -582,10 +594,6 @@ def train(args):
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     global_step = 0
-    causal_mask = jnp.broadcast_to(
-        make_causal_mask(args.max_dec_len),
-        (num_devices, 1, args.max_dec_len, args.max_dec_len),
-    )
 
     text_ffn_mask = _make_ffn_mask(args.batch_size, config.d_ff, _MAT_FF_WIDTHS)
     text_ffn_mask = jnp.broadcast_to(
@@ -629,11 +637,11 @@ def train(args):
             epoch_step = 0
 
         text_losses = []
-        _curriculum_tc = tool_counts if getattr(args, "curriculum", False) else None
         text_batch_iter = PrefetchIterator(
             lambda: get_batches(enc_inputs, dec_inputs, dec_targets, unique_batch_size,
                                 loss_mask=train_loss_mask,
-                                tool_counts=_curriculum_tc),
+                                enc_seg_ids=train_enc_seg,
+                                dec_seg_ids=train_dec_seg),
             prefetch=4,
         )
 
@@ -652,12 +660,22 @@ def train(args):
         for step_i in pbar:
             t0 = time.perf_counter()
 
-            src, tgt_in, tgt_out, lm = next(text_batch_iter)
+            src, tgt_in, tgt_out, lm, enc_seg, dec_seg = next(text_batch_iter)
+
+            # Upcast from int16/float16 storage to int32/float32 for JAX
+            src = np.asarray(src, dtype=np.int32)
+            tgt_in = np.asarray(tgt_in, dtype=np.int32)
+            tgt_out = np.asarray(tgt_out, dtype=np.int32)
+            lm = np.asarray(lm, dtype=np.float32)
+            enc_seg = np.asarray(enc_seg, dtype=np.int32)
+            dec_seg = np.asarray(dec_seg, dtype=np.int32)
 
             src_b = shard_batch(src, num_devices)
             tgt_in_b = shard_batch(tgt_in, num_devices)
             tgt_out_b = shard_batch(tgt_out, num_devices)
             lm_b = shard_batch(lm, num_devices)
+            enc_seg_b = shard_batch(enc_seg, num_devices)
+            dec_seg_b = shard_batch(dec_seg, num_devices)
 
             rng, text_rng = jax.random.split(rng)
             text_rngs = jax.random.split(text_rng, num_devices)
@@ -682,7 +700,7 @@ def train(args):
             cur_prune_mask = prune_mask if prune_mask is not None else dummy_prune_mask
 
             state, loss, grad_norm = p_train_step(
-                state, src_b, tgt_in_b, tgt_out_b, causal_mask,
+                state, src_b, tgt_in_b, tgt_out_b, enc_seg_b, dec_seg_b,
                 cur_prune_mask, text_ffn_mask, text_rngs, lm_b,
                 cl_q_b, cl_t_b, cl_rngs, do_qat, do_cl, do_prune,
             )
@@ -706,12 +724,19 @@ def train(args):
             eval_every = getattr(args, "eval_every", 100)
             if global_step % eval_every == 0 or global_step == total_steps:
                 _eval_params = jax_utils.unreplicate(state).params
-                val_causal = make_causal_mask(args.max_dec_len)
                 total_loss, total_toks = 0.0, 0.0
                 _val_n = count_batches(len(val_enc), args.batch_size)
-                for vb in tqdm(get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False, loss_mask=val_loss_mask),
+                for vb in tqdm(get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False,
+                                           loss_mask=val_loss_mask, enc_seg_ids=val_enc_seg, dec_seg_ids=val_dec_seg),
                                total=_val_n, desc="  val loss", leave=False):
-                    vl, vt = val_loss_fn(_eval_params, vb[0], vb[1], vb[2], val_causal, vb[3])
+                    src_v, di_v, dt_v, lm_v, es_v, ds_v = vb
+                    src_v = jnp.asarray(src_v, dtype=jnp.int32)
+                    di_v = jnp.asarray(di_v, dtype=jnp.int32)
+                    dt_v = jnp.asarray(dt_v, dtype=jnp.int32)
+                    lm_v = jnp.asarray(lm_v, dtype=jnp.float32)
+                    es_v = jnp.asarray(es_v, dtype=jnp.int32)
+                    ds_v = jnp.asarray(ds_v, dtype=jnp.int32)
+                    vl, vt = val_loss_fn(_eval_params, src_v, di_v, dt_v, lm_v, es_v, ds_v)
                     total_loss += float(vl)
                     total_toks += float(vt)
                 last_val_ppl = float(math.exp(min(total_loss / max(total_toks, 1), 20)))
@@ -770,7 +795,6 @@ def train(args):
         final_ppl = math.exp(min(final_loss, 20)) if not math.isnan(final_loss) else float("nan")
 
         eval_params = jax_utils.unreplicate(state).params
-        val_causal = make_causal_mask(args.max_dec_len)
 
         q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE)
         mat_vl_fns = {}
@@ -786,16 +810,23 @@ def train(args):
 
         _val_n = count_batches(len(val_enc), args.batch_size)
         _val_bar = tqdm(get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size,
-                              shuffle=False, loss_mask=val_loss_mask),
+                              shuffle=False, loss_mask=val_loss_mask,
+                              enc_seg_ids=val_enc_seg, dec_seg_ids=val_dec_seg),
                         total=_val_n, desc="  eval val loss", leave=False)
         for vb in _val_bar:
-            src, dec_in, dec_tgt, lm = vb[0], vb[1], vb[2], vb[3]
-            vl, vt = val_loss_fn(eval_params, src, dec_in, dec_tgt, val_causal, lm)
+            src, dec_in, dec_tgt, lm, es, ds = vb
+            src = jnp.asarray(src, dtype=jnp.int32)
+            dec_in = jnp.asarray(dec_in, dtype=jnp.int32)
+            dec_tgt = jnp.asarray(dec_tgt, dtype=jnp.int32)
+            lm = jnp.asarray(lm, dtype=jnp.float32)
+            es = jnp.asarray(es, dtype=jnp.int32)
+            ds = jnp.asarray(ds, dtype=jnp.int32)
+            vl, vt = val_loss_fn(eval_params, src, dec_in, dec_tgt, lm, es, ds)
             full_loss += float(vl); full_toks += float(vt)
-            vl, vt = val_loss_fn(q_params, src, dec_in, dec_tgt, val_causal, lm)
+            vl, vt = val_loss_fn(q_params, src, dec_in, dec_tgt, lm, es, ds)
             q_loss += float(vl); q_toks += float(vt)
             for f, fn in mat_vl_fns.items():
-                vl, vt = fn(eval_params, src, dec_in, dec_tgt, val_causal, lm)
+                vl, vt = fn(eval_params, src, dec_in, dec_tgt, lm, es, ds)
                 mat_accum[f][0] += float(vl)
                 mat_accum[f][1] += float(vt)
 
@@ -861,6 +892,7 @@ def train(args):
                 [ex["tools"] for ex in _chunk],
                 max_gen_len=eval_gen_len,
                 max_enc_len=args.max_enc_len,
+                constrained=False,
             ))
         _gen_elapsed = time.perf_counter() - _gen_t0
         _gen_total_toks = sum(len(tokenizer.encode(p)) for p in all_preds)

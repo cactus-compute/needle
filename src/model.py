@@ -505,9 +505,10 @@ class EncoderDecoderTransformer(nn.Module):
         t_emb = self.encode_contrastive(tool_tokens, deterministic=deterministic)
         return q_emb, t_emb, self.log_temp
 
-    def __call__(self, src, tgt, src_mask=None, tgt_mask=None):
+    def __call__(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None):
         encoder_out, enc_mask = self.encode_text(src, src_mask=src_mask)
-        logits = self.decode(tgt, encoder_out, self_mask=tgt_mask, cross_mask=enc_mask)
+        cm = cross_mask if cross_mask is not None else enc_mask
+        logits = self.decode(tgt, encoder_out, self_mask=tgt_mask, cross_mask=cm)
         return logits
 
     def _run_decoder(self, encoder_out, tgt, tgt_mask=None, cross_mask=None, ffn_mask=None, deterministic=True):
@@ -517,10 +518,11 @@ class EncoderDecoderTransformer(nn.Module):
         x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=cross_mask, rope=rope, ffn_mask=ffn_mask, deterministic=deterministic)
         return x.astype(jnp.float32)
 
-    def forward_masked(self, src, tgt, src_mask=None, tgt_mask=None, ffn_mask=None, deterministic=True):
+    def forward_masked(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, ffn_mask=None, deterministic=True):
         """Single forward with per-batch-item FFN masking. Returns (logits, slot_div)."""
         encoder_out, enc_mask = self.encode_text(src, src_mask=src_mask, ffn_mask=ffn_mask, deterministic=deterministic)
-        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, cross_mask=enc_mask, ffn_mask=ffn_mask, deterministic=deterministic)
+        cm = cross_mask if cross_mask is not None else enc_mask
+        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, cross_mask=cm, ffn_mask=ffn_mask, deterministic=deterministic)
         logits = x_f32 @ self.embedding.embedding.T
         return logits, 0.0
 
@@ -603,5 +605,42 @@ def make_padding_mask(tokens, pad_token_id):
 
 def make_mel_padding_mask(mel):
     """Create padding mask from mel spectrogram: non-zero frames are valid."""
-    mask = jnp.any(mel != 0, axis=-1)  
-    return mask[:, None, None, :] 
+    mask = jnp.any(mel != 0, axis=-1)
+    return mask[:, None, None, :]
+
+
+def make_packing_mask(seg_ids):
+    """Block-diagonal self-attention mask from segment IDs.
+
+    seg_ids: (B, T) int array where 0 = padding, 1+ = segment number.
+    Returns: (B, 1, T, T) bool mask — True where attention is allowed.
+    Tokens attend to each other only if they share the same non-zero segment ID.
+    """
+    # (B, T, 1) == (B, 1, T) -> (B, T, T)
+    mask = (seg_ids[:, :, None] == seg_ids[:, None, :]) & (seg_ids[:, :, None] > 0)
+    return mask[:, None, :, :]
+
+
+def make_causal_packing_mask(seg_ids):
+    """Block-diagonal causal mask from segment IDs.
+
+    Same as make_packing_mask but also enforces causal ordering within each segment.
+    Returns: (B, 1, T, T) bool mask.
+    """
+    T = seg_ids.shape[1]
+    causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+    block = (seg_ids[:, :, None] == seg_ids[:, None, :]) & (seg_ids[:, :, None] > 0)
+    return (block & causal[None, :, :])[:, None, :, :]
+
+
+def make_cross_packing_mask(enc_seg_ids, dec_seg_ids):
+    """Cross-attention mask for packed sequences.
+
+    enc_seg_ids: (B, T_enc) int segment IDs.
+    dec_seg_ids: (B, T_dec) int segment IDs.
+    Returns: (B, 1, T_dec, T_enc) bool mask — decoder token d attends to
+    encoder token e iff they share the same non-zero segment ID.
+    """
+    # (B, T_dec, 1) == (B, 1, T_enc) -> (B, T_dec, T_enc)
+    mask = (dec_seg_ids[:, :, None] == enc_seg_ids[:, None, :]) & (dec_seg_ids[:, :, None] > 0)
+    return mask[:, None, :, :]

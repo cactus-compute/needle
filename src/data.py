@@ -345,7 +345,6 @@ def _download_tokenizer_from_hf():
     local = snapshot_download(
         _HF_TOKENIZER_REPO,
         repo_type="dataset",
-        token=True,
     )
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
     for fname in os.listdir(local):
@@ -359,12 +358,8 @@ def _download_tokenizer_from_hf():
 def get_tokenizer(max_samples=None):
     model_path = TOKENIZER_PREFIX + ".model"
     if not os.path.exists(model_path):
-        try:
-            _download_tokenizer_from_hf()
-        except Exception:
-            pass
-    if not os.path.exists(model_path):
-        train_tokenizer(max_samples=max_samples)
+        print("Downloading pretrained tokenizer from HuggingFace...")
+        _download_tokenizer_from_hf()
     return NeedleTokenizer(model_path)
 
 
@@ -423,7 +418,7 @@ def _cache_key(prefix, n_samples, max_enc_len, max_dec_len,
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
-def _save_cache_metadata(split, text_cache_id, n_samples, max_enc_len, max_dec_len):
+def _save_cache_metadata(split, text_cache_id, n_samples, max_enc_len, max_dec_len, max_tool_len=256):
     """Save metadata JSON for a split locally."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     meta = {
@@ -432,6 +427,7 @@ def _save_cache_metadata(split, text_cache_id, n_samples, max_enc_len, max_dec_l
         "n_samples": n_samples,
         "max_enc_len": max_enc_len,
         "max_dec_len": max_dec_len,
+        "max_tool_len": max_tool_len,
     }
     meta_path = os.path.join(CACHE_DIR, f"{split}_metadata.json")
     with open(meta_path, "w") as f:
@@ -451,37 +447,29 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
                             w_name=3.0, w_value=2.0, w_key=1.5, shuffle_tools=True):
     """Prepare tool-call encoder-decoder pairs with <tool_call> task token.
 
-    Encoder input: [query_tokens..., <tools>, tools_tokens...] truncated to max_enc_len.
-    Decoder input:  [EOS, <tool_call>, answer_tokens..., PAD...]
-    Decoder target: [<tool_call>, answer_tokens..., EOS, PAD...]
-    Loss mask: token-level weights based on JSON structure (tool names, arg keys/values).
+    Stores variable-length sequences as flat int16/float16 arrays with offsets
+    for compact on-disk representation (~5-7x smaller than padded int32).
+    Padding to fixed max lengths happens at batch time via VarLenArray.
 
-    Returns (enc_inputs, dec_inputs, dec_targets, loss_mask, kept_indices, tool_counts).
+    Returns (enc, dec_in, dec_tgt, loss, kept_indices, tool_counts) where
+    the first four are VarLenArray objects when loaded from cache.
     """
 
     cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len,
                           w_name, w_value, w_key, shuffle_tools)
     cache_path = os.path.join(CACHE_DIR, cache_id)
 
-    tc_suffixes = ["_enc.npy", "_dec_in.npy", "_dec_tgt.npy", "_loss_mask.npy", "_kept_idx.npy", "_tool_count.npy"]
-
-    def _load_tc_cache():
+    if os.path.exists(cache_path + "_enc_data.npy"):
+        print(f"Loading cached tool-call data ({cache_id})...")
+        enc = VarLenArray.load(cache_path + "_enc", max_enc_len, pad_value=PAD_ID)
+        dec_in = VarLenArray.load(cache_path + "_dec_in", max_dec_len, pad_value=PAD_ID)
+        dec_tgt = VarLenArray.load(cache_path + "_dec_tgt", max_dec_len, pad_value=PAD_ID)
+        loss = VarLenArray.load(cache_path + "_loss", max_dec_len, pad_value=0)
+        kept = np.load(cache_path + "_kept_idx.npy")
         tc_path = cache_path + "_tool_count.npy"
         tc = np.load(tc_path) if os.path.exists(tc_path) else None
-        return (
-            np.load(cache_path + "_enc.npy"),
-            np.load(cache_path + "_dec_in.npy"),
-            np.load(cache_path + "_dec_tgt.npy"),
-            np.load(cache_path + "_loss_mask.npy"),
-            np.load(cache_path + "_kept_idx.npy"),
-            tc,
-        )
+        return enc, dec_in, dec_tgt, loss, kept, tc
 
-    if os.path.exists(cache_path + "_enc.npy"):
-        print(f"Loading cached tool-call data ({cache_id})...")
-        return _load_tc_cache()
-
-    pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
     tool_call_id = tokenizer.tool_call_token_id
     tools_sep_id = tokenizer.tools_token_id
@@ -530,107 +518,87 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     all_ans_tokens = [tok for chunk in ans_results for tok in chunk]
 
     n = len(ds)
+    enc_seqs = []
+    dec_in_seqs = []
+    dec_tgt_seqs = []
+    loss_seqs = []
+    query_lens_list = []
+    kept_indices = []
+    kept_tool_counts = []
 
-    def _fill_sample(j, e_tok, t_tok, a_tok, ans_text,
-                     enc_arr, dec_in_arr, dec_tgt_arr, lm_arr):
-        """Fill arrays at position j for one sample. Returns False if skipped."""
+    for i in tqdm(range(n), desc="Building pairs"):
+        e_tok = all_enc_tokens[i]
+        t_tok = all_tools_tokens[i]
+        a_tok = all_ans_tokens[i]
+
         # Encoder: [query..., <tools>, tools...] truncated to max_enc_len
         max_query = max_enc_len - 1 - 1  # room for <tools> + at least 1 tools token
         if len(e_tok) > max_query:
             e_tok = e_tok[:max_query]
-        remaining = max_enc_len - len(e_tok) - 1  # 1 for <tools>
+        remaining = max_enc_len - len(e_tok) - 1
         t_trunc = t_tok[:remaining]
-
         enc_seq = e_tok + [tools_sep_id] + t_trunc
-        el = len(enc_seq)
-        enc_arr[j, :el] = enc_seq
 
         al = len(a_tok)
-        # Decoder needs: [EOS, <tool_call>, answer..., EOS] = 2 + al + 1
         if 2 + al + 1 > max_dec_len:
-            return False
+            continue  # skip samples too long for decoder
 
         # Decoder input: [EOS, <tool_call>, answer...]
-        dec_in_arr[j, 0] = eos_id
-        dec_in_arr[j, 1] = tool_call_id
-        if al > 0:
-            dec_in_arr[j, 2:2 + al] = a_tok
-
+        dec_in_seq = [eos_id, tool_call_id] + list(a_tok)
         # Decoder target: [<tool_call>, answer..., EOS]
-        dec_tgt_arr[j, 0] = tool_call_id
-        if al > 0:
-            dec_tgt_arr[j, 1:1 + al] = a_tok
-        dec_tgt_arr[j, 1 + al] = eos_id
+        dec_tgt_seq = [tool_call_id] + list(a_tok) + [eos_id]
 
         # Token-level loss weighting
-        lm_arr[j, 0] = 1.0  # <tool_call> prediction
-        token_weights = _token_weights_for_answer(ans_text, a_tok, tokenizer.sp,
+        weights = np.ones(len(dec_tgt_seq), dtype=np.float16)
+        token_weights = _token_weights_for_answer(ans_texts[i], a_tok, tokenizer.sp,
                                                    w_name=w_name, w_value=w_value, w_key=w_key)
-        lm_arr[j, 1:1 + len(token_weights)] = token_weights
-        lm_arr[j, 1 + al] = 1.0  # EOS stays at baseline weight
-        return True
+        weights[1:1 + len(token_weights)] = token_weights.astype(np.float16)
+        weights[1 + al] = 1.0  # EOS at baseline
+
+        enc_seqs.append(np.array(enc_seq, dtype=np.int16))
+        dec_in_seqs.append(np.array(dec_in_seq, dtype=np.int16))
+        dec_tgt_seqs.append(np.array(dec_tgt_seq, dtype=np.int16))
+        loss_seqs.append(weights)
+        query_lens_list.append(len(e_tok))
+        kept_indices.append(i)
+        kept_tool_counts.append(tool_counts[i])
+
+    skipped = n - len(kept_indices)
+    if skipped > 0:
+        print(f"  Skipped {skipped} examples (too long for max_dec_len={max_dec_len})")
+
+    kept_indices = np.array(kept_indices, dtype=np.int64)
+    query_lens = np.array(query_lens_list, dtype=np.int32)
+    kept_tool_counts = np.array(kept_tool_counts, dtype=np.int32)
 
     os.makedirs(CACHE_DIR, exist_ok=True)
-
-    enc_inputs = np.full((n, max_enc_len), pad_id, dtype=np.int32)
-    dec_inputs = np.full((n, max_dec_len), pad_id, dtype=np.int32)
-    dec_targets = np.full((n, max_dec_len), pad_id, dtype=np.int32)
-    loss_mask = np.zeros((n, max_dec_len), dtype=np.float32)
-
-    skipped = 0
-    for i in tqdm(range(n), desc="Building pairs"):
-        if not _fill_sample(i, all_enc_tokens[i], all_tools_tokens[i],
-                            all_ans_tokens[i], ans_texts[i],
-                            enc_inputs, dec_inputs, dec_targets, loss_mask):
-            skipped += 1
-
-    if skipped > 0:
-        keep = enc_inputs[:, 0] != pad_id
-        kept_indices = np.where(keep)[0].astype(np.int64)
-        enc_inputs = enc_inputs[keep]
-        dec_inputs = dec_inputs[keep]
-        dec_targets = dec_targets[keep]
-        loss_mask = loss_mask[keep]
-        tool_counts = tool_counts[keep]
-        print(f"  Skipped {skipped} examples (too long for max_dec_len={max_dec_len})")
-    else:
-        kept_indices = np.arange(n, dtype=np.int64)
-
-    np.save(cache_path + "_enc.npy", enc_inputs)
-    np.save(cache_path + "_dec_in.npy", dec_inputs)
-    np.save(cache_path + "_dec_tgt.npy", dec_targets)
-    np.save(cache_path + "_loss_mask.npy", loss_mask)
+    _save_varlen(cache_path + "_enc", enc_seqs)
+    _save_varlen(cache_path + "_dec_in", dec_in_seqs)
+    _save_varlen(cache_path + "_dec_tgt", dec_tgt_seqs)
+    _save_varlen(cache_path + "_loss", loss_seqs)
+    np.save(cache_path + "_query_len.npy", query_lens)
     np.save(cache_path + "_kept_idx.npy", kept_indices)
-    np.save(cache_path + "_tool_count.npy", tool_counts)
-    print(f"Cached {len(enc_inputs):,} tool-call pairs to {CACHE_DIR}/{cache_id}")
+    np.save(cache_path + "_tool_count.npy", kept_tool_counts)
+    print(f"Cached {len(enc_seqs):,} tool-call pairs to {CACHE_DIR}/{cache_id}")
 
     max_tool_len = getattr(prepare_tool_call_pairs, '_max_tool_len', 256)
     _build_contrastive_arrays(ds, enc_texts, tools_texts, cache_path,
                               model_path, max_enc_len, max_tool_len,
                               num_workers, chunk_size, kept_indices)
 
-    return enc_inputs, dec_inputs, dec_targets, loss_mask, kept_indices, tool_counts
+    return enc_seqs, dec_in_seqs, dec_tgt_seqs, loss_seqs, kept_indices, kept_tool_counts
 
 
 def _build_contrastive_arrays(ds, enc_texts, tools_texts, cache_path,
                               model_path, max_enc_len, max_tool_len,
                               num_workers, chunk_size, kept_indices):
-    """Build and save contrastive arrays: query-only tokens + individual tool tokens."""
-    kept_set = set(kept_indices.tolist()) if kept_indices is not None else set(range(len(enc_texts)))
-    kept_queries = [enc_texts[i] for i in range(len(enc_texts)) if i in kept_set]
+    """Build and save contrastive arrays: individual tool tokens (variable-length int16).
 
-    q_chunks = [kept_queries[i:i + chunk_size] for i in range(0, len(kept_queries), chunk_size)]
-    with mp.Pool(num_workers, initializer=_init_worker,
-                 initargs=(model_path, max_enc_len)) as pool:
-        q_results = list(tqdm(pool.imap(_tokenize_chunk, q_chunks),
-                              total=len(q_chunks), desc="Tokenizing queries (contrastive)"))
-    query_tokens_list = [tok for chunk in q_results for tok in chunk]
-    n_kept = len(query_tokens_list)
-    query_arr = np.full((n_kept, max_enc_len), PAD_ID, dtype=np.int32)
-    for i, toks in enumerate(query_tokens_list):
-        l = min(len(toks), max_enc_len)
-        query_arr[i, :l] = toks[:l]
-    np.save(cache_path + "_query_only.npy", query_arr)
+    Query-only tokens are NOT stored separately — they are derived at load time
+    from the encoder data + query_len via QueryOnlyArray.
+    """
+    kept_set = set(kept_indices.tolist()) if kept_indices is not None else set(range(len(enc_texts)))
+    n_kept = len(kept_set)
 
     tool_texts_individual = []
     tool_ex_idx = []
@@ -676,20 +644,15 @@ def _build_contrastive_arrays(ds, enc_texts, tools_texts, cache_path,
                      initargs=(model_path, max_tool_len)) as pool:
             t_results = list(tqdm(pool.imap(_tokenize_chunk, t_chunks),
                                   total=len(t_chunks), desc="Tokenizing tools (contrastive)"))
-        tool_tokens_list = [tok for chunk in t_results for tok in chunk]
-
-        n_tools = len(tool_tokens_list)
-        tool_arr = np.full((n_tools, max_tool_len), PAD_ID, dtype=np.int32)
-        for i, toks in enumerate(tool_tokens_list):
-            l = min(len(toks), max_tool_len)
-            tool_arr[i, :l] = toks[:l]
+        tool_seqs = [np.array(tok[:max_tool_len], dtype=np.int16)
+                     for chunk in t_results for tok in chunk]
     else:
-        tool_arr = np.zeros((0, max_tool_len), dtype=np.int32)
+        tool_seqs = []
 
-    np.save(cache_path + "_tool_individual.npy", tool_arr)
+    _save_varlen(cache_path + "_tool_ind", tool_seqs)
     np.save(cache_path + "_tool_ex_idx.npy", np.array(tool_ex_idx, dtype=np.int32))
     np.save(cache_path + "_tool_is_pos.npy", np.array(tool_is_pos, dtype=np.bool_))
-    print(f"  Contrastive: {n_kept} queries, {len(tool_ex_idx)} individual tools")
+    print(f"  Contrastive: {n_kept} queries (from enc), {len(tool_ex_idx)} individual tools")
 
 
 def get_contrastive_batches(query_tokens, tool_tokens, tool_ex_idx, tool_is_pos, batch_size):
@@ -722,7 +685,8 @@ def get_contrastive_batches(query_tokens, tool_tokens, tool_ex_idx, tool_is_pos,
         yield q_batch, t_batch
 
 
-def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True, loss_mask=None, tool_counts=None):
+def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True,
+                loss_mask=None, tool_counts=None, enc_seg_ids=None, dec_seg_ids=None):
     n = len(enc_inputs)
     if tool_counts is not None:
         order = np.argsort(tool_counts, kind='stable')
@@ -741,7 +705,111 @@ def get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=True, l
         batch = (np.array(enc_inputs[idx]), np.array(dec_inputs[idx]), np.array(dec_targets[idx]))
         if loss_mask is not None:
             batch = batch + (np.array(loss_mask[idx]),)
+        if enc_seg_ids is not None:
+            batch = batch + (np.array(enc_seg_ids[idx]), np.array(dec_seg_ids[idx]))
         yield batch
+
+
+def _seq_lens(arr):
+    """Get per-sequence lengths from a VarLenArray via its offsets."""
+    return np.diff(arr._offsets).astype(np.int32)
+
+
+def pack_sequences(cache_path, enc_vl, dec_in_vl, dec_tgt_vl, loss_vl):
+    """Pre-pack variable-length sequences into dense bins with segment IDs.
+
+    Uses first-fit-decreasing bin packing with vectorized bin search.
+    Saves packed int16 arrays + segment ID arrays.
+
+    Returns the number of packed bins.
+    """
+    n = len(enc_vl)
+    max_enc = enc_vl._max_len
+    max_dec = dec_in_vl._max_len
+
+    enc_lens = _seq_lens(enc_vl)
+    dec_lens = _seq_lens(dec_in_vl)
+
+    # Sort by encoder length descending — first-fit-decreasing
+    order = np.argsort(-enc_lens)
+
+    # Vectorized bin packing: numpy arrays for bin capacities
+    # Pre-allocate for worst case (every seq gets its own bin)
+    bin_enc_rem = np.empty(n, dtype=np.int32)
+    bin_dec_rem = np.empty(n, dtype=np.int32)
+    bin_contents = [[] for _ in range(n)]
+    n_bins = 0
+
+    for idx in tqdm(order, desc="Bin packing"):
+        el = int(enc_lens[idx])
+        dl = int(dec_lens[idx])
+
+        # Vectorized search: find all bins where both enc and dec fit
+        if n_bins > 0:
+            fits = (bin_enc_rem[:n_bins] >= el) & (bin_dec_rem[:n_bins] >= dl)
+            candidates = np.flatnonzero(fits)
+        else:
+            candidates = np.array([], dtype=np.intp)
+
+        if len(candidates) > 0:
+            b = candidates[0]
+            bin_enc_rem[b] -= el
+            bin_dec_rem[b] -= dl
+            bin_contents[b].append(int(idx))
+        else:
+            bin_enc_rem[n_bins] = max_enc - el
+            bin_dec_rem[n_bins] = max_dec - dl
+            bin_contents[n_bins].append(int(idx))
+            n_bins += 1
+
+    bin_enc_rem = bin_enc_rem[:n_bins]
+    bin_dec_rem = bin_dec_rem[:n_bins]
+    bin_contents = bin_contents[:n_bins]
+
+    # Fill packed arrays — parallelized with multiprocessing
+    packed_enc = np.zeros((n_bins, max_enc), dtype=np.int16)
+    packed_dec_in = np.zeros((n_bins, max_dec), dtype=np.int16)
+    packed_dec_tgt = np.zeros((n_bins, max_dec), dtype=np.int16)
+    packed_loss = np.zeros((n_bins, max_dec), dtype=np.float16)
+    packed_enc_seg = np.zeros((n_bins, max_enc), dtype=np.int16)
+    packed_dec_seg = np.zeros((n_bins, max_dec), dtype=np.int16)
+
+    for row in tqdm(range(n_bins), desc="Writing packed bins"):
+        enc_pos = 0
+        dec_pos = 0
+        for seg_id, idx in enumerate(bin_contents[row], start=1):
+            el = int(enc_lens[idx])
+            dl = int(dec_lens[idx])
+
+            e_start = int(enc_vl._offsets[idx])
+            packed_enc[row, enc_pos:enc_pos + el] = enc_vl._data[e_start:e_start + el]
+            packed_enc_seg[row, enc_pos:enc_pos + el] = seg_id
+
+            di_start = int(dec_in_vl._offsets[idx])
+            packed_dec_in[row, dec_pos:dec_pos + dl] = dec_in_vl._data[di_start:di_start + dl]
+
+            dt_start = int(dec_tgt_vl._offsets[idx])
+            packed_dec_tgt[row, dec_pos:dec_pos + dl] = dec_tgt_vl._data[dt_start:dt_start + dl]
+
+            lm_start = int(loss_vl._offsets[idx])
+            packed_loss[row, dec_pos:dec_pos + dl] = loss_vl._data[lm_start:lm_start + dl]
+
+            packed_dec_seg[row, dec_pos:dec_pos + dl] = seg_id
+
+            enc_pos += el
+            dec_pos += dl
+
+    np.save(cache_path + "_packed_enc.npy", packed_enc)
+    np.save(cache_path + "_packed_dec_in.npy", packed_dec_in)
+    np.save(cache_path + "_packed_dec_tgt.npy", packed_dec_tgt)
+    np.save(cache_path + "_packed_loss.npy", packed_loss)
+    np.save(cache_path + "_packed_enc_seg.npy", packed_enc_seg)
+    np.save(cache_path + "_packed_dec_seg.npy", packed_dec_seg)
+
+    total_cap = n_bins * (max_enc + max_dec)
+    used = int(np.sum(max_enc - bin_enc_rem)) + int(np.sum(max_dec - bin_dec_rem))
+    print(f"  Packed {n} sequences into {n_bins} bins ({used / total_cap:.0%} utilization)")
+    return n_bins
 
 
 
@@ -848,6 +916,128 @@ def compute_mel_spectrogram(audio, sr=16000, n_mels=80, n_fft=400, hop_length=16
     return log_mel.astype(np.float32)
 
 
+class VarLenArray:
+    """Variable-length storage with on-demand padding to fixed max_len.
+
+    Stores sequences as a flat 1D array (int16 or float16) plus an offsets array.
+    When indexed, returns padded arrays cast to int32/float32 for JAX compatibility.
+    """
+
+    def __init__(self, data, offsets, max_len, pad_value=0):
+        self._data = data
+        self._offsets = offsets
+        self._max_len = max_len
+        self._pad_value = pad_value
+        self._n = len(offsets) - 1
+        self._out_dtype = np.float32 if data.dtype == np.float16 else np.int32
+
+    @classmethod
+    def load(cls, prefix, max_len, pad_value=0, mmap_mode=None):
+        data = np.load(prefix + "_data.npy", mmap_mode=mmap_mode)
+        offsets = np.load(prefix + "_offsets.npy", mmap_mode=mmap_mode)
+        return cls(data, offsets, max_len, pad_value)
+
+    def __len__(self):
+        return self._n
+
+    @property
+    def shape(self):
+        return (self._n, self._max_len)
+
+    @property
+    def dtype(self):
+        return self._out_dtype
+
+    def __getitem__(self, idx):
+        if isinstance(idx, (int, np.integer)):
+            if idx < 0:
+                idx += self._n
+            start, end = int(self._offsets[idx]), int(self._offsets[idx + 1])
+            result = np.full(self._max_len, self._pad_value, dtype=self._out_dtype)
+            seq = self._data[start:end]
+            result[:len(seq)] = seq.astype(self._out_dtype)
+            return result
+
+        if isinstance(idx, np.ndarray):
+            batch_size = len(idx)
+            result = np.full((batch_size, self._max_len), self._pad_value, dtype=self._out_dtype)
+            for j, i in enumerate(idx):
+                start, end = int(self._offsets[i]), int(self._offsets[i + 1])
+                seq = self._data[start:end]
+                result[j, :len(seq)] = seq.astype(self._out_dtype)
+            return result
+
+        if isinstance(idx, slice):
+            indices = np.arange(*idx.indices(self._n))
+            return self[indices]
+
+        raise TypeError(f"Unsupported index type: {type(idx)}")
+
+
+class QueryOnlyArray:
+    """Extracts query portions from encoder variable-length data without duplication.
+
+    Queries are the prefix of each encoder sequence (before the <tools> separator).
+    Instead of storing a separate copy, this derives them on-the-fly from encoder data.
+    """
+
+    def __init__(self, enc_data, enc_offsets, query_lens, max_len):
+        self._enc_data = enc_data
+        self._enc_offsets = enc_offsets
+        self._query_lens = query_lens
+        self._max_len = max_len
+        self._n = len(query_lens)
+
+    def __len__(self):
+        return self._n
+
+    @property
+    def shape(self):
+        return (self._n, self._max_len)
+
+    @property
+    def dtype(self):
+        return np.int32
+
+    def __getitem__(self, idx):
+        if isinstance(idx, (int, np.integer)):
+            if idx < 0:
+                idx += self._n
+            start = int(self._enc_offsets[idx])
+            qlen = int(self._query_lens[idx])
+            result = np.full(self._max_len, PAD_ID, dtype=np.int32)
+            result[:qlen] = self._enc_data[start:start + qlen].astype(np.int32)
+            return result
+
+        if isinstance(idx, np.ndarray):
+            batch_size = len(idx)
+            result = np.full((batch_size, self._max_len), PAD_ID, dtype=np.int32)
+            for j, i in enumerate(idx):
+                start = int(self._enc_offsets[i])
+                qlen = int(self._query_lens[i])
+                result[j, :qlen] = self._enc_data[start:start + qlen].astype(np.int32)
+            return result
+
+        if isinstance(idx, slice):
+            indices = np.arange(*idx.indices(self._n))
+            return self[indices]
+
+        raise TypeError(f"Unsupported index type: {type(idx)}")
+
+
+def _save_varlen(prefix, sequences):
+    """Save variable-length sequences as flat data + offsets .npy files."""
+    offsets = np.zeros(len(sequences) + 1, dtype=np.int64)
+    for i, seq in enumerate(sequences):
+        offsets[i + 1] = offsets[i] + len(seq)
+    if sequences:
+        data = np.concatenate(sequences)
+    else:
+        data = np.array([], dtype=np.int16)
+    np.save(prefix + "_data.npy", data)
+    np.save(prefix + "_offsets.npy", offsets)
+
+
 class ShardedMmapArray:
     """Array-like wrapper over multiple .npy shard files with mmap support.
 
@@ -904,13 +1094,13 @@ class ShardedMmapArray:
 
 
 def load_prepared_data(split, mmap=False):
-    """Load pre-tokenized .npy files. If mmap=True, returns memory-mapped arrays.
+    """Load pre-tokenized variable-length data. Returns VarLenArray objects
+    that pad to fixed max lengths on-the-fly when indexed.
 
-    Tries local cache only. Raises FileNotFoundError if not found
-    (run 'needle tokenize' first).
+    If mmap=True, underlying flat arrays are memory-mapped.
 
     Returns dict with keys: enc_inputs, dec_inputs, dec_targets, loss_mask,
-    kept_indices.
+    kept_indices, tool_counts, query_only, tool_individual, tool_ex_idx, tool_is_pos.
     """
     meta = _load_cache_metadata(split)
     if meta is None:
@@ -926,32 +1116,69 @@ def load_prepared_data(split, mmap=False):
 
     text_cache_id = meta["text_cache_id"]
     cache_path = os.path.join(CACHE_DIR, text_cache_id)
+    max_enc_len = meta.get("max_enc_len", DEFAULT_MAX_ENC_LEN)
+    max_dec_len = meta.get("max_dec_len", DEFAULT_MAX_DEC_LEN)
+    max_tool_len = meta.get("max_tool_len", 256)
 
-    if not os.path.exists(cache_path + "_enc.npy"):
+    if not os.path.exists(cache_path + "_enc_data.npy"):
         raise FileNotFoundError(
             f"Text cache '{text_cache_id}' not found. Run 'needle tokenize' first."
         )
 
     mmap_mode = "r" if mmap else None
+
+    enc = VarLenArray.load(cache_path + "_enc", max_enc_len, pad_value=PAD_ID, mmap_mode=mmap_mode)
+    dec_in = VarLenArray.load(cache_path + "_dec_in", max_dec_len, pad_value=PAD_ID, mmap_mode=mmap_mode)
+    dec_tgt = VarLenArray.load(cache_path + "_dec_tgt", max_dec_len, pad_value=PAD_ID, mmap_mode=mmap_mode)
+    loss = VarLenArray.load(cache_path + "_loss", max_dec_len, pad_value=0, mmap_mode=mmap_mode)
+    kept = np.load(cache_path + "_kept_idx.npy", mmap_mode=mmap_mode)
+
     tc_path = cache_path + "_tool_count.npy"
     tc = np.load(tc_path, mmap_mode=mmap_mode) if os.path.exists(tc_path) else None
+
+    # Query-only: derived from encoder data + query lengths (no duplication)
+    query_only = None
+    ql_path = cache_path + "_query_len.npy"
+    if os.path.exists(ql_path):
+        query_lens = np.load(ql_path, mmap_mode=mmap_mode)
+        query_only = QueryOnlyArray(enc._data, enc._offsets, query_lens, max_enc_len)
+
+    # Tool individual: variable-length
+    tool_individual = None
+    if os.path.exists(cache_path + "_tool_ind_data.npy"):
+        tool_individual = VarLenArray.load(cache_path + "_tool_ind", max_tool_len,
+                                           pad_value=PAD_ID, mmap_mode=mmap_mode)
+
     def _load_optional(suffix):
         p = cache_path + suffix
         if os.path.exists(p):
             return np.load(p, mmap_mode=mmap_mode)
         return None
 
+    # Pre-packed arrays (if available from 'needle tokenize')
+    packed = {}
+    if os.path.exists(cache_path + "_packed_enc.npy"):
+        packed = {
+            "packed_enc": np.load(cache_path + "_packed_enc.npy", mmap_mode=mmap_mode),
+            "packed_dec_in": np.load(cache_path + "_packed_dec_in.npy", mmap_mode=mmap_mode),
+            "packed_dec_tgt": np.load(cache_path + "_packed_dec_tgt.npy", mmap_mode=mmap_mode),
+            "packed_loss": np.load(cache_path + "_packed_loss.npy", mmap_mode=mmap_mode),
+            "packed_enc_seg": np.load(cache_path + "_packed_enc_seg.npy", mmap_mode=mmap_mode),
+            "packed_dec_seg": np.load(cache_path + "_packed_dec_seg.npy", mmap_mode=mmap_mode),
+        }
+
     return {
-        "enc_inputs": np.load(cache_path + "_enc.npy", mmap_mode=mmap_mode),
-        "dec_inputs": np.load(cache_path + "_dec_in.npy", mmap_mode=mmap_mode),
-        "dec_targets": np.load(cache_path + "_dec_tgt.npy", mmap_mode=mmap_mode),
-        "loss_mask": np.load(cache_path + "_loss_mask.npy", mmap_mode=mmap_mode),
-        "kept_indices": np.load(cache_path + "_kept_idx.npy", mmap_mode=mmap_mode),
+        "enc_inputs": enc,
+        "dec_inputs": dec_in,
+        "dec_targets": dec_tgt,
+        "loss_mask": loss,
+        "kept_indices": kept,
         "tool_counts": tc,
-        "query_only": _load_optional("_query_only.npy"),
-        "tool_individual": _load_optional("_tool_individual.npy"),
+        "query_only": query_only,
+        "tool_individual": tool_individual,
         "tool_ex_idx": _load_optional("_tool_ex_idx.npy"),
         "tool_is_pos": _load_optional("_tool_is_pos.npy"),
+        **packed,
     }
 
 
@@ -1000,3 +1227,5 @@ class PrefetchIterator:
 def count_batches(n_samples, batch_size):
     """Return the number of full batches for a dataset of n_samples."""
     return n_samples // batch_size
+
+
