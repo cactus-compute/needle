@@ -538,7 +538,7 @@ class EncoderDecoderTransformer(nn.Module):
         mask = (jnp.arange(self.config.d_ff) < ff_width).astype(dtype)
         return jnp.broadcast_to(mask[None, :], (B, self.config.d_ff))
 
-    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, mat_ff_widths=None):
+    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mat_ff_widths=None):
         """Eval-only: separate per-width forwards for reporting per-width PPL.
 
         mat_ff_widths: list of FFN widths to evaluate (e.g. [1024, 512, 256]).
@@ -547,7 +547,8 @@ class EncoderDecoderTransformer(nn.Module):
         B = src.shape[0]
 
         encoder_out, enc_mask = self.encode_text(src, src_mask=src_mask)
-        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, cross_mask=enc_mask)
+        cm = cross_mask if cross_mask is not None else enc_mask
+        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, cross_mask=cm)
         logits = x_f32 @ emb.T
 
         mat_logits = []
@@ -555,7 +556,7 @@ class EncoderDecoderTransformer(nn.Module):
             for ff_w in mat_ff_widths:
                 mask = self._make_eval_ffn_mask(ff_w, B, x_f32.dtype)
                 enc_m, enc_m_mask = self.encode_text(src, src_mask=src_mask, ffn_mask=mask)
-                x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, cross_mask=enc_m_mask, ffn_mask=mask)
+                x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, cross_mask=cm, ffn_mask=mask)
                 mat_logits.append(x_m @ emb.T)
 
         return logits, 0.0, mat_logits
