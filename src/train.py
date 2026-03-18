@@ -682,7 +682,7 @@ def train(args):
 
             do_qat = jnp.broadcast_to(jnp.array(global_step % 100 == 0), (num_devices,))
 
-            do_contrastive = cl_batch_iter is not None and global_step % 100 == 0
+            do_contrastive = cl_batch_iter is not None and global_step % 1000 == 0
             cl_q_b, cl_t_b, cl_rngs = dummy_cl_tokens, dummy_cl_tokens, dummy_cl_rng
             if do_contrastive:
                 try:
@@ -938,6 +938,8 @@ def train(args):
         tc_halluc_params, tc_total_pred_params = 0, 0
         tc_missing_params, tc_total_ref_params = 0, 0
         tc_correct_values, tc_matched_params = 0, 0
+        tc_struct_correct, tc_struct_total = 0, 0
+        tc_semantic_correct, tc_semantic_total = 0, 0
 
         _pc_keys = ("n", "exact", "name_tp", "name_fp", "name_fn",
                      "call_tp", "call_fp", "call_fn", "parse_err")
@@ -1008,7 +1010,20 @@ def train(args):
                     if any(pred_args == _json_mod.dumps(ra, sort_keys=True) for ra in ref_by_name[c["name"]]):
                         tc_args_correct += 1
 
-            tool_param_map = {t["name"]: set((t.get("parameters") or {}).keys()) for t in tool_defs if isinstance(t, dict) and "name" in t}
+            # Build schema: name -> {param_name: type_string}
+            _STRUCTURED_TYPES = {"integer", "number", "boolean", "float", "int", "bool"}
+            tool_param_map = {}
+            tool_param_types = {}
+            for t in tool_defs:
+                if not isinstance(t, dict) or "name" not in t:
+                    continue
+                params = t.get("parameters") or {}
+                tool_param_map[t["name"]] = set(params.keys())
+                tool_param_types[t["name"]] = {
+                    k: v.get("type", "string") if isinstance(v, dict) else "string"
+                    for k, v in params.items()
+                }
+
             for c in pred_calls:
                 if not isinstance(c, dict) or "name" not in c:
                     continue
@@ -1026,9 +1041,21 @@ def train(args):
                     tc_missing_params += len(ref_keys - pred_keys)
                     matched_keys = pred_keys & ref_keys
                     tc_matched_params += len(matched_keys)
+                    ptypes = tool_param_types.get(cname, {})
                     for k in matched_keys:
-                        if _json_mod.dumps(c.get("arguments", {})[k], sort_keys=True) == _json_mod.dumps(ref_args[k], sort_keys=True):
-                            tc_correct_values += 1
+                        pred_v = _json_mod.dumps(c.get("arguments", {})[k], sort_keys=True)
+                        ref_v = _json_mod.dumps(ref_args[k], sort_keys=True)
+                        is_structured = ptypes.get(k, "string") in _STRUCTURED_TYPES
+                        if is_structured:
+                            tc_struct_total += 1
+                            if pred_v == ref_v:
+                                tc_correct_values += 1
+                                tc_struct_correct += 1
+                        else:
+                            tc_semantic_total += 1
+                            if pred_v == ref_v:
+                                tc_correct_values += 1
+                                tc_semantic_correct += 1
 
         tc_metrics = {}
         if tc_n > 0:
@@ -1044,6 +1071,10 @@ def train(args):
             tc_metrics["param_haluc"] = tc_halluc_params / max(tc_total_pred_params, 1)
             tc_metrics["param_miss"] = tc_missing_params / max(tc_total_ref_params, 1)
             tc_metrics["value_acc"] = tc_correct_values / max(tc_matched_params, 1)
+            tc_metrics["struct_acc"] = tc_struct_correct / max(tc_struct_total, 1)
+            tc_metrics["semantic_acc"] = tc_semantic_correct / max(tc_semantic_total, 1)
+            tc_metrics["struct_n"] = tc_struct_total
+            tc_metrics["semantic_n"] = tc_semantic_total
 
         if tc_metrics and tc_metrics["call_f1"] > best_call_f1:
             best_call_f1 = tc_metrics["call_f1"]
@@ -1086,6 +1117,8 @@ def train(args):
             print(f"  Param haluc    {tc_metrics['param_haluc']:>10.1%}")
             print(f"  Param miss     {tc_metrics['param_miss']:>10.1%}")
             print(f"  Value acc      {tc_metrics['value_acc']:>10.1%}")
+            print(f"    Structured   {tc_metrics['struct_acc']:>10.1%}  ({tc_metrics['struct_n']} params)")
+            print(f"    Semantic     {tc_metrics['semantic_acc']:>10.1%}  ({tc_metrics['semantic_n']} params)")
             print(f"  Args acc       {tc_metrics['args_acc']:>10.1%}")
             print(f"  Call F1        {tc_metrics['call_f1']:>10.1%}")
             print(f"  Exact match    {tc_metrics['exact_match']:>10.1%}")

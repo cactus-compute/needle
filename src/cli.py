@@ -22,8 +22,8 @@ def main():
     p.add_argument("--d-model", type=int, default=1024)
     p.add_argument("--num-heads", type=int, default=4)
     p.add_argument("--num-kv-heads", type=int, default=4)
-    p.add_argument("--num-layers", type=int, default=8)
-    p.add_argument("--num-dec-layers", type=int, default=8)
+    p.add_argument("--num-layers", type=int, default=6)
+    p.add_argument("--num-dec-layers", type=int, default=6)
     p.add_argument("--max-enc-len", type=int, default=DEFAULT_MAX_ENC_LEN)
     p.add_argument("--max-dec-len", type=int, default=DEFAULT_MAX_DEC_LEN)
     p.add_argument("--max-samples", type=int, default=None)
@@ -46,7 +46,7 @@ def main():
     p.add_argument("--activation", type=str, default="swiglu", choices=["drelu", "swiglu", "geglu"])
     p.add_argument("--num-memory-slots", type=int, default=128,
                    help="(DEPRECATED — ignored, kept for checkpoint compat)")
-    p.add_argument("--mat-factors", type=int, nargs="*", default=[2, 4],
+    p.add_argument("--mat-factors", type=int, nargs="*", default=[2, 4, 8],
                    help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4)")
     p.add_argument("--dropout", type=float, default=0.0,
                    help="Dropout rate for residual connections (default: 0.0)")
