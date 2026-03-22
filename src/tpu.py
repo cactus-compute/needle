@@ -193,8 +193,19 @@ def tpu_create(args):
             tpu_connect(args)
             return
         stderr = result.stderr.strip()
-        last_line = stderr.splitlines()[-1] if stderr else "unknown error"
-        print(f"[tpu] {zone}: {last_line}")
+        if not stderr:
+            stderr = result.stdout.strip()
+        
+        if stderr and any(phrase in stderr.lower() for phrase in [
+            "active account selected",
+            "gcloud auth login",
+            "could not load the default credentials",
+            "reauth",
+        ]):
+            print(f"[tpu] AUTH ERROR:\n{stderr}", file=sys.stderr)
+            sys.exit(1)
+        first_line = stderr.splitlines()[0] if stderr else "unknown error"
+        print(f"[tpu] {zone}: {first_line}")
     print(
         f"[tpu] ERROR: could not create '{args.name}' in any zone.",
         file=sys.stderr,
