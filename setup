@@ -23,7 +23,21 @@ if [ -f /etc/os-release ] && grep -qi 'ubuntu\|debian' /etc/os-release; then
         fi
     fi
 else
-    PYTHON=python3
+    # On macOS or other systems, find Python >= 3.11
+    PYTHON=""
+    for candidate in python3.13 python3.12 python3.11 python3; do
+        if command -v "$candidate" &>/dev/null; then
+            PY_OK=$("$candidate" -c "import sys; print(int(sys.version_info >= (3, 11)))" 2>/dev/null || echo "0")
+            if [ "$PY_OK" = "1" ]; then
+                PYTHON="$candidate"
+                break
+            fi
+        fi
+    done
+    if [ -z "$PYTHON" ]; then
+        echo "Error: Python >= 3.11 is required. Install it with: brew install python@3.12"
+        return 1 2>/dev/null || exit 1
+    fi
 fi
 
 # Recreate venv if it doesn't exist or was built with the wrong Python

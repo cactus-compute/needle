@@ -249,7 +249,7 @@ needle [command]
 
 - Setup gcloud 1: download the `macOS ARM` from [here](https://docs.cloud.google.com/sdk/docs/install-sdk) and uzip.
 - Setup gcloud 2: open terminal, cd to ypur downloads and run `./google-cloud-sdk/install.sh`
-- Setup gcloud 3: run `gloud init`, sign in with cactus email, should prompt for project
+- Setup gcloud 3: restart terminal and run `gloud init`, sign in with cactus email, should prompt for project
 - Setup gcloud 4: else, set the project with `gcloud config set project needle-488623`
 - setup gcloud 5: run `gcloud help` and read carefully
 
@@ -297,4 +297,16 @@ needle [command]
 
 10. (Optional) Delete instance when no longer needed
    needle tpu delete my-experiment
+```
+
+## Current TPU Instance
+
+```
+  Name       Zone        Type   Software         IP (ext)        Created
+  ─────────────────────────────────────────────────────────────────────────
+  henry      us-east5-a  v6e-8  v2-alpha-tpuv6e  34.186.252.53   Mar 17, 2026
+```
+
+```bash
+gcloud compute tpus tpu-vm ssh henry --zone=us-east5-a
 ```
