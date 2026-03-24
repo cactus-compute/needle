@@ -19,10 +19,6 @@ from concurrent.futures import ThreadPoolExecutor
 from google import genai
 from tqdm import tqdm
 
-# Each pool is a list of tools that might appear together on a device.
-# The generator picks a random subset from 1-2 pools per example to create
-# realistic tool availability scenarios.
-
 POOL_TIME_PRODUCTIVITY = [
     {"name": "set_timer", "description": "Set a timer for the specified duration or end time.", "parameters": {"time_human": {"type": "string", "description": "The duration or target end time in human readable format e.g. '1 hour and 30 minutes', '45 minutes', 'for 1:50pm', 'at 13:30'.", "required": True}}},
     {"name": "set_alarm", "description": "Set an alarm for a specified time.", "parameters": {"time_hours": {"type": "number", "description": "The hour component of the alarm time (24 hour time).", "required": True}, "time_minutes": {"type": "number", "description": "The minute component of the alarm time (0-59).", "required": True}, "label": {"type": "string", "description": "An optional label or title for the alarm.", "required": False}}},
@@ -729,22 +725,44 @@ OUTPUT FORMAT — return a JSON array, nothing else:
 
 Return ONLY valid JSON. No markdown, no explanation."""
 
-def make_client():
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
+def make_clients():
+    """Create Gemini clients from GEMINI_API_KEY (comma-separated for multiple keys)."""
+    raw = os.environ.get("GEMINI_API_KEY", "")
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    if not keys:
         print("Error: GEMINI_API_KEY environment variable not set.", file=sys.stderr)
-        print("Get one at https://aistudio.google.com/apikey", file=sys.stderr)
+        print("Set one or more comma-separated keys:", file=sys.stderr)
+        print("  export GEMINI_API_KEY=key1,key2,key3", file=sys.stderr)
+        print("Get keys at https://aistudio.google.com/apikey", file=sys.stderr)
         sys.exit(1)
-    return genai.Client(api_key=api_key)
+    clients = [genai.Client(api_key=k) for k in keys]
+    print(f"Using {len(clients)} API key(s)")
+    return clients
 
 
-def generate_batch(client, batch_size, rng, model):
+class ClientPool:
+    """Round-robin pool of Gemini clients for distributing requests across API keys."""
+
+    def __init__(self, clients):
+        self._clients = clients
+        self._idx = 0
+        self._lock = __import__("threading").Lock()
+
+    def get(self):
+        with self._lock:
+            client = self._clients[self._idx % len(self._clients)]
+            self._idx += 1
+            return client
+
+
+def generate_batch(client_pool, batch_size, rng, model):
     """Generate one batch of examples. Returns list of dicts."""
     call_type, call_desc = rng.choice(CALL_TYPES)
     tools = _pick_tools(rng, force_empty=(call_type == "no_tools"))
 
     prompt = build_prompt(batch_size, call_desc, tools, rng)
 
+    client = client_pool.get()
     response = client.models.generate_content(
         model=model,
         contents=prompt,
@@ -808,9 +826,10 @@ def generate_batch(client, batch_size, rng, model):
     return valid
 
 
-def generate_all(num_samples, workers=8, batch_size=25, model=MODEL):
+def generate_all(num_samples, workers=8, batch_size=25, model=MODEL, client_pool=None):
     """Generate num_samples examples using parallel Gemini calls."""
-    client = make_client()
+    if client_pool is None:
+        client_pool = ClientPool(make_clients())
     rng = random.Random(42)
 
     target = int(num_samples * 1.3)
@@ -827,7 +846,7 @@ def generate_all(num_samples, workers=8, batch_size=25, model=MODEL):
         def _submit_one():
             nonlocal submitted
             batch_rng = random.Random(rng.randint(0, 2**32))
-            f = pool.submit(generate_batch, client, batch_size, batch_rng, model)
+            f = pool.submit(generate_batch, client_pool, batch_size, batch_rng, model)
             pending.add(f)
             submitted += 1
 
@@ -868,6 +887,63 @@ def generate_all(num_samples, workers=8, batch_size=25, model=MODEL):
 
 LOCAL_UNIFIED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "tool_calls_unified")
 HF_DATASET_REPO = "Cactus-Compute/tool-calls"
+UPLOAD_EVERY = 1000
+
+
+def _load_existing():
+    """Load existing dataset from disk or HuggingFace."""
+    from datasets import load_dataset, load_from_disk
+
+    local = os.path.abspath(LOCAL_UNIFIED_DIR)
+    if os.path.exists(local) and any(f.endswith(".arrow") for f in os.listdir(local)):
+        ds = load_from_disk(local)
+        print(f"Loaded existing dataset: {len(ds)} rows")
+    else:
+        print(f"Downloading existing dataset from {HF_DATASET_REPO}...")
+        ds = load_dataset(HF_DATASET_REPO, split="train", token=True)
+        print(f"Downloaded: {len(ds)} rows")
+    return ds
+
+
+def _merge_and_upload(existing, new_examples):
+    """Merge new examples into existing dataset, save locally, and upload."""
+    import shutil
+    from collections import Counter
+    from datasets import Dataset, concatenate_datasets
+
+    new_ds = Dataset.from_dict({
+        "query": [ex["query"] for ex in new_examples],
+        "tools": [ex["tools"] for ex in new_examples],
+        "answers": [ex["answers"] for ex in new_examples],
+        "source": [ex["source"] for ex in new_examples],
+        "model": [ex["model"] for ex in new_examples],
+    })
+    new_ds = new_ds.select_columns(existing.column_names)
+
+    merged = concatenate_datasets([existing, new_ds])
+    print(f"\nMerged: {len(merged)} rows (+{len(new_ds)} new)")
+
+    for src, cnt in Counter(merged["source"]).most_common():
+        print(f"  {src}: {cnt}")
+
+    local = os.path.abspath(LOCAL_UNIFIED_DIR)
+    tmp_dir = local + "_tmp"
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir)
+    merged.save_to_disk(tmp_dir)
+    if os.path.exists(local):
+        shutil.rmtree(local)
+    os.rename(tmp_dir, local)
+    print("Saved locally.")
+
+    from huggingface_hub import HfApi
+    api = HfApi()
+    api.create_repo(HF_DATASET_REPO, repo_type="dataset", private=False, exist_ok=True)
+    print(f"Uploading to {HF_DATASET_REPO}...")
+    merged.push_to_hub(HF_DATASET_REPO, token=True)
+    print(f"Upload complete: {HF_DATASET_REPO}")
+
+    return merged
 
 
 def main():
@@ -878,79 +954,67 @@ def main():
     parser.add_argument("--model", type=str, default=MODEL, help="Gemini model")
     parser.add_argument("--dry-run", action="store_true", help="Generate only, skip save and upload")
     parser.add_argument("--output-jsonl", type=str, default=None, help="Also save raw generations to JSONL")
+    parser.add_argument("--upload-every", type=int, default=UPLOAD_EVERY, help="Merge+upload every N samples (default 1000)")
     args = parser.parse_args()
 
-    examples = generate_all(args.num_samples, args.workers, args.batch_size, args.model)
+    client_pool = ClientPool(make_clients())
 
-    if not examples:
-        print("No examples generated. Exiting.")
-        sys.exit(1)
+    remaining = args.num_samples
+    total_generated = 0
+    existing = None if args.dry_run else _load_existing()
+    seen_queries = set()
+    if existing and not args.dry_run:
+        seen_queries = set(existing["query"][:50000])
 
+    while remaining > 0:
+        chunk_size = min(remaining, args.upload_every)
+        print(f"\n{'='*50}")
+        print(f"Generating chunk: {chunk_size} samples ({total_generated}/{args.num_samples} done)")
+        print(f"{'='*50}")
+
+        examples = generate_all(chunk_size, args.workers, args.batch_size, args.model, client_pool=client_pool)
+
+        if not examples:
+            print("No examples generated in this chunk, stopping.")
+            break
+
+        fresh = []
+        for ex in examples:
+            if ex["query"] not in seen_queries:
+                seen_queries.add(ex["query"])
+                fresh.append(ex)
+        if len(fresh) < len(examples):
+            print(f"  Removed {len(examples) - len(fresh)} cross-chunk duplicates")
+        examples = fresh
+
+        if not examples:
+            print("All examples were duplicates, stopping.")
+            break
+
+        total_generated += len(examples)
+        remaining -= len(examples)
+
+        if args.output_jsonl:
+            with open(args.output_jsonl, "a") as f:
+                for ex in examples:
+                    f.write(json.dumps(ex) + "\n")
+
+        if total_generated == len(examples):
+            print("\nSample examples:")
+            for ex in examples[:5]:
+                print(f"  Q: {ex['query']}")
+                print(f"  A: {ex['answers'][:150]}")
+                print()
+
+        if args.dry_run:
+            print(f"  Chunk: {len(examples)} examples (dry-run, not uploading)")
+            continue
+
+        existing = _merge_and_upload(existing, examples)
+
+    print(f"\nDone. Total generated: {total_generated:,}")
     if args.output_jsonl:
-        with open(args.output_jsonl, "w") as f:
-            for ex in examples:
-                f.write(json.dumps(ex) + "\n")
-        print(f"Saved raw JSONL to {args.output_jsonl}")
-
-    print("\nSample examples:")
-    for ex in examples[:5]:
-        print(f"  Q: {ex['query']}")
-        print(f"  A: {ex['answers'][:150]}")
-        print()
-
-    if args.dry_run:
-        print(f"--dry-run: {len(examples)} examples generated, skipping save and upload")
-        return
-
-    from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk
-
-    local = os.path.abspath(LOCAL_UNIFIED_DIR)
-    if os.path.exists(local) and any(f.endswith(".arrow") for f in os.listdir(local)):
-        existing = load_from_disk(local)
-        print(f"Loaded existing dataset: {len(existing)} rows")
-    else:
-        print(f"Downloading existing dataset from {HF_DATASET_REPO}...")
-        existing = load_dataset(HF_DATASET_REPO, split="train", token=True)
-        print(f"Downloaded: {len(existing)} rows")
-
-    new_ds = Dataset.from_dict({
-        "query": [ex["query"] for ex in examples],
-        "tools": [ex["tools"] for ex in examples],
-        "answers": [ex["answers"] for ex in examples],
-        "source": [ex["source"] for ex in examples],
-        "model": [ex["model"] for ex in examples],
-    })
-    new_ds = new_ds.select_columns(existing.column_names)
-
-    existing_queries = set(existing["query"][:20000])
-    overlap = sum(1 for q in new_ds["query"] if q in existing_queries)
-    if overlap:
-        print(f"Warning: {overlap} overlapping queries with existing data")
-
-    merged = concatenate_datasets([existing, new_ds])
-    print(f"\nMerged: {len(merged)} rows ({len(existing)} existing + {len(new_ds)} new)")
-
-    from collections import Counter
-    for src, cnt in Counter(merged["source"]).most_common():
-        print(f"  {src}: {cnt}")
-
-    import shutil
-    tmp_dir = local + "_tmp"
-    if os.path.exists(tmp_dir):
-        shutil.rmtree(tmp_dir)
-    print(f"\nSaving to {local}...")
-    merged.save_to_disk(tmp_dir)
-    if os.path.exists(local):
-        shutil.rmtree(local)
-    os.rename(tmp_dir, local)
-    print("Saved.")
-
-    from huggingface_hub import HfApi
-    api = HfApi()
-    api.create_repo(HF_DATASET_REPO, repo_type="dataset", private=False, exist_ok=True)
-    print(f"\nUploading to {HF_DATASET_REPO}...")
-    merged.push_to_hub(HF_DATASET_REPO, token=True)
-    print(f"Upload complete: {HF_DATASET_REPO}")
+        print(f"Raw JSONL: {args.output_jsonl}")
 
 
 if __name__ == "__main__":
