@@ -100,6 +100,47 @@ def export_submodel(checkpoint_path, factor, output_path):
     print()
 
 
+def slice_params(params, config, factor):
+    """Slice params in-memory to a matryoshka sub-model at given shrink factor.
+
+    Returns (sliced_params, new_config).
+    """
+    d_ff = config.d_ff
+    d_ff_new = d_ff // factor
+    if d_ff_new == 0:
+        raise ValueError(f"factor={factor} too large: would give d_ff=0")
+
+    def slice_leaf(key_path, leaf):
+        arr = np.asarray(leaf)
+        if arr.ndim not in (2, 3):
+            return arr
+        parent_name = None
+        for part in key_path:
+            name = part.key if hasattr(part, "key") else str(part)
+            if name in _FFN_KERNEL_NAMES:
+                parent_name = name
+                break
+        if parent_name is None:
+            return arr
+        if arr.ndim == 2:
+            rows, cols = arr.shape
+            if parent_name in ("gate_proj", "up_proj") and cols == d_ff:
+                return arr[:, :d_ff_new]
+            elif parent_name == "down_proj" and rows == d_ff:
+                return arr[:d_ff_new, :]
+        elif arr.ndim == 3:
+            _, rows, cols = arr.shape
+            if parent_name in ("gate_proj", "up_proj") and cols == d_ff:
+                return arr[:, :, :d_ff_new]
+            elif parent_name == "down_proj" and rows == d_ff:
+                return arr[:, :d_ff_new, :]
+        return arr
+
+    sliced = jax.tree_util.tree_map_with_path(slice_leaf, params)
+    new_config = replace(config, d_ff=d_ff_new)
+    return sliced, new_config
+
+
 def main(args):
     checkpoint = args.checkpoint
     factor = args.factor

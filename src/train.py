@@ -957,13 +957,27 @@ def train(args):
         eval_gen_len = min(args.max_dec_len, 512)
         _EVAL_BATCH = 32
         _n_chunks = (len(all_eval_examples) + _EVAL_BATCH - 1) // _EVAL_BATCH
+
+        # Use smallest matryoshka slice for generation eval if available
+        if _MAT_FACTORS:
+            from .export import slice_params
+            _max_factor = max(_MAT_FACTORS)
+            _mat_params, _mat_config = slice_params(eval_params, config, _max_factor)
+            _mat_params = jax.tree.map(jnp.array, _mat_params)
+            _gen_model = EncoderDecoderTransformer(_mat_config)
+            _gen_label = f"{_max_factor}x (d_ff={_mat_config.d_ff})"
+        else:
+            _mat_params = eval_params
+            _gen_model = eval_model
+            _gen_label = "full"
+
         all_preds = []
         _gen_t0 = time.perf_counter()
         for _ei in tqdm(range(0, len(all_eval_examples), _EVAL_BATCH),
-                        total=_n_chunks, desc="  eval generate", leave=False):
+                        total=_n_chunks, desc=f"  eval generate ({_gen_label})", leave=False):
             _chunk = all_eval_examples[_ei:_ei + _EVAL_BATCH]
             all_preds.extend(generate_batch(
-                eval_model, eval_params, tokenizer,
+                _gen_model, _mat_params, tokenizer,
                 [ex["query"] for ex in _chunk],
                 [ex["tools"] for ex in _chunk],
                 max_gen_len=eval_gen_len,
@@ -973,6 +987,7 @@ def train(args):
         _gen_elapsed = time.perf_counter() - _gen_t0
         _gen_total_toks = sum(len(tokenizer.encode(p)) for p in all_preds)
         _gen_tok_per_sec = _gen_total_toks / max(_gen_elapsed, 1e-6)
+        del _mat_params
 
         display_preds = all_preds[:len(display_pairs)]
         pool_preds = {}
@@ -1121,11 +1136,21 @@ def train(args):
         _best_metric = pool_metrics.get("struct_single", {}).get("call_f1", 0)
         if _best_metric > best_call_f1:
             best_call_f1 = _best_metric
-            best_ckpt_path = os.path.join(args.checkpoint_dir, f"needle_{args.num_layers}_{args.d_model}_best.pkl")
+            best_ckpt_path = os.path.join(args.checkpoint_dir, f"needle_{args.num_layers}_{args.d_model}_{config.d_ff}_best.pkl")
             import shutil as _shutil
             _shutil.copy2(ckpt_path, best_ckpt_path)
             print(f"  ** New best struct call_f1={best_call_f1:.1%} → {best_ckpt_path}")
             _upload_checkpoint(best_ckpt_path)
+            if _MAT_FACTORS:
+                from .export import export_submodel
+                for factor in _MAT_FACTORS:
+                    d_ff_sub = config.d_ff // factor
+                    mat_ckpt_path = os.path.join(
+                        args.checkpoint_dir,
+                        f"needle_{args.num_layers}_{args.d_model}_{d_ff_sub}_best.pkl",
+                    )
+                    export_submodel(best_ckpt_path, factor, mat_ckpt_path)
+                    _upload_checkpoint(mat_ckpt_path)
 
         retrieval_metrics = None
         if has_contrastive and _CONTRASTIVE_WEIGHT > 0:
@@ -1198,7 +1223,7 @@ def train(args):
                 print(f"  Recall@{k:<3}     {v:>10.1%}")
             print(f"  MRR            {rm['mrr']:>10.3f}")
         print(f"  ─────────────────────────────────────")
-        print(f"  Throughput     {_gen_tok_per_sec:>10.1f} tok/s  ({len(all_eval_examples)} samples, {_gen_elapsed:.1f}s)")
+        print(f"  Throughput     {_gen_tok_per_sec:>10.1f} tok/s  ({len(all_eval_examples)} samples, {_gen_elapsed:.1f}s, {_gen_label})")
         if unified_samples:
             print(f"  ─── Samples ({len(unified_samples)}) ───────────────────")
             for j, s in enumerate(unified_samples):
