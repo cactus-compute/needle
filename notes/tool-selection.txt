@@ -15,11 +15,16 @@ select the right tool(s) for a given query. Two challenges:
       search_flights vs search_hotels vs search_restaurants). This is a
       retrieval problem, not a generation problem.
 
+  (C) The model generates JSON tool calls autoregressively. While it learns
+      JSON structure well (99-100% parse rate), it can still hallucinate
+      invalid function names or argument keys. The valid tool definitions are
+      already in the encoder input — we can constrain the decoder to only
+      produce valid names/keys at inference time.
+
 The standard approach is a separate retrieval model (e.g., embedding API)
 to pre-filter tools before passing them to the generator. This adds a
 second model, a second inference pass, and a mismatch between the
 representations used for retrieval and generation.
-
 
 ## 2. Key Insight: Shared Encoder, Dual Use
 

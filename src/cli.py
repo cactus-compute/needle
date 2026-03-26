@@ -15,7 +15,7 @@ def main():
 
     p = sub.add_parser("train", add_help=False)
     p.add_argument("--checkpoint", type=str, default=None)
-    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
@@ -46,7 +46,7 @@ def main():
     p.add_argument("--activation", type=str, default="swiglu", choices=["drelu", "swiglu", "geglu"])
     p.add_argument("--num-memory-slots", type=int, default=128,
                    help="(DEPRECATED — ignored, kept for checkpoint compat)")
-    p.add_argument("--mat-factors", type=int, nargs="*", default=[2, 4, 8],
+    p.add_argument("--mat-factors", type=int, nargs="*", default=[2, 4],
                    help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4)")
     p.add_argument("--dropout", type=float, default=0.0,
                    help="Dropout rate for residual connections (default: 0.0)")
@@ -58,6 +58,8 @@ def main():
                    help="Dimension of contrastive projection head (default: 128)")
     p.add_argument("--conv-kernel-size", type=int, default=0,
                    help="Conformer conv kernel size in encoder (0=disabled, 15=default when enabled)")
+    p.add_argument("--no-feedforward", action=argparse.BooleanOptionalAction, default=True,
+                   help="Remove feedforward layers entirely (default: True)")
 
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,

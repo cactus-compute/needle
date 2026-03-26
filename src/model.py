@@ -50,6 +50,7 @@ class TransformerConfig:
     contrastive_dim: int = 128
     conv_kernel_size: int = 0
     enable_speech: bool = False
+    no_feedforward: bool = True
 
     @property
     def jax_dtype(self):
@@ -221,7 +222,7 @@ class ConvModule(nn.Module):
 
 
 class EncoderBlock(nn.Module):
-    """Pre-norm self-attention + pre-norm FFN with residual connections."""
+    """Pre-norm self-attention + pre-norm FFN with gated residual connections."""
     num_heads: int
     num_kv_heads: int
     d_model: int
@@ -231,27 +232,32 @@ class EncoderBlock(nn.Module):
     activation: str = "drelu"
     dropout_rate: float = 0.0
     conv_kernel_size: int = 0
+    no_feedforward: bool = True
 
     @nn.compact
     def __call__(self, x, mask=None, rope=None, ffn_mask=None, deterministic=True):
+        gate = nn.sigmoid(self.param("attn_gate", jinit.zeros, ())).astype(self.dtype)
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
         x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
             x, x, mask=mask, rope=rope
         )
-        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic) + residual
+        x = residual + gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
 
         if self.conv_kernel_size > 0:
+            conv_gate = nn.sigmoid(self.param("conv_gate", jinit.zeros, ())).astype(self.dtype)
             residual = x
             x = ZCRMSNorm(dtype=self.dtype)(x)
             x = ConvModule(self.d_model, self.conv_kernel_size, self.num_layers,
                            self.dtype, name="conv_module")(x)
-            x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic) + residual
+            x = residual + conv_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
 
-        residual = x
-        x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x, ffn_mask=ffn_mask)
-        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic) + residual
+        if not self.no_feedforward:
+            ffn_gate = nn.sigmoid(self.param("ffn_gate", jinit.zeros, ())).astype(self.dtype)
+            residual = x
+            x = ZCRMSNorm(dtype=self.dtype)(x)
+            x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x, ffn_mask=ffn_mask)
+            x = residual + ffn_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
 
         return x
 
@@ -267,6 +273,7 @@ class _EncoderScanBody(nn.Module):
     activation: str = "drelu"
     dropout_rate: float = 0.0
     conv_kernel_size: int = 0
+    no_feedforward: bool = True
     deterministic: bool = True
 
     @nn.compact
@@ -275,7 +282,7 @@ class _EncoderScanBody(nn.Module):
         x = EncoderBlock(
             self.num_heads, self.num_kv_heads, self.d_model, self.d_ff,
             self.num_layers, self.dtype, self.activation, self.dropout_rate,
-            self.conv_kernel_size,
+            self.conv_kernel_size, self.no_feedforward,
         )(x, mask, rope, ffn_mask, self.deterministic)
         return (x, mask, rope, ffn_mask), None
 
@@ -299,7 +306,7 @@ class Encoder(nn.Module):
         (x, _, _, _), _ = ScanBlock(
             cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
             cfg.total_layers, dt, cfg.activation, cfg.dropout_rate,
-            cfg.conv_kernel_size, deterministic, name="layers",
+            cfg.conv_kernel_size, cfg.no_feedforward, deterministic, name="layers",
         )((x, mask, rope, ffn_mask), None)
 
         x = ZCRMSNorm(dtype=dt, name="final_norm")(x)
@@ -315,27 +322,32 @@ class DecoderBlock(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
     dropout_rate: float = 0.0
+    no_feedforward: bool = True
 
     @nn.compact
     def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, ffn_mask=None, deterministic=True):
+        self_gate = nn.sigmoid(self.param("self_attn_gate", jinit.zeros, ())).astype(self.dtype)
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
         x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
             x, x, mask=self_mask, rope=rope
         )
-        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic) + residual
+        x = residual + self_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
 
+        cross_gate = nn.sigmoid(self.param("cross_attn_gate", jinit.zeros, ())).astype(self.dtype)
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
         x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="cross_attn")(
             x, encoder_out, mask=cross_mask
         )
-        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic) + residual
+        x = residual + cross_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
 
-        residual = x
-        x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x, ffn_mask=ffn_mask)
-        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic) + residual
+        if not self.no_feedforward:
+            ffn_gate = nn.sigmoid(self.param("ffn_gate", jinit.zeros, ())).astype(self.dtype)
+            residual = x
+            x = ZCRMSNorm(dtype=self.dtype)(x)
+            x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x, ffn_mask=ffn_mask)
+            x = residual + ffn_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
 
         return x
 
@@ -351,6 +363,7 @@ class _DecoderScanBody(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
     dropout_rate: float = 0.0
+    no_feedforward: bool = True
     deterministic: bool = True
 
     @nn.compact
@@ -359,6 +372,7 @@ class _DecoderScanBody(nn.Module):
         x = DecoderBlock(
             self.num_heads, self.num_kv_heads, self.d_model, self.d_ff,
             self.num_layers, self.dtype, self.activation, self.dropout_rate,
+            self.no_feedforward,
         )(x, encoder_out, self_mask, cross_mask, rope, ffn_mask, self.deterministic)
         return (x, encoder_out, self_mask, cross_mask, rope, ffn_mask), None
 
@@ -381,7 +395,7 @@ class Decoder(nn.Module):
         (x, _, _, _, _, _), _ = ScanBlock(
             cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
             cfg.total_layers, dt, cfg.activation, cfg.dropout_rate,
-            deterministic, name="layers",
+            cfg.no_feedforward, deterministic, name="layers",
         )((x, encoder_out, self_mask, cross_mask, rope, ffn_mask), None)
 
         x = ZCRMSNorm(dtype=dt)(x)

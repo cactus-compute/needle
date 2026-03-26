@@ -531,6 +531,7 @@ def train(args):
             contrastive_dim=getattr(args, "contrastive_dim", 128),
             conv_kernel_size=getattr(args, "conv_kernel_size", 0),
             enable_speech=getattr(args, "enable_speech", False),
+            no_feedforward=getattr(args, "no_feedforward", True),
         )
 
     global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF, _CONTRASTIVE_WEIGHT
@@ -538,7 +539,7 @@ def train(args):
     _CONTRASTIVE_WEIGHT = getattr(args, "contrastive_weight", 0.1)
     _D_FF = config.d_ff
     mat_factors_raw = getattr(args, "mat_factors", None)
-    if mat_factors_raw:
+    if mat_factors_raw and not config.no_feedforward:
         _MAT_FACTORS = tuple(f for f in mat_factors_raw if f > 1)
         _MAT_FF_WIDTHS = tuple(config.d_ff // f for f in _MAT_FACTORS)
     else:
@@ -970,6 +971,9 @@ def train(args):
             _mat_params = eval_params
             _gen_model = eval_model
             _gen_label = "full"
+
+        _mat_params = _quantize_params(_mat_params, group_size=_GROUP_SIZE)
+        _gen_label += " INT4"
 
         all_preds = []
         _gen_t0 = time.perf_counter()
