@@ -379,7 +379,7 @@ def load_tool_calls(split="train", max_samples=None, return_global_indices=False
     rng = np.random.RandomState(42)
     perm = rng.permutation(n)
 
-    val_size = min(5000, int(n * 0.1))
+    val_size = min(10000, int(n * 0.1))
     val_indices = perm[-val_size:]
     train_indices = perm[:-val_size]
 
