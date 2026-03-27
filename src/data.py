@@ -48,7 +48,7 @@ DEFAULT_MAX_ENC_LEN = 1024
 DEFAULT_MAX_DEC_LEN = 512
 DEFAULT_MAX_GEN_LEN = 512
 
-_unified_dataset_cache = None
+_split_dataset_cache = {}
 
 
 def _mark_json_value(s, char_w, key, value_str, weight):
@@ -154,41 +154,43 @@ def _token_weights_for_answer(answer_str, token_ids, sp_model,
     return weights
 
 
-def _load_unified_dataset():
-    """Load the unified dataset from disk.
+def _load_split_dataset(split="train"):
+    """Load a dataset split from disk or HuggingFace.
 
-    Caches the result in memory after first load.
+    Caches each split in memory after first load.
     Uses soundfile as the audio decoding backend.
     """
-    global _unified_dataset_cache
-    if _unified_dataset_cache is not None:
-        return _unified_dataset_cache
+    hf_split = "validation" if split in ("validation", "val", "test") else "train"
 
-    if os.path.exists(LOCAL_UNIFIED_DIR) and any(
-        f.endswith(".arrow") for f in os.listdir(LOCAL_UNIFIED_DIR)
+    if hf_split in _split_dataset_cache:
+        return _split_dataset_cache[hf_split]
+
+    local_dir = os.path.join(LOCAL_UNIFIED_DIR, hf_split)
+    if os.path.exists(local_dir) and any(
+        f.endswith(".arrow") for f in os.listdir(local_dir)
     ):
         try:
-            ds = load_from_disk(LOCAL_UNIFIED_DIR)
-            print(f"Loaded unified dataset from {LOCAL_UNIFIED_DIR} ({len(ds)} rows)")
-            _unified_dataset_cache = _set_audio_backend(ds)
-            return _unified_dataset_cache
+            ds = load_from_disk(local_dir)
+            print(f"Loaded {hf_split} split from {local_dir} ({len(ds)} rows)")
+            _split_dataset_cache[hf_split] = _set_audio_backend(ds)
+            return _split_dataset_cache[hf_split]
         except Exception as e:
-            print(f"Warning: failed to load from {LOCAL_UNIFIED_DIR}: {e}")
+            print(f"Warning: failed to load from {local_dir}: {e}")
 
     try:
         from datasets import load_dataset as _hf_load
-        print("Downloading dataset from HuggingFace (Cactus-Compute/tool-calls)...")
-        ds = _hf_load("Cactus-Compute/tool-calls", split="train", token=True)
-        os.makedirs(LOCAL_UNIFIED_DIR, exist_ok=True)
-        ds.save_to_disk(LOCAL_UNIFIED_DIR)
-        print(f"Loaded from HuggingFace -> {LOCAL_UNIFIED_DIR} ({len(ds)} rows)")
-        _unified_dataset_cache = _set_audio_backend(ds)
-        return _unified_dataset_cache
+        print(f"Downloading {hf_split} split from HuggingFace (Cactus-Compute/tool-calls)...")
+        ds = _hf_load("Cactus-Compute/tool-calls", split=hf_split, token=True)
+        os.makedirs(local_dir, exist_ok=True)
+        ds.save_to_disk(local_dir)
+        print(f"Loaded from HuggingFace -> {local_dir} ({len(ds)} rows)")
+        _split_dataset_cache[hf_split] = _set_audio_backend(ds)
+        return _split_dataset_cache[hf_split]
     except Exception as e:
         print(f"Warning: HuggingFace download failed: {e}")
 
     raise FileNotFoundError(
-        f"Dataset not found at {LOCAL_UNIFIED_DIR}. "
+        f"Dataset split '{hf_split}' not found at {local_dir}. "
         f"Run 'needle tokenize' first."
     )
 
@@ -278,7 +280,10 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
 
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
 
-    ds = _load_unified_dataset()
+    from datasets import concatenate_datasets
+    train_ds = _load_split_dataset("train")
+    val_ds = _load_split_dataset("validation")
+    ds = concatenate_datasets([train_ds, val_ds])
     if max_samples:
         ds = ds.select(range(min(max_samples, len(ds))))
 
@@ -364,36 +369,26 @@ def get_tokenizer(max_samples=None):
 
 
 def load_tool_calls(split="train", max_samples=None, return_global_indices=False):
-    """Load tool-calling dataset with shuffled train/val split.
+    """Load tool-calling dataset split directly from HuggingFace.
 
-    Shuffles the full dataset with a fixed seed, then splits:
-      - val: min(5000, 10% of total)
-      - train: everything else
+    The dataset has official train/validation splits on HuggingFace.
+    Train is shuffled with a fixed seed; validation is returned as-is.
 
-    If return_global_indices is True, also return a numpy array mapping each
-    split-local row position back to its row id in the full unified dataset.
+    If return_global_indices is True, also return a numpy array of row indices
+    (sequential within the split).
     """
-    ds = _load_unified_dataset()
+    ds = _load_split_dataset(split)
     n = len(ds)
+    global_indices = np.arange(n, dtype=np.int64)
 
-    rng = np.random.RandomState(42)
-    perm = rng.permutation(n)
-
-    val_size = min(10000, int(n * 0.1))
-    val_indices = perm[-val_size:]
-    train_indices = perm[:-val_size]
-
-    if split in ("validation", "val", "test"):
-        global_indices = val_indices.astype(np.int64)
-    elif split == "train":
-        global_indices = train_indices.astype(np.int64)
-    else:
-        global_indices = perm.astype(np.int64)
-
-    ds = ds.select(global_indices.tolist())
+    if split == "train":
+        rng = np.random.RandomState(42)
+        perm = rng.permutation(n).astype(np.int64)
+        ds = ds.select(perm.tolist())
+        global_indices = perm
 
     if max_samples:
-        limit = min(max_samples, len(ds))
+        limit = min(max_samples, n)
         ds = ds.select(range(limit))
         global_indices = global_indices[:limit]
 
@@ -808,35 +803,27 @@ def pack_sequences(cache_path, enc_vl, dec_in_vl, dec_tgt_vl, loss_vl):
 
 
 def load_tool_call_audio(split="train", max_samples=None):
-    """Return dataset-global indices for the given split.
+    """Return dataset-local indices for the given split.
 
-    Applies the same 90/10 split as load_tool_calls. Audio is NOT loaded into memory.
+    Audio is NOT loaded into memory.
     """
-    ds = _load_unified_dataset()
+    ds = _load_split_dataset(split)
     n = len(ds)
-
-    if split in ("validation", "val", "test"):
-        start, end = int(n * 0.9), n
-    elif split == "train":
-        start, end = 0, int(n * 0.9)
-    else:
-        start, end = 0, n
-
-    indices = list(range(start, end))
+    indices = list(range(n))
     if max_samples:
         indices = indices[:max_samples]
     return indices
 
 
-def load_example_with_audio(idx):
-    """Load a dataset example by global index.
+def load_example_with_audio(idx, split="train"):
+    """Load a dataset example by index within a split.
 
     Returns dict with {query, answers, tools, audio_array, sampling_rate}.
     Audio fields are None for text-only datasets.
     """
-    ds = _load_unified_dataset()
+    ds = _load_split_dataset(split)
     if idx < 0 or idx >= len(ds):
-        raise IndexError(f"Index {idx} out of range (dataset has {len(ds)} rows)")
+        raise IndexError(f"Index {idx} out of range (split has {len(ds)} rows)")
     ex = ds[idx]
 
     audio, sr = None, None

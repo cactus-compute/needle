@@ -69,20 +69,22 @@ def _clear_local_caches():
 
 
 def _download_synth_dataset():
-    """Download synthesized tool-calling dataset from HuggingFace."""
+    """Download synthesized tool-calling dataset (train + validation) from HuggingFace."""
     from datasets import load_dataset
 
     print("Downloading dataset from HuggingFace (Cactus-Compute/tool-calls)...")
-    try:
-        ds = load_dataset("Cactus-Compute/tool-calls", split="train", token=True)
-    except Exception as e:
-        raise FileNotFoundError(
-            f"Dataset not found on HuggingFace (Cactus-Compute/tool-calls): {e}\n"
-            "Run 'python scripts/push_to_hf.py' first."
-        )
-    os.makedirs(LOCAL_UNIFIED_DIR, exist_ok=True)
-    ds.save_to_disk(LOCAL_UNIFIED_DIR)
-    print(f"Saved {len(ds):,} rows to {LOCAL_UNIFIED_DIR}")
+    for split in ("train", "validation"):
+        try:
+            ds = load_dataset("Cactus-Compute/tool-calls", split=split, token=True)
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Dataset split '{split}' not found on HuggingFace (Cactus-Compute/tool-calls): {e}\n"
+                "Run 'python scripts/generate_data.py' first."
+            )
+        split_dir = os.path.join(LOCAL_UNIFIED_DIR, split)
+        os.makedirs(split_dir, exist_ok=True)
+        ds.save_to_disk(split_dir)
+        print(f"Saved {split}: {len(ds):,} rows to {split_dir}")
 
 
 def tokenize(args):

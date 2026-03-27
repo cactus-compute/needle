@@ -98,14 +98,15 @@ def main():
     os.rename(tmp_dir, local)
     print("Saved.")
 
-    # Upload to HuggingFace
+    # Upload to HuggingFace (train split only)
     from huggingface_hub import HfApi
 
     api = HfApi()
     api.create_repo(HF_DATASET_REPO, repo_type="dataset", private=False, exist_ok=True)
-    print(f"\nUploading to {HF_DATASET_REPO}...")
-    merged.push_to_hub(HF_DATASET_REPO, token=True)
+    print(f"\nUploading to {HF_DATASET_REPO} (train split)...")
+    merged.push_to_hub(HF_DATASET_REPO, split="train", token=True)
     print(f"Upload complete: {HF_DATASET_REPO}")
+    print("NOTE: Run 'python scripts/split_dataset.py' to create the validation split.")
 
 
 if __name__ == "__main__":
