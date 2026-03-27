@@ -872,55 +872,21 @@ def train(args):
         display_pairs = display_with + display_without
 
         import json as _json_mod
-        _STRUCTURED_TYPES = {"integer", "number", "boolean", "float", "int", "bool"}
-        tc_per_bucket = 30
+        tc_per_bucket = 50
         tc_rng = np.random.RandomState(epoch + 42)
 
         def _classify_sample(ex):
-            """Classify a sample as (arg_type, call_type) for stratified eval.
-
-            arg_type: 'structured', 'semantic', or 'empty'
-            call_type: 'single', 'multi', or 'empty'
-            """
+            """Classify a sample as single or multi call."""
             try:
-                tools = _json_mod.loads(ex["tools"])
                 answers = _json_mod.loads(ex["answers"])
             except (ValueError, TypeError):
-                return "empty", "empty"
+                return "empty"
             if not answers or not isinstance(answers, list):
-                return "empty", "empty"
+                return "empty"
+            return "single" if len(answers) == 1 else "multi"
 
-            call_type = "single" if len(answers) == 1 else "multi"
-
-            type_map = {}
-            for t in tools:
-                if not isinstance(t, dict) or "name" not in t:
-                    continue
-                for k, v in (t.get("parameters") or {}).items():
-                    ptype = v.get("type", "string") if isinstance(v, dict) else "string"
-                    if not isinstance(ptype, str):
-                        ptype = "string"
-                    type_map[(t["name"], k)] = ptype
-
-            n_struct, n_sem = 0, 0
-            for call in answers:
-                if not isinstance(call, dict):
-                    continue
-                cname = call.get("name")
-                if not isinstance(cname, str):
-                    continue
-                for k in (call.get("arguments") or {}).keys():
-                    if type_map.get((cname, k), "string") in _STRUCTURED_TYPES:
-                        n_struct += 1
-                    else:
-                        n_sem += 1
-            if n_struct + n_sem == 0:
-                return "empty", call_type
-            arg_type = "struct" if n_struct >= n_sem else "semantic"
-            return arg_type, call_type
-
-        # 4 pools: (structured|semantic) × (single|multi), each balanced by tool count
-        _pool_names = ["struct_single", "struct_multi", "semantic_single", "semantic_multi"]
+        # 2 pools: single/multi, each balanced by tool count
+        _pool_names = ["single", "multi"]
         _pool_buckets = {name: {t: [] for t in range(11)} for name in _pool_names}
 
         for k in range(len(val_kept)):
@@ -929,12 +895,10 @@ def train(args):
                 nc = min(len(_json_mod.loads(ex["tools"])), 10)
             except (ValueError, TypeError):
                 nc = 0
-            arg_type, call_type = _classify_sample(ex)
-            if arg_type == "empty":
+            call_type = _classify_sample(ex)
+            if call_type == "empty":
                 continue
-            pool_key = f"{arg_type}_{call_type}"
-            if pool_key in _pool_buckets:
-                _pool_buckets[pool_key][nc].append(k)
+            _pool_buckets[call_type][nc].append(k)
 
         def _balanced_sample(buckets, per_bucket, rng):
             pool = []
@@ -1137,13 +1101,13 @@ def train(args):
         for name in _pool_names:
             pool_metrics[name], pool_pc[name] = _eval_pool(eval_pools[name], pool_preds[name])
 
-        _best_metric = pool_metrics.get("struct_single", {}).get("call_f1", 0)
+        _best_metric = pool_metrics.get("single", {}).get("call_f1", 0)
         if _best_metric > best_call_f1:
             best_call_f1 = _best_metric
             best_ckpt_path = os.path.join(args.checkpoint_dir, f"needle_{args.num_layers}_{args.d_model}_{config.d_ff}_best.pkl")
             import shutil as _shutil
             _shutil.copy2(ckpt_path, best_ckpt_path)
-            print(f"  ** New best struct call_f1={best_call_f1:.1%} → {best_ckpt_path}")
+            print(f"  ** New best single call_f1={best_call_f1:.1%} → {best_ckpt_path}")
             _upload_checkpoint(best_ckpt_path)
             if _MAT_FACTORS:
                 from .export import export_submodel
@@ -1213,10 +1177,8 @@ def train(args):
                     print(f"  {t:>6}  {d['n']:>4}  {nf1:>7.1%}  {d['name_tp']:>4} {d['name_fp']:>4} {d['name_fn']:>4}  {cf1:>7.1%}  {d['call_tp']:>4} {d['call_fp']:>4} {d['call_fn']:>4}  {ex_:>5.1%}  {pr_:>5.1%}")
 
         _label_map = {
-            "struct_single": "Structured / Single-Call",
-            "struct_multi": "Structured / Multi-Call",
-            "semantic_single": "Semantic / Single-Call",
-            "semantic_multi": "Semantic / Multi-Call",
+            "single": "Single-Call",
+            "multi": "Multi-Call",
         }
         for name in _pool_names:
             _print_tc_metrics(_label_map[name], pool_metrics[name], pool_pc[name])
