@@ -441,17 +441,13 @@ def _estimate_mat_params(config, matryoshka_factor):
     emb = v * d
     attn = d * d + d * kv_dim * 2 + d * d
     ffn = d * d_ff * 3
-    conv = 0
-    if config.conv_kernel_size > 0:
-        K = config.conv_kernel_size
-        conv = d * 2 * d + d * K + d + d * d 
     speech_sub = 0
     if getattr(config, "enable_speech", True):
         C = 256
         n_mels = getattr(config, "n_mels", 80)
         freq_out = n_mels // 8
         speech_sub = (1 * C * 9) + (C * 9 + C * C) + (C * 9 + C * C) + (C * freq_out * d)
-    enc_block = attn + conv + ffn
+    enc_block = attn + ffn
     dec_block = attn * 2 + ffn
     total = emb + speech_sub + n_enc * enc_block + n_dec * dec_block
     return int(total)
@@ -529,7 +525,6 @@ def train(args):
             activation=getattr(args, "activation", "drelu"),
             num_memory_slots=getattr(args, "num_memory_slots", 64),
             contrastive_dim=getattr(args, "contrastive_dim", 128),
-            conv_kernel_size=getattr(args, "conv_kernel_size", 0),
             enable_speech=getattr(args, "enable_speech", False),
             no_feedforward=getattr(args, "no_feedforward", True),
         )

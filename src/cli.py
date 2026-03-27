@@ -19,11 +19,11 @@ def main():
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
-    p.add_argument("--d-model", type=int, default=768)
-    p.add_argument("--num-heads", type=int, default=4)
+    p.add_argument("--d-model", type=int, default=512)
+    p.add_argument("--num-heads", type=int, default=8)
     p.add_argument("--num-kv-heads", type=int, default=4)
-    p.add_argument("--num-layers", type=int, default=6)
-    p.add_argument("--num-dec-layers", type=int, default=6)
+    p.add_argument("--num-layers", type=int, default=12)
+    p.add_argument("--num-dec-layers", type=int, default=12)
     p.add_argument("--max-enc-len", type=int, default=DEFAULT_MAX_ENC_LEN)
     p.add_argument("--max-dec-len", type=int, default=DEFAULT_MAX_DEC_LEN)
     p.add_argument("--max-samples", type=int, default=None)
@@ -56,8 +56,6 @@ def main():
                    help="Weight for CLIP-style contrastive loss (default: 0.1)")
     p.add_argument("--contrastive-dim", type=int, default=128,
                    help="Dimension of contrastive projection head (default: 128)")
-    p.add_argument("--conv-kernel-size", type=int, default=0,
-                   help="Conformer conv kernel size in encoder (0=disabled, 15=default when enabled)")
     p.add_argument("--no-feedforward", action=argparse.BooleanOptionalAction, default=True,
                    help="Remove feedforward layers entirely (default: True)")
 
