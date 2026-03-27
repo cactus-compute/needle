@@ -13,7 +13,7 @@ The architecture choices are interdependent:
   - We do not need MLPs for tiny models 
   - Structured loss weighting targets the actual error distribution 
   - QAT provides regularisation eliminating the need for dropout 
-  - Attention is a nonlinearity in the absence of MLP 
+  - softmax is a nonlinearity, so scaled dot-product attention (softmax(QK^T/√d) · V) is nonlinear. 
 
 ----
 

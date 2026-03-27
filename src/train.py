@@ -1104,7 +1104,10 @@ def train(args):
         _best_metric = pool_metrics.get("single", {}).get("call_f1", 0)
         if _best_metric > best_call_f1:
             best_call_f1 = _best_metric
-            best_ckpt_path = os.path.join(args.checkpoint_dir, f"needle_{args.num_layers}_{args.d_model}_{config.d_ff}_best.pkl")
+            if config.no_feedforward:
+                best_ckpt_path = os.path.join(args.checkpoint_dir, f"needle_{args.num_layers}_{args.d_model}_best.pkl")
+            else:
+                best_ckpt_path = os.path.join(args.checkpoint_dir, f"needle_{args.num_layers}_{args.d_model}_{config.d_ff}_best.pkl")
             import shutil as _shutil
             _shutil.copy2(ckpt_path, best_ckpt_path)
             print(f"  ** New best single call_f1={best_call_f1:.1%} → {best_ckpt_path}")

@@ -19,7 +19,7 @@ def main():
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
-    p.add_argument("--d-model", type=int, default=512)
+    p.add_argument("--d-model", type=int, default=768)
     p.add_argument("--num-heads", type=int, default=4)
     p.add_argument("--num-kv-heads", type=int, default=4)
     p.add_argument("--num-layers", type=int, default=6)
