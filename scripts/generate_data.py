@@ -495,13 +495,16 @@ SCENARIOS = [
 ]
 
 CALL_TYPES = [
+    ("single", "exactly 1 tool call"),                                                                      # 4/10 = 40%
     ("single", "exactly 1 tool call"),
     ("single", "exactly 1 tool call"),
     ("single", "exactly 1 tool call"),
+    ("multi", "2-3 tool calls (the user wants multiple things done at once)"),                               # 4/10 = 40%
     ("multi", "2-3 tool calls (the user wants multiple things done at once)"),
     ("multi", "2-3 tool calls (the user wants multiple things done at once)"),
-    ("none", "NO tool calls — the user asks something none of the available tools can handle, answers must be []"),
-    ("no_tools", "NO tool calls — there are NO tools available at all, answers must be []"),
+    ("multi", "2-3 tool calls (the user wants multiple things done at once)"),
+    ("none", "NO tool calls — the user asks a question or makes a request that NONE of the available tools can fulfill (e.g. asking for opinions, general knowledge, emotional support, or tasks outside the tool capabilities). The query must NOT be something any of the listed tools could handle. answers must be []"),  # 1/10 = 10%
+    ("no_tools", "NO tool calls — there are NO tools available at all, answers must be []"),                 # 1/10 = 10%
 ]
 
 MODEL = "gemini-3.1-flash-lite-preview"
@@ -637,6 +640,15 @@ def generate_batch(client_pool, batch_size, rng, model):
     tools_str = json.dumps(tools, separators=(",", ":"))
     tool_name_set = {t["name"] for t in tools}
 
+    # Build keyword set for rejecting bad empty-answer examples
+    # Maps tool descriptions to simple action words for fuzzy matching
+    _tool_keywords = set()
+    for t in tools:
+        _tool_keywords.add(t["name"].replace("_", " "))
+        for word in t.get("description", "").lower().split():
+            if len(word) > 4 and word not in ("the", "from", "with", "that", "this", "about", "which", "their", "optional"):
+                _tool_keywords.add(word)
+
     for ex in examples:
         if not isinstance(ex, dict):
             continue
@@ -660,6 +672,12 @@ def generate_batch(client_pool, batch_size, rng, model):
                 break
         if not ok:
             continue
+
+        # Reject empty answers that look like they should have tool calls
+        if len(answers) == 0 and tools and call_type == "none":
+            query_lower = query.lower()
+            if any(kw in query_lower for kw in _tool_keywords if len(kw) > 5):
+                continue  # skip — query matches a tool but answer is empty
 
         valid.append({
             "query": query,
@@ -848,9 +866,12 @@ def main():
 
         if total_generated == len(examples):
             print("\nSample examples:")
-            for ex in examples[:5]:
+            sample_indices = list(range(len(examples)))
+            random.shuffle(sample_indices)
+            for idx in sample_indices[:20]:
+                ex = examples[idx]
                 print(f"  Q: {ex['query']}")
-                print(f"  A: {ex['answers'][:150]}")
+                print(f"  A: {ex['answers'][:200]}")
                 print()
 
         if args.dry_run:
