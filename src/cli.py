@@ -16,7 +16,7 @@ def main():
     p = sub.add_parser("train", add_help=False)
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--d-model", type=int, default=512)

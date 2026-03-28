@@ -316,9 +316,10 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, ffn_mask, rng, loss_mask,
     )
     logits_f32 = logits.astype(jnp.float32)
     mask = loss_mask
+    num_tokens = jnp.maximum(jnp.sum(mask > 0), 1.0)
     ce_loss = jnp.sum(
         optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
-    ) / jnp.maximum(jnp.sum(mask), 1.0)
+    ) / num_tokens
     z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
     return ce_loss + z_loss
 
