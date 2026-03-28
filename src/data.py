@@ -502,9 +502,10 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     if shuffle_tools:
         tools_texts = [_shuffle_tools_json(t, seed=i) for i, t in enumerate(tools_texts)]
 
+    n = len(ds)
     num_workers = min(64, max(1, (os.cpu_count() or 1) // 2))
     model_path = TOKENIZER_PREFIX + ".model"
-    chunk_size = max(1, len(enc_texts) // (num_workers * 4))
+    chunk_size = max(1, n // (num_workers * 4))
 
     # Tokenize all three fields in a single pool
     all_texts = enc_texts + tools_texts + ans_texts
@@ -518,8 +519,6 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     all_enc_tokens = all_tokens_flat[:n]
     all_tools_tokens = all_tokens_flat[n:2*n]
     all_ans_tokens = all_tokens_flat[2*n:]
-
-    n = len(ds)
 
     # Build pairs (no SentencePiece needed — pure list ops)
     enc_seqs = []
