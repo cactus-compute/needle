@@ -16,7 +16,7 @@ def main():
     p = sub.add_parser("train", add_help=False)
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--d-model", type=int, default=512)
@@ -44,18 +44,20 @@ def main():
     p.add_argument("--prune-end-frac", type=float, default=0.67,
                    help="Fraction of epoch at which pruning finishes and mask locks (default: 0.67)")
     p.add_argument("--activation", type=str, default="swiglu", choices=["drelu", "swiglu", "geglu"])
-    p.add_argument("--num-memory-slots", type=int, default=128,
-                   help="(DEPRECATED — ignored, kept for checkpoint compat)")
     p.add_argument("--mat-factors", type=int, nargs="*", default=[2, 4],
                    help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4)")
     p.add_argument("--dropout", type=float, default=0.0,
                    help="Dropout rate for residual connections (default: 0.0)")
-    p.add_argument("--curriculum", action="store_true",
-                   help="Sort batches easy→hard by tool count each epoch")
     p.add_argument("--contrastive-weight", type=float, default=0.1,
                    help="Weight for CLIP-style contrastive loss (default: 0.1)")
     p.add_argument("--contrastive-dim", type=int, default=128,
                    help="Dimension of contrastive projection head (default: 128)")
+    p.add_argument("--w-name", type=float, default=2.0,
+                   help="Loss weight for tool name tokens (default: 2.0)")
+    p.add_argument("--w-value", type=float, default=4.0,
+                   help="Loss weight for argument value tokens (default: 4.0)")
+    p.add_argument("--w-key", type=float, default=1.5,
+                   help="Loss weight for argument key tokens (default: 1.5)")
     p.add_argument("--no-feedforward", action=argparse.BooleanOptionalAction, default=True,
                    help="Remove feedforward layers entirely (default: True)")
 
@@ -66,12 +68,6 @@ def main():
                    help=f"Max encoder sequence length (default: {DEFAULT_MAX_ENC_LEN})")
     p.add_argument("--max-dec-len", type=int, default=DEFAULT_MAX_DEC_LEN,
                    help=f"Max decoder sequence length (default: {DEFAULT_MAX_DEC_LEN})")
-    p.add_argument("--w-name", type=float, default=3.0,
-                   help="Loss weight for tool name tokens (default: 3.0)")
-    p.add_argument("--w-value", type=float, default=2.0,
-                   help="Loss weight for argument value tokens (default: 2.0)")
-    p.add_argument("--w-key", type=float, default=1.5,
-                   help="Loss weight for argument key tokens (default: 1.5)")
     p.add_argument("--shuffle-tools", action=argparse.BooleanOptionalAction, default=True,
                    help="Shuffle tool order in encoder input (default: True)")
     p.add_argument("--max-tool-len", type=int, default=256,

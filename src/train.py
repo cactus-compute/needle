@@ -278,6 +278,8 @@ _MAT_FACTORS = ()
 _MAT_FF_WIDTHS = ()
 _D_FF = 2048
 _CONTRASTIVE_WEIGHT = 0.1
+# Weight map: class 0=base, 1=name, 2=value, 3=key (set from CLI args at train time)
+_LOSS_WEIGHT_MAP = jnp.array([1.0, 3.0, 2.0, 1.5], dtype=jnp.float32)
 
 
 def _clip_contrastive_loss(q_emb, t_emb, log_temp):
@@ -315,8 +317,13 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, ffn_mask, rng, loss_mask,
         rngs={"dropout": rng},
     )
     logits_f32 = logits.astype(jnp.float32)
-    mask = loss_mask
-    num_tokens = jnp.maximum(jnp.sum(mask > 0), 1.0)
+    # loss_mask contains class labels (0=base,1=name,2=value,3=key) from packed data;
+    # non-padding positions have seg_id > 0, padding has class 0 and seg_id 0.
+    # Convert to weights via lookup, then zero out padding using dec_seg_ids.
+    token_weights = _LOSS_WEIGHT_MAP[loss_mask.astype(jnp.int32)]
+    padding_mask = (dec_seg_ids > 0).astype(jnp.float32)
+    mask = token_weights * padding_mask
+    num_tokens = jnp.maximum(jnp.sum(padding_mask), 1.0)
     ce_loss = jnp.sum(
         optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
     ) / num_tokens
@@ -403,7 +410,9 @@ def _make_val_loss_fn(apply_fn):
             src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=cross_mask,
         )
         loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tgt_out)
-        return jnp.sum(loss * loss_mask), jnp.sum(loss_mask)
+        # Val uses uniform weights for consistent PPL — just mask padding via seg_ids
+        padding_mask = (dec_seg_ids > 0).astype(jnp.float32)
+        return jnp.sum(loss * padding_mask), jnp.sum(padding_mask)
     return val_loss_batch
 
 
@@ -422,7 +431,8 @@ def _make_mat_val_loss_fn(apply_fn, ff_width):
         )
         trunc_logits = mat_logits[0].astype(jnp.float32)
         loss = optax.softmax_cross_entropy_with_integer_labels(trunc_logits, tgt_out)
-        return jnp.sum(loss * loss_mask), jnp.sum(loss_mask)
+        padding_mask = (dec_seg_ids > 0).astype(jnp.float32)
+        return jnp.sum(loss * padding_mask), jnp.sum(padding_mask)
     return val_loss_batch
 
 
@@ -530,9 +540,15 @@ def train(args):
             no_feedforward=getattr(args, "no_feedforward", True),
         )
 
-    global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF, _CONTRASTIVE_WEIGHT
+    global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF, _CONTRASTIVE_WEIGHT, _LOSS_WEIGHT_MAP
     _GROUP_SIZE = getattr(args, "group_size", 32)
     _CONTRASTIVE_WEIGHT = getattr(args, "contrastive_weight", 0.1)
+    _LOSS_WEIGHT_MAP = jnp.array([
+        1.0,                                       # 0: base (boilerplate)
+        getattr(args, "w_name", 2.0),              # 1: tool name
+        getattr(args, "w_value", 4.0),             # 2: argument value
+        getattr(args, "w_key", 1.5),               # 3: argument key
+    ], dtype=jnp.float32)
     _D_FF = config.d_ff
     mat_factors_raw = getattr(args, "mat_factors", None)
     if mat_factors_raw and not config.no_feedforward:
@@ -663,7 +679,7 @@ def train(args):
             src = np.asarray(src, dtype=np.int32)
             tgt_in = np.asarray(tgt_in, dtype=np.int32)
             tgt_out = np.asarray(tgt_out, dtype=np.int32)
-            lm = np.asarray(lm, dtype=np.float32)
+            lm = np.asarray(lm, dtype=np.int32)  # class labels (0=base,1=name,2=value,3=key)
             enc_seg = np.asarray(enc_seg, dtype=np.int32)
             dec_seg = np.asarray(dec_seg, dtype=np.int32)
 

@@ -102,40 +102,45 @@ def _shuffle_tools_json(tools_str, seed):
     return _json.dumps(tools, separators=(",", ":"))
 
 
-def _token_weights_for_answer(answer_str, token_ids, sp_model,
-                               w_name=3.0, w_value=2.0, w_key=1.5):
-    """Compute per-token loss weights based on JSON structure.
 
-    Parses the answer JSON to identify character spans of tool names,
-    argument keys, and argument values, then maps to token-level weights
-    using SentencePiece byte offsets.
+TOKEN_CLASS_BASE = 0 
+TOKEN_CLASS_NAME = 1 
+TOKEN_CLASS_VALUE = 2 
+TOKEN_CLASS_KEY = 3 
+
+
+def _token_classes_for_answer(answer_str, token_ids, sp_model):
+    """Compute per-token class labels based on JSON structure.
+
+    Returns int8 array of class labels (TOKEN_CLASS_*).
+    Weight scalars are applied at train time, so tokenization is weight-agnostic.
     """
     n = len(token_ids)
-    weights = np.ones(n, dtype=np.float32)
+    classes = np.zeros(n, dtype=np.int8)
 
     try:
         calls = _json.loads(answer_str)
     except (ValueError, TypeError):
-        return weights
+        return classes
 
     if not isinstance(calls, list):
-        return weights
+        return classes
 
-    char_w = np.ones(len(answer_str), dtype=np.float32)
+    char_cls = np.zeros(len(answer_str), dtype=np.int8)
 
     for call in calls:
         if not isinstance(call, dict):
             continue
         name = call.get("name", "")
         if name:
-            _mark_json_value(answer_str, char_w, "name", name, w_name)
+            _mark_json_value(answer_str, char_cls, "name", name, TOKEN_CLASS_NAME)
 
         args = call.get("arguments", {})
         if isinstance(args, dict):
             for k, v in args.items():
-                _mark_json_key_in_args(answer_str, char_w, k, w_key)
+                _mark_json_key_in_args(answer_str, char_cls, k, TOKEN_CLASS_KEY)
                 v_str = _json.dumps(v) if not isinstance(v, str) else v
-                _mark_json_value(answer_str, char_w, k, v_str, w_value)
+                _mark_json_value(answer_str, char_cls, k, v_str, TOKEN_CLASS_VALUE)
 
     pieces = sp_model.Encode(answer_str, out_type=str)
     pos = 0
@@ -145,13 +150,23 @@ def _token_weights_for_answer(answer_str, token_ids, sp_model,
         raw = piece.replace('\u2581', ' ')
         plen = len(raw)
         if plen > 0 and pos + plen <= len(answer_str):
-            token_w = char_w[pos:pos + plen].max()
-            weights[i] = token_w
+            classes[i] = char_cls[pos:pos + plen].max()
             pos += plen
         else:
             pos += max(plen, 1)
 
-    return weights
+    return classes
+
+
+def _token_weights_for_answer(answer_str, token_ids, sp_model,
+                               w_name=3.0, w_value=2.0, w_key=1.5):
+    """Compute per-token loss weights from class labels and weight scalars.
+
+    Convenience wrapper for backward compatibility.
+    """
+    classes = _token_classes_for_answer(answer_str, token_ids, sp_model)
+    weight_map = np.array([1.0, w_name, w_value, w_key], dtype=np.float32)
+    return weight_map[classes]
 
 
 def _load_split_dataset(split="train"):
@@ -446,12 +461,16 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     for compact on-disk representation (~5-7x smaller than padded int32).
     Padding to fixed max lengths happens at batch time via VarLenArray.
 
-    Returns (enc, dec_in, dec_tgt, loss, kept_indices, tool_counts) where
+    The loss array stores per-token class labels (int8: 0=base, 1=name,
+    2=value, 3=key) rather than final weights. Weight scalars are applied
+    at train time so tokenization doesn't need to be re-run when weights change.
+
+    Returns (enc, dec_in, dec_tgt, loss_classes, kept_indices, tool_counts) where
     the first four are VarLenArray objects when loaded from cache.
     """
 
     cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len,
-                          w_name, w_value, w_key, shuffle_tools)
+                          1.0, 1.0, 1.0, shuffle_tools)  # weights no longer affect cache
     cache_path = os.path.join(CACHE_DIR, cache_id)
 
     if os.path.exists(cache_path + "_enc_data.npy"):
@@ -543,17 +562,16 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
         # Decoder target: [<tool_call>, answer..., EOS]
         dec_tgt_seq = [tool_call_id] + list(a_tok) + [eos_id]
 
-        # Token-level loss weighting
-        weights = np.ones(len(dec_tgt_seq), dtype=np.float16)
-        token_weights = _token_weights_for_answer(ans_texts[i], a_tok, tokenizer.sp,
-                                                   w_name=w_name, w_value=w_value, w_key=w_key)
-        weights[1:1 + len(token_weights)] = token_weights.astype(np.float16)
-        weights[1 + al] = 1.0  # EOS at baseline
+        # Token-level class labels for loss weighting (applied at train time)
+        classes = np.zeros(len(dec_tgt_seq), dtype=np.int8)
+        token_classes = _token_classes_for_answer(ans_texts[i], a_tok, tokenizer.sp)
+        classes[1:1 + len(token_classes)] = token_classes
+        # classes[0] = 0 (<tool_call>), classes[1+al] = 0 (EOS) — base weight
 
         enc_seqs.append(np.array(enc_seq, dtype=np.int16))
         dec_in_seqs.append(np.array(dec_in_seq, dtype=np.int16))
         dec_tgt_seqs.append(np.array(dec_tgt_seq, dtype=np.int16))
-        loss_seqs.append(weights)
+        loss_seqs.append(classes)
         query_lens_list.append(len(e_tok))
         kept_indices.append(i)
         kept_tool_counts.append(tool_counts[i])
@@ -759,7 +777,7 @@ def pack_sequences(cache_path, enc_vl, dec_in_vl, dec_tgt_vl, loss_vl):
     packed_enc = np.zeros((n_bins, max_enc), dtype=np.int16)
     packed_dec_in = np.zeros((n_bins, max_dec), dtype=np.int16)
     packed_dec_tgt = np.zeros((n_bins, max_dec), dtype=np.int16)
-    packed_loss = np.zeros((n_bins, max_dec), dtype=np.float16)
+    packed_loss = np.zeros((n_bins, max_dec), dtype=np.int8)
     packed_enc_seg = np.zeros((n_bins, max_enc), dtype=np.int16)
     packed_dec_seg = np.zeros((n_bins, max_dec), dtype=np.int16)
 

@@ -48,6 +48,17 @@ POOL_LISTS_NOTES = [
     {"name": "delete_note", "description": "Delete a note by matching its title or content.", "parameters": {"search_text": {"type": "string", "description": "Text to match the note to delete.", "required": True}}},
     {"name": "mark_list_item_done", "description": "Mark a list item as completed.", "parameters": {"list_name": {"type": "string", "description": "The list name.", "required": True}, "search_text": {"type": "string", "description": "Text to match the item to mark done.", "required": True}}},
     {"name": "share_list", "description": "Share a list with another contact.", "parameters": {"list_name": {"type": "string", "description": "The list to share.", "required": True}, "contact_id": {"type": "string", "description": "The contact to share with.", "required": True}}},
+    {"name": "edit_note", "description": "Edit an existing note by appending or replacing its content.", "parameters": {"search_text": {"type": "string", "description": "Text to match the note to edit.", "required": True}, "new_text": {"type": "string", "description": "New text to append or replace with.", "required": True}, "mode": {"type": "string", "description": "'append' to add to existing or 'replace' to overwrite.", "required": False}}},
+    {"name": "pin_note", "description": "Pin or unpin a note so it stays at the top.", "parameters": {"search_text": {"type": "string", "description": "Text to match the note.", "required": True}, "pinned": {"type": "boolean", "description": "True to pin, false to unpin.", "required": True}}},
+    {"name": "tag_note", "description": "Add or remove a tag/label on a note.", "parameters": {"search_text": {"type": "string", "description": "Text to match the note.", "required": True}, "tag": {"type": "string", "description": "Tag name e.g. 'work', 'personal', 'urgent', 'ideas'.", "required": True}, "action": {"type": "string", "description": "'add' or 'remove'.", "required": False}}},
+    {"name": "archive_note", "description": "Archive or unarchive a note.", "parameters": {"search_text": {"type": "string", "description": "Text to match the note.", "required": True}, "archive": {"type": "boolean", "description": "True to archive, false to unarchive.", "required": True}}},
+    {"name": "create_voice_note", "description": "Record a voice note with optional transcription.", "parameters": {"title": {"type": "string", "description": "Optional title for the voice note.", "required": False}, "transcribe": {"type": "boolean", "description": "Whether to automatically transcribe the recording.", "required": False}}},
+    {"name": "create_checklist", "description": "Create a note with a checklist of items.", "parameters": {"title": {"type": "string", "description": "Title for the checklist.", "required": True}, "items": {"type": "string", "description": "Comma-separated list of checklist items.", "required": True}}},
+    {"name": "rename_list", "description": "Rename an existing list.", "parameters": {"list_name": {"type": "string", "description": "Current name of the list.", "required": True}, "new_name": {"type": "string", "description": "New name for the list.", "required": True}}},
+    {"name": "sort_list", "description": "Sort list items by a given criteria.", "parameters": {"list_name": {"type": "string", "description": "The list to sort.", "required": True}, "sort_by": {"type": "string", "description": "'alphabetical', 'date_added', 'priority', or 'completed'.", "required": False}}},
+    {"name": "duplicate_list", "description": "Create a copy of an existing list.", "parameters": {"list_name": {"type": "string", "description": "The list to duplicate.", "required": True}, "new_name": {"type": "string", "description": "Name for the duplicate.", "required": False}}},
+    {"name": "export_note", "description": "Export a note as a text file or PDF.", "parameters": {"search_text": {"type": "string", "description": "Text to match the note to export.", "required": True}, "format": {"type": "string", "description": "'text' or 'pdf'.", "required": False}}},
+    {"name": "get_all_notes", "description": "List all notes, optionally filtered by tag.", "parameters": {"tag": {"type": "string", "description": "Optional tag to filter by.", "required": False}}},
 ]
 
 POOL_MESSAGING = [
@@ -143,415 +154,170 @@ POOL_UTILITY = [
 ]
 
 POOL_CAMERA_PHOTOS = [
-    {
-        "name": "take_photo",
-        "description": "Take a photo using the device camera.",
-        "parameters": {
-            "camera": {
-                "type": "string",
-                "description": "'front' or 'back' camera.",
-                "required": False,
-            },
-            "timer_seconds": {
-                "type": "number",
-                "description": "Optional countdown timer in seconds before taking the photo.",
-                "required": False,
-            },
-        },
-    },
-    {
-        "name": "record_video",
-        "description": "Start or stop recording a video.",
-        "parameters": {
-            "action": {
-                "type": "string",
-                "description": "'start' or 'stop'.",
-                "required": True,
-            },
-            "camera": {
-                "type": "string",
-                "description": "'front' or 'back' camera.",
-                "required": False,
-            },
-        },
-    },
-    {
-        "name": "open_gallery",
-        "description": "Open the photo gallery or a specific album.",
-        "parameters": {
-            "album": {
-                "type": "string",
-                "description": "Optional album name to open.",
-                "required": False,
-            },
-        },
-    },
-    {
-        "name": "share_photo",
-        "description": "Share the most recent photo or a specified photo with a contact.",
-        "parameters": {
-            "contact_id": {
-                "type": "string",
-                "description": "The contact to share with.",
-                "required": True,
-            },
-            "photo_description": {
-                "type": "string",
-                "description": "Description to identify which photo, e.g. 'last photo', 'screenshot'.",
-                "required": False,
-            },
-        },
-    },
+    {"name": "take_photo", "description": "Take a photo using the device camera.", "parameters": {"camera": {"type": "string", "description": "'front' or 'back' camera.", "required": False}, "timer_seconds": {"type": "number", "description": "Optional countdown timer in seconds before taking the photo.", "required": False}}},
+    {"name": "record_video", "description": "Start or stop recording a video.", "parameters": {"action": {"type": "string", "description": "'start' or 'stop'.", "required": True}, "camera": {"type": "string", "description": "'front' or 'back' camera.", "required": False}}},
+    {"name": "open_gallery", "description": "Open the photo gallery or a specific album.", "parameters": {"album": {"type": "string", "description": "Optional album name to open.", "required": False}}},
+    {"name": "share_photo", "description": "Share the most recent photo or a specified photo with a contact.", "parameters": {"contact_id": {"type": "string", "description": "The contact to share with.", "required": True}, "photo_description": {"type": "string", "description": "Description to identify which photo, e.g. 'last photo', 'screenshot'.", "required": False}}},
+    {"name": "take_panorama", "description": "Take a panoramic photo.", "parameters": {"direction": {"type": "string", "description": "Optional sweep direction e.g. 'left', 'right'.", "required": False}}},
+    {"name": "take_burst_photos", "description": "Take a burst of photos in quick succession.", "parameters": {"count": {"type": "number", "description": "Optional number of photos to take in the burst.", "required": False}}},
+    {"name": "edit_photo", "description": "Edit a photo with a specified action.", "parameters": {"action": {"type": "string", "description": "'crop', 'rotate', or 'filter'.", "required": True}, "filter_name": {"type": "string", "description": "Optional filter name when action is 'filter' e.g. 'sepia', 'noir', 'vivid'.", "required": False}}},
+    {"name": "delete_photo", "description": "Delete a photo by description.", "parameters": {"photo_description": {"type": "string", "description": "Description to identify the photo to delete.", "required": True}}},
+    {"name": "create_photo_album", "description": "Create a new photo album.", "parameters": {"album_name": {"type": "string", "description": "Name for the new album.", "required": True}}},
+    {"name": "search_photos", "description": "Search photos by keyword or description.", "parameters": {"query": {"type": "string", "description": "Search query e.g. 'beach', 'sunset', 'birthday'.", "required": True}}},
 ]
 
 POOL_FITNESS_HEALTH = [
-    {
-        "name": "start_workout",
-        "description": "Start tracking a workout activity.",
-        "parameters": {
-            "workout_type": {
-                "type": "string",
-                "description": "Type of workout e.g. 'running', 'cycling', 'walking', 'strength', 'yoga'.",
-                "required": True,
-            },
-        },
-    },
-    {
-        "name": "stop_workout",
-        "description": "Stop the currently active workout tracking.",
-        "parameters": {},
-    },
-    {
-        "name": "log_water_intake",
-        "description": "Log water consumption.",
-        "parameters": {
-            "amount_ml": {
-                "type": "number",
-                "description": "Amount of water in milliliters.",
-                "required": True,
-            },
-        },
-    },
-    {
-        "name": "get_step_count",
-        "description": "Get the current step count for today.",
-        "parameters": {},
-    },
-    {
-        "name": "start_sleep_tracking",
-        "description": "Start or stop sleep tracking.",
-        "parameters": {
-            "action": {
-                "type": "string",
-                "description": "'start' or 'stop'.",
-                "required": True,
-            },
-        },
-    },
-    {
-        "name": "log_meal",
-        "description": "Log a meal or food item for nutrition tracking.",
-        "parameters": {
-            "description": {
-                "type": "string",
-                "description": "Description of the food or meal.",
-                "required": True,
-            },
-            "meal_type": {
-                "type": "string",
-                "description": "'breakfast', 'lunch', 'dinner', or 'snack'.",
-                "required": False,
-            },
-        },
-    },
+    {"name": "start_workout", "description": "Start tracking a workout activity.", "parameters": {"workout_type": {"type": "string", "description": "Type of workout e.g. 'running', 'cycling', 'walking', 'strength', 'yoga'.", "required": True}}},
+    {"name": "stop_workout", "description": "Stop the currently active workout tracking.", "parameters": {}},
+    {"name": "log_water_intake", "description": "Log water consumption.", "parameters": {"amount_ml": {"type": "number", "description": "Amount of water in milliliters.", "required": True}}},
+    {"name": "get_step_count", "description": "Get the current step count for today.", "parameters": {}},
+    {"name": "start_sleep_tracking", "description": "Start or stop sleep tracking.", "parameters": {"action": {"type": "string", "description": "'start' or 'stop'.", "required": True}}},
+    {"name": "log_meal", "description": "Log a meal or food item for nutrition tracking.", "parameters": {"description": {"type": "string", "description": "Description of the food or meal.", "required": True}, "meal_type": {"type": "string", "description": "'breakfast', 'lunch', 'dinner', or 'snack'.", "required": False}}},
+    {"name": "get_heart_rate_history", "description": "Get heart rate history over a period.", "parameters": {"period": {"type": "string", "description": "Optional period e.g. 'today', 'this_week', 'this_month'.", "required": False}}},
+    {"name": "set_step_goal", "description": "Set a daily step goal.", "parameters": {"steps": {"type": "number", "description": "The target number of steps per day.", "required": True}}},
+    {"name": "get_sleep_summary", "description": "Get a summary of sleep data for a given date.", "parameters": {"date": {"type": "string", "description": "Optional date in human readable format e.g. 'last night', 'yesterday'. Defaults to last night.", "required": False}}},
+    {"name": "log_blood_pressure", "description": "Log a blood pressure reading.", "parameters": {"systolic": {"type": "number", "description": "The systolic pressure value.", "required": True}, "diastolic": {"type": "number", "description": "The diastolic pressure value.", "required": True}}},
 ]
 
 POOL_SYSTEM = [
-    {
-        "name": "toggle_airplane_mode",
-        "description": "Turn airplane mode on or off.",
-        "parameters": {
-            "enabled": {
-                "type": "boolean",
-                "description": "True to enable, false to disable.",
-                "required": True,
-            },
-        },
-    },
-    {
-        "name": "clear_notifications",
-        "description": "Clear all or specific app notifications.",
-        "parameters": {
-            "app_name": {
-                "type": "string",
-                "description": "Optional app name to clear notifications for. Clears all if omitted.",
-                "required": False,
-            },
-        },
-    },
-    {
-        "name": "open_settings",
-        "description": "Open device settings or a specific settings page.",
-        "parameters": {
-            "page": {
-                "type": "string",
-                "description": "Optional settings page e.g. 'wifi', 'bluetooth', 'display', 'battery', 'storage'.",
-                "required": False,
-            },
-        },
-    },
-    {
-        "name": "check_battery",
-        "description": "Check the current battery level and charging status.",
-        "parameters": {},
-    },
-    {
-        "name": "toggle_dark_mode",
-        "description": "Enable or disable dark mode.",
-        "parameters": {
-            "enabled": {
-                "type": "boolean",
-                "description": "True for dark mode, false for light mode.",
-                "required": True,
-            },
-        },
-    },
-    {
-        "name": "toggle_location_services",
-        "description": "Turn location services on or off.",
-        "parameters": {
-            "enabled": {
-                "type": "boolean",
-                "description": "True to enable, false to disable.",
-                "required": True,
-            },
-        },
-    },
-    {
-        "name": "restart_device",
-        "description": "Restart or shut down the device.",
-        "parameters": {
-            "action": {
-                "type": "string",
-                "description": "'restart' or 'shutdown'.",
-                "required": True,
-            },
-        },
-    },
+    {"name": "toggle_airplane_mode", "description": "Turn airplane mode on or off.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
+    {"name": "clear_notifications", "description": "Clear all or specific app notifications.", "parameters": {"app_name": {"type": "string", "description": "Optional app name to clear notifications for. Clears all if omitted.", "required": False}}},
+    {"name": "open_settings", "description": "Open device settings or a specific settings page.", "parameters": {"page": {"type": "string", "description": "Optional settings page e.g. 'wifi', 'bluetooth', 'display', 'battery', 'storage'.", "required": False}}},
+    {"name": "check_battery", "description": "Check the current battery level and charging status.", "parameters": {}},
+    {"name": "toggle_dark_mode", "description": "Enable or disable dark mode.", "parameters": {"enabled": {"type": "boolean", "description": "True for dark mode, false for light mode.", "required": True}}},
+    {"name": "toggle_location_services", "description": "Turn location services on or off.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
+    {"name": "restart_device", "description": "Restart or shut down the device.", "parameters": {"action": {"type": "string", "description": "'restart' or 'shutdown'.", "required": True}}},
 ]
 
 POOL_FINANCE = [
-    {
-        "name": "send_payment",
-        "description": "Send a payment to a contact.",
-        "parameters": {
-            "contact_id": {
-                "type": "string",
-                "description": "The recipient contact ID.",
-                "required": True,
-            },
-            "amount": {
-                "type": "number",
-                "description": "The amount to send.",
-                "required": True,
-            },
-            "currency": {
-                "type": "string",
-                "description": "Currency code e.g. 'USD', 'EUR', 'GBP'.",
-                "required": False,
-            },
-            "note": {
-                "type": "string",
-                "description": "Optional payment note e.g. 'for dinner'.",
-                "required": False,
-            },
-        },
-    },
-    {
-        "name": "check_balance",
-        "description": "Check the current account balance.",
-        "parameters": {
-            "account": {
-                "type": "string",
-                "description": "Account name e.g. 'checking', 'savings', 'credit card'.",
-                "required": False,
-            },
-        },
-    },
-    {
-        "name": "convert_currency",
-        "description": "Convert an amount between currencies.",
-        "parameters": {
-            "amount": {
-                "type": "number",
-                "description": "The amount to convert.",
-                "required": True,
-            },
-            "from_currency": {
-                "type": "string",
-                "description": "Source currency code e.g. 'USD'.",
-                "required": True,
-            },
-            "to_currency": {
-                "type": "string",
-                "description": "Target currency code e.g. 'EUR'.",
-                "required": True,
-            },
-        },
-    },
+    {"name": "send_payment", "description": "Send a payment to a contact.", "parameters": {"contact_id": {"type": "string", "description": "The recipient contact ID.", "required": True}, "amount": {"type": "number", "description": "The amount to send.", "required": True}, "currency": {"type": "string", "description": "Currency code e.g. 'USD', 'EUR', 'GBP'.", "required": False}, "note": {"type": "string", "description": "Optional payment note e.g. 'for dinner'.", "required": False}}},
+    {"name": "check_balance", "description": "Check the current account balance.", "parameters": {"account": {"type": "string", "description": "Account name e.g. 'checking', 'savings', 'credit card'.", "required": False}}},
+    {"name": "convert_currency", "description": "Convert an amount between currencies.", "parameters": {"amount": {"type": "number", "description": "The amount to convert.", "required": True}, "from_currency": {"type": "string", "description": "Source currency code e.g. 'USD'.", "required": True}, "to_currency": {"type": "string", "description": "Target currency code e.g. 'EUR'.", "required": True}}},
+    {"name": "request_payment", "description": "Request a payment from a contact.", "parameters": {"contact_id": {"type": "string", "description": "The contact to request payment from.", "required": True}, "amount": {"type": "number", "description": "The amount to request.", "required": True}, "note": {"type": "string", "description": "Optional note for the request.", "required": False}}},
+    {"name": "get_recent_transactions", "description": "Get a list of recent transactions.", "parameters": {"count": {"type": "number", "description": "Number of transactions to retrieve.", "required": False}, "account": {"type": "string", "description": "Optional account name to filter by.", "required": False}}},
+    {"name": "set_budget", "description": "Set a spending budget for a category.", "parameters": {"category": {"type": "string", "description": "Budget category e.g. 'food', 'entertainment', 'transport'.", "required": True}, "amount": {"type": "number", "description": "The budget amount.", "required": True}, "period": {"type": "string", "description": "Optional budget period e.g. 'weekly', 'monthly'.", "required": False}}},
+    {"name": "get_spending_summary", "description": "Get a summary of spending for a period.", "parameters": {"period": {"type": "string", "description": "Optional period e.g. 'today', 'this_week', 'this_month'.", "required": False}}},
+    {"name": "pay_bill", "description": "Pay a bill to a biller.", "parameters": {"biller_name": {"type": "string", "description": "Name of the biller e.g. 'electric company', 'internet provider'.", "required": True}, "amount": {"type": "number", "description": "Optional amount to pay. Uses default if omitted.", "required": False}}},
+    {"name": "split_bill", "description": "Split a bill among contacts.", "parameters": {"contact_ids": {"type": "string", "description": "Comma-separated contact IDs to split with.", "required": True}, "total_amount": {"type": "number", "description": "The total bill amount to split.", "required": True}, "note": {"type": "string", "description": "Optional note for the split.", "required": False}}},
+    {"name": "get_stock_price", "description": "Get the current price of a stock.", "parameters": {"symbol": {"type": "string", "description": "The stock ticker symbol e.g. 'AAPL', 'GOOGL'.", "required": True}}},
 ]
 
 POOL_READING_NEWS = [
-    {
-        "name": "get_news_headlines",
-        "description": "Get the latest news headlines, optionally filtered by topic.",
-        "parameters": {
-            "topic": {
-                "type": "string",
-                "description": "Optional topic filter e.g. 'technology', 'sports', 'politics', 'business'.",
-                "required": False,
-            },
-        },
-    },
-    {
-        "name": "read_aloud",
-        "description": "Read text content aloud using text-to-speech.",
-        "parameters": {
-            "text": {
-                "type": "string",
-                "description": "The text to read aloud.",
-                "required": True,
-            },
-            "speed": {
-                "type": "number",
-                "description": "Speech rate multiplier (0.5 = slow, 1.0 = normal, 2.0 = fast).",
-                "required": False,
-            },
-        },
-    },
-    {
-        "name": "summarize_page",
-        "description": "Summarize the content of the currently open web page or article.",
-        "parameters": {},
-    },
+    {"name": "get_news_headlines", "description": "Get the latest news headlines, optionally filtered by topic.", "parameters": {"topic": {"type": "string", "description": "Optional topic filter e.g. 'technology', 'sports', 'politics', 'business'.", "required": False}}},
+    {"name": "read_aloud", "description": "Read text content aloud using text-to-speech.", "parameters": {"text": {"type": "string", "description": "The text to read aloud.", "required": True}, "speed": {"type": "number", "description": "Speech rate multiplier (0.5 = slow, 1.0 = normal, 2.0 = fast).", "required": False}}},
+    {"name": "summarize_page", "description": "Summarize the content of the currently open web page or article.", "parameters": {}},
+    {"name": "save_article", "description": "Save the current article for later reading.", "parameters": {"title": {"type": "string", "description": "Optional title to save the article under.", "required": False}}},
+    {"name": "get_saved_articles", "description": "Retrieve the list of saved articles.", "parameters": {}},
+    {"name": "subscribe_newsletter", "description": "Subscribe to a newsletter by topic.", "parameters": {"topic": {"type": "string", "description": "The newsletter topic to subscribe to.", "required": True}}},
+    {"name": "open_ebook", "description": "Open an ebook by title.", "parameters": {"title": {"type": "string", "description": "The title of the ebook to open.", "required": True}}},
+    {"name": "set_reading_goal", "description": "Set a daily reading goal in pages.", "parameters": {"pages_per_day": {"type": "number", "description": "Number of pages to read per day.", "required": True}}},
+    {"name": "get_reading_progress", "description": "Get current reading progress toward the daily goal.", "parameters": {}},
+    {"name": "listen_to_article", "description": "Listen to an article using text-to-speech.", "parameters": {"speed": {"type": "number", "description": "Optional playback speed multiplier (0.5 to 2.0).", "required": False}}},
 ]
 
 POOL_ACCESSIBILITY = [
-    {
-        "name": "set_font_size",
-        "description": "Set the system font size.",
-        "parameters": {
-            "size": {
-                "type": "string",
-                "description": "'small', 'medium', 'large', or 'extra_large'.",
-                "required": True,
-            },
-        },
-    },
-    {
-        "name": "toggle_voice_assistant",
-        "description": "Enable or disable the voice assistant listener.",
-        "parameters": {
-            "enabled": {
-                "type": "boolean",
-                "description": "True to enable, false to disable.",
-                "required": True,
-            },
-        },
-    },
-    {
-        "name": "toggle_magnifier",
-        "description": "Enable or disable the screen magnifier.",
-        "parameters": {
-            "enabled": {
-                "type": "boolean",
-                "description": "True to enable, false to disable.",
-                "required": True,
-            },
-        },
-    },
-    {
-        "name": "toggle_screen_reader",
-        "description": "Enable or disable the screen reader for accessibility.",
-        "parameters": {
-            "enabled": {
-                "type": "boolean",
-                "description": "True to enable, false to disable.",
-                "required": True,
-            },
-        },
-    },
+    {"name": "set_font_size", "description": "Set the system font size.", "parameters": {"size": {"type": "string", "description": "'small', 'medium', 'large', or 'extra_large'.", "required": True}}},
+    {"name": "toggle_voice_assistant", "description": "Enable or disable the voice assistant listener.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
+    {"name": "toggle_magnifier", "description": "Enable or disable the screen magnifier.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
+    {"name": "toggle_screen_reader", "description": "Enable or disable the screen reader for accessibility.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
 ]
 
 POOL_SHOPPING = [
-    {
-        "name": "search_product",
-        "description": "Search for a product to buy online.",
-        "parameters": {
-            "query": {
-                "type": "string",
-                "description": "Product search query.",
-                "required": True,
-            },
-        },
-    },
-    {
-        "name": "add_to_cart",
-        "description": "Add a product to the shopping cart.",
-        "parameters": {
-            "product_name": {
-                "type": "string",
-                "description": "Name or description of the product.",
-                "required": True,
-            },
-            "quantity": {
-                "type": "number",
-                "description": "Number of items to add.",
-                "required": False,
-            },
-        },
-    },
-    {
-        "name": "check_order_status",
-        "description": "Check the status of a recent order.",
-        "parameters": {
-            "order_id": {
-                "type": "string",
-                "description": "The order ID to check. If omitted, checks the most recent order.",
-                "required": False,
-            },
-        },
-    },
+    {"name": "search_product", "description": "Search for a product to buy online.", "parameters": {"query": {"type": "string", "description": "Product search query.", "required": True}}},
+    {"name": "add_to_cart", "description": "Add a product to the shopping cart.", "parameters": {"product_name": {"type": "string", "description": "Name or description of the product.", "required": True}, "quantity": {"type": "number", "description": "Number of items to add.", "required": False}}},
+    {"name": "check_order_status", "description": "Check the status of a recent order.", "parameters": {"order_id": {"type": "string", "description": "The order ID to check. If omitted, checks the most recent order.", "required": False}}},
 ]
 
 POOL_SOCIAL = [
-    {
-        "name": "post_status_update",
-        "description": "Post a status update or message to social media.",
-        "parameters": {
-            "text": {
-                "type": "string",
-                "description": "The status text to post.",
-                "required": True,
-            },
-            "platform": {
-                "type": "string",
-                "description": "Social platform e.g. 'twitter', 'facebook', 'instagram'.",
-                "required": False,
-            },
-        },
-    },
-    {
-        "name": "check_social_notifications",
-        "description": "Check recent social media notifications.",
-        "parameters": {
-            "platform": {
-                "type": "string",
-                "description": "Optional platform filter.",
-                "required": False,
-            },
-        },
-    },
+    {"name": "post_status_update", "description": "Post a status update or message to social media.", "parameters": {"text": {"type": "string", "description": "The status text to post.", "required": True}, "platform": {"type": "string", "description": "Social platform e.g. 'twitter', 'facebook', 'instagram'.", "required": False}}},
+    {"name": "check_social_notifications", "description": "Check recent social media notifications.", "parameters": {"platform": {"type": "string", "description": "Optional platform filter.", "required": False}}},
+    {"name": "like_post", "description": "Like a post on social media.", "parameters": {"post_id": {"type": "string", "description": "The ID of the post to like.", "required": True}}},
+    {"name": "comment_on_post", "description": "Leave a comment on a social media post.", "parameters": {"post_id": {"type": "string", "description": "The ID of the post to comment on.", "required": True}, "text": {"type": "string", "description": "The comment text.", "required": True}}},
+    {"name": "share_post", "description": "Share a post to another platform or feed.", "parameters": {"post_id": {"type": "string", "description": "The ID of the post to share.", "required": True}, "platform": {"type": "string", "description": "Optional target platform e.g. 'twitter', 'facebook'.", "required": False}}},
+    {"name": "follow_user", "description": "Follow a user on social media.", "parameters": {"username": {"type": "string", "description": "The username to follow.", "required": True}}},
+    {"name": "unfollow_user", "description": "Unfollow a user on social media.", "parameters": {"username": {"type": "string", "description": "The username to unfollow.", "required": True}}},
+    {"name": "get_trending_topics", "description": "Get currently trending topics on social media.", "parameters": {"platform": {"type": "string", "description": "Optional platform filter.", "required": False}}},
+    {"name": "send_direct_message", "description": "Send a direct message to a user on social media.", "parameters": {"username": {"type": "string", "description": "The recipient username.", "required": True}, "text": {"type": "string", "description": "The message text.", "required": True}}},
+    {"name": "check_direct_messages", "description": "Check recent direct messages on social media.", "parameters": {"platform": {"type": "string", "description": "Optional platform filter.", "required": False}}},
+]
+
+POOL_RIDE_DELIVERY = [
+    {"name": "request_ride", "description": "Request a ride to a destination.", "parameters": {"destination": {"type": "string", "description": "The destination address or place name.", "required": True}, "ride_type": {"type": "string", "description": "'standard', 'xl', or 'shared'.", "required": False}}},
+    {"name": "cancel_ride", "description": "Cancel the current ride request.", "parameters": {}},
+    {"name": "track_ride_eta", "description": "Track the ETA of the current ride.", "parameters": {}},
+    {"name": "rate_ride", "description": "Rate a completed ride.", "parameters": {"rating": {"type": "number", "description": "Rating from 1 to 5.", "required": True}, "feedback": {"type": "string", "description": "Optional feedback text.", "required": False}}},
+    {"name": "order_food", "description": "Order food delivery from a restaurant.", "parameters": {"restaurant": {"type": "string", "description": "Name of the restaurant.", "required": True}, "items": {"type": "string", "description": "Description of what to order.", "required": True}}},
+    {"name": "track_food_delivery", "description": "Track the status of a food delivery order.", "parameters": {}},
+]
+
+POOL_FILE_MANAGEMENT = [
+    {"name": "open_file", "description": "Open a file by name.", "parameters": {"file_name": {"type": "string", "description": "Name of the file to open.", "required": True}}},
+    {"name": "share_file", "description": "Share a file with a contact.", "parameters": {"file_name": {"type": "string", "description": "Name of the file to share.", "required": True}, "contact_id": {"type": "string", "description": "The contact to share with.", "required": True}}},
+    {"name": "download_file", "description": "Download a file from a URL.", "parameters": {"url": {"type": "string", "description": "The URL to download from.", "required": True}}},
+    {"name": "move_file", "description": "Move a file to a different folder.", "parameters": {"file_name": {"type": "string", "description": "Name of the file to move.", "required": True}, "destination_folder": {"type": "string", "description": "The destination folder path.", "required": True}}},
+    {"name": "compress_files", "description": "Compress files into an archive.", "parameters": {"file_names": {"type": "string", "description": "Description of files to compress.", "required": True}, "archive_name": {"type": "string", "description": "Name for the resulting archive.", "required": True}}},
+    {"name": "create_folder", "description": "Create a new folder.", "parameters": {"folder_name": {"type": "string", "description": "Name of the folder to create.", "required": True}}},
+    {"name": "delete_file", "description": "Delete a file.", "parameters": {"file_name": {"type": "string", "description": "Name of the file to delete.", "required": True}}},
+]
+
+POOL_WEARABLE = [
+    {"name": "check_heart_rate", "description": "Check the current heart rate from the wearable sensor.", "parameters": {}},
+    {"name": "check_blood_oxygen", "description": "Check the current blood oxygen level.", "parameters": {}},
+    {"name": "start_breathing_exercise", "description": "Start a guided breathing exercise.", "parameters": {"duration_minutes": {"type": "number", "description": "Duration of the exercise in minutes.", "required": False}}},
+    {"name": "find_my_phone", "description": "Trigger the phone to ring so you can find it.", "parameters": {}},
+    {"name": "toggle_always_on_display", "description": "Enable or disable the always-on display.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
+    {"name": "change_watch_face", "description": "Change the watch face.", "parameters": {"face_name": {"type": "string", "description": "Name of the watch face to switch to.", "required": True}}},
+    {"name": "set_activity_goal", "description": "Set a daily activity goal.", "parameters": {"goal_type": {"type": "string", "description": "'steps', 'calories', or 'distance'.", "required": True}, "value": {"type": "number", "description": "The target value for the goal.", "required": True}}},
+    {"name": "check_activity_progress", "description": "Check progress toward the current activity goal.", "parameters": {}},
+    {"name": "toggle_fall_detection", "description": "Enable or disable fall detection.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
+    {"name": "trigger_emergency_sos", "description": "Trigger an emergency SOS alert.", "parameters": {}},
+]
+
+POOL_DESKTOP = [
+    {"name": "minimize_window", "description": "Minimize the current window.", "parameters": {}},
+    {"name": "maximize_window", "description": "Maximize the current window.", "parameters": {}},
+    {"name": "split_screen", "description": "Snap the current window to a screen position.", "parameters": {"position": {"type": "string", "description": "'left' or 'right'.", "required": True}}},
+    {"name": "switch_virtual_desktop", "description": "Switch to another virtual desktop.", "parameters": {"direction": {"type": "string", "description": "'next', 'previous', or a desktop number.", "required": True}}},
+    {"name": "toggle_vpn", "description": "Turn VPN on or off.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}, "server": {"type": "string", "description": "Optional VPN server name or location.", "required": False}}},
+    {"name": "switch_audio_output", "description": "Switch the audio output device.", "parameters": {"device_name": {"type": "string", "description": "Name of the output device e.g. 'External Speakers', 'HDMI'.", "required": True}}},
+    {"name": "switch_audio_input", "description": "Switch the audio input device.", "parameters": {"device_name": {"type": "string", "description": "Name of the input device e.g. 'External Mic', 'Webcam'.", "required": True}}},
+    {"name": "print_document", "description": "Print the current document.", "parameters": {"printer_name": {"type": "string", "description": "Optional printer name.", "required": False}, "copies": {"type": "number", "description": "Number of copies to print.", "required": False}}},
+    {"name": "check_system_updates", "description": "Check for available system updates.", "parameters": {}},
+    {"name": "install_system_updates", "description": "Install available system updates.", "parameters": {}},
+    {"name": "take_screenshot_region", "description": "Take a screenshot of a specific region.", "parameters": {"region": {"type": "string", "description": "'full', 'window', or 'selection'.", "required": False}}},
+    {"name": "kill_process", "description": "Force quit an application by name.", "parameters": {"app_name": {"type": "string", "description": "Name of the application to kill.", "required": True}}},
+    {"name": "check_system_resources", "description": "Check current CPU, memory, and disk usage.", "parameters": {}},
+]
+
+POOL_BROWSER = [
+    {"name": "open_tab", "description": "Open a new browser tab.", "parameters": {"url": {"type": "string", "description": "Optional URL to open.", "required": False}, "query": {"type": "string", "description": "Optional search query to open.", "required": False}}},
+    {"name": "close_tab", "description": "Close the current browser tab.", "parameters": {}},
+    {"name": "bookmark_page", "description": "Bookmark the current page.", "parameters": {}},
+    {"name": "clear_browsing_data", "description": "Clear browsing data.", "parameters": {"data_type": {"type": "string", "description": "'history', 'cookies', 'cache', or 'all'.", "required": True}}},
+    {"name": "open_private_window", "description": "Open a new private/incognito browser window.", "parameters": {}},
+    {"name": "find_in_page", "description": "Find text on the current page.", "parameters": {"text": {"type": "string", "description": "The text to search for.", "required": True}}},
+]
+
+POOL_EMERGENCY_SAFETY = [
+    {"name": "call_emergency_services", "description": "Call emergency services.", "parameters": {"service_type": {"type": "string", "description": "'police', 'fire', or 'ambulance'.", "required": False}}},
+    {"name": "share_emergency_location", "description": "Share current location with an emergency contact.", "parameters": {"contact_id": {"type": "string", "description": "The emergency contact to share location with.", "required": True}}},
+    {"name": "set_emergency_contact", "description": "Set up an emergency contact.", "parameters": {"name": {"type": "string", "description": "Full name of the emergency contact.", "required": True}, "phone": {"type": "string", "description": "Phone number of the emergency contact.", "required": True}}},
+    {"name": "toggle_medical_id", "description": "Enable or disable the medical ID display.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
+    {"name": "send_safety_check", "description": "Send a safety check-in to a contact.", "parameters": {"contact_id": {"type": "string", "description": "The contact to send the safety check to.", "required": True}, "message": {"type": "string", "description": "Optional message to include.", "required": False}}},
+    {"name": "get_emergency_contacts", "description": "Get the list of emergency contacts.", "parameters": {}},
+    {"name": "report_safety_issue", "description": "Report a safety issue or hazard.", "parameters": {"description": {"type": "string", "description": "Description of the safety issue.", "required": True}, "location": {"type": "string", "description": "Optional location of the issue.", "required": False}}},
+    {"name": "enable_crash_detection", "description": "Enable or disable automatic crash detection.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
+]
+
+POOL_DIGITAL_WELLBEING = [
+    {"name": "check_screen_time", "description": "Check screen time usage.", "parameters": {"period": {"type": "string", "description": "'today' or 'week'.", "required": False}}},
+    {"name": "set_app_timer", "description": "Set a usage time limit for an app.", "parameters": {"app_name": {"type": "string", "description": "Name of the app to limit.", "required": True}, "duration_minutes": {"type": "number", "description": "Maximum usage time in minutes.", "required": True}}},
+    {"name": "toggle_bedtime_mode", "description": "Enable or disable bedtime mode.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
+    {"name": "set_content_restriction", "description": "Set content restriction level.", "parameters": {"restriction_level": {"type": "string", "description": "'off', 'moderate', or 'strict'.", "required": True}}},
+    {"name": "check_app_usage", "description": "Check usage statistics for an app.", "parameters": {"app_name": {"type": "string", "description": "Optional app name to check. Shows all apps if omitted.", "required": False}}},
+    {"name": "pause_all_notifications", "description": "Temporarily pause all notifications.", "parameters": {"duration_minutes": {"type": "number", "description": "Optional duration in minutes before resuming notifications.", "required": False}}},
+    {"name": "get_daily_summary", "description": "Get a daily summary of device usage and wellbeing stats.", "parameters": {}},
+    {"name": "set_downtime_schedule", "description": "Set a recurring downtime schedule to limit device use.", "parameters": {"start_time": {"type": "string", "description": "Start time for downtime e.g. '22:00'.", "required": True}, "end_time": {"type": "string", "description": "End time for downtime e.g. '07:00'.", "required": True}}},
 ]
 
 ALL_POOLS = [
@@ -571,6 +337,13 @@ ALL_POOLS = [
     POOL_ACCESSIBILITY,
     POOL_SHOPPING,
     POOL_SOCIAL,
+    POOL_RIDE_DELIVERY,
+    POOL_FILE_MANAGEMENT,
+    POOL_WEARABLE,
+    POOL_DESKTOP,
+    POOL_BROWSER,
+    POOL_EMERGENCY_SAFETY,
+    POOL_DIGITAL_WELLBEING,
 ]
 
 
@@ -644,6 +417,75 @@ SCENARIOS = [
     # Social
     "posting a tweet", "checking instagram notifications",
     "posting a status update on facebook",
+    # Ride-hailing & delivery
+    "ordering an Uber to the airport", "tracking a food delivery",
+    "canceling a ride", "ordering pizza from a nearby place",
+    # File management
+    "opening a downloaded PDF", "sharing a document with a coworker",
+    "creating a new folder for photos", "compressing files to send",
+    "moving a file to the downloads folder",
+    # Wearable
+    "checking heart rate during exercise", "finding my phone from my watch",
+    "changing the watch face", "starting a breathing exercise",
+    "checking if I hit my step goal", "checking blood oxygen before sleep",
+    # Desktop/laptop
+    "splitting the screen for multitasking", "switching to external speakers",
+    "printing a document", "killing a frozen app",
+    "connecting to VPN for work", "checking for system updates",
+    "switching to the next virtual desktop",
+    # Browser
+    "opening a new private window", "bookmarking this page",
+    "clearing browser history", "finding text on this page",
+    # Emergency & safety
+    "calling 911", "sending my location to emergency contact",
+    "triggering SOS from watch", "setting up emergency contacts",
+    # Digital wellbeing
+    "checking how much time I spent on my phone today",
+    "setting a 30 minute limit on social media",
+    "turning on bedtime mode", "checking which app I used most this week",
+    # Cross-device & undo
+    "cancel the timer I just set", "undo the last action",
+    "reply to the last message", "call back the last number",
+    "find the nearest pharmacy and navigate there",
+    # Meeting & productivity context
+    "noting an action item from a meeting", "scheduling a follow-up meeting with the team",
+    "reminding me to send the proposal after the call", "texting someone I'm running late to the meeting",
+    "setting a timer for a 15 minute break between meetings", "adding meeting notes about the budget discussion",
+    "creating a todo for the deliverables we agreed on", "sharing meeting notes with attendees",
+    "scheduling a 1-on-1 for next week", "setting do not disturb for an hour-long meeting",
+    "recording a voice memo of key takeaways", "emailing the client a summary after the call",
+    "checking my calendar for conflicts before accepting", "creating a checklist of action items from standup",
+    # Indirect / implicit intent
+    "it's really dark in here", "I can't hear anything on this call",
+    "I'm freezing", "it's too bright", "I'm bored",
+    "I need to wake up early tomorrow", "I keep forgetting to drink water",
+    # Corrections and follow-ups
+    "no wait, make that 7:30 instead", "actually send it to Sarah not John",
+    "cancel what I just set", "change the timer to 10 minutes",
+    "undo that", "never mind, turn it back on",
+    # Temporal and conditional
+    "every weekday at 8am", "when I get home remind me to call mom",
+    "in 2 hours turn off the lights", "tomorrow morning check the weather",
+    "after work start the robot vacuum", "at sunset close the blinds",
+    # Multi-person and group
+    "message both Sarah and John about dinner", "set up a group call with the team",
+    "share my location with everyone in the family group",
+    "send the same email to Alice, Bob, and Carol",
+    # Context references
+    "call them back", "open that file from earlier",
+    "reply saying I'll be there in 10", "send them what I just screenshotted",
+    "play that song again", "go back to the last page",
+    # Multilingual and code-switched
+    "set un timer por 5 minutos", "envoie un message à Jean",
+    "spiel etwas Musik", "mets le volume à 50",
+    "llama a mamá", "recherche le restaurant le plus proche",
+    # Ultra-terse commands
+    "timer 5", "alarm 7am", "lights off", "call mom", "weather",
+    "screenshot", "wifi off", "volume up", "next song", "lock door",
+    # Verbose and conversational
+    "hey so I was thinking could you maybe set a reminder for me to pick up the dry cleaning sometime tomorrow afternoon if that's not too much trouble",
+    "ok so I need you to do a few things: first turn off the living room lights, then lock the front door, and also set the alarm for 6:30",
+    "I'm about to go into a meeting so can you put my phone on do not disturb and also remind me in an hour to check my email",
     # Edge cases
     "very short terse command like 'timer 5 min'",
     "long polite request with extra context",
@@ -683,34 +525,38 @@ def _pick_tools(rng, force_empty=False):
 
 def build_prompt(batch_size, call_desc, tools, rng):
     """Build a prompt asking Gemini to generate a batch of examples."""
-    scenarios_sample = rng.sample(SCENARIOS, min(10, len(SCENARIOS)))
+    scenarios_sample = rng.sample(SCENARIOS, min(20, len(SCENARIOS)))
     scenarios_str = "\n".join(f"  - {s}" for s in scenarios_sample)
 
     if tools:
-        tools_section = f"AVAILABLE TOOLS:\n{json.dumps(tools, indent=2)}"
+        tools_section = f"AVAILABLE TOOLS:\n{json.dumps(tools, separators=(',', ':'))}"
         tool_rules = """- Tool call format: {{"name": "tool_name", "arguments": {{"param": "value"}}}}
 - Arguments must match the parameter schemas exactly — use correct types (string, number, boolean)
 - Do NOT invent tools not in the list — only use the tools shown above
 - For contact_id params, use realistic placeholders like "contact_alice_123", "contact_john_456"
 - For evaluate_js, write real working JavaScript with console.log()
 - Number params should be actual numbers not strings (e.g. 7 not "7")
-- Boolean params should be actual booleans not strings (e.g. true not "true")"""
+- Boolean params should be actual booleans not strings (e.g. true not "true")
+- Vary argument values widely — don't repeat the same locations, names, times, or phrases across examples
+- Sometimes include optional parameters, sometimes omit them — mix it up naturally
+- Never produce partial tool calls — every call must have "name" and "arguments" with all required params"""
     else:
         tools_section = "AVAILABLE TOOLS: NONE — no tools are available."
         tool_rules = "- Since no tools are available, ALL answers must be empty arrays []"
 
-    return f"""Generate {batch_size} diverse on-device assistant tool-calling training examples for phones and computers.
+    return f"""Generate {batch_size} diverse on-device assistant tool-calling training examples for phones, wearables, and computers.
 
 {tools_section}
 
 REQUIREMENTS:
 - Each example: a "query" (user's natural language) and "answers" (JSON tool calls array)
 - This batch: {call_desc}
-- Queries should sound like real users talking to a phone/computer voice assistant or typing a quick command
-- Vary style: casual ("timer 5 min"), terse ("alarm 7am"), polite ("Could you please..."), conversational ("hey can you set a timer for like 20 minutes")
+- Queries should sound like real users talking to a phone/computer/watch voice assistant or typing a quick command
+- Vary query length: mix ultra-short ("timer 5 min", "lights off"), medium ("set an alarm for 7am tomorrow"), and long conversational ("hey can you set a timer for like 20 minutes, I'm making pasta")
+- Vary style: casual, terse, polite ("Could you please..."), conversational, indirect ("it's dark in here" meaning turn on lights)
 {tool_rules}
 - For empty call examples, answers must be []
-- Every query must be UNIQUE — do not repeat patterns
+- Every query must be UNIQUE — do not repeat patterns or rephrase the same intent
 
 SCENARIO INSPIRATION (vary well beyond these):
 {scenarios_str}
