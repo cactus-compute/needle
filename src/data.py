@@ -286,6 +286,14 @@ def _tokenize_chunk(texts):
     return [_worker_sp.Encode(t, out_type=int)[:_worker_max_len] for t in texts]
 
 
+def _compute_classes_chunk(chunk):
+    """Compute token classes for a chunk of (answer_str, token_ids) pairs."""
+    results = []
+    for answer_str, token_ids in chunk:
+        results.append(_token_classes_for_answer(answer_str, token_ids, _worker_sp))
+    return results
+
+
 def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
     """Train a SentencePiece BPE tokenizer on tool-calling corpus."""
     model_path = TOKENIZER_PREFIX + ".model"
@@ -325,7 +333,7 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
             user_defined_symbols=["<tool_call>", "<tools>"],
             byte_fallback=True,
             normalization_rule_name="identity",
-            num_threads=min(20, max(1, (os.cpu_count() or 1) // 4)),
+            num_threads=min(64, max(1, (os.cpu_count() or 1) // 2)),
             train_extremely_large_corpus=False,
             minloglevel=2,
         )
@@ -486,85 +494,83 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
         except (ValueError, TypeError):
             return s
 
+    print("  Compacting JSON and preparing texts...")
     ans_texts = [_compact(a) for a in ans_texts]
     tools_texts = [_compact(t) for t in tools_texts]
-
     tool_counts = np.array([_count_tool_calls(a) for a in ans_texts], dtype=np.int32)
 
     if shuffle_tools:
         tools_texts = [_shuffle_tools_json(t, seed=i) for i, t in enumerate(tools_texts)]
 
-    num_workers = min(20, max(1, (os.cpu_count() or 1) // 4))
+    num_workers = min(64, max(1, (os.cpu_count() or 1) // 2))
     model_path = TOKENIZER_PREFIX + ".model"
     chunk_size = max(1, len(enc_texts) // (num_workers * 4))
 
-    enc_chunks = [enc_texts[i:i + chunk_size] for i in range(0, len(enc_texts), chunk_size)]
+    # Tokenize all three fields in a single pool
+    all_texts = enc_texts + tools_texts + ans_texts
+    max_tok_len = max(max_enc_len, max_dec_len)
+    all_chunks = [all_texts[i:i + chunk_size] for i in range(0, len(all_texts), chunk_size)]
     with mp.Pool(num_workers, initializer=_init_worker,
-                 initargs=(model_path, max_enc_len)) as pool:
-        enc_results = list(tqdm(pool.imap(_tokenize_chunk, enc_chunks),
-                                total=len(enc_chunks), desc="Tokenizing queries"))
-    all_enc_tokens = [tok for chunk in enc_results for tok in chunk]
-
-    tools_chunks = [tools_texts[i:i + chunk_size] for i in range(0, len(tools_texts), chunk_size)]
-    with mp.Pool(num_workers, initializer=_init_worker,
-                 initargs=(model_path, max_enc_len)) as pool:
-        tools_results = list(tqdm(pool.imap(_tokenize_chunk, tools_chunks),
-                                  total=len(tools_chunks), desc="Tokenizing tools"))
-    all_tools_tokens = [tok for chunk in tools_results for tok in chunk]
-
-    ans_chunks = [ans_texts[i:i + chunk_size] for i in range(0, len(ans_texts), chunk_size)]
-    with mp.Pool(num_workers, initializer=_init_worker,
-                 initargs=(model_path, max_dec_len)) as pool:
-        ans_results = list(tqdm(pool.imap(_tokenize_chunk, ans_chunks),
-                                total=len(ans_chunks), desc="Tokenizing answers"))
-    all_ans_tokens = [tok for chunk in ans_results for tok in chunk]
+                 initargs=(model_path, max_tok_len)) as pool:
+        all_results = list(tqdm(pool.imap(_tokenize_chunk, all_chunks),
+                                total=len(all_chunks), desc="Tokenizing"))
+    all_tokens_flat = [tok for chunk in all_results for tok in chunk]
+    all_enc_tokens = all_tokens_flat[:n]
+    all_tools_tokens = all_tokens_flat[n:2*n]
+    all_ans_tokens = all_tokens_flat[2*n:]
 
     n = len(ds)
+
+    # Build pairs (no SentencePiece needed — pure list ops)
     enc_seqs = []
     dec_in_seqs = []
     dec_tgt_seqs = []
-    loss_seqs = []
     kept_indices = []
     kept_tool_counts = []
+    kept_ans_texts = []  # for parallel class computation
+    kept_ans_tokens = []
 
-    for i in tqdm(range(n), desc="Building pairs"):
+    for i in range(n):
         e_tok = all_enc_tokens[i]
         t_tok = all_tools_tokens[i]
         a_tok = all_ans_tokens[i]
 
-        # Encoder: [query..., <tools>, tools...] truncated to max_enc_len
-        max_query = max_enc_len - 1 - 1  # room for <tools> + at least 1 tools token
+        max_query = max_enc_len - 2
         if len(e_tok) > max_query:
             e_tok = e_tok[:max_query]
         remaining = max_enc_len - len(e_tok) - 1
-        t_trunc = t_tok[:remaining]
-        enc_seq = e_tok + [tools_sep_id] + t_trunc
+        enc_seq = e_tok + [tools_sep_id] + t_tok[:remaining]
 
         al = len(a_tok)
         if 2 + al + 1 > max_dec_len:
-            continue  # skip samples too long for decoder
-
-        # Decoder input: [EOS, <tool_call>, answer...]
-        dec_in_seq = [eos_id, tool_call_id] + list(a_tok)
-        # Decoder target: [<tool_call>, answer..., EOS]
-        dec_tgt_seq = [tool_call_id] + list(a_tok) + [eos_id]
-
-        # Token-level class labels for loss weighting (applied at train time)
-        classes = np.zeros(len(dec_tgt_seq), dtype=np.int8)
-        token_classes = _token_classes_for_answer(ans_texts[i], a_tok, tokenizer.sp)
-        classes[1:1 + len(token_classes)] = token_classes
-        # classes[0] = 0 (<tool_call>), classes[1+al] = 0 (EOS) — base weight
+            continue
 
         enc_seqs.append(np.array(enc_seq, dtype=np.int16))
-        dec_in_seqs.append(np.array(dec_in_seq, dtype=np.int16))
-        dec_tgt_seqs.append(np.array(dec_tgt_seq, dtype=np.int16))
-        loss_seqs.append(classes)
+        dec_in_seqs.append(np.array([eos_id, tool_call_id] + list(a_tok), dtype=np.int16))
+        dec_tgt_seqs.append(np.array([tool_call_id] + list(a_tok) + [eos_id], dtype=np.int16))
         kept_indices.append(i)
         kept_tool_counts.append(tool_counts[i])
+        kept_ans_texts.append(ans_texts[i])
+        kept_ans_tokens.append(a_tok)
 
     skipped = n - len(kept_indices)
     if skipped > 0:
         print(f"  Skipped {skipped} examples (too long for max_dec_len={max_dec_len})")
+
+    # Compute token classes in parallel (requires SentencePiece re-encoding)
+    class_inputs = list(zip(kept_ans_texts, kept_ans_tokens))
+    class_chunks = [class_inputs[i:i + chunk_size] for i in range(0, len(class_inputs), chunk_size)]
+    with mp.Pool(num_workers, initializer=_init_worker,
+                 initargs=(model_path, max_dec_len)) as pool:
+        class_results = list(tqdm(pool.imap(_compute_classes_chunk, class_chunks),
+                                  total=len(class_chunks), desc="Computing token classes"))
+    all_classes = [cls for chunk in class_results for cls in chunk]
+
+    loss_seqs = []
+    for j, token_classes in enumerate(all_classes):
+        classes = np.zeros(len(dec_tgt_seqs[j]), dtype=np.int8)
+        classes[1:1 + len(token_classes)] = token_classes
+        loss_seqs.append(classes)
 
     kept_indices = np.array(kept_indices, dtype=np.int64)
     kept_tool_counts = np.array(kept_tool_counts, dtype=np.int32)
@@ -581,19 +587,20 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     np.save(cache_path + "_tool_count.npy", kept_tool_counts)
 
     max_tool_len = getattr(prepare_tool_call_pairs, '_max_tool_len', 256)
-    _build_contrastive_arrays(ds, enc_texts, tools_texts, cache_path,
+    _build_contrastive_arrays(ds, enc_texts, tools_texts, all_enc_tokens, cache_path,
                               model_path, max_enc_len, max_tool_len,
                               num_workers, chunk_size, kept_indices)
 
     return enc_vl, dec_in_vl, dec_tgt_vl, loss_vl, kept_indices, kept_tool_counts
 
 
-def _build_contrastive_arrays(ds, enc_texts, tools_texts, cache_path,
+def _build_contrastive_arrays(ds, enc_texts, tools_texts, all_enc_tokens, cache_path,
                               model_path, max_enc_len, max_tool_len,
                               num_workers, chunk_size, kept_indices):
     """Build and save contrastive arrays: query-only + individual tool tokens.
 
     Both are stored as variable-length int16 arrays (VarLen format).
+    Query tokens are reused from the main tokenization pass (all_enc_tokens).
     """
     kept_set = set(kept_indices.tolist()) if kept_indices is not None else set(range(len(enc_texts)))
     n_kept = len(kept_set)
@@ -647,18 +654,8 @@ def _build_contrastive_arrays(ds, enc_texts, tools_texts, cache_path,
     else:
         tool_seqs = []
 
-    # Save query-only tokens (variable-length)
-    query_texts_kept = [enc_texts[i] for i in kept_list]
-    if query_texts_kept:
-        q_chunks = [query_texts_kept[i:i + chunk_size]
-                    for i in range(0, len(query_texts_kept), chunk_size)]
-        with mp.Pool(num_workers, initializer=_init_worker,
-                     initargs=(model_path, max_enc_len)) as pool:
-            q_results = list(tqdm(pool.imap(_tokenize_chunk, q_chunks),
-                                  total=len(q_chunks), desc="Tokenizing queries (contrastive)"))
-        query_seqs = [np.array(tok, dtype=np.int16) for chunk in q_results for tok in chunk]
-    else:
-        query_seqs = []
+    # Reuse already-tokenized query tokens (no re-tokenization needed)
+    query_seqs = [np.array(all_enc_tokens[i], dtype=np.int16) for i in kept_list]
     _save_varlen(cache_path + "_query_only", query_seqs)
 
     _save_varlen(cache_path + "_tool_ind", tool_seqs)
