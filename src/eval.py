@@ -444,7 +444,7 @@ def main(args):
 
     print(f"\nevaluating tool-call perplexity ({args.max_eval_samples} samples)...")
     ds = load_tool_calls("validation", max_samples=args.max_eval_samples)
-    enc_inputs, dec_inputs, dec_targets, loss_mask_arr, _ = prepare_tool_call_pairs(
+    enc_inputs, dec_inputs, dec_targets, loss_mask_arr, _, _ = prepare_tool_call_pairs(
         ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
     )
     ppl = compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, args.batch_size, config.pad_token_id, loss_mask=loss_mask_arr)

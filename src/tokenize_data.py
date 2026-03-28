@@ -18,7 +18,6 @@ from .data import (
     DEFAULT_MAX_ENC_LEN,
     LOCAL_UNIFIED_DIR,
     TOKENIZER_DIR,
-    VarLenArray,
     _cache_key,
     _save_cache_metadata,
     get_tokenizer,
@@ -55,6 +54,7 @@ def _push_to_hf(cache_dir, tokenizer_dir):
         repo_id=_HF_TOKENIZED_REPO,
         repo_type="dataset",
         allow_patterns=["*.npy", "*.json"],
+        delete_patterns=["*.npy", "*.json"],  
     )
 
     print("HuggingFace upload complete.")
@@ -113,28 +113,14 @@ def tokenize(args):
         shuffle_tools = getattr(args, "shuffle_tools", True)
         max_tool_len = getattr(args, "max_tool_len", 256)
         prepare_tool_call_pairs._max_tool_len = max_tool_len
-        _, _, _, _, kept_indices, _ = prepare_tool_call_pairs(
+        enc_vl, dec_in_vl, dec_tgt_vl, loss_vl, kept_indices, _ = prepare_tool_call_pairs(
             ds, tokenizer, max_enc_len=max_enc_len, max_dec_len=max_dec_len,
             shuffle_tools=shuffle_tools,
         )
-        # Cache key must match the one used inside prepare_tool_call_pairs
-        # (weights are no longer part of the cache key — class labels stored instead)
         text_cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len,
                                    1.0, 1.0, 1.0, shuffle_tools)
-
         cache_path = os.path.join(CACHE_DIR, text_cache_id)
-        enc_vl = VarLenArray.load(cache_path + "_enc", max_enc_len)
-        dec_in_vl = VarLenArray.load(cache_path + "_dec_in", max_dec_len)
-        dec_tgt_vl = VarLenArray.load(cache_path + "_dec_tgt", max_dec_len)
-        loss_vl = VarLenArray.load(cache_path + "_loss", max_dec_len)
         pack_sequences(cache_path, enc_vl, dec_in_vl, dec_tgt_vl, loss_vl)
-
-        # Clean up unpacked VarLenArrays — only packed arrays are needed for training
-        for suffix in ("_enc", "_dec_in", "_dec_tgt", "_loss"):
-            for ext in ("_data.npy", "_offsets.npy"):
-                path = cache_path + suffix + ext
-                if os.path.exists(path):
-                    os.remove(path)
 
         _save_cache_metadata(split, text_cache_id, len(kept_indices),
                              max_enc_len, max_dec_len, max_tool_len)

@@ -354,6 +354,9 @@ def _download_tokenized_from_hf():
         if fname.startswith("."):
             continue
         dst = os.path.join(CACHE_DIR, fname)
+        # Metadata JSONs: always overwrite so HF matches downloaded data
+        if fname.endswith(".json") and os.path.exists(dst):
+            os.remove(dst)
         if not os.path.exists(dst):
             os.symlink(os.path.join(local, fname), dst)
 
@@ -457,32 +460,17 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
                             w_name=3.0, w_value=2.0, w_key=1.5, shuffle_tools=True):
     """Prepare tool-call encoder-decoder pairs with <tool_call> task token.
 
-    Stores variable-length sequences as flat int16/float16 arrays with offsets
-    for compact on-disk representation (~5-7x smaller than padded int32).
-    Padding to fixed max lengths happens at batch time via VarLenArray.
-
+    Builds variable-length sequences in memory as VarLenArray objects.
     The loss array stores per-token class labels (int8: 0=base, 1=name,
     2=value, 3=key) rather than final weights. Weight scalars are applied
     at train time so tokenization doesn't need to be re-run when weights change.
 
-    Returns (enc, dec_in, dec_tgt, loss_classes, kept_indices, tool_counts) where
-    the first four are VarLenArray objects when loaded from cache.
+    Returns (enc_vl, dec_in_vl, dec_tgt_vl, loss_vl, kept_indices, tool_counts).
     """
 
     cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len,
                           1.0, 1.0, 1.0, shuffle_tools)  # weights no longer affect cache
     cache_path = os.path.join(CACHE_DIR, cache_id)
-
-    if os.path.exists(cache_path + "_enc_data.npy"):
-        print(f"Loading cached tool-call data ({cache_id})...")
-        enc = VarLenArray.load(cache_path + "_enc", max_enc_len, pad_value=PAD_ID)
-        dec_in = VarLenArray.load(cache_path + "_dec_in", max_dec_len, pad_value=PAD_ID)
-        dec_tgt = VarLenArray.load(cache_path + "_dec_tgt", max_dec_len, pad_value=PAD_ID)
-        loss = VarLenArray.load(cache_path + "_loss", max_dec_len, pad_value=0)
-        kept = np.load(cache_path + "_kept_idx.npy")
-        tc_path = cache_path + "_tool_count.npy"
-        tc = np.load(tc_path) if os.path.exists(tc_path) else None
-        return enc, dec_in, dec_tgt, loss, kept, tc
 
     eos_id = tokenizer.eos_token_id
     tool_call_id = tokenizer.tool_call_token_id
@@ -536,7 +524,6 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     dec_in_seqs = []
     dec_tgt_seqs = []
     loss_seqs = []
-    query_lens_list = []
     kept_indices = []
     kept_tool_counts = []
 
@@ -572,7 +559,6 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
         dec_in_seqs.append(np.array(dec_in_seq, dtype=np.int16))
         dec_tgt_seqs.append(np.array(dec_tgt_seq, dtype=np.int16))
         loss_seqs.append(classes)
-        query_lens_list.append(len(e_tok))
         kept_indices.append(i)
         kept_tool_counts.append(tool_counts[i])
 
@@ -581,34 +567,33 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
         print(f"  Skipped {skipped} examples (too long for max_dec_len={max_dec_len})")
 
     kept_indices = np.array(kept_indices, dtype=np.int64)
-    query_lens = np.array(query_lens_list, dtype=np.int32)
     kept_tool_counts = np.array(kept_tool_counts, dtype=np.int32)
 
+    enc_vl = VarLenArray.from_sequences(enc_seqs, max_enc_len, pad_value=PAD_ID)
+    dec_in_vl = VarLenArray.from_sequences(dec_in_seqs, max_dec_len, pad_value=PAD_ID)
+    dec_tgt_vl = VarLenArray.from_sequences(dec_tgt_seqs, max_dec_len, pad_value=PAD_ID)
+    loss_vl = VarLenArray.from_sequences(loss_seqs, max_dec_len, pad_value=0)
+    print(f"Prepared {len(enc_seqs):,} tool-call pairs")
+
+    # Save auxiliary arrays needed for training (kept indices, tool counts, contrastive)
     os.makedirs(CACHE_DIR, exist_ok=True)
-    _save_varlen(cache_path + "_enc", enc_seqs)
-    _save_varlen(cache_path + "_dec_in", dec_in_seqs)
-    _save_varlen(cache_path + "_dec_tgt", dec_tgt_seqs)
-    _save_varlen(cache_path + "_loss", loss_seqs)
-    np.save(cache_path + "_query_len.npy", query_lens)
     np.save(cache_path + "_kept_idx.npy", kept_indices)
     np.save(cache_path + "_tool_count.npy", kept_tool_counts)
-    print(f"Cached {len(enc_seqs):,} tool-call pairs to {CACHE_DIR}/{cache_id}")
 
     max_tool_len = getattr(prepare_tool_call_pairs, '_max_tool_len', 256)
     _build_contrastive_arrays(ds, enc_texts, tools_texts, cache_path,
                               model_path, max_enc_len, max_tool_len,
                               num_workers, chunk_size, kept_indices)
 
-    return enc_seqs, dec_in_seqs, dec_tgt_seqs, loss_seqs, kept_indices, kept_tool_counts
+    return enc_vl, dec_in_vl, dec_tgt_vl, loss_vl, kept_indices, kept_tool_counts
 
 
 def _build_contrastive_arrays(ds, enc_texts, tools_texts, cache_path,
                               model_path, max_enc_len, max_tool_len,
                               num_workers, chunk_size, kept_indices):
-    """Build and save contrastive arrays: individual tool tokens (variable-length int16).
+    """Build and save contrastive arrays: query-only + individual tool tokens.
 
-    Query-only tokens are NOT stored separately — they are derived at load time
-    from the encoder data + query_len via QueryOnlyArray.
+    Both are stored as variable-length int16 arrays (VarLen format).
     """
     kept_set = set(kept_indices.tolist()) if kept_indices is not None else set(range(len(enc_texts)))
     n_kept = len(kept_set)
@@ -662,10 +647,24 @@ def _build_contrastive_arrays(ds, enc_texts, tools_texts, cache_path,
     else:
         tool_seqs = []
 
+    # Save query-only tokens (variable-length)
+    query_texts_kept = [enc_texts[i] for i in kept_list]
+    if query_texts_kept:
+        q_chunks = [query_texts_kept[i:i + chunk_size]
+                    for i in range(0, len(query_texts_kept), chunk_size)]
+        with mp.Pool(num_workers, initializer=_init_worker,
+                     initargs=(model_path, max_enc_len)) as pool:
+            q_results = list(tqdm(pool.imap(_tokenize_chunk, q_chunks),
+                                  total=len(q_chunks), desc="Tokenizing queries (contrastive)"))
+        query_seqs = [np.array(tok, dtype=np.int16) for chunk in q_results for tok in chunk]
+    else:
+        query_seqs = []
+    _save_varlen(cache_path + "_query_only", query_seqs)
+
     _save_varlen(cache_path + "_tool_ind", tool_seqs)
     np.save(cache_path + "_tool_ex_idx.npy", np.array(tool_ex_idx, dtype=np.int32))
     np.save(cache_path + "_tool_is_pos.npy", np.array(tool_is_pos, dtype=np.bool_))
-    print(f"  Contrastive: {n_kept} queries (from enc), {len(tool_ex_idx)} individual tools")
+    print(f"  Contrastive: {len(query_seqs)} queries, {len(tool_ex_idx)} individual tools")
 
 
 def get_contrastive_batches(query_tokens, tool_tokens, tool_ex_idx, tool_is_pos, batch_size):
@@ -931,6 +930,15 @@ class VarLenArray:
         self._out_dtype = np.float32 if data.dtype == np.float16 else np.int32
 
     @classmethod
+    def from_sequences(cls, sequences, max_len, pad_value=0):
+        """Build a VarLenArray in memory from a list of 1D numpy arrays."""
+        offsets = np.zeros(len(sequences) + 1, dtype=np.int64)
+        for i, seq in enumerate(sequences):
+            offsets[i + 1] = offsets[i] + len(seq)
+        data = np.concatenate(sequences) if sequences else np.array([], dtype=np.int16)
+        return cls(data, offsets, max_len, pad_value)
+
+    @classmethod
     def load(cls, prefix, max_len, pad_value=0, mmap_mode=None):
         data = np.load(prefix + "_data.npy", mmap_mode=mmap_mode)
         offsets = np.load(prefix + "_offsets.npy", mmap_mode=mmap_mode)
@@ -972,56 +980,6 @@ class VarLenArray:
 
         raise TypeError(f"Unsupported index type: {type(idx)}")
 
-
-class QueryOnlyArray:
-    """Extracts query portions from encoder variable-length data without duplication.
-
-    Queries are the prefix of each encoder sequence (before the <tools> separator).
-    Instead of storing a separate copy, this derives them on-the-fly from encoder data.
-    """
-
-    def __init__(self, enc_data, enc_offsets, query_lens, max_len):
-        self._enc_data = enc_data
-        self._enc_offsets = enc_offsets
-        self._query_lens = query_lens
-        self._max_len = max_len
-        self._n = len(query_lens)
-
-    def __len__(self):
-        return self._n
-
-    @property
-    def shape(self):
-        return (self._n, self._max_len)
-
-    @property
-    def dtype(self):
-        return np.int32
-
-    def __getitem__(self, idx):
-        if isinstance(idx, (int, np.integer)):
-            if idx < 0:
-                idx += self._n
-            start = int(self._enc_offsets[idx])
-            qlen = int(self._query_lens[idx])
-            result = np.full(self._max_len, PAD_ID, dtype=np.int32)
-            result[:qlen] = self._enc_data[start:start + qlen].astype(np.int32)
-            return result
-
-        if isinstance(idx, np.ndarray):
-            batch_size = len(idx)
-            result = np.full((batch_size, self._max_len), PAD_ID, dtype=np.int32)
-            for j, i in enumerate(idx):
-                start = int(self._enc_offsets[i])
-                qlen = int(self._query_lens[i])
-                result[j, :qlen] = self._enc_data[start:start + qlen].astype(np.int32)
-            return result
-
-        if isinstance(idx, slice):
-            indices = np.arange(*idx.indices(self._n))
-            return self[indices]
-
-        raise TypeError(f"Unsupported index type: {type(idx)}")
 
 
 def _save_varlen(prefix, sequences):
@@ -1093,13 +1051,13 @@ class ShardedMmapArray:
 
 
 def load_prepared_data(split, mmap=False):
-    """Load pre-tokenized variable-length data. Returns VarLenArray objects
-    that pad to fixed max lengths on-the-fly when indexed.
+    """Load pre-packed tokenized data from disk.
 
-    If mmap=True, underlying flat arrays are memory-mapped.
+    If mmap=True, underlying arrays are memory-mapped.
 
-    Returns dict with keys: enc_inputs, dec_inputs, dec_targets, loss_mask,
-    kept_indices, tool_counts, query_only, tool_individual, tool_ex_idx, tool_is_pos.
+    Returns dict with keys: packed_enc, packed_dec_in, packed_dec_tgt, packed_loss,
+    packed_enc_seg, packed_dec_seg, kept_indices, tool_counts, query_only,
+    tool_individual, tool_ex_idx, tool_is_pos.
     """
     meta = _load_cache_metadata(split)
     if meta is None:
@@ -1119,65 +1077,41 @@ def load_prepared_data(split, mmap=False):
     max_dec_len = meta.get("max_dec_len", DEFAULT_MAX_DEC_LEN)
     max_tool_len = meta.get("max_tool_len", 256)
 
-    if not os.path.exists(cache_path + "_enc_data.npy"):
+    if not os.path.exists(cache_path + "_packed_enc.npy"):
         raise FileNotFoundError(
             f"Text cache '{text_cache_id}' not found. Run 'needle tokenize' first."
         )
 
     mmap_mode = "r" if mmap else None
 
-    enc = VarLenArray.load(cache_path + "_enc", max_enc_len, pad_value=PAD_ID, mmap_mode=mmap_mode)
-    dec_in = VarLenArray.load(cache_path + "_dec_in", max_dec_len, pad_value=PAD_ID, mmap_mode=mmap_mode)
-    dec_tgt = VarLenArray.load(cache_path + "_dec_tgt", max_dec_len, pad_value=PAD_ID, mmap_mode=mmap_mode)
-    loss = VarLenArray.load(cache_path + "_loss", max_dec_len, pad_value=0, mmap_mode=mmap_mode)
-    kept = np.load(cache_path + "_kept_idx.npy", mmap_mode=mmap_mode)
+    def _load_optional(suffix):
+        p = cache_path + suffix
+        return np.load(p, mmap_mode=mmap_mode) if os.path.exists(p) else None
 
-    tc_path = cache_path + "_tool_count.npy"
-    tc = np.load(tc_path, mmap_mode=mmap_mode) if os.path.exists(tc_path) else None
-
-    # Query-only: derived from encoder data + query lengths (no duplication)
+    # Contrastive arrays
     query_only = None
-    ql_path = cache_path + "_query_len.npy"
-    if os.path.exists(ql_path):
-        query_lens = np.load(ql_path, mmap_mode=mmap_mode)
-        query_only = QueryOnlyArray(enc._data, enc._offsets, query_lens, max_enc_len)
+    if os.path.exists(cache_path + "_query_only_data.npy"):
+        query_only = VarLenArray.load(cache_path + "_query_only", max_enc_len,
+                                      pad_value=PAD_ID, mmap_mode=mmap_mode)
 
-    # Tool individual: variable-length
     tool_individual = None
     if os.path.exists(cache_path + "_tool_ind_data.npy"):
         tool_individual = VarLenArray.load(cache_path + "_tool_ind", max_tool_len,
                                            pad_value=PAD_ID, mmap_mode=mmap_mode)
 
-    def _load_optional(suffix):
-        p = cache_path + suffix
-        if os.path.exists(p):
-            return np.load(p, mmap_mode=mmap_mode)
-        return None
-
-    # Pre-packed arrays (if available from 'needle tokenize')
-    packed = {}
-    if os.path.exists(cache_path + "_packed_enc.npy"):
-        packed = {
-            "packed_enc": np.load(cache_path + "_packed_enc.npy", mmap_mode=mmap_mode),
-            "packed_dec_in": np.load(cache_path + "_packed_dec_in.npy", mmap_mode=mmap_mode),
-            "packed_dec_tgt": np.load(cache_path + "_packed_dec_tgt.npy", mmap_mode=mmap_mode),
-            "packed_loss": np.load(cache_path + "_packed_loss.npy", mmap_mode=mmap_mode),
-            "packed_enc_seg": np.load(cache_path + "_packed_enc_seg.npy", mmap_mode=mmap_mode),
-            "packed_dec_seg": np.load(cache_path + "_packed_dec_seg.npy", mmap_mode=mmap_mode),
-        }
-
     return {
-        "enc_inputs": enc,
-        "dec_inputs": dec_in,
-        "dec_targets": dec_tgt,
-        "loss_mask": loss,
-        "kept_indices": kept,
-        "tool_counts": tc,
+        "packed_enc": np.load(cache_path + "_packed_enc.npy", mmap_mode=mmap_mode),
+        "packed_dec_in": np.load(cache_path + "_packed_dec_in.npy", mmap_mode=mmap_mode),
+        "packed_dec_tgt": np.load(cache_path + "_packed_dec_tgt.npy", mmap_mode=mmap_mode),
+        "packed_loss": np.load(cache_path + "_packed_loss.npy", mmap_mode=mmap_mode),
+        "packed_enc_seg": np.load(cache_path + "_packed_enc_seg.npy", mmap_mode=mmap_mode),
+        "packed_dec_seg": np.load(cache_path + "_packed_dec_seg.npy", mmap_mode=mmap_mode),
+        "kept_indices": _load_optional("_kept_idx.npy"),
+        "tool_counts": _load_optional("_tool_count.npy"),
         "query_only": query_only,
         "tool_individual": tool_individual,
         "tool_ex_idx": _load_optional("_tool_ex_idx.npy"),
         "tool_is_pos": _load_optional("_tool_is_pos.npy"),
-        **packed,
     }
 
 
