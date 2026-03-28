@@ -110,18 +110,17 @@ def tokenize(args):
             max_samples=args.max_samples,
             return_global_indices=True,
         )
-        w_name = getattr(args, "w_name", 3.0)
-        w_value = getattr(args, "w_value", 2.0)
-        w_key = getattr(args, "w_key", 1.5)
         shuffle_tools = getattr(args, "shuffle_tools", True)
         max_tool_len = getattr(args, "max_tool_len", 256)
         prepare_tool_call_pairs._max_tool_len = max_tool_len
         _, _, _, _, kept_indices, _ = prepare_tool_call_pairs(
             ds, tokenizer, max_enc_len=max_enc_len, max_dec_len=max_dec_len,
-            w_name=w_name, w_value=w_value, w_key=w_key, shuffle_tools=shuffle_tools,
+            shuffle_tools=shuffle_tools,
         )
+        # Cache key must match the one used inside prepare_tool_call_pairs
+        # (weights are no longer part of the cache key — class labels stored instead)
         text_cache_id = _cache_key("toolcall", len(ds), max_enc_len, max_dec_len,
-                                   w_name, w_value, w_key, shuffle_tools)
+                                   1.0, 1.0, 1.0, shuffle_tools)
 
         cache_path = os.path.join(CACHE_DIR, text_cache_id)
         enc_vl = VarLenArray.load(cache_path + "_enc", max_enc_len)
@@ -129,6 +128,13 @@ def tokenize(args):
         dec_tgt_vl = VarLenArray.load(cache_path + "_dec_tgt", max_dec_len)
         loss_vl = VarLenArray.load(cache_path + "_loss", max_dec_len)
         pack_sequences(cache_path, enc_vl, dec_in_vl, dec_tgt_vl, loss_vl)
+
+        # Clean up unpacked VarLenArrays — only packed arrays are needed for training
+        for suffix in ("_enc", "_dec_in", "_dec_tgt", "_loss"):
+            for ext in ("_data.npy", "_offsets.npy"):
+                path = cache_path + suffix + ext
+                if os.path.exists(path):
+                    os.remove(path)
 
         _save_cache_metadata(split, text_cache_id, len(kept_indices),
                              max_enc_len, max_dec_len, max_tool_len)

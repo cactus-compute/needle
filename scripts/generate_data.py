@@ -765,6 +765,15 @@ def _load_existing():
     else:
         print(f"Downloading existing dataset from {HF_DATASET_REPO}...")
         ds = load_dataset(HF_DATASET_REPO, split="train", token=True)
+        # Save locally so subsequent chunks don't re-download
+        os.makedirs(local, exist_ok=True)
+        ds.save_to_disk(local)
+        # Clear HF download cache to avoid double storage
+        hf_cache = os.path.expanduser("~/.cache/huggingface/datasets")
+        if os.path.exists(hf_cache):
+            import shutil
+            shutil.rmtree(hf_cache)
+            print(f"Cleared HF dataset cache ({hf_cache})")
         print(f"Downloaded: {len(ds)} rows")
     return ds
 
@@ -829,7 +838,7 @@ def main():
     existing = None if args.dry_run else _load_existing()
     seen_queries = set()
     if existing and not args.dry_run:
-        seen_queries = set(existing["query"][:50000])
+        seen_queries = set(existing["query"])
 
     while remaining > 0:
         chunk_size = min(remaining, args.upload_every)
