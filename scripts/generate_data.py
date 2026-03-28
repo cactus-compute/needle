@@ -751,7 +751,7 @@ def generate_all(num_samples, workers=8, batch_size=25, model=MODEL, client_pool
 
 LOCAL_UNIFIED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "tool_calls_unified")
 HF_DATASET_REPO = "Cactus-Compute/tool-calls"
-UPLOAD_EVERY = 1000
+UPLOAD_EVERY = 10000
 
 
 def _load_existing():
