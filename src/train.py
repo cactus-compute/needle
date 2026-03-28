@@ -26,7 +26,7 @@ from .model import (
     make_cross_packing_mask,
 )
 
-_HF_CHECKPOINT_REPO = "Cactus-Compute/needle"
+_HF_CHECKPOINT_REPO = "Cactus-Compute/checkpoints"
 
 
 def _upload_checkpoint(ckpt_path):
