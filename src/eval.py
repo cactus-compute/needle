@@ -7,44 +7,54 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from .data import get_batches, get_tokenizer, load_tool_calls, prepare_tool_call_pairs, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN
+from .data import get_tokenizer, load_tool_calls, load_prepared_data, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN
 from .model import (
     EncoderDecoderTransformer,
     TransformerConfig,
     make_causal_mask,
+    make_causal_packing_mask,
     make_padding_mask,
+    make_packing_mask,
+    make_cross_packing_mask,
 )
 from .run import load_checkpoint, _get_decode_fn
 
 
-def compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, batch_size, pad_id, loss_mask=None):
+def compute_perplexity_packed(model, params, packed_data, batch_size):
+    """Compute perplexity from pre-packed data with segment IDs."""
+    enc = packed_data["packed_enc"]
+    dec_in = packed_data["packed_dec_in"]
+    dec_tgt = packed_data["packed_dec_tgt"]
+    enc_seg = packed_data["packed_enc_seg"]
+    dec_seg = packed_data["packed_dec_seg"]
+
     total_loss = 0.0
     total_tokens = 0
+    n = len(enc)
 
-    for batch in get_batches(enc_inputs, dec_inputs, dec_targets, batch_size, shuffle=False, loss_mask=loss_mask):
-        if loss_mask is not None:
-            src, tgt_in, tgt_out, lm = batch
-            src, tgt_in, tgt_out, lm = jnp.array(src), jnp.array(tgt_in), jnp.array(tgt_out), jnp.array(lm)
-            mask = lm
-        else:
-            src, tgt_in, tgt_out = batch
-            src, tgt_in, tgt_out = jnp.array(src), jnp.array(tgt_in), jnp.array(tgt_out)
-            mask = (tgt_out != pad_id).astype(jnp.float32)
+    for i in range(0, n - batch_size + 1, batch_size):
+        src = jnp.asarray(enc[i:i+batch_size], dtype=jnp.int32)
+        tgt_in = jnp.asarray(dec_in[i:i+batch_size], dtype=jnp.int32)
+        tgt_out = jnp.asarray(dec_tgt[i:i+batch_size], dtype=jnp.int32)
+        es = jnp.asarray(enc_seg[i:i+batch_size], dtype=jnp.int32)
+        ds = jnp.asarray(dec_seg[i:i+batch_size], dtype=jnp.int32)
 
-        src_mask = make_padding_mask(src, pad_id)
-        tgt_mask = make_causal_mask(tgt_in.shape[1]) & make_padding_mask(tgt_in, pad_id)
+        src_mask = make_packing_mask(es)
+        tgt_mask = make_causal_packing_mask(ds)
+        cross_mask = make_cross_packing_mask(es, ds)
 
         logits = model.apply(
             {"params": params}, src, tgt_in,
-            src_mask=src_mask, tgt_mask=tgt_mask,
+            src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=cross_mask,
         )
 
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits, tgt_out)
-        total_loss += float(jnp.sum(loss * mask))
-        total_tokens += int(jnp.sum(mask))
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tgt_out)
+        padding_mask = (ds > 0).astype(jnp.float32)
+        total_loss += float(jnp.sum(loss * padding_mask))
+        total_tokens += int(jnp.sum(padding_mask))
 
     avg_nll = total_loss / max(total_tokens, 1)
-    return math.exp(avg_nll)
+    return math.exp(min(avg_nll, 20))
 
 
 def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is the weather?', max_gen_len=64):
@@ -168,13 +178,14 @@ def compute_wer(hypotheses, references):
     return total_edits / max(total_ref_words, 1)
 
 
-def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, constrained=True):
+def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, constrained=True, ds=None):
     """Generate tool-call predictions and compute structured metrics."""
     import json
     from .run import generate_batch, normalize_tools, restore_tool_names
     from .data import load_tool_calls, to_snake_case
 
-    ds = load_tool_calls("validation", max_samples=num_samples)
+    if ds is None:
+        ds = load_tool_calls("validation", max_samples=num_samples)
 
     queries = [ex["query"] for ex in ds]
     tools_list = [ex["tools"] for ex in ds]
@@ -433,6 +444,8 @@ def benchmark_retrieval(model, params, tokenizer, num_samples=500, max_len=256, 
 
 
 def main(args):
+    import json as _json_mod
+
     params, config = load_checkpoint(args.checkpoint)
     model = EncoderDecoderTransformer(config)
     tokenizer = get_tokenizer()
@@ -442,48 +455,85 @@ def main(args):
     print(f"parameters:  {param_count:,}")
     print(f"config:      d={config.d_model}, heads={config.num_heads}, layers={config.num_encoder_layers}/{config.num_decoder_layers}")
 
-    print(f"\nevaluating tool-call perplexity ({args.max_eval_samples} samples)...")
-    ds = load_tool_calls("validation", max_samples=args.max_eval_samples)
-    enc_inputs, dec_inputs, dec_targets, loss_mask_arr, _, _ = prepare_tool_call_pairs(
-        ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
-    )
-    ppl = compute_perplexity(model, params, enc_inputs, dec_inputs, dec_targets, args.batch_size, config.pad_token_id, loss_mask=loss_mask_arr)
+    # --- Perplexity from pre-packed data (no re-tokenization) ---
+    print(f"\nevaluating perplexity (pre-packed val data)...")
+    try:
+        val_data = load_prepared_data("val", mmap=True)
+        n_bins = len(val_data["packed_enc"])
+        ppl = compute_perplexity_packed(model, params, val_data, args.batch_size)
+        print(f"  perplexity: {ppl:.2f}  ({n_bins} packed bins)")
+    except FileNotFoundError:
+        print("  Skipped — no pre-packed val data. Run 'needle tokenize' first.")
+        ppl = None
 
+    # --- Tool-call accuracy with stratified sampling (matches training eval) ---
     tc_samples = getattr(args, "tool_call_samples", 200)
-    tc = None
-    if tc_samples > 0:
-        print(f"\nevaluating tool-call accuracy ({tc_samples} samples)...")
-        tc = benchmark_tool_calls(model, params, tokenizer, num_samples=tc_samples, max_gen_len=args.max_gen_len, max_enc_len=args.max_enc_len, constrained=not getattr(args, "no_constrained", False))
+    use_constrained = not getattr(args, "no_constrained", False)
 
-    print(f"\n  ─────────────────────────────────────")
-    print(f"  Tool-Call Metrics")
-    print(f"  ─────────────────────────────────────")
-    print(f"  Perplexity       {ppl:>10.2f}  ({args.max_eval_samples} samples)")
-    if tc:
-        print(f"  JSON parse rate  {tc['json_parse_rate']:>10.1%}")
-        print(f"  Exact match      {tc['exact_match']:>10.1%}")
-        print(f"  ─── Function Name ───────────────────")
-        print(f"  Precision        {tc['name_precision']:>10.3f}")
-        print(f"  Recall           {tc['name_recall']:>10.3f}")
-        print(f"  F1               {tc['name_f1']:>10.3f}")
-        print(f"  ─── Parameter-Level ────────────────")
-        print(f"  Param haluc      {tc['param_haluc']:>10.1%}")
-        print(f"  Param miss       {tc['param_miss']:>10.1%}")
-        print(f"  Value acc        {tc['value_acc']:>10.1%}")
-        print(f"  Args acc         {tc['args_acc']:>10.1%}")
-        print(f"  ─── Full Call (name+args) ───────────")
-        print(f"  Precision        {tc['call_precision']:>10.3f}")
-        print(f"  Recall           {tc['call_recall']:>10.3f}")
-        print(f"  F1               {tc['call_f1']:>10.3f}")
-        print(f"  ─────────────────────────────────────")
-        print(f"  Defer ref/pred   {tc['empty_ref_pct']:.1%} / {tc['empty_pred_pct']:.1%}")
-        if tc["samples"]:
-            print(f"\n  samples:")
-            for query, ref, pred in tc["samples"][:5]:
-                print(f"    Q: {query}")
-                print(f"    R: {ref}")
-                print(f"    P: {pred}")
-                print()
+    if tc_samples > 0:
+        val_ds = load_tool_calls("validation")
+        rng = np.random.RandomState(42)
+
+        def _classify(ex):
+            try:
+                answers = _json_mod.loads(ex["answers"])
+            except (ValueError, TypeError):
+                return "empty"
+            if not answers or not isinstance(answers, list):
+                return "empty"
+            return "single" if len(answers) == 1 else "multi"
+
+        pool_names = ["single", "multi"]
+        pool_buckets = {name: {t: [] for t in range(11)} for name in pool_names}
+
+        for k in range(len(val_ds)):
+            ex = val_ds[k]
+            try:
+                nc = min(len(_json_mod.loads(ex["tools"])), 10)
+            except (ValueError, TypeError):
+                nc = 0
+            ct = _classify(ex)
+            if ct != "empty":
+                pool_buckets[ct][nc].append(k)
+
+        per_bucket = max(1, tc_samples // 14)  # ~7 tool-count buckets * 2 pools
+
+        for name in pool_names:
+            label = "Single-Call" if name == "single" else "Multi-Call"
+            pool = []
+            for t in range(11):
+                b = np.array(pool_buckets[name][t])
+                if len(b) > 0:
+                    rng.shuffle(b)
+                    pool.extend(b[:per_bucket].tolist())
+            rng.shuffle(pool)
+            examples = [val_ds[k] for k in pool]
+
+            if not examples:
+                continue
+
+            print(f"\n  evaluating {label} ({len(examples)} samples, constrained={use_constrained})...")
+            tc = benchmark_tool_calls(
+                model, params, tokenizer, num_samples=len(examples),
+                max_gen_len=args.max_gen_len, max_enc_len=args.max_enc_len,
+                constrained=use_constrained, ds=examples,
+            )
+            print(f"  ─── {label} ({len(examples)} samples) ───")
+            print(f"  JSON parse       {tc['json_parse_rate']:>10.1%}")
+            print(f"  Name F1          {tc['name_f1']:>10.1%}")
+            print(f"  Param haluc      {tc['param_haluc']:>10.1%}")
+            print(f"  Param miss       {tc['param_miss']:>10.1%}")
+            print(f"  Value acc        {tc['value_acc']:>10.1%}")
+            print(f"  Args acc         {tc['args_acc']:>10.1%}")
+            print(f"  Call F1          {tc['call_f1']:>10.1%}")
+            print(f"  Exact match      {tc['exact_match']:>10.1%}")
+            if tc["samples"]:
+                print(f"  samples:")
+                for query, ref, pred in tc["samples"][:3]:
+                    print(f"    Q: {query}")
+                    print(f"    R: {ref}")
+                    print(f"    P: {pred}")
+                    print()
 
     print(f"\nmeasuring throughput ({args.throughput_runs} runs)...")
     throughput = measure_throughput(model, params, tokenizer, num_runs=args.throughput_runs)
