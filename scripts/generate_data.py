@@ -512,32 +512,50 @@ SCENARIOS = [
 ]
 
 CALL_TYPES = [
-    ("single", "exactly 1 tool call"),                                                                      # 3/14 ≈ 21%
+    ("single", "exactly 1 tool call"),                                                                      # 3/16 ≈ 19%
     ("single", "exactly 1 tool call"),
     ("single", "exactly 1 tool call"),
-    ("multi", "2-3 tool calls (the user wants multiple things done at once)"),                               # 3/14 ≈ 21%
+    ("multi", "2-3 tool calls (the user wants multiple things done at once)"),                               # 3/16 ≈ 19%
     ("multi", "2-3 tool calls (the user wants multiple things done at once)"),
     ("multi", "2-3 tool calls (the user wants multiple things done at once)"),
-    ("multi_few_tools", "2-4 tool calls using ONLY 1-3 of the available tools — the user wants multiple actions with the SAME or very few tools, with DIFFERENT detailed argument values each time (e.g. sending messages to 3 different people, setting 2 different alarms, creating multiple list items). Each call MUST have distinct, realistic argument values — vary names, times, locations, messages, etc."),  # 4/14 ≈ 29%
+    ("multi_few_tools", "2-4 tool calls using ONLY 1-3 of the available tools — the user wants multiple actions with the SAME or very few tools, with DIFFERENT detailed argument values each time (e.g. sending messages to 3 different people, setting 2 different alarms, creating multiple list items). Each call MUST have distinct, realistic argument values — vary names, times, locations, messages, etc."),  # 4/16 ≈ 25%
     ("multi_few_tools", "2-4 tool calls using ONLY 1-3 of the available tools — the user wants multiple actions with the SAME or very few tools, with DIFFERENT detailed argument values each time (e.g. sending messages to 3 different people, setting 2 different alarms, creating multiple list items). Each call MUST have distinct, realistic argument values — vary names, times, locations, messages, etc."),
     ("multi_few_tools", "2-4 tool calls using ONLY 1-3 of the available tools — the user wants multiple actions with the SAME or very few tools, with DIFFERENT detailed argument values each time (e.g. sending messages to 3 different people, setting 2 different alarms, creating multiple list items). Each call MUST have distinct, realistic argument values — vary names, times, locations, messages, etc."),
     ("multi_few_tools", "2-4 tool calls using ONLY 1-3 of the available tools — the user wants multiple actions with the SAME or very few tools, with DIFFERENT detailed argument values each time (e.g. sending messages to 3 different people, setting 2 different alarms, creating multiple list items). Each call MUST have distinct, realistic argument values — vary names, times, locations, messages, etc."),
-    ("multi_long_values", "2-3 tool calls where argument values are LONG and detailed — full sentences for message text, multi-word descriptions, specific addresses, complete email bodies, detailed notes. Each argument value should be at least 5-10 words, not just a single word or number."),  # 2/14 ≈ 14%
+    ("multi_long_values", "2-3 tool calls where argument values are LONG and detailed — full sentences for message text, multi-word descriptions, specific addresses, complete email bodies, detailed notes. Each argument value should be at least 5-10 words, not just a single word or number."),  # 2/16 ≈ 12%
     ("multi_long_values", "2-3 tool calls where argument values are LONG and detailed — full sentences for message text, multi-word descriptions, specific addresses, complete email bodies, detailed notes. Each argument value should be at least 5-10 words, not just a single word or number."),
-    ("none", "NO tool calls — the user asks a question or makes a request that NONE of the available tools can fulfill (e.g. asking for opinions, general knowledge, emotional support, or tasks outside the tool capabilities). The query must NOT be something any of the listed tools could handle. answers must be []"),  # 1/14 ≈ 7%
-    ("no_tools", "NO tool calls — there are NO tools available at all, answers must be []"),                 # 1/14 ≈ 7%
+    ("none", "NO tool calls — the user asks a question or makes a request that NONE of the available tools can fulfill (e.g. asking for opinions, general knowledge, emotional support, or tasks outside the tool capabilities). The query must NOT be something any of the listed tools could handle. answers must be []"),  # 1/16 ≈ 6%
+    ("near_miss", "NO tool calls — the query is RELATED to the domain of the available tools but the tools CANNOT actually fulfill the request. "  # 2/16 ≈ 12%
+     "Examples: asking for HISTORY of alarms when only set_alarm exists, asking to EDIT a calendar event when only create/delete exist, "
+     "asking for a feature a tool doesn't support (e.g. 'set a recurring timer' when set_timer has no repeat param), "
+     "asking about the STATUS of something when only action tools exist, asking to do something to an entity the tools don't cover. "
+     "The query should sound natural and plausible — a real user might reasonably expect this to work. answers must be []"),
+    ("near_miss", "NO tool calls — the query is RELATED to the domain of the available tools but the tools CANNOT actually fulfill the request. "
+     "Examples: asking for HISTORY of alarms when only set_alarm exists, asking to EDIT a calendar event when only create/delete exist, "
+     "asking for a feature a tool doesn't support (e.g. 'set a recurring timer' when set_timer has no repeat param), "
+     "asking about the STATUS of something when only action tools exist, asking to do something to an entity the tools don't cover. "
+     "The query should sound natural and plausible — a real user might reasonably expect this to work. answers must be []"),
+    ("no_tools", "NO tool calls — there are NO tools available at all, answers must be []"),                 # 1/16 ≈ 6%
 ]
 
 MODEL = "gemini-3.1-flash-lite-preview"
 
 MAX_TOOLS = 10
 
+_TOOL_COUNT_WEIGHTS = {
+    1: 8, 2: 10, 3: 14, 4: 14, 5: 14, 6: 12, 7: 10, 8: 8, 9: 5, 10: 5,
+}
+_TOOL_COUNTS = list(_TOOL_COUNT_WEIGHTS.keys())
+_TOOL_WEIGHTS = list(_TOOL_COUNT_WEIGHTS.values())
+
 
 def _pick_tools(rng, force_empty=False, few_tools=False):
-    """Pick 0-10 tools from 1-3 random pools.
+    """Pick tools from 1-3 random pools, with explicit control over total count.
 
     If few_tools=True, pick only 1-3 tools from a single pool (for multi-call
     scenarios where the same tools are called multiple times with different args).
+    If force_empty=True, return no tools.
+    Otherwise, sample a target count from _TOOL_COUNT_WEIGHTS and fill from pools.
     """
     if force_empty:
         return []
@@ -545,14 +563,27 @@ def _pick_tools(rng, force_empty=False, few_tools=False):
         pool = rng.choice(ALL_POOLS)
         k = rng.randint(1, min(3, len(pool)))
         return rng.sample(pool, k)
-    num_pools = rng.choice([1, 1, 2, 2, 3])
-    pools = rng.sample(ALL_POOLS, num_pools)
-    tools = []
+
+    # Pick target tool count from explicit distribution
+    target = rng.choices(_TOOL_COUNTS, weights=_TOOL_WEIGHTS, k=1)[0]
+
+    # Draw from 1-3 pools, collect candidates, then trim/pad to target
+    num_pools = 1 if target <= 3 else rng.choice([1, 2, 2, 3])
+    pools = rng.sample(ALL_POOLS, min(num_pools, len(ALL_POOLS)))
+    candidates = []
     for pool in pools:
-        k = rng.randint(max(1, len(pool) // 2), len(pool))
-        tools.extend(rng.sample(pool, k))
-    rng.shuffle(tools)
-    return tools[:MAX_TOOLS]
+        candidates.extend(pool)
+
+    # Deduplicate by tool name (pools shouldn't overlap, but be safe)
+    seen = set()
+    unique = []
+    for t in candidates:
+        if t["name"] not in seen:
+            seen.add(t["name"])
+            unique.append(t)
+
+    rng.shuffle(unique)
+    return unique[:target]
 
 
 def build_prompt(batch_size, call_desc, tools, rng):
@@ -644,12 +675,16 @@ def generate_batch(client_pool, batch_size, rng, model):
 
     prompt = build_prompt(batch_size, call_desc, tools, rng)
 
+    # Vary temperature per batch for diversity: mostly 0.9-1.1 with occasional
+    # low (more precise args) and high (more creative queries) extremes.
+    temperature = rng.choice([0.7, 0.8, 0.9, 1.0, 1.0, 1.0, 1.1, 1.1, 1.2, 1.3])
+
     client = client_pool.get()
     response = client.models.generate_content(
         model=model,
         contents=prompt,
         config={
-            "temperature": 1.0,
+            "temperature": temperature,
             "max_output_tokens": 16384,
         },
     )
@@ -706,7 +741,8 @@ def generate_batch(client_pool, batch_size, rng, model):
         if not ok:
             continue
 
-        # Reject empty answers that look like they should have tool calls
+        # Reject empty answers that look like they should have tool calls.
+        # Skip this filter for "near_miss" — those intentionally have related keywords.
         if len(answers) == 0 and tools and call_type == "none":
             query_lower = query.lower()
             if any(kw in query_lower for kw in _tool_keywords if len(kw) > 5):
@@ -784,7 +820,7 @@ def generate_all(num_samples, workers=8, batch_size=25, model=MODEL, client_pool
 
 LOCAL_UNIFIED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "tool_calls_unified")
 HF_DATASET_REPO = "Cactus-Compute/tool-calls"
-UPLOAD_EVERY = 10000
+UPLOAD_EVERY = 30000
 
 
 def _load_existing():
