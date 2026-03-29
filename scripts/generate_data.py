@@ -486,6 +486,23 @@ SCENARIOS = [
     "hey so I was thinking could you maybe set a reminder for me to pick up the dry cleaning sometime tomorrow afternoon if that's not too much trouble",
     "ok so I need you to do a few things: first turn off the living room lights, then lock the front door, and also set the alarm for 6:30",
     "I'm about to go into a meeting so can you put my phone on do not disturb and also remind me in an hour to check my email",
+    # Multi-call with same tool (few tools, different args)
+    "send a message to Alice about the meeting AND a message to Bob about the deadline",
+    "set an alarm for 6:30am for gym AND another for 8am for work",
+    "add milk, bread, and eggs to the shopping list as separate items",
+    "create reminders for dentist on Monday, haircut on Wednesday, and vet on Friday",
+    "text Sarah I'm running late, text John I'll be there in 20, text Mom dinner is at 7",
+    "set timers for pasta 12 minutes, sauce 8 minutes, and garlic bread 5 minutes",
+    "send an email to the team about the Q3 report AND another to the client about the proposal deadline",
+    "add three different notes: one about the meeting summary, one about the project timeline, and one about the budget",
+    "create calendar events for Monday standup at 9, Wednesday review at 2, and Friday retro at 4",
+    "log breakfast as oatmeal with blueberries, lunch as grilled chicken salad, dinner as pasta carbonara",
+    # Multi-call with long argument values
+    "send a detailed message to the team explaining that the deployment is postponed to next Tuesday due to the security review",
+    "create a note with the full recipe for chocolate chip cookies including all ingredients and steps",
+    "email the landlord about the broken dishwasher explaining what happened and when it started",
+    "set a reminder with the full address: 1234 Oak Street, Apartment 5B, Springfield, IL 62704",
+    "post a status update about how excited I am for the conference next week and all the sessions I'm looking forward to",
     # Edge cases
     "very short terse command like 'timer 5 min'",
     "long polite request with extra context",
@@ -495,16 +512,20 @@ SCENARIOS = [
 ]
 
 CALL_TYPES = [
-    ("single", "exactly 1 tool call"),                                                                      # 4/10 = 40%
+    ("single", "exactly 1 tool call"),                                                                      # 3/14 ≈ 21%
     ("single", "exactly 1 tool call"),
     ("single", "exactly 1 tool call"),
-    ("single", "exactly 1 tool call"),
-    ("multi", "2-3 tool calls (the user wants multiple things done at once)"),                               # 4/10 = 40%
+    ("multi", "2-3 tool calls (the user wants multiple things done at once)"),                               # 3/14 ≈ 21%
     ("multi", "2-3 tool calls (the user wants multiple things done at once)"),
     ("multi", "2-3 tool calls (the user wants multiple things done at once)"),
-    ("multi", "2-3 tool calls (the user wants multiple things done at once)"),
-    ("none", "NO tool calls — the user asks a question or makes a request that NONE of the available tools can fulfill (e.g. asking for opinions, general knowledge, emotional support, or tasks outside the tool capabilities). The query must NOT be something any of the listed tools could handle. answers must be []"),  # 1/10 = 10%
-    ("no_tools", "NO tool calls — there are NO tools available at all, answers must be []"),                 # 1/10 = 10%
+    ("multi_few_tools", "2-4 tool calls using ONLY 1-3 of the available tools — the user wants multiple actions with the SAME or very few tools, with DIFFERENT detailed argument values each time (e.g. sending messages to 3 different people, setting 2 different alarms, creating multiple list items). Each call MUST have distinct, realistic argument values — vary names, times, locations, messages, etc."),  # 4/14 ≈ 29%
+    ("multi_few_tools", "2-4 tool calls using ONLY 1-3 of the available tools — the user wants multiple actions with the SAME or very few tools, with DIFFERENT detailed argument values each time (e.g. sending messages to 3 different people, setting 2 different alarms, creating multiple list items). Each call MUST have distinct, realistic argument values — vary names, times, locations, messages, etc."),
+    ("multi_few_tools", "2-4 tool calls using ONLY 1-3 of the available tools — the user wants multiple actions with the SAME or very few tools, with DIFFERENT detailed argument values each time (e.g. sending messages to 3 different people, setting 2 different alarms, creating multiple list items). Each call MUST have distinct, realistic argument values — vary names, times, locations, messages, etc."),
+    ("multi_few_tools", "2-4 tool calls using ONLY 1-3 of the available tools — the user wants multiple actions with the SAME or very few tools, with DIFFERENT detailed argument values each time (e.g. sending messages to 3 different people, setting 2 different alarms, creating multiple list items). Each call MUST have distinct, realistic argument values — vary names, times, locations, messages, etc."),
+    ("multi_long_values", "2-3 tool calls where argument values are LONG and detailed — full sentences for message text, multi-word descriptions, specific addresses, complete email bodies, detailed notes. Each argument value should be at least 5-10 words, not just a single word or number."),  # 2/14 ≈ 14%
+    ("multi_long_values", "2-3 tool calls where argument values are LONG and detailed — full sentences for message text, multi-word descriptions, specific addresses, complete email bodies, detailed notes. Each argument value should be at least 5-10 words, not just a single word or number."),
+    ("none", "NO tool calls — the user asks a question or makes a request that NONE of the available tools can fulfill (e.g. asking for opinions, general knowledge, emotional support, or tasks outside the tool capabilities). The query must NOT be something any of the listed tools could handle. answers must be []"),  # 1/14 ≈ 7%
+    ("no_tools", "NO tool calls — there are NO tools available at all, answers must be []"),                 # 1/14 ≈ 7%
 ]
 
 MODEL = "gemini-3.1-flash-lite-preview"
@@ -512,10 +533,18 @@ MODEL = "gemini-3.1-flash-lite-preview"
 MAX_TOOLS = 10
 
 
-def _pick_tools(rng, force_empty=False):
-    """Pick 0-10 tools from 1-3 random pools."""
+def _pick_tools(rng, force_empty=False, few_tools=False):
+    """Pick 0-10 tools from 1-3 random pools.
+
+    If few_tools=True, pick only 1-3 tools from a single pool (for multi-call
+    scenarios where the same tools are called multiple times with different args).
+    """
     if force_empty:
         return []
+    if few_tools:
+        pool = rng.choice(ALL_POOLS)
+        k = rng.randint(1, min(3, len(pool)))
+        return rng.sample(pool, k)
     num_pools = rng.choice([1, 1, 2, 2, 3])
     pools = rng.sample(ALL_POOLS, num_pools)
     tools = []
@@ -607,7 +636,11 @@ class ClientPool:
 def generate_batch(client_pool, batch_size, rng, model):
     """Generate one batch of examples. Returns list of dicts."""
     call_type, call_desc = rng.choice(CALL_TYPES)
-    tools = _pick_tools(rng, force_empty=(call_type == "no_tools"))
+    tools = _pick_tools(
+        rng,
+        force_empty=(call_type == "no_tools"),
+        few_tools=(call_type in ("multi_few_tools", "multi_long_values")),
+    )
 
     prompt = build_prompt(batch_size, call_desc, tools, rng)
 
