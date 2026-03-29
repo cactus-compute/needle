@@ -13,6 +13,7 @@ import concurrent.futures
 import json
 import os
 import random
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -320,6 +321,126 @@ POOL_DIGITAL_WELLBEING = [
     {"name": "set_downtime_schedule", "description": "Set a recurring downtime schedule to limit device use.", "parameters": {"start_time": {"type": "string", "description": "Start time for downtime e.g. '22:00'.", "required": True}, "end_time": {"type": "string", "description": "End time for downtime e.g. '07:00'.", "required": True}}},
 ]
 
+POOL_TV_STREAMING = [
+    {"name": "play_show", "description": "Play a TV show or movie by title on a streaming service.", "parameters": {"title": {"type": "string", "description": "Title of the show or movie.", "required": True}, "service": {"type": "string", "description": "Streaming service e.g. 'netflix', 'hulu', 'disney+', 'prime'.", "required": False}}},
+    {"name": "switch_tv_input", "description": "Switch the TV input source.", "parameters": {"input": {"type": "string", "description": "Input source e.g. 'HDMI 1', 'HDMI 2', 'USB', 'antenna'.", "required": True}}},
+    {"name": "toggle_subtitles", "description": "Turn subtitles on or off.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}, "language": {"type": "string", "description": "Subtitle language e.g. 'english', 'spanish'.", "required": False}}},
+    {"name": "set_tv_volume", "description": "Set the TV volume level.", "parameters": {"level": {"type": "number", "description": "Volume level from 0 to 100.", "required": True}}},
+    {"name": "tv_power", "description": "Turn the TV on or off.", "parameters": {"action": {"type": "string", "description": "'on' or 'off'.", "required": True}}},
+    {"name": "tv_channel", "description": "Switch to a specific TV channel.", "parameters": {"channel": {"type": "string", "description": "Channel number or name.", "required": True}}},
+    {"name": "rewind_media", "description": "Rewind the current media by a specified amount.", "parameters": {"seconds": {"type": "number", "description": "Number of seconds to rewind.", "required": False}}},
+    {"name": "fast_forward_media", "description": "Fast forward the current media by a specified amount.", "parameters": {"seconds": {"type": "number", "description": "Number of seconds to fast forward.", "required": False}}},
+    {"name": "search_streaming", "description": "Search for content across streaming services.", "parameters": {"query": {"type": "string", "description": "Search query for movies, shows, or actors.", "required": True}}},
+    {"name": "add_to_watchlist", "description": "Add a show or movie to your watchlist.", "parameters": {"title": {"type": "string", "description": "Title to add.", "required": True}}},
+    {"name": "get_continue_watching", "description": "Get a list of shows/movies you haven't finished.", "parameters": {}},
+    {"name": "set_sleep_timer_tv", "description": "Set a sleep timer to auto-turn off the TV.", "parameters": {"minutes": {"type": "number", "description": "Minutes until the TV turns off.", "required": True}}},
+]
+
+POOL_VEHICLE = [
+    {"name": "lock_car", "description": "Lock or unlock the car remotely.", "parameters": {"action": {"type": "string", "description": "'lock' or 'unlock'.", "required": True}}},
+    {"name": "start_car", "description": "Remote start or stop the car engine.", "parameters": {"action": {"type": "string", "description": "'start' or 'stop'.", "required": True}}},
+    {"name": "car_climate", "description": "Set the car's climate control remotely.", "parameters": {"temperature": {"type": "number", "description": "Target temperature in degrees.", "required": True}, "unit": {"type": "string", "description": "'fahrenheit' or 'celsius'.", "required": False}}},
+    {"name": "find_my_car", "description": "Locate your parked car on a map.", "parameters": {}},
+    {"name": "check_car_status", "description": "Check car status: fuel/battery level, tire pressure, doors.", "parameters": {}},
+    {"name": "honk_horn", "description": "Honk the car horn remotely to locate it.", "parameters": {}},
+    {"name": "flash_lights", "description": "Flash the car lights remotely.", "parameters": {}},
+    {"name": "open_trunk", "description": "Open or close the car trunk remotely.", "parameters": {"action": {"type": "string", "description": "'open' or 'close'.", "required": True}}},
+    {"name": "get_fuel_level", "description": "Check the current fuel or battery level.", "parameters": {}},
+    {"name": "find_ev_charger", "description": "Find nearby EV charging stations.", "parameters": {"connector_type": {"type": "string", "description": "Optional connector type e.g. 'CCS', 'CHAdeMO', 'Tesla'.", "required": False}}},
+    {"name": "set_charge_limit", "description": "Set the EV charge limit percentage.", "parameters": {"percent": {"type": "number", "description": "Charge limit 50-100%.", "required": True}}},
+    {"name": "get_range", "description": "Get the estimated remaining driving range.", "parameters": {}},
+    {"name": "toggle_valet_mode", "description": "Enable or disable valet mode.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
+]
+
+POOL_TRAVEL = [
+    {"name": "search_flights", "description": "Search for flights between cities.", "parameters": {"origin": {"type": "string", "description": "Origin city or airport code.", "required": True}, "destination": {"type": "string", "description": "Destination city or airport code.", "required": True}, "date": {"type": "string", "description": "Travel date in human readable format.", "required": True}}},
+    {"name": "search_hotels", "description": "Search for hotels in a location.", "parameters": {"location": {"type": "string", "description": "City or area to search.", "required": True}, "check_in": {"type": "string", "description": "Check-in date.", "required": True}, "check_out": {"type": "string", "description": "Check-out date.", "required": True}}},
+    {"name": "check_in_flight", "description": "Check in for an upcoming flight.", "parameters": {"confirmation_code": {"type": "string", "description": "Booking confirmation code.", "required": True}}},
+    {"name": "show_boarding_pass", "description": "Display the boarding pass for an upcoming flight.", "parameters": {"confirmation_code": {"type": "string", "description": "Optional booking confirmation code. Shows next flight if omitted.", "required": False}}},
+    {"name": "get_flight_status", "description": "Check the status of a flight.", "parameters": {"flight_number": {"type": "string", "description": "Flight number e.g. 'UA123', 'DL456'.", "required": True}}},
+    {"name": "book_rental_car", "description": "Search for rental cars at a location.", "parameters": {"location": {"type": "string", "description": "Pickup location.", "required": True}, "pickup_date": {"type": "string", "description": "Pickup date.", "required": True}, "return_date": {"type": "string", "description": "Return date.", "required": True}}},
+    {"name": "get_trip_itinerary", "description": "Show the itinerary for an upcoming trip.", "parameters": {"trip_name": {"type": "string", "description": "Optional trip name or destination.", "required": False}}},
+    {"name": "convert_timezone", "description": "Convert a time between timezones.", "parameters": {"time": {"type": "string", "description": "Time to convert e.g. '3pm'.", "required": True}, "from_tz": {"type": "string", "description": "Source timezone e.g. 'EST', 'America/New_York'.", "required": True}, "to_tz": {"type": "string", "description": "Target timezone.", "required": True}}},
+    {"name": "get_exchange_rate", "description": "Get the current exchange rate between currencies.", "parameters": {"from_currency": {"type": "string", "description": "Source currency code.", "required": True}, "to_currency": {"type": "string", "description": "Target currency code.", "required": True}}},
+    {"name": "translate_phrase", "description": "Translate a phrase for travel purposes.", "parameters": {"text": {"type": "string", "description": "Text to translate.", "required": True}, "target_language": {"type": "string", "description": "Target language.", "required": True}}},
+]
+
+POOL_COOKING_KITCHEN = [
+    {"name": "search_recipe", "description": "Search for a recipe by dish name or ingredients.", "parameters": {"query": {"type": "string", "description": "Dish name or ingredients to search for.", "required": True}}},
+    {"name": "set_oven", "description": "Preheat or set the smart oven temperature.", "parameters": {"temperature": {"type": "number", "description": "Temperature in degrees.", "required": True}, "unit": {"type": "string", "description": "'fahrenheit' or 'celsius'.", "required": False}, "mode": {"type": "string", "description": "'bake', 'broil', 'convection', or 'air_fry'.", "required": False}}},
+    {"name": "start_dishwasher", "description": "Start or schedule the dishwasher.", "parameters": {"cycle": {"type": "string", "description": "'normal', 'heavy', 'quick', or 'eco'.", "required": False}, "delay_minutes": {"type": "number", "description": "Optional delay before starting.", "required": False}}},
+    {"name": "control_coffee_maker", "description": "Control the smart coffee maker.", "parameters": {"action": {"type": "string", "description": "'brew', 'stop', or 'warm'.", "required": True}, "size": {"type": "string", "description": "'small', 'medium', or 'large'.", "required": False}, "strength": {"type": "string", "description": "'mild', 'medium', or 'strong'.", "required": False}}},
+    {"name": "cooking_convert", "description": "Convert between cooking measurements.", "parameters": {"value": {"type": "number", "description": "The value to convert.", "required": True}, "from_unit": {"type": "string", "description": "Source unit e.g. 'cups', 'tablespoons', 'grams', 'ounces'.", "required": True}, "to_unit": {"type": "string", "description": "Target unit.", "required": True}}},
+    {"name": "set_cooking_timer", "description": "Set a named cooking timer.", "parameters": {"label": {"type": "string", "description": "Label for the timer e.g. 'pasta', 'chicken', 'rice'.", "required": True}, "minutes": {"type": "number", "description": "Timer duration in minutes.", "required": True}}},
+    {"name": "get_substitution", "description": "Get a cooking ingredient substitution.", "parameters": {"ingredient": {"type": "string", "description": "The ingredient to substitute e.g. 'buttermilk', 'eggs'.", "required": True}}},
+    {"name": "control_slow_cooker", "description": "Control the smart slow cooker.", "parameters": {"action": {"type": "string", "description": "'start', 'stop', or 'warm'.", "required": True}, "setting": {"type": "string", "description": "'low', 'medium', or 'high'.", "required": False}, "hours": {"type": "number", "description": "Cooking duration in hours.", "required": False}}},
+    {"name": "check_fridge_inventory", "description": "Check what's in the smart fridge.", "parameters": {"category": {"type": "string", "description": "Optional category e.g. 'dairy', 'vegetables', 'drinks'.", "required": False}}},
+]
+
+POOL_PARENTAL_FAMILY = [
+    {"name": "get_family_location", "description": "Check the current location of a family member.", "parameters": {"member": {"type": "string", "description": "Name of the family member.", "required": True}}},
+    {"name": "set_child_screen_time", "description": "Set a daily screen time limit for a child's device.", "parameters": {"child_name": {"type": "string", "description": "Name of the child.", "required": True}, "minutes": {"type": "number", "description": "Daily screen time limit in minutes.", "required": True}}},
+    {"name": "lock_child_device", "description": "Immediately lock or unlock a child's device.", "parameters": {"child_name": {"type": "string", "description": "Name of the child.", "required": True}, "action": {"type": "string", "description": "'lock' or 'unlock'.", "required": True}}},
+    {"name": "get_child_activity", "description": "Get a child's recent device activity and app usage.", "parameters": {"child_name": {"type": "string", "description": "Name of the child.", "required": True}}},
+    {"name": "set_content_filter", "description": "Set content filtering level for a child's device.", "parameters": {"child_name": {"type": "string", "description": "Name of the child.", "required": True}, "level": {"type": "string", "description": "'strict', 'moderate', or 'off'.", "required": True}}},
+    {"name": "send_family_broadcast", "description": "Send a message to all family members.", "parameters": {"message": {"type": "string", "description": "The message to broadcast.", "required": True}}},
+    {"name": "set_family_geofence", "description": "Set an alert when a family member arrives at or leaves a location.", "parameters": {"member": {"type": "string", "description": "Family member name.", "required": True}, "location": {"type": "string", "description": "Location name e.g. 'school', 'home', 'work'.", "required": True}, "trigger": {"type": "string", "description": "'arrive' or 'leave'.", "required": True}}},
+    {"name": "request_check_in", "description": "Send a check-in request to a family member.", "parameters": {"member": {"type": "string", "description": "Family member name.", "required": True}}},
+]
+
+POOL_AUTOMATION = [
+    {"name": "run_shortcut", "description": "Run a saved automation shortcut by name.", "parameters": {"name": {"type": "string", "description": "Name of the shortcut e.g. 'morning routine', 'bedtime', 'leaving home'.", "required": True}}},
+    {"name": "create_routine", "description": "Create a new automation routine with a trigger and actions.", "parameters": {"name": {"type": "string", "description": "Name for the routine.", "required": True}, "trigger": {"type": "string", "description": "When to run e.g. 'every weekday at 7am', 'when I arrive home', 'at sunset'.", "required": True}, "actions": {"type": "string", "description": "Description of actions to perform.", "required": True}}},
+    {"name": "list_routines", "description": "List all saved automation routines.", "parameters": {}},
+    {"name": "delete_routine", "description": "Delete an automation routine by name.", "parameters": {"name": {"type": "string", "description": "Name of the routine to delete.", "required": True}}},
+    {"name": "toggle_routine", "description": "Enable or disable an automation routine.", "parameters": {"name": {"type": "string", "description": "Name of the routine.", "required": True}, "enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
+    {"name": "run_scene", "description": "Activate a smart home scene.", "parameters": {"scene_name": {"type": "string", "description": "Scene name e.g. 'movie night', 'dinner party', 'good morning', 'away'.", "required": True}}},
+    {"name": "get_routine_history", "description": "Check when a routine last ran.", "parameters": {"name": {"type": "string", "description": "Name of the routine.", "required": True}}},
+]
+
+POOL_CONNECTIVITY = [
+    {"name": "toggle_mobile_data", "description": "Turn mobile data on or off.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
+    {"name": "toggle_nfc", "description": "Turn NFC on or off.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
+    {"name": "share_wifi", "description": "Share the current WiFi network credentials via QR code or nearby share.", "parameters": {}},
+    {"name": "get_data_usage", "description": "Check mobile data usage for the current billing period.", "parameters": {}},
+    {"name": "set_data_limit", "description": "Set a mobile data usage warning or limit.", "parameters": {"limit_gb": {"type": "number", "description": "Data limit in gigabytes.", "required": True}}},
+    {"name": "get_wifi_info", "description": "Get info about the current WiFi connection: network name, signal strength, speed.", "parameters": {}},
+    {"name": "forget_wifi_network", "description": "Forget a saved WiFi network.", "parameters": {"ssid": {"type": "string", "description": "Name of the WiFi network to forget.", "required": True}}},
+    {"name": "get_connected_devices", "description": "List all Bluetooth or WiFi devices currently connected.", "parameters": {"connection_type": {"type": "string", "description": "'bluetooth' or 'wifi'.", "required": False}}},
+    {"name": "disconnect_bluetooth_device", "description": "Disconnect a specific Bluetooth device.", "parameters": {"device_name": {"type": "string", "description": "Name of the device to disconnect.", "required": True}}},
+]
+
+POOL_SCREEN_CAPTURE = [
+    {"name": "start_screen_recording", "description": "Start recording the screen.", "parameters": {"audio": {"type": "boolean", "description": "Whether to record microphone audio too.", "required": False}}},
+    {"name": "stop_screen_recording", "description": "Stop the current screen recording and save it.", "parameters": {}},
+    {"name": "take_scrolling_screenshot", "description": "Take a long scrolling screenshot of the current page.", "parameters": {}},
+    {"name": "annotate_screenshot", "description": "Open the most recent screenshot for annotation/markup.", "parameters": {}},
+    {"name": "screen_mirror", "description": "Mirror the screen to an external display.", "parameters": {"device_name": {"type": "string", "description": "Name of the display e.g. 'Living Room TV', 'Office Monitor'.", "required": True}}},
+    {"name": "stop_screen_mirror", "description": "Stop screen mirroring.", "parameters": {}},
+    {"name": "picture_in_picture", "description": "Enable or disable picture-in-picture mode for the current app.", "parameters": {"enabled": {"type": "boolean", "description": "True to enable, false to disable.", "required": True}}},
+]
+
+POOL_EMAIL = [
+    {"name": "compose_email", "description": "Compose and send an email.", "parameters": {"to": {"type": "string", "description": "Recipient email address.", "required": True}, "subject": {"type": "string", "description": "Email subject line.", "required": True}, "body": {"type": "string", "description": "Email body text.", "required": True}, "cc": {"type": "string", "description": "Optional CC recipients.", "required": False}}},
+    {"name": "reply_email", "description": "Reply to the most recent or specified email.", "parameters": {"body": {"type": "string", "description": "Reply text.", "required": True}, "subject_match": {"type": "string", "description": "Optional subject line to identify which email to reply to.", "required": False}}},
+    {"name": "forward_email", "description": "Forward an email to someone.", "parameters": {"to": {"type": "string", "description": "Recipient to forward to.", "required": True}, "subject_match": {"type": "string", "description": "Subject line to identify the email.", "required": False}}},
+    {"name": "archive_email", "description": "Archive an email.", "parameters": {"subject_match": {"type": "string", "description": "Subject line to identify the email.", "required": True}}},
+    {"name": "snooze_email", "description": "Snooze an email to reappear later.", "parameters": {"subject_match": {"type": "string", "description": "Subject line to identify the email.", "required": True}, "snooze_until": {"type": "string", "description": "When to resurface e.g. 'tomorrow morning', 'next Monday'.", "required": True}}},
+    {"name": "label_email", "description": "Apply a label or folder to an email.", "parameters": {"subject_match": {"type": "string", "description": "Subject to identify the email.", "required": True}, "label": {"type": "string", "description": "Label name e.g. 'work', 'personal', 'receipts'.", "required": True}}},
+    {"name": "mark_email_spam", "description": "Mark an email as spam.", "parameters": {"subject_match": {"type": "string", "description": "Subject to identify the email.", "required": True}}},
+    {"name": "get_unread_emails", "description": "Get unread emails, optionally filtered.", "parameters": {"from_contact": {"type": "string", "description": "Optional sender name to filter by.", "required": False}, "count": {"type": "number", "description": "Number of emails to show.", "required": False}}},
+    {"name": "search_email", "description": "Search emails by keyword.", "parameters": {"query": {"type": "string", "description": "Search query.", "required": True}}},
+]
+
+POOL_PASSWORDS = [
+    {"name": "get_password", "description": "Retrieve a saved password for a site or app.", "parameters": {"site": {"type": "string", "description": "Website or app name.", "required": True}}},
+    {"name": "generate_password", "description": "Generate a secure random password.", "parameters": {"length": {"type": "number", "description": "Password length (default 16).", "required": False}, "include_symbols": {"type": "boolean", "description": "Whether to include symbols.", "required": False}}},
+    {"name": "get_totp_code", "description": "Get the current 2FA/TOTP code for a site.", "parameters": {"site": {"type": "string", "description": "Website or app name.", "required": True}}},
+    {"name": "save_password", "description": "Save or update a password for a site.", "parameters": {"site": {"type": "string", "description": "Website or app name.", "required": True}, "username": {"type": "string", "description": "Username or email.", "required": True}, "password": {"type": "string", "description": "The password to save.", "required": True}}},
+    {"name": "check_password_breach", "description": "Check if a password or account has been in a data breach.", "parameters": {"site": {"type": "string", "description": "Optional site to check. Checks all if omitted.", "required": False}}},
+    {"name": "autofill_login", "description": "Autofill login credentials on the current page.", "parameters": {}},
+]
+
 ALL_POOLS = [
     POOL_TIME_PRODUCTIVITY,
     POOL_LISTS_NOTES,
@@ -344,6 +465,16 @@ ALL_POOLS = [
     POOL_BROWSER,
     POOL_EMERGENCY_SAFETY,
     POOL_DIGITAL_WELLBEING,
+    POOL_TV_STREAMING,
+    POOL_VEHICLE,
+    POOL_TRAVEL,
+    POOL_COOKING_KITCHEN,
+    POOL_PARENTAL_FAMILY,
+    POOL_AUTOMATION,
+    POOL_CONNECTIVITY,
+    POOL_SCREEN_CAPTURE,
+    POOL_EMAIL,
+    POOL_PASSWORDS,
 ]
 
 
@@ -455,10 +586,25 @@ SCENARIOS = [
     "scheduling a 1-on-1 for next week", "setting do not disturb for an hour-long meeting",
     "recording a voice memo of key takeaways", "emailing the client a summary after the call",
     "checking my calendar for conflicts before accepting", "creating a checklist of action items from standup",
-    # Indirect / implicit intent
+    # Indirect / implicit intent — observations, feelings, complaints (not commands)
     "it's really dark in here", "I can't hear anything on this call",
     "I'm freezing", "it's too bright", "I'm bored",
     "I need to wake up early tomorrow", "I keep forgetting to drink water",
+    "my phone is about to die", "I can barely see my screen",
+    "this room is stuffy", "it's so loud in here", "I can't sleep",
+    "I'm lost and I don't know where I am", "my eyes are hurting from this screen",
+    "it's getting dark outside", "I'm starving", "I wonder what the weather's like",
+    "ugh I have so much to do today", "I'm late for my meeting",
+    "my back hurts from sitting all day", "I haven't moved in hours",
+    "it smells like something is burning in the kitchen", "the house feels empty and creepy",
+    "I'm so tired", "why is it so hot in here", "the baby is sleeping so everything needs to be quiet",
+    "I think I left the front door unlocked", "my hands are full and I need light",
+    "this song is terrible", "I have no idea what time it is over there",
+    "I promised Sarah I'd call her back", "the kids have been on their tablets all day",
+    "I should probably stretch or something", "I wonder if my package arrived",
+    "this article is really long I don't have time to read all of it",
+    "I need to remember to buy milk on the way home",
+    "my car must be low on gas by now", "I have no idea where I parked",
     # Corrections and follow-ups
     "no wait, make that 7:30 instead", "actually send it to Sarah not John",
     "cancel what I just set", "change the timer to 10 minutes",
@@ -503,6 +649,146 @@ SCENARIOS = [
     "email the landlord about the broken dishwasher explaining what happened and when it started",
     "set a reminder with the full address: 1234 Oak Street, Apartment 5B, Springfield, IL 62704",
     "post a status update about how excited I am for the conference next week and all the sessions I'm looking forward to",
+    # TV & streaming
+    "play Stranger Things on Netflix", "turn on subtitles", "switch to HDMI 2",
+    "turn off the TV in 30 minutes", "search for action movies", "rewind 30 seconds",
+    "what was I watching last night", "add this to my watchlist",
+    "turn down the TV volume to 20", "play the next episode",
+    # Vehicle & car
+    "lock my car", "start the car and turn on the heat", "where did I park",
+    "check my tire pressure", "honk the horn so I can find my car",
+    "how much gas do I have left", "preheat the cabin to 72",
+    "open the trunk", "find a charging station nearby", "set charge limit to 80 percent",
+    "is my car locked", "turn on valet mode",
+    # Travel & booking
+    "find flights to Tokyo next month", "check in for my Delta flight",
+    "show my boarding pass", "is my flight on time", "what's the exchange rate for euros",
+    "what time is it in London right now", "find hotels in Barcelona for next weekend",
+    "show me my trip itinerary", "rent a car at LAX for Thursday",
+    # Cooking & kitchen
+    "preheat the oven to 375", "how many grams is 2 cups of flour",
+    "set a timer for the pasta, 12 minutes", "what can I substitute for eggs in baking",
+    "start the dishwasher on eco mode", "brew a large strong coffee",
+    "search for chicken tikka masala recipe", "what's in the fridge",
+    "start the slow cooker on low for 8 hours",
+    # Parental & family
+    "where is my daughter right now", "lock Tommy's iPad",
+    "how much screen time did Emma use today", "set a 2 hour limit on Jake's tablet",
+    "send a message to the whole family: dinner is at 7",
+    "alert me when Sarah leaves school", "ask Ben to check in",
+    "set strict content filter on the kids' devices",
+    # Automation & shortcuts
+    "run my morning routine", "trigger the bedtime shortcut",
+    "what automations do I have", "turn off the leaving home routine",
+    "run movie night scene", "delete the weekend cleanup routine",
+    "when did my morning routine last run",
+    "create a routine that turns off lights at 11pm every night",
+    # Connectivity
+    "turn off mobile data", "how much data have I used this month",
+    "what wifi am I connected to", "share the wifi password",
+    "forget the Starbucks wifi network", "what bluetooth devices are connected",
+    "disconnect my AirPods", "turn on NFC", "set a 5 gig data limit",
+    # Screen capture & mirroring
+    "start screen recording", "stop recording the screen",
+    "take a scrolling screenshot", "mirror my screen to the living room TV",
+    "stop mirroring", "turn on picture in picture",
+    "record the screen with my mic on",
+    # Email management
+    "check my unread emails", "reply to the email from Sarah saying I'll be there",
+    "archive the email about the weekly report", "snooze that email until Monday",
+    "label the Amazon receipt as shopping", "mark that as spam",
+    "forward the meeting invite to John", "search emails for invoice",
+    "any emails from my boss today",
+    # Passwords & security
+    "what's my Netflix password", "generate a new password",
+    "show me the 2FA code for GitHub", "has my email been in a data breach",
+    "autofill the login on this page", "save this password for spotify",
+    # Chained real-world workflows
+    "I just parked — save this location and set a 2 hour timer",
+    "I'm leaving work — start the car, turn on the AC, and get directions home",
+    "going to bed — lock the doors, turn off all lights, and set alarm for 6:30",
+    "heading to a meeting — put phone on DND, text my wife I'll be late, and set a 1 hour timer",
+    "at the airport — check in for my flight, show boarding pass, and turn on airplane mode",
+    "cooking dinner — preheat oven to 400, set a timer for chicken 45 minutes, and play jazz",
+    # Device-state queries
+    "is my bluetooth on", "what devices are connected", "how much storage do I have left",
+    "what's my battery percentage", "is wifi connected", "what network am I on",
+    "is do not disturb on", "what's the screen brightness set to",
+    # Quantified and precise requests
+    "set brightness to exactly 40 percent", "volume to 30", "timer for 7 minutes and 30 seconds",
+    "set thermostat to 68.5 degrees", "alarm for 6:15am sharp",
+    "rewind exactly 10 seconds", "set charge limit to 90 percent",
+    # Negation and cancellation
+    "don't set an alarm for tomorrow", "stop reminding me about the dentist",
+    "I don't want notifications from Instagram anymore",
+    "turn off all my alarms", "remove everything from my shopping list",
+    "unsubscribe from the sports newsletter", "disable the morning routine",
+    "cancel my ride", "stop the screen recording",
+    # Disfluent / natural speech — filler words, false starts, self-corrections
+    "um can you like set a timer for uh 10 minutes",
+    "hey so I was thinking like maybe turn off the lights or whatever",
+    "okay so uh send a message to... wait who was it... oh right, send it to Mike",
+    "alright so um I need an alarm for like 7... no wait 7:30 tomorrow morning",
+    "hmm can you uh play some music, like jazz or something chill I guess",
+    "oh yeah hey turn the volume down a bit it's kinda loud",
+    "so like I think I need to uh check my email or something",
+    "wait actually no, set it to 20 minutes not 15",
+    "could you um like maybe turn on do not disturb if that's a thing",
+    "hey uh what's the... what's the weather like out there",
+    "okay okay so I need to like text Sarah and tell her um that I'll be late",
+    "set a — no actually make that a reminder, not a timer, for 3pm",
+    "uh brightness, like turn it up, I can't really see",
+    "so I think maybe we should lock the front door, right? yeah do that",
+    "hey siri — I mean, uh, can you just play the next song",
+    "well I guess I should probably set an alarm, like for early, maybe 6?",
+    "turn turn off the uh the bluetooth thing",
+    "oh um could you check like how much battery I have left or whatever",
+    "right so basically I need directions to the uh the airport, yeah",
+    "let me think... okay yeah just add milk to the shopping list",
+    "so um like my mom asked me to call her so yeah can you call mom",
+    "hey wait before I forget can you remind me tomorrow about the dentist thing",
+    "I dunno just like play something, anything really, some background music",
+    "ugh okay fine just turn on the flashlight I can't see anything",
+    # Typos, keyboard errors, and autocorrect fails
+    "sned a mesage to john", "set a tmier for 5 minuets",
+    "paly some musik", "trun off the lghts", "waht time is it",
+    "cll mom", "serch for nearby coffe shops", "togle bluetooth",
+    "chekc my emial", "lok the fron door",
+    "turnoff wifi", "setanalarm for 6am", "sendan email to boss",
+    "brigtness to 50", "plya next track", "clera notifications",
+    "naviagte to the airprot", "cehck battery lvl", "diretions home",
+    "remidn me to buy grocries tmrw", "txt sarah im on my way",
+    # Speech-to-text / ASR errors and homophones
+    "set a timer for to minutes", "turn on the bluetooth for my new ear buds",
+    "play some lo-fi beets", "can you check the whether tomorrow",
+    "send a text two mom", "search four italian restaurants nearby",
+    "cud you set an alarm four 7", "wanna play some chillhop",
+    "gonna need directions too the mall", "lemme see my colander for today",
+    "I hafta call the dentist", "shoulda set a reminder earlier",
+    "whatcha got on my to do list", "gimme the whether for this weekend",
+    # Dropped words / telegram style
+    "timer 5", "alarm 7am", "lights off bedroom", "weather tokyo",
+    "message john meeting canceled", "brightness max", "volume 30",
+    "directions airport no tolls", "remind dentist thursday 2pm",
+    "play chill playlist shuffle", "lock front back doors",
+    "wifi off bluetooth on", "screenshot now", "call sarah mobile",
+    # Ambiguous queries requiring disambiguation between similar tools
+    "send this to John", "message Sarah about the meeting",
+    "remind me about the groceries", "play that song",
+    "navigate to the store", "set a timer for the food",
+    "write a note about the project", "share this with the team",
+    "look up that restaurant", "find my way home",
+    "tell mom I'll be late", "send the file to Dave",
+    "book something for Friday", "get me a ride there",
+    # Argument value edge cases — special characters, diverse names, long values
+    "text José García that the piñata is ready 🎉",
+    "send an email to björk.svensson@example.com about the résumé",
+    "set a reminder: pick up Wei's dry cleaning at 3456 MLK Jr Blvd, Apt 12B, Oakland CA 94609",
+    "note down the wifi password: xK9#mP2$vL5!nQ8@",
+    "message Aisha: hey girl!! 💕 sooo excited for saturday, gonna be amazing 🥳🎶",
+    "create a note with this recipe: 2½ cups flour, ¾ tsp salt, 1⅓ cups milk at 350°F for 25-30 min",
+    "email the team: Hi everyone — quick update RE: Q3 targets. We're at 94.7% of goal ($1,247,832 / $1,318,000). Need to close 3 more deals by EOD Friday. Let's sync at 2:30pm in Room 4B. Thanks!",
+    "add to shopping list: 2% milk × 2, free-range eggs (dozen), sriracha mayo, 0.5kg chicken thighs",
     # Edge cases
     "very short terse command like 'timer 5 min'",
     "long polite request with extra context",
@@ -524,18 +810,63 @@ CALL_TYPES = [
     ("multi_few_tools", "2-4 tool calls using ONLY 1-3 of the available tools — the user wants multiple actions with the SAME or very few tools, with DIFFERENT detailed argument values each time (e.g. sending messages to 3 different people, setting 2 different alarms, creating multiple list items). Each call MUST have distinct, realistic argument values — vary names, times, locations, messages, etc."),
     ("multi_long_values", "2-3 tool calls where argument values are LONG and detailed — full sentences for message text, multi-word descriptions, specific addresses, complete email bodies, detailed notes. Each argument value should be at least 5-10 words, not just a single word or number."),  # 2/16 ≈ 12%
     ("multi_long_values", "2-3 tool calls where argument values are LONG and detailed — full sentences for message text, multi-word descriptions, specific addresses, complete email bodies, detailed notes. Each argument value should be at least 5-10 words, not just a single word or number."),
-    ("none", "NO tool calls — the user asks a question or makes a request that NONE of the available tools can fulfill (e.g. asking for opinions, general knowledge, emotional support, or tasks outside the tool capabilities). The query must NOT be something any of the listed tools could handle. answers must be []"),  # 1/16 ≈ 6%
-    ("near_miss", "NO tool calls — the query is RELATED to the domain of the available tools but the tools CANNOT actually fulfill the request. "  # 2/16 ≈ 12%
-     "Examples: asking for HISTORY of alarms when only set_alarm exists, asking to EDIT a calendar event when only create/delete exist, "
-     "asking for a feature a tool doesn't support (e.g. 'set a recurring timer' when set_timer has no repeat param), "
-     "asking about the STATUS of something when only action tools exist, asking to do something to an entity the tools don't cover. "
-     "The query should sound natural and plausible — a real user might reasonably expect this to work. answers must be []"),
+    ("none", "NO tool calls — the user asks a question or makes a request that NONE of the available tools can fulfill. "
+     "answers must be []. Every query must be specific, detailed, and UNIQUE — no generic one-liners."),
     ("near_miss", "NO tool calls — the query is RELATED to the domain of the available tools but the tools CANNOT actually fulfill the request. "
      "Examples: asking for HISTORY of alarms when only set_alarm exists, asking to EDIT a calendar event when only create/delete exist, "
      "asking for a feature a tool doesn't support (e.g. 'set a recurring timer' when set_timer has no repeat param), "
      "asking about the STATUS of something when only action tools exist, asking to do something to an entity the tools don't cover. "
      "The query should sound natural and plausible — a real user might reasonably expect this to work. answers must be []"),
-    ("no_tools", "NO tool calls — there are NO tools available at all, answers must be []"),                 # 1/16 ≈ 6%
+    ("indirect", "1-2 tool calls — but the query is an INDIRECT or IMPLICIT statement, NOT a direct command. "  # 2/18 ≈ 11%
+     "The user describes a situation, feeling, observation, or complaint and the assistant must INFER which tool to call. "
+     "Examples: 'it's freezing in here' → set_thermostat higher, 'I can barely see my screen' → set_brightness higher, "
+     "'it's so loud' → set_volume lower, 'I'm bored' → play_music or get_news, "
+     "'my phone is about to die' → toggle_power_saving on, 'I can't sleep' → toggle_bedtime_mode or start_sleep_tracking, "
+     "'I'm lost' → get_directions or share_location, 'this room is stuffy' → control_fan on. "
+     "The query must NEVER contain the tool name or action verb directly — it should be a natural human observation or complaint. "
+     "Vary between statements ('it's dark'), questions ('why is it so hot?'), and complaints ('ugh this is way too bright')."),
+    ("indirect", "1-2 tool calls — but the query is an INDIRECT or IMPLICIT statement, NOT a direct command. "
+     "The user describes a situation, feeling, observation, or complaint and the assistant must INFER which tool to call. "
+     "Examples: 'it's freezing in here' → set_thermostat higher, 'I can barely see my screen' → set_brightness higher, "
+     "'it's so loud' → set_volume lower, 'I'm bored' → play_music or get_news, "
+     "'my phone is about to die' → toggle_power_saving on, 'I can't sleep' → toggle_bedtime_mode or start_sleep_tracking, "
+     "'I'm lost' → get_directions or share_location, 'this room is stuffy' → control_fan on. "
+     "The query must NEVER contain the tool name or action verb directly — it should be a natural human observation or complaint. "
+     "Vary between statements ('it's dark'), questions ('why is it so hot?'), and complaints ('ugh this is way too bright')."),
+    ("disfluent", "1-2 tool calls — but the query must contain NATURAL SPEECH DISFLUENCIES like real voice transcriptions. "  # 2/20 ≈ 10%
+     "Include filler words (um, uh, hmm, like, so, well, okay, right), false starts ('set a — no wait, make that...'), "
+     "self-corrections ('send it to John, I mean Sarah'), hedging ('I think maybe', 'if possible', 'or whatever'), "
+     "trailing off ('can you like... turn off the...'), repetitions ('turn turn off the lights'), "
+     "and casual padding ('oh yeah', 'hey so', 'alright so', 'wait actually'). "
+     "The underlying intent should still be clear and map to a valid tool call — the disfluencies are just surface noise. "
+     "Mix short disfluent queries ('uh lights off') with longer rambly ones."),
+    ("disfluent", "1-2 tool calls — but the query must contain NATURAL SPEECH DISFLUENCIES like real voice transcriptions. "
+     "Include filler words (um, uh, hmm, like, so, well, okay, right), false starts ('set a — no wait, make that...'), "
+     "self-corrections ('send it to John, I mean Sarah'), hedging ('I think maybe', 'if possible', 'or whatever'), "
+     "trailing off ('can you like... turn off the...'), repetitions ('turn turn off the lights'), "
+     "and casual padding ('oh yeah', 'hey so', 'alright so', 'wait actually'). "
+     "The underlying intent should still be clear and map to a valid tool call — the disfluencies are just surface noise. "
+     "Mix short disfluent queries ('uh lights off') with longer rambly ones."),
+    ("garbled", "1-2 tool calls — but the query must contain REALISTIC TYPOS and SPEECH-TO-TEXT ERRORS, as if transcribed by an imperfect ASR system or typed hastily on a phone keyboard. "  # 2/22 ≈ 9%
+     "Include: swapped/missing/doubled letters ('trun' for 'turn', 'mesage' for 'message', 'tiemr' for 'timer'), "
+     "autocorrect mistakes ('set a duck timer' for 'set a 10 minute timer'), "
+     "missing spaces ('turnoff the lights', 'setanalarm'), "
+     "homophones from speech ('there' for 'their', 'weather' for 'whether', 'to' for 'two', 'four' for 'for'), "
+     "dropped words ('set timer 5' instead of 'set a timer for 5 minutes'), "
+     "and phonetic misspellings from voice ('cud you' for 'could you', 'wanna' for 'want to', 'gonna' for 'going to'). "
+     "Keep 1-3 errors per query — not every word should be wrong. The intent must still be recoverable. "
+     "The tool calls in answers must be CORRECT — garbling is only in the query, not the output."),
+    ("garbled", "1-2 tool calls — but the query must contain REALISTIC TYPOS and SPEECH-TO-TEXT ERRORS, as if transcribed by an imperfect ASR system or typed hastily on a phone keyboard. "
+     "Include: swapped/missing/doubled letters ('trun' for 'turn', 'mesage' for 'message', 'tiemr' for 'timer'), "
+     "autocorrect mistakes ('set a duck timer' for 'set a 10 minute timer'), "
+     "missing spaces ('turnoff the lights', 'setanalarm'), "
+     "homophones from speech ('there' for 'their', 'weather' for 'whether', 'to' for 'two', 'four' for 'for'), "
+     "dropped words ('set timer 5' instead of 'set a timer for 5 minutes'), "
+     "and phonetic misspellings from voice ('cud you' for 'could you', 'wanna' for 'want to', 'gonna' for 'going to'). "
+     "Keep 1-3 errors per query — not every word should be wrong. The intent must still be recoverable. "
+     "The tool calls in answers must be CORRECT — garbling is only in the query, not the output."),
+    ("no_tools", "NO tool calls — there are NO tools available at all, answers must be []. "
+     "Generate diverse, specific queries as if the user expects tools to exist. Every query must be UNIQUE."),
 ]
 
 MODEL = "gemini-3.1-flash-lite-preview"
@@ -567,33 +898,87 @@ def _pick_tools(rng, force_empty=False, few_tools=False):
     # Pick target tool count from explicit distribution
     target = rng.choices(_TOOL_COUNTS, weights=_TOOL_WEIGHTS, k=1)[0]
 
-    # Draw from 1-3 pools, collect candidates, then trim/pad to target
-    num_pools = 1 if target <= 3 else rng.choice([1, 2, 2, 3])
-    pools = rng.sample(ALL_POOLS, min(num_pools, len(ALL_POOLS)))
+    # Draw from pools, adding more pools if needed to meet the target count
+    pool_order = list(range(len(ALL_POOLS)))
+    rng.shuffle(pool_order)
+
     candidates = []
-    for pool in pools:
-        candidates.extend(pool)
-
-    # Deduplicate by tool name (pools shouldn't overlap, but be safe)
     seen = set()
-    unique = []
-    for t in candidates:
-        if t["name"] not in seen:
-            seen.add(t["name"])
-            unique.append(t)
+    for pi in pool_order:
+        for t in ALL_POOLS[pi]:
+            if t["name"] not in seen:
+                seen.add(t["name"])
+                candidates.append(t)
+        if len(candidates) >= target:
+            break
 
-    rng.shuffle(unique)
-    return unique[:target]
+    rng.shuffle(candidates)
+    return candidates[:target]
 
 
-def build_prompt(batch_size, call_desc, tools, rng):
+# Random context seeds to inject diversity into each batch's prompt.
+# Each batch gets one — forces Gemini into a different user/situation space.
+_CONTEXT_SEEDS = [
+    "The user is a busy parent managing kids and household",
+    "The user is a college student studying for finals",
+    "The user is commuting on public transit",
+    "The user is cooking dinner while multitasking",
+    "The user is an elderly person who isn't very tech-savvy",
+    "The user is a teenager using their phone casually",
+    "The user is a remote worker in a home office",
+    "The user is at the gym between sets",
+    "The user is traveling abroad and unfamiliar with the area",
+    "The user is a professional in back-to-back meetings all day",
+    "The user is getting ready for bed and winding down",
+    "The user is driving and using voice commands hands-free",
+    "The user is a small business owner managing their shop",
+    "The user is hosting a dinner party with guests arriving soon",
+    "The user is a freelancer juggling multiple client projects",
+    "The user is on a hiking trail with limited connectivity",
+    "The user is a nurse on a busy hospital shift",
+    "The user is a musician setting up for a live performance",
+    "The user is a pet owner managing their dog's routine",
+    "The user is moving into a new apartment this weekend",
+    "The user is planning a surprise birthday party",
+    "The user is a photographer on location at a shoot",
+    "The user is a teacher preparing for tomorrow's class",
+    "The user is recovering from surgery and resting at home",
+    "The user is at an airport waiting for a delayed flight",
+    "The user is a gamer streaming on Twitch",
+    "The user is gardening outside on a sunny afternoon",
+    "The user is a new employee on their first week at work",
+    "The user is babysitting their niece and nephew",
+    "The user is a rideshare driver between pickups",
+]
+
+
+def build_prompt(batch_size, call_desc, tools, rng, query_length_hint=None):
     """Build a prompt asking Gemini to generate a batch of examples."""
     scenarios_sample = rng.sample(SCENARIOS, min(20, len(SCENARIOS)))
     scenarios_str = "\n".join(f"  - {s}" for s in scenarios_sample)
+    context_seed = rng.choice(_CONTEXT_SEEDS)
+
+    length_instruction = ""
+    if query_length_hint:
+        length_instruction = f"\n- Query length for this batch: {query_length_hint}"
 
     if tools:
         tools_section = f"AVAILABLE TOOLS:\n{json.dumps(tools, separators=(',', ':'))}"
-        tool_rules = """- Tool call format: {{"name": "tool_name", "arguments": {{"param": "value"}}}}
+
+        # Check if overlapping tools are present for disambiguation instruction
+        tool_names = [t["name"] for t in tools]
+        has_overlaps = any(
+            a["name"] in tool_names and b["name"] in tool_names
+            for a, b in _OVERLAP_PAIRS
+        )
+        disambig_rule = ""
+        if has_overlaps:
+            disambig_rule = ("\n- IMPORTANT: Some tools in this set have OVERLAPPING functionality. "
+                             "When generating queries, make sure the user's intent clearly maps to ONE specific tool. "
+                             "For ambiguous cases where the query could match either tool, pick the MOST specific one "
+                             "(e.g. 'text mom' → send_text_message, 'message mom on WhatsApp' → send_instant_message).")
+
+        tool_rules = f"""- Tool call format: {{"name": "tool_name", "arguments": {{"param": "value"}}}}
 - Arguments must match the parameter schemas exactly — use correct types (string, number, boolean)
 - Do NOT invent tools not in the list — only use the tools shown above
 - For contact_id params, use realistic placeholders like "contact_alice_123", "contact_john_456"
@@ -602,24 +987,29 @@ def build_prompt(batch_size, call_desc, tools, rng):
 - Boolean params should be actual booleans not strings (e.g. true not "true")
 - Vary argument values widely — don't repeat the same locations, names, times, or phrases across examples
 - Sometimes include optional parameters, sometimes omit them — mix it up naturally
-- Never produce partial tool calls — every call must have "name" and "arguments" with all required params"""
+- Never produce partial tool calls — every call must have "name" and "arguments" with all required params
+- Include REALISTIC argument values: names from diverse cultures (José, Aisha, Wei, Björk), real-looking addresses, emoji in messages (😊👍), URLs, decimal numbers (68.5, 3.14), varied time formats ('7am', '19:30', 'quarter past 3')
+- Occasionally use very long string values for message/text/body params: multi-sentence emails, detailed notes, full addresses with apartment numbers{disambig_rule}"""
     else:
         tools_section = "AVAILABLE TOOLS: NONE — no tools are available."
         tool_rules = "- Since no tools are available, ALL answers must be empty arrays []"
 
     return f"""Generate {batch_size} diverse on-device assistant tool-calling training examples for phones, wearables, and computers.
 
+USER CONTEXT HINT (use as inspiration for ~half the examples, vary the rest freely): {context_seed}
+
 {tools_section}
 
 REQUIREMENTS:
 - Each example: a "query" (user's natural language) and "answers" (JSON tool calls array)
 - This batch: {call_desc}
-- Queries should sound like real users talking to a phone/computer/watch voice assistant or typing a quick command
-- Vary query length: mix ultra-short ("timer 5 min", "lights off"), medium ("set an alarm for 7am tomorrow"), and long conversational ("hey can you set a timer for like 20 minutes, I'm making pasta")
+- Queries should sound like real users talking to a phone/computer/watch voice assistant or typing a quick command{length_instruction}
 - Vary style: casual, terse, polite ("Could you please..."), conversational, indirect ("it's dark in here" meaning turn on lights)
 {tool_rules}
 - For empty call examples, answers must be []
 - Every query must be UNIQUE — do not repeat patterns or rephrase the same intent
+- CRITICAL: use DIFFERENT tools across examples in this batch — do NOT generate multiple examples that all call the same tool. Spread usage across ALL available tools. If there are 6 tools, each should appear in at least one example
+- Vary which tools are used and how many are called per example — some examples should use tools from different ends of the list
 
 SCENARIO INSPIRATION (vary well beyond these):
 {scenarios_str}
@@ -664,6 +1054,232 @@ class ClientPool:
             return client
 
 
+
+# Overlapping tool pairs — semantically similar tools that require disambiguation
+_OVERLAP_PAIRS = [
+    (
+        {"name": "send_text_message", "description": "Send a text message to a contact via SMS.", "parameters": {"contact_id": {"type": "string", "description": "The contact to message.", "required": True}, "text": {"type": "string", "description": "The message text.", "required": True}}},
+        {"name": "send_instant_message", "description": "Send an instant message to a contact.", "parameters": {"contact_id": {"type": "string", "description": "The unique identifier of the recipient contact.", "required": True}, "text": {"type": "string", "description": "The message text to send.", "required": True}}},
+    ),
+    (
+        {"name": "send_email", "description": "Send an email to a recipient.", "parameters": {"to": {"type": "string", "description": "The recipient's email address.", "required": True}, "subject": {"type": "string", "description": "The email subject line.", "required": True}, "body": {"type": "string", "description": "The email body text.", "required": True}}},
+        {"name": "compose_email", "description": "Compose and send an email.", "parameters": {"to": {"type": "string", "description": "Recipient email address.", "required": True}, "subject": {"type": "string", "description": "Email subject line.", "required": True}, "body": {"type": "string", "description": "Email body text.", "required": True}, "cc": {"type": "string", "description": "Optional CC recipients.", "required": False}}},
+    ),
+    (
+        {"name": "create_reminder", "description": "Create a reminder for the user at a specific time.", "parameters": {"message": {"type": "string", "description": "The reminder message.", "required": True}, "date_time_human": {"type": "string", "description": "The date and/or time for the reminder.", "required": False}}},
+        {"name": "create_list_item", "description": "Add a new item to a user's list with an optional reminder.", "parameters": {"list_name": {"type": "string", "description": "Short name of the list.", "required": True}, "message": {"type": "string", "description": "The text of the list item.", "required": True}, "reminder_date_time_human": {"type": "string", "description": "Optional reminder date/time.", "required": False}}},
+    ),
+    (
+        {"name": "get_directions", "description": "Get directions to a destination.", "parameters": {"destination": {"type": "string", "description": "The destination address or place name.", "required": True}, "mode": {"type": "string", "description": "Travel mode: 'driving', 'walking', 'transit', 'cycling'.", "required": False}}},
+        {"name": "start_navigation", "description": "Start turn-by-turn navigation to a destination.", "parameters": {"destination": {"type": "string", "description": "The destination.", "required": True}, "mode": {"type": "string", "description": "Travel mode.", "required": False}, "avoid_tolls": {"type": "boolean", "description": "Whether to avoid toll roads.", "required": False}}},
+    ),
+    (
+        {"name": "play_music", "description": "Play music by song name, artist, album, or genre.", "parameters": {"query": {"type": "string", "description": "Search query: song title, artist name, album, or genre.", "required": True}}},
+        {"name": "play_playlist", "description": "Play a specific playlist by name.", "parameters": {"playlist_name": {"type": "string", "description": "Name of the playlist to play.", "required": True}}},
+    ),
+    (
+        {"name": "set_timer", "description": "Set a timer for the specified duration or end time.", "parameters": {"time_human": {"type": "string", "description": "The duration or target end time in human readable format.", "required": True}}},
+        {"name": "set_cooking_timer", "description": "Set a named cooking timer.", "parameters": {"label": {"type": "string", "description": "Label for the timer.", "required": True}, "minutes": {"type": "number", "description": "Timer duration in minutes.", "required": True}}},
+    ),
+]
+
+
+_QUERY_LENGTH_DESCS = [
+    "ultra-short (1-5 words, like 'lights off', 'timer 5', 'call mom')",
+    "short (5-10 words, like 'set an alarm for 7am tomorrow')",
+    "medium (10-20 words, a normal sentence or two)",
+    "long conversational (20+ words, with filler, context, or explanation)",
+]
+
+
+# Words that are common filler / can reasonably appear in argument values
+# without being in the query (articles, prepositions, generic action words).
+_GROUNDING_STOPWORDS = frozenset({
+    "a", "an", "the", "of", "to", "in", "on", "at", "for", "and", "or",
+    "is", "it", "my", "me", "i", "you", "your", "this", "that", "with",
+    "from", "by", "as", "be", "do", "not", "no", "so", "up", "out",
+    "if", "but", "all", "just", "about", "can", "will", "am", "are",
+    "was", "were", "been", "has", "have", "had", "would", "could",
+    "should", "may", "might", "shall", "its", "our", "we", "they",
+    "them", "their", "he", "she", "him", "her", "his", "who", "what",
+    "when", "where", "how", "which", "some", "any", "each", "every",
+    "also", "than", "then", "now", "here", "there", "very", "too",
+    "more", "much", "many", "most", "other", "new", "old", "get",
+    "set", "make", "take", "let", "got", "going", "gonna", "want",
+    "need", "like", "please", "thanks", "hey", "hi", "ok", "okay",
+    "sure", "yes", "no", "true", "false", "null", "none",
+    "don't", "doesn't", "didn't", "won't", "can't", "couldn't",
+    "shouldn't", "wouldn't", "isn't", "aren't", "wasn't", "weren't",
+})
+
+# Param names where values are expected to be generated/inferred, not quoted from query
+_FREEFORM_PARAMS = frozenset({
+    "contact_id", "password", "js", "url", "source", "confirmation_code",
+    "order_id", "post_id",
+})
+
+
+def _grounding_check(pname, pval, pdesc, query, query_lower):
+    """Check that significant words in a string argument value are grounded in the query.
+
+    Returns False if the value contains specific details not traceable to the query.
+    """
+    # Skip params where values are generated/inferred, not extracted from query
+    if pname in _FREEFORM_PARAMS:
+        return True
+
+    # Skip very short values — single words are usually fine (tool names, modes, etc.)
+    val = pval.strip()
+    if len(val) <= 15:
+        return True
+
+    # Skip if the param description suggests free-form/generated content
+    pdesc_lower = pdesc.lower() if pdesc else ""
+    freeform_hints = ("url", "link", "password", "code", "javascript", "js ",
+                      "email address", "phone number")
+    if any(hint in pdesc_lower for hint in freeform_hints):
+        return True
+
+    # Extract significant words from the value (3+ chars, not stopwords)
+    val_words = set()
+    for word in re.findall(r'[a-zA-Z\u00C0-\u024F]{3,}', val.lower()):
+        if word not in _GROUNDING_STOPWORDS:
+            val_words.add(word)
+
+    if not val_words:
+        return True
+
+    # Extract significant words from the query
+    query_words = set()
+    for word in re.findall(r'[a-zA-Z\u00C0-\u024F]{3,}', query_lower):
+        if word not in _GROUNDING_STOPWORDS:
+            query_words.add(word)
+
+    # Check: what fraction of value words appear in or are substrings of query words?
+    grounded = 0
+    for vw in val_words:
+        # Direct match
+        if vw in query_words:
+            grounded += 1
+            continue
+        # Substring match (catches "grocery" in "groceries", "alarm" in "alarms")
+        if any(vw in qw or qw in vw for qw in query_words):
+            grounded += 1
+            continue
+        # Check if the word appears anywhere in the raw query (catches multi-word matches)
+        if vw in query_lower:
+            grounded += 1
+            continue
+
+    # Require at least 50% of significant value words to be grounded in the query.
+    # This allows some inference (e.g., "Saturday" from "this weekend") while catching
+    # fabricated specifics (e.g., "Bank of America" from "bank").
+    grounding_ratio = grounded / len(val_words)
+    if grounding_ratio < 0.5:
+        return False
+
+    # Additional hard checks for specific fabrication patterns
+    # Reject fabricated phone numbers in non-phone params
+    phones = re.findall(r'[\+]?[\d\s\-\(\)]{7,}', val)
+    if phones and pname not in ("phone", "phone_number"):
+        query_digits = set(re.findall(r'\d{3,}', query))
+        val_digits = set(re.findall(r'\d{3,}', val))
+        if val_digits and not val_digits & query_digits:
+            return False
+
+    # Reject fabricated email addresses in non-email params
+    emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', val)
+    if emails and pname not in ("to", "email", "cc", "bcc", "from_contact"):
+        for email in emails:
+            local = email.split("@")[0].replace(".", " ").replace("_", " ")
+            if not any(w.lower() in query_lower for w in local.split() if len(w) > 2):
+                return False
+
+    return True
+
+
+def _semantic_check(tool_name, args, schema, query, call_type="single"):
+    """Lightweight rule-based semantic validation of argument values.
+
+    Returns False if any argument value is obviously nonsensical.
+    Catches the most common Gemini hallucination patterns without needing an LLM judge.
+    """
+    query_lower = query.lower()
+
+    for pname, pval in args.items():
+        pinfo = schema.get(pname, {})
+        expected_type = pinfo.get("type", "string")
+        pdesc = pinfo.get("description", "").lower()
+
+        # Number range checks 
+        if expected_type == "number" and isinstance(pval, (int, float)):
+            if any(kw in pname for kw in ("level", "brightness", "percent")):
+                if pval < 0 or pval > 100:
+                    return False
+            if pname == "temperature" and "thermostat" in tool_name:
+                if pval < 40 or pval > 100: 
+                    return False
+            if any(kw in pname for kw in ("minutes", "duration", "hours", "seconds", "count")):
+                if pval < 0:
+                    return False
+            if pname == "rating":
+                if pval < 1 or pval > 5:
+                    return False
+
+        # String emptiness checks
+        if expected_type == "string" and isinstance(pval, str):
+            if pinfo.get("required") and not pval.strip():
+                return False
+            val_lower = pval.strip().lower()
+            if val_lower in ("", "null", "none", "undefined", "n/a", "todo",
+                             "example", "test", "placeholder", "your_",
+                             "insert", "[", "{", "..."):
+                if pinfo.get("required"):
+                    return False
+
+        # Enum-like string checks from description 
+        if expected_type == "string" and isinstance(pval, str) and pdesc:
+            quoted = re.findall(r"'([^']+)'", pdesc)
+            if len(quoted) >= 2:  # looks like an enum
+                if pval.lower() not in [q.lower() for q in quoted]:
+                    if len(pval) < 30:
+                        return False
+
+        # check alignment with query intent
+        if expected_type == "boolean" and isinstance(pval, bool):
+            if pname == "enabled":
+                disable_words = ("off", "disable", "stop", "don't", "no ", "without")
+                enable_words = ("on", "enable", "start", "turn on", "activate")
+                query_wants_off = any(w in query_lower for w in disable_words)
+                query_wants_on = any(w in query_lower for w in enable_words)
+                # Only reject clear contradictions — if ambiguous, allow
+                if query_wants_off and not query_wants_on and pval is True:
+                    return False
+                if query_wants_on and not query_wants_off and pval is False:
+                    return False
+
+        # Grounding check: argument values must be traceable to the query.
+        # Skip for call types where semantic inference is the point (indirect,
+        # disfluent, garbled) — those intentionally have values not literally in the query.
+        # For multi_long_values, only skip grounding on free-text content params
+        # (message bodies, notes, etc.) — not on identifier params like names/sites.
+        _SKIP_GROUNDING_TYPES = ("indirect", "disfluent", "garbled")
+        _LONG_CONTENT_PARAMS = frozenset({
+            "text", "body", "message", "note", "new_text", "items",
+            "description", "feedback", "actions", "js",
+        })
+        skip_grounding = (
+            call_type in _SKIP_GROUNDING_TYPES
+            or (call_type == "multi_long_values" and pname in _LONG_CONTENT_PARAMS)
+        )
+        if expected_type == "string" and isinstance(pval, str) and not skip_grounding:
+            ok = _grounding_check(pname, pval, pdesc, query, query_lower)
+            if not ok:
+                return False
+
+    return True
+
+
 def generate_batch(client_pool, batch_size, rng, model):
     """Generate one batch of examples. Returns list of dicts."""
     call_type, call_desc = rng.choice(CALL_TYPES)
@@ -673,7 +1289,24 @@ def generate_batch(client_pool, batch_size, rng, model):
         few_tools=(call_type in ("multi_few_tools", "multi_long_values")),
     )
 
-    prompt = build_prompt(batch_size, call_desc, tools, rng)
+    # Inject overlapping tools ~20% of the time ---
+    if tools and len(tools) >= 2 and rng.random() < 0.20:
+        pair = rng.choice(_OVERLAP_PAIRS)
+        # Replace one random tool with both overlapping tools
+        idx = rng.randint(0, len(tools) - 1)
+        tools[idx] = pair[0]
+        if len(tools) < MAX_TOOLS:
+            tools.insert(idx + 1, pair[1])
+        else:
+            # Replace another tool if at max
+            other = (idx + 1) % len(tools)
+            tools[other] = pair[1]
+
+
+    # Pick a query length bucket for this batch ---
+    query_length_hint = rng.choice(_QUERY_LENGTH_DESCS)
+
+    prompt = build_prompt(batch_size, call_desc, tools, rng, query_length_hint=query_length_hint)
 
     # Vary temperature per batch for diversity: mostly 0.9-1.1 with occasional
     # low (more precise args) and high (more creative queries) extremes.
@@ -708,6 +1341,15 @@ def generate_batch(client_pool, batch_size, rng, model):
     tools_str = json.dumps(tools, separators=(",", ":"))
     tool_name_set = {t["name"] for t in tools}
 
+    # Build schema map for parameter validation: {tool_name: {param_name: {type, required}}}
+    tool_schema = {}
+    for t in tools:
+        params = t.get("parameters", {})
+        tool_schema[t["name"]] = {
+            k: {"type": v.get("type", "string"), "required": v.get("required", False)}
+            for k, v in params.items()
+        } if isinstance(params, dict) else {}
+
     # Build keyword set for rejecting bad empty-answer examples
     # Maps tool descriptions to simple action words for fuzzy matching
     _tool_keywords = set()
@@ -732,11 +1374,46 @@ def generate_batch(client_pool, batch_size, rng, model):
             if not isinstance(call, dict):
                 ok = False
                 break
-            if call.get("name") not in tool_name_set:
+            cname = call.get("name")
+            if cname not in tool_name_set:
                 ok = False
                 break
-            if not isinstance(call.get("arguments", {}), dict):
+            args = call.get("arguments", {})
+            if not isinstance(args, dict):
                 ok = False
+                break
+
+            # Validate required params are present
+            schema = tool_schema.get(cname, {})
+            for pname, pinfo in schema.items():
+                if pinfo["required"] and pname not in args:
+                    ok = False
+                    break
+
+            # Validate and coerce argument types
+            if ok:
+                for pname, pval in list(args.items()):
+                    if pname not in schema:
+                        continue  # extra params — tolerate
+                    expected = schema[pname]["type"]
+                    if expected == "number" and isinstance(pval, str):
+                        try:
+                            args[pname] = float(pval) if "." in pval else int(pval)
+                        except ValueError:
+                            ok = False
+                            break
+                    elif expected == "boolean" and isinstance(pval, str):
+                        if pval.lower() in ("true", "false"):
+                            args[pname] = pval.lower() == "true"
+                        else:
+                            ok = False
+                            break
+
+            # Lightweight semantic checks on argument values
+            if ok:
+                ok = _semantic_check(cname, args, schema, query, call_type)
+
+            if not ok:
                 break
         if not ok:
             continue
@@ -754,6 +1431,8 @@ def generate_batch(client_pool, batch_size, rng, model):
             "answers": json.dumps(answers, separators=(",", ":")),
             "source": "synth-gemini-assistant",
             "model": model,
+            "call_type": call_type,
+            "num_tools": len(tools),
         })
 
     return valid
@@ -803,17 +1482,28 @@ def generate_all(num_samples, workers=8, batch_size=25, model=MODEL, client_pool
 
     pbar.close()
 
+    def _dedup_key(query):
+        """Normalize query for dedup: lowercase, strip punctuation/whitespace."""
+        return " ".join(query.lower().split()).strip(".,!?;:'\"")
+
     seen = set()
     deduped = []
     for ex in all_examples:
-        if ex["query"] not in seen:
-            seen.add(ex["query"])
+        key = _dedup_key(ex["query"])
+        if key not in seen:
+            seen.add(key)
             deduped.append(ex)
 
     if len(deduped) > num_samples:
         deduped = deduped[:num_samples]
 
+    # Log distribution stats
+    from collections import Counter
+    type_counts = Counter(ex.get("call_type", "unknown") for ex in deduped)
+    tool_counts = Counter(ex.get("num_tools", -1) for ex in deduped)
     print(f"Generated {len(deduped):,} unique examples ({len(all_examples) - len(deduped)} duplicates removed, {failed} failed batches)")
+    print(f"  Call type distribution: {dict(type_counts.most_common())}")
+    print(f"  Tool count distribution: {dict(sorted(tool_counts.items()))}")
     return deduped
 
 
@@ -878,11 +1568,38 @@ def _merge_and_upload(existing, new_examples):
     os.rename(tmp_dir, local)
     print("Saved locally.")
 
-    from huggingface_hub import HfApi
+    import tempfile
+    from huggingface_hub import HfApi, CommitOperationDelete
+
     api = HfApi()
     api.create_repo(HF_DATASET_REPO, repo_type="dataset", private=False, exist_ok=True)
+
+    # Export to parquet and upload via HfApi to avoid push_to_hub dataset card bug
+    parquet_dir = tempfile.mkdtemp(prefix="needle_upload_")
+    print(f"Exporting to parquet...")
+    merged.to_parquet(os.path.join(parquet_dir, "train.parquet"))
+
+    # Delete old train shards first
+    files = api.list_repo_files(HF_DATASET_REPO, repo_type="dataset", token=True)
+    old_train = [f for f in files if f.startswith("data/train-")]
+    if old_train:
+        print(f"Deleting {len(old_train)} old train shards...")
+        ops = [CommitOperationDelete(path_in_repo=f) for f in old_train]
+        api.create_commit(
+            repo_id=HF_DATASET_REPO, repo_type="dataset", operations=ops,
+            commit_message="Remove old train shards before re-upload", token=True,
+        )
+
     print(f"Uploading to {HF_DATASET_REPO} (train split)...")
-    merged.push_to_hub(HF_DATASET_REPO, split="train", token=True)
+    api.upload_file(
+        path_or_fileobj=os.path.join(parquet_dir, "train.parquet"),
+        path_in_repo="data/train-00000-of-00001.parquet",
+        repo_id=HF_DATASET_REPO, repo_type="dataset", token=True,
+        commit_message=f"Upload train data ({len(merged)} rows)",
+    )
+
+    import shutil as _shutil
+    _shutil.rmtree(parquet_dir)
     print(f"Upload complete: {HF_DATASET_REPO}")
     print("NOTE: Run 'python scripts/split_dataset.py' to create the validation split.")
 
@@ -892,7 +1609,7 @@ def _merge_and_upload(existing, new_examples):
 def main():
     parser = argparse.ArgumentParser(description="Generate on-device assistant tool-calling data with Gemini")
     parser.add_argument("--num-samples", type=int, default=5000, help="Number of samples to generate")
-    parser.add_argument("--batch-size", type=int, default=25, help="Examples per Gemini call")
+    parser.add_argument("--batch-size", type=int, default=10, help="Examples per Gemini call (smaller = more tool diversity, more API calls)")
     parser.add_argument("--workers", type=int, default=8, help="Parallel Gemini calls")
     parser.add_argument("--model", type=str, default=MODEL, help="Gemini model")
     parser.add_argument("--dry-run", action="store_true", help="Generate only, skip save and upload")
@@ -905,9 +1622,12 @@ def main():
     remaining = args.num_samples
     total_generated = 0
     existing = None if args.dry_run else _load_existing()
+    def _dedup_key(query):
+        return " ".join(query.lower().split()).strip(".,!?;:'\"")
+
     seen_queries = set()
     if existing and not args.dry_run:
-        seen_queries = set(existing["query"])
+        seen_queries = set(_dedup_key(q) for q in existing["query"])
 
     while remaining > 0:
         chunk_size = min(remaining, args.upload_every)
@@ -923,8 +1643,9 @@ def main():
 
         fresh = []
         for ex in examples:
-            if ex["query"] not in seen_queries:
-                seen_queries.add(ex["query"])
+            key = _dedup_key(ex["query"])
+            if key not in seen_queries:
+                seen_queries.add(key)
                 fresh.append(ex)
         if len(fresh) < len(examples):
             print(f"  Removed {len(examples) - len(fresh)} cross-chunk duplicates")
@@ -946,7 +1667,7 @@ def main():
             print("\nSample examples:")
             sample_indices = list(range(len(examples)))
             random.shuffle(sample_indices)
-            for idx in sample_indices[:20]:
+            for idx in sample_indices[:100]:
                 ex = examples[idx]
                 print(f"  Q: {ex['query']}")
                 print(f"  A: {ex['answers'][:200]}")

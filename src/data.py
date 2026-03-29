@@ -90,15 +90,38 @@ def _count_tool_calls(answers_str):
 
 
 def _shuffle_tools_json(tools_str, seed):
-    """Parse tools JSON array, shuffle order deterministically, re-serialize."""
+    """Parse tools JSON array, shuffle tool order and parameter order deterministically.
+
+    Shuffles both the order of tools in the list and the order of parameters
+    within each tool's parameter dict, preventing the model from memorizing
+    positional patterns in the encoder input.
+    """
     try:
         tools = _json.loads(tools_str)
     except (ValueError, TypeError):
         return tools_str
-    if not isinstance(tools, list) or len(tools) <= 1:
+    if not isinstance(tools, list):
         return tools_str
     rng = np.random.RandomState(seed)
-    rng.shuffle(tools)
+    # Shuffle tool order
+    if len(tools) > 1:
+        rng.shuffle(tools)
+    # Shuffle parameter order within each tool
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        params = tool.get("parameters")
+        if isinstance(params, dict) and len(params) > 1:
+            keys = list(params.keys())
+            rng.shuffle(keys)
+            tool["parameters"] = {k: params[k] for k in keys}
+        # Also shuffle top-level tool keys (name, description, parameters)
+        top_keys = list(tool.keys())
+        if len(top_keys) > 1:
+            rng.shuffle(top_keys)
+            shuffled = {k: tool[k] for k in top_keys}
+            tool.clear()
+            tool.update(shuffled)
     return _json.dumps(tools, separators=(",", ":"))
 
 
