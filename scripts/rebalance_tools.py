@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import json
+import os
 import random
 from collections import Counter
 
@@ -176,9 +177,39 @@ def rebalance(dry_run=False):
             total = sum(verify_counts.values())
             print(f"  {n:>2} tools: {verify_counts[n]:>10,} ({verify_counts[n]/total*100:5.1f}%)")
 
-    # Upload
-    print(f"\nUploading to {HF_REPO} (train split)...")
-    new_ds.push_to_hub(HF_REPO, split="train", token=True)
+    # Save locally then upload via HfApi to avoid push_to_hub dataset card bug
+    import tempfile
+    from huggingface_hub import HfApi, CommitOperationDelete
+
+    local_dir = tempfile.mkdtemp(prefix="rebalanced_")
+    print(f"\nSaving to {local_dir}...")
+    new_ds.to_parquet(os.path.join(local_dir, "train.parquet"))
+
+    api = HfApi()
+
+    # Delete old train shards
+    files = api.list_repo_files(HF_REPO, repo_type="dataset", token=True)
+    old_train = [f for f in files if f.startswith("data/train-")]
+    if old_train:
+        print(f"Deleting {len(old_train)} old train shards...")
+        ops = [CommitOperationDelete(path_in_repo=f) for f in old_train]
+        api.create_commit(
+            repo_id=HF_REPO, repo_type="dataset", operations=ops,
+            commit_message="Remove old train shards", token=True,
+        )
+
+    # Upload new train data
+    print(f"Uploading rebalanced train split...")
+    api.upload_file(
+        path_or_fileobj=os.path.join(local_dir, "train.parquet"),
+        path_in_repo="data/train-00000-of-00001.parquet",
+        repo_id=HF_REPO, repo_type="dataset", token=True,
+        commit_message="Upload rebalanced train data",
+    )
+
+    # Clean up
+    import shutil
+    shutil.rmtree(local_dir)
     print("Done.")
 
 
