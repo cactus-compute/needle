@@ -546,11 +546,11 @@ SCENARIOS = [
     "searching for a product online", "adding something to cart",
     "checking order delivery status", "buying a phone case",
     # Social
-    "posting a tweet", "checking instagram notifications",
-    "posting a status update on facebook",
+    "posting on social media", "checking social notifications",
+    "posting a status update",
     # Ride-hailing & delivery
-    "ordering an Uber to the airport", "tracking a food delivery",
-    "canceling a ride", "ordering pizza from a nearby place",
+    "ordering a ride to a destination", "tracking a food delivery",
+    "canceling a ride", "ordering food from a nearby place",
     # File management
     "opening a downloaded PDF", "sharing a document with a coworker",
     "creating a new folder for photos", "compressing files to send",
@@ -600,13 +600,13 @@ SCENARIOS = [
     "I'm so tired", "why is it so hot in here", "the baby is sleeping so everything needs to be quiet",
     "I think I left the front door unlocked", "my hands are full and I need light",
     "this song is terrible", "I have no idea what time it is over there",
-    "I promised Sarah I'd call her back", "the kids have been on their tablets all day",
+    "I promised someone I'd call them back", "the kids have been on their tablets all day",
     "I should probably stretch or something", "I wonder if my package arrived",
     "this article is really long I don't have time to read all of it",
     "I need to remember to buy milk on the way home",
     "my car must be low on gas by now", "I have no idea where I parked",
     # Corrections and follow-ups
-    "no wait, make that 7:30 instead", "actually send it to Sarah not John",
+    "correcting a time just set", "redirecting a message to a different person",
     "cancel what I just set", "change the timer to 10 minutes",
     "undo that", "never mind, turn it back on",
     # Temporal and conditional
@@ -614,9 +614,9 @@ SCENARIOS = [
     "in 2 hours turn off the lights", "tomorrow morning check the weather",
     "after work start the robot vacuum", "at sunset close the blinds",
     # Multi-person and group
-    "message both Sarah and John about dinner", "set up a group call with the team",
-    "share my location with everyone in the family group",
-    "send the same email to Alice, Bob, and Carol",
+    "messaging two people about the same event", "setting up a group call",
+    "sharing location with a family group",
+    "sending the same email to multiple recipients",
     # Context references
     "call them back", "open that file from earlier",
     "reply saying I'll be there in 10", "send them what I just screenshotted",
@@ -633,50 +633,50 @@ SCENARIOS = [
     "ok so I need you to do a few things: first turn off the living room lights, then lock the front door, and also set the alarm for 6:30",
     "I'm about to go into a meeting so can you put my phone on do not disturb and also remind me in an hour to check my email",
     # Multi-call with same tool (few tools, different args)
-    "send a message to Alice about the meeting AND a message to Bob about the deadline",
-    "set an alarm for 6:30am for gym AND another for 8am for work",
-    "add milk, bread, and eggs to the shopping list as separate items",
-    "create reminders for dentist on Monday, haircut on Wednesday, and vet on Friday",
-    "text Sarah I'm running late, text John I'll be there in 20, text Mom dinner is at 7",
-    "set timers for pasta 12 minutes, sauce 8 minutes, and garlic bread 5 minutes",
-    "send an email to the team about the Q3 report AND another to the client about the proposal deadline",
-    "add three different notes: one about the meeting summary, one about the project timeline, and one about the budget",
-    "create calendar events for Monday standup at 9, Wednesday review at 2, and Friday retro at 4",
-    "log breakfast as oatmeal with blueberries, lunch as grilled chicken salad, dinner as pasta carbonara",
+    "sending different messages to two people about different topics",
+    "setting two alarms for different times and purposes",
+    "adding multiple grocery items to a shopping list separately",
+    "creating reminders for several appointments across the week",
+    "texting three different people with different status updates",
+    "setting multiple cooking timers for different dishes",
+    "sending two separate emails about different work topics",
+    "adding several distinct notes about different subjects",
+    "creating multiple calendar events for different days",
+    "logging several meals throughout the day",
     # Multi-call with long argument values
-    "send a detailed message to the team explaining that the deployment is postponed to next Tuesday due to the security review",
-    "create a note with the full recipe for chocolate chip cookies including all ingredients and steps",
-    "email the landlord about the broken dishwasher explaining what happened and when it started",
-    "set a reminder with the full address: 1234 Oak Street, Apartment 5B, Springfield, IL 62704",
-    "post a status update about how excited I am for the conference next week and all the sessions I'm looking forward to",
+    "sending a detailed work message with a specific reason for a schedule change",
+    "creating a note with a full recipe including all ingredients and steps",
+    "emailing someone about a maintenance issue with a detailed explanation",
+    "setting a reminder that includes a full street address",
+    "posting a long enthusiastic status update about an upcoming event",
     # TV & streaming
-    "play Stranger Things on Netflix", "turn on subtitles", "switch to HDMI 2",
-    "turn off the TV in 30 minutes", "search for action movies", "rewind 30 seconds",
-    "what was I watching last night", "add this to my watchlist",
-    "turn down the TV volume to 20", "play the next episode",
+    "playing a show on a streaming service", "turning on subtitles", "switching TV input",
+    "setting a TV sleep timer", "searching for a genre of movies", "rewinding playback",
+    "resuming what was playing last", "adding something to a watchlist",
+    "adjusting TV volume to a specific level", "playing the next episode",
     # Vehicle & car
-    "lock my car", "start the car and turn on the heat", "where did I park",
-    "check my tire pressure", "honk the horn so I can find my car",
-    "how much gas do I have left", "preheat the cabin to 72",
-    "open the trunk", "find a charging station nearby", "set charge limit to 80 percent",
-    "is my car locked", "turn on valet mode",
+    "locking the car remotely", "remote starting the car with climate on", "finding where I parked",
+    "checking tire pressure", "honking to locate the car",
+    "checking fuel or battery level", "preheating the cabin",
+    "opening the trunk remotely", "finding a charging station", "setting EV charge limit",
+    "checking if car is locked", "enabling valet mode",
     # Travel & booking
-    "find flights to Tokyo next month", "check in for my Delta flight",
-    "show my boarding pass", "is my flight on time", "what's the exchange rate for euros",
-    "what time is it in London right now", "find hotels in Barcelona for next weekend",
-    "show me my trip itinerary", "rent a car at LAX for Thursday",
+    "searching for flights to a destination", "checking in for a flight",
+    "showing a boarding pass", "checking flight status", "checking currency exchange rate",
+    "checking time in another timezone", "searching for hotels in a city",
+    "viewing a trip itinerary", "renting a car at an airport",
     # Cooking & kitchen
-    "preheat the oven to 375", "how many grams is 2 cups of flour",
-    "set a timer for the pasta, 12 minutes", "what can I substitute for eggs in baking",
-    "start the dishwasher on eco mode", "brew a large strong coffee",
-    "search for chicken tikka masala recipe", "what's in the fridge",
-    "start the slow cooker on low for 8 hours",
+    "preheating the oven to a temperature", "converting cooking measurements",
+    "setting a named cooking timer", "finding an ingredient substitution",
+    "starting the dishwasher on a specific cycle", "brewing coffee with size and strength",
+    "searching for a specific recipe", "checking fridge inventory",
+    "starting the slow cooker with settings",
     # Parental & family
-    "where is my daughter right now", "lock Tommy's iPad",
-    "how much screen time did Emma use today", "set a 2 hour limit on Jake's tablet",
-    "send a message to the whole family: dinner is at 7",
-    "alert me when Sarah leaves school", "ask Ben to check in",
-    "set strict content filter on the kids' devices",
+    "checking a family member's location", "locking a child's device",
+    "checking a child's screen time usage", "setting screen time limits",
+    "broadcasting a message to the whole family",
+    "geofencing alerts for when someone arrives or leaves", "requesting a check-in",
+    "setting content filters on kids' devices",
     # Automation & shortcuts
     "run my morning routine", "trigger the bedtime shortcut",
     "what automations do I have", "turn off the leaving home routine",
@@ -686,23 +686,23 @@ SCENARIOS = [
     # Connectivity
     "turn off mobile data", "how much data have I used this month",
     "what wifi am I connected to", "share the wifi password",
-    "forget the Starbucks wifi network", "what bluetooth devices are connected",
-    "disconnect my AirPods", "turn on NFC", "set a 5 gig data limit",
+    "forgetting a saved wifi network", "listing connected bluetooth devices",
+    "disconnecting a specific bluetooth device", "toggling NFC", "setting a data usage limit",
     # Screen capture & mirroring
     "start screen recording", "stop recording the screen",
     "take a scrolling screenshot", "mirror my screen to the living room TV",
     "stop mirroring", "turn on picture in picture",
     "record the screen with my mic on",
     # Email management
-    "check my unread emails", "reply to the email from Sarah saying I'll be there",
-    "archive the email about the weekly report", "snooze that email until Monday",
-    "label the Amazon receipt as shopping", "mark that as spam",
-    "forward the meeting invite to John", "search emails for invoice",
-    "any emails from my boss today",
+    "checking unread emails", "replying to an email from someone",
+    "archiving an email about a topic", "snoozing an email until later",
+    "labeling an email by category", "marking email as spam",
+    "forwarding an email to someone", "searching emails by keyword",
+    "checking emails from a specific sender",
     # Passwords & security
-    "what's my Netflix password", "generate a new password",
-    "show me the 2FA code for GitHub", "has my email been in a data breach",
-    "autofill the login on this page", "save this password for spotify",
+    "retrieving a saved password for a service", "generating a new password",
+    "getting a 2FA code for a site", "checking for data breaches",
+    "autofilling login credentials", "saving a new password",
     # Chained real-world workflows
     "I just parked — save this location and set a 2 hour timer",
     "I'm leaving work — start the car, turn on the AC, and get directions home",
@@ -735,7 +735,7 @@ SCENARIOS = [
     "wait actually no, set it to 20 minutes not 15",
     "could you um like maybe turn on do not disturb if that's a thing",
     "hey uh what's the... what's the weather like out there",
-    "okay okay so I need to like text Sarah and tell her um that I'll be late",
+    "rambling about needing to text someone that you're running late",
     "set a — no actually make that a reminder, not a timer, for 3pm",
     "uh brightness, like turn it up, I can't really see",
     "so I think maybe we should lock the front door, right? yeah do that",
@@ -749,46 +749,64 @@ SCENARIOS = [
     "hey wait before I forget can you remind me tomorrow about the dentist thing",
     "I dunno just like play something, anything really, some background music",
     "ugh okay fine just turn on the flashlight I can't see anything",
-    # Typos, keyboard errors, and autocorrect fails
-    "sned a mesage to john", "set a tmier for 5 minuets",
-    "paly some musik", "trun off the lghts", "waht time is it",
-    "cll mom", "serch for nearby coffe shops", "togle bluetooth",
-    "chekc my emial", "lok the fron door",
-    "turnoff wifi", "setanalarm for 6am", "sendan email to boss",
-    "brigtness to 50", "plya next track", "clera notifications",
-    "naviagte to the airprot", "cehck battery lvl", "diretions home",
-    "remidn me to buy grocries tmrw", "txt sarah im on my way",
-    # Speech-to-text / ASR errors and homophones
-    "set a timer for to minutes", "turn on the bluetooth for my new ear buds",
-    "play some lo-fi beets", "can you check the whether tomorrow",
-    "send a text two mom", "search four italian restaurants nearby",
-    "cud you set an alarm four 7", "wanna play some chillhop",
-    "gonna need directions too the mall", "lemme see my colander for today",
-    "I hafta call the dentist", "shoulda set a reminder earlier",
-    "whatcha got on my to do list", "gimme the whether for this weekend",
-    # Dropped words / telegram style
-    "timer 5", "alarm 7am", "lights off bedroom", "weather tokyo",
-    "message john meeting canceled", "brightness max", "volume 30",
-    "directions airport no tolls", "remind dentist thursday 2pm",
-    "play chill playlist shuffle", "lock front back doors",
-    "wifi off bluetooth on", "screenshot now", "call sarah mobile",
+    # Typos and keyboard errors — themes for Gemini to generate its own misspellings
+    "sending a message with typos in the command",
+    "setting a timer with misspelled words",
+    "playing music with garbled text", "toggling a setting with missing letters",
+    "checking something with swapped letters", "calling someone with truncated words",
+    "searching nearby with typos", "toggling connectivity with misspelling",
+    "checking email with keyboard errors", "locking something with missing vowels",
+    "running words together without spaces", "setting something with no spaces",
+    "adjusting a setting with a typo", "navigating with misspelled destination",
+    "a reminder with text-speak abbreviations", "texting with informal shorthand",
+    # Speech-to-text / ASR errors — themes
+    "a timer request where a number sounds like a different word",
+    "connecting a device where the name gets mangled by speech recognition",
+    "playing music where the genre gets misheard",
+    "checking something where homophones get confused (weather/whether, to/two, for/four)",
+    "casual speech with wanna/gonna/gotta contractions",
+    "slang and phonetic spelling like lemme/gimme/hafta/shoulda",
+    # Dropped words / telegram style — themes
+    "ultra-short command with just a number or single word",
+    "device command with just the setting name and value, no verbs",
+    "message with just recipient and content, no filler words",
+    "directions with just destination and constraint, no articles",
+    "reminder with just topic, day, and time — no complete sentence",
+    "multiple toggles in telegram style, no connecting words",
     # Ambiguous queries requiring disambiguation between similar tools
-    "send this to John", "message Sarah about the meeting",
-    "remind me about the groceries", "play that song",
-    "navigate to the store", "set a timer for the food",
-    "write a note about the project", "share this with the team",
-    "look up that restaurant", "find my way home",
-    "tell mom I'll be late", "send the file to Dave",
-    "book something for Friday", "get me a ride there",
-    # Argument value edge cases — special characters, diverse names, long values
-    "text José García that the piñata is ready 🎉",
-    "send an email to björk.svensson@example.com about the résumé",
-    "set a reminder: pick up Wei's dry cleaning at 3456 MLK Jr Blvd, Apt 12B, Oakland CA 94609",
-    "note down the wifi password: xK9#mP2$vL5!nQ8@",
-    "message Aisha: hey girl!! 💕 sooo excited for saturday, gonna be amazing 🥳🎶",
-    "create a note with this recipe: 2½ cups flour, ¾ tsp salt, 1⅓ cups milk at 350°F for 25-30 min",
-    "email the team: Hi everyone — quick update RE: Q3 targets. We're at 94.7% of goal ($1,247,832 / $1,318,000). Need to close 3 more deals by EOD Friday. Let's sync at 2:30pm in Room 4B. Thanks!",
-    "add to shopping list: 2% milk × 2, free-range eggs (dozen), sriracha mayo, 0.5kg chicken thighs",
+    "sending something to someone without specifying the channel",
+    "messaging someone about a topic without specifying SMS vs instant message",
+    "setting a reminder without specifying reminder vs list item",
+    "playing something without specifying song vs playlist vs radio",
+    "navigating somewhere without specifying directions vs turn-by-turn",
+    "setting a timer without specifying generic vs cooking timer",
+    "writing something down without specifying note vs list vs reminder",
+    "sharing something without specifying the method or recipient type",
+    "looking up a place without specifying search vs navigate",
+    "telling someone something without specifying call vs text vs email",
+    "booking something without specifying the service type",
+    # Argument value edge cases — themes for special characters, diverse content
+    "texting someone with emoji in the message",
+    "emailing someone at a non-English domain about a work topic",
+    "setting a reminder with a full street address including apartment number",
+    "noting down a complex password or code with special characters",
+    "sending a casual excited message with lots of emoji",
+    "emailing a colleague at a foreign company about a deadline",
+    "creating a note with a recipe using fractions and degree symbols",
+    "texting someone about travel logistics with flight details",
+    "sending a professional email with specific numbers, percentages, and a meeting time",
+    "adding a shopping list with quantities, brands, and metric measurements",
+    # Math, calculations, and conversions
+    "what's 15 percent of 89.99", "split 247 dollars three ways",
+    "how many days until March 15", "what's 72 fahrenheit in celsius",
+    "calculate the area of a circle with radius 5", "what's the square root of 144",
+    "how much is 30% off of $65", "if I drive 180 miles at 60mph how long will it take",
+    "convert 2.5 hours to minutes and seconds", "what's 19 times 23 plus 7",
+    "how many calories if I eat 3 servings of 240 calories each",
+    "what's my average if I scored 87, 92, 78, and 95", "tip for $43.50 at 20%",
+    "what day of the week is January 1 2025", "BMI for 175 lbs and 5 foot 10",
+    "how many cups in 750ml", "convert 3 tablespoons to teaspoons",
+    "what's 1000 yen in dollars roughly", "compound interest on 5000 at 4% for 3 years",
     # Edge cases
     "very short terse command like 'timer 5 min'",
     "long polite request with extra context",
@@ -835,14 +853,14 @@ CALL_TYPES = [
      "Vary between statements ('it's dark'), questions ('why is it so hot?'), and complaints ('ugh this is way too bright')."),
     ("disfluent", "1-2 tool calls — but the query must contain NATURAL SPEECH DISFLUENCIES like real voice transcriptions. "  # 2/20 ≈ 10%
      "Include filler words (um, uh, hmm, like, so, well, okay, right), false starts ('set a — no wait, make that...'), "
-     "self-corrections ('send it to John, I mean Sarah'), hedging ('I think maybe', 'if possible', 'or whatever'), "
+     "self-corrections ('send it to — no wait, the other one'), hedging ('I think maybe', 'if possible', 'or whatever'), "
      "trailing off ('can you like... turn off the...'), repetitions ('turn turn off the lights'), "
      "and casual padding ('oh yeah', 'hey so', 'alright so', 'wait actually'). "
      "The underlying intent should still be clear and map to a valid tool call — the disfluencies are just surface noise. "
      "Mix short disfluent queries ('uh lights off') with longer rambly ones."),
     ("disfluent", "1-2 tool calls — but the query must contain NATURAL SPEECH DISFLUENCIES like real voice transcriptions. "
      "Include filler words (um, uh, hmm, like, so, well, okay, right), false starts ('set a — no wait, make that...'), "
-     "self-corrections ('send it to John, I mean Sarah'), hedging ('I think maybe', 'if possible', 'or whatever'), "
+     "self-corrections ('send it to — no wait, the other one'), hedging ('I think maybe', 'if possible', 'or whatever'), "
      "trailing off ('can you like... turn off the...'), repetitions ('turn turn off the lights'), "
      "and casual padding ('oh yeah', 'hey so', 'alright so', 'wait actually'). "
      "The underlying intent should still be clear and map to a valid tool call — the disfluencies are just surface noise. "
@@ -981,15 +999,16 @@ def build_prompt(batch_size, call_desc, tools, rng, query_length_hint=None):
         tool_rules = f"""- Tool call format: {{"name": "tool_name", "arguments": {{"param": "value"}}}}
 - Arguments must match the parameter schemas exactly — use correct types (string, number, boolean)
 - Do NOT invent tools not in the list — only use the tools shown above
-- For contact_id params, use realistic placeholders like "contact_alice_123", "contact_john_456"
+- For contact_id params, use realistic placeholders like "contact_firstname_NNN" with varied names and numbers — never repeat the same contact_id across examples
 - For evaluate_js, write real working JavaScript with console.log()
 - Number params should be actual numbers not strings (e.g. 7 not "7")
 - Boolean params should be actual booleans not strings (e.g. true not "true")
 - Vary argument values widely — don't repeat the same locations, names, times, or phrases across examples
 - Sometimes include optional parameters, sometimes omit them — mix it up naturally
 - Never produce partial tool calls — every call must have "name" and "arguments" with all required params
-- Include REALISTIC argument values: names from diverse cultures (José, Aisha, Wei, Björk), real-looking addresses, emoji in messages (😊👍), URLs, decimal numbers (68.5, 3.14), varied time formats ('7am', '19:30', 'quarter past 3')
-- Occasionally use very long string values for message/text/body params: multi-sentence emails, detailed notes, full addresses with apartment numbers{disambig_rule}"""
+- Include REALISTIC argument values: names from MANY diverse cultures and languages (Arabic, East Asian, South Asian, European, African, Latin American — never repeat the same name across examples in this batch), emoji in messages, decimal numbers, varied time formats ('7am', '19:30', 'quarter past 3')
+- CRITICAL GROUNDING RULE: argument values must come DIRECTLY from the query. Do NOT invent specific names, brands, numbers, or details the user didn't say. If the user says "streaming service", use "streaming service" not "Netflix". If they say "furniture store", use "furniture store" not "IKEA". If they say "set a timer for the pizza", use label "pizza" not "pepperoni pizza". The user's EXACT words should appear in the arguments. Only contact_id params may use placeholders like "contact_alice_123".
+- For album names, labels, titles: use ONLY words the user actually said — do not embellish or add creative flourishes{disambig_rule}"""
     else:
         tools_section = "AVAILABLE TOOLS: NONE — no tools are available."
         tool_rules = "- Since no tools are available, ALL answers must be empty arrays []"
@@ -1011,7 +1030,7 @@ REQUIREMENTS:
 - CRITICAL: use DIFFERENT tools across examples in this batch — do NOT generate multiple examples that all call the same tool. Spread usage across ALL available tools. If there are 6 tools, each should appear in at least one example
 - Vary which tools are used and how many are called per example — some examples should use tools from different ends of the list
 
-SCENARIO INSPIRATION (vary well beyond these):
+THEME INSPIRATION — use these as starting points, but generate your OWN unique queries with different names, places, numbers, and details every time. NEVER copy these verbatim:
 {scenarios_str}
 
 OUTPUT FORMAT — return a JSON array, nothing else:
@@ -1123,14 +1142,14 @@ def _grounding_check(pname, pval, pdesc, query, query_lower):
     """Check that significant words in a string argument value are grounded in the query.
 
     Returns False if the value contains specific details not traceable to the query.
+    Strict: every specific noun/name/identifier must come from the query.
     """
     # Skip params where values are generated/inferred, not extracted from query
     if pname in _FREEFORM_PARAMS:
         return True
 
-    # Skip very short values — single words are usually fine (tool names, modes, etc.)
     val = pval.strip()
-    if len(val) <= 15:
+    if not val:
         return True
 
     # Skip if the param description suggests free-form/generated content
@@ -1140,7 +1159,13 @@ def _grounding_check(pname, pval, pdesc, query, query_lower):
     if any(hint in pdesc_lower for hint in freeform_hints):
         return True
 
-    # Extract significant words from the value (3+ chars, not stopwords)
+    # For enum-like values that match description options, always allow
+    # (e.g., "driving", "bake", "front" — these are valid fixed choices)
+    quoted = re.findall(r"'([^']+)'", pdesc_lower)
+    if quoted and val.lower() in [q.lower() for q in quoted]:
+        return True
+
+    # Extract significant words from value and query
     val_words = set()
     for word in re.findall(r'[a-zA-Z\u00C0-\u024F]{3,}', val.lower()):
         if word not in _GROUNDING_STOPWORDS:
@@ -1149,34 +1174,36 @@ def _grounding_check(pname, pval, pdesc, query, query_lower):
     if not val_words:
         return True
 
-    # Extract significant words from the query
     query_words = set()
     for word in re.findall(r'[a-zA-Z\u00C0-\u024F]{3,}', query_lower):
         if word not in _GROUNDING_STOPWORDS:
             query_words.add(word)
 
-    # Check: what fraction of value words appear in or are substrings of query words?
+    # Check grounding: every significant value word must trace to the query
     grounded = 0
     for vw in val_words:
-        # Direct match
         if vw in query_words:
             grounded += 1
             continue
-        # Substring match (catches "grocery" in "groceries", "alarm" in "alarms")
+        # Substring/stem match (catches "grocery"/"groceries", "alarm"/"alarms")
         if any(vw in qw or qw in vw for qw in query_words):
             grounded += 1
             continue
-        # Check if the word appears anywhere in the raw query (catches multi-word matches)
+        # Raw substring in query (catches compound words, multi-word names)
         if vw in query_lower:
             grounded += 1
             continue
 
-    # Require at least 50% of significant value words to be grounded in the query.
-    # This allows some inference (e.g., "Saturday" from "this weekend") while catching
-    # fabricated specifics (e.g., "Bank of America" from "bank").
-    grounding_ratio = grounded / len(val_words)
-    if grounding_ratio < 0.5:
-        return False
+    # Strict threshold: 75% of value words must be grounded.
+    # For short values (≤3 significant words), require ALL to be grounded —
+    # this catches "Netflix" from "streaming service", "IKEA" from "furniture store".
+    if len(val_words) <= 3:
+        if grounded < len(val_words):
+            return False
+    else:
+        grounding_ratio = grounded / len(val_words)
+        if grounding_ratio < 0.75:
+            return False
 
     # Additional hard checks for specific fabrication patterns
     # Reject fabricated phone numbers in non-phone params
@@ -1280,30 +1307,188 @@ def _semantic_check(tool_name, args, schema, query, call_type="single"):
     return True
 
 
+# Description rephrase templates — vary how tool descriptions are worded
+# without changing the meaning. Prevents the model from memorizing exact phrasing.
+_DESC_TEMPLATES = [
+    lambda d: d,  # original
+    lambda d: d,  # original (weighted higher)
+    lambda d: d,  # original (weighted higher)
+    lambda d: d.rstrip(".") + "." if not d.endswith(".") else d,  # normalize period
+    lambda d: d[0].upper() + d[1:] if d and d[0].islower() else d,  # capitalize
+    lambda d: d.replace(".", ",", 1).rstrip(",") + "." if d.count(".") > 1 else d,  # comma variant
+    lambda d: d.split(".")[0].strip() + "." if "." in d else d,  # first sentence only
+    lambda d: d.replace(" the ", " a ", 1) if " the " in d else d,  # article swap
+    lambda d: d.replace("Enable or disable", "Toggle").replace("enable or disable", "toggle") if "nable or disable" in d else d,
+    lambda d: d.replace("Turn ", "Switch ").replace("turn ", "switch ") if d.startswith(("Turn", "turn")) else d,
+]
+
+
+# Domain categories for tool synthesis — Gemini invents tools within these bounds
+_SYNTH_DOMAINS = [
+    "smart kitchen appliances (oven, fridge, blender, air purifier, water filter)",
+    "pet care and pet tech (feeder, tracker, health monitor, activity log)",
+    "personal finance and budgeting (subscriptions, savings goals, expense tracking)",
+    "study and education tools (flashcards, quiz, study timer, citation generator)",
+    "creative tools (drawing, music composition, video editing, photo collage)",
+    "gardening and plant care (watering schedule, soil sensor, plant identifier, weather alerts)",
+    "meeting and collaboration (screen share, whiteboard, poll, action items, transcription)",
+    "home maintenance (HVAC filter, smoke detector, water leak sensor, appliance warranty)",
+    "sports and outdoor activities (route planner, gear checklist, weather for trail, pace tracker)",
+    "baby and childcare (feeding log, diaper tracker, sleep monitor, milestone tracker)",
+    "subscription and account management (cancel subscription, change plan, check renewal date)",
+    "custom device peripherals (drone control, 3D printer, smart mirror, e-ink display)",
+    "language learning (vocabulary drill, pronunciation check, daily lesson, streak tracker)",
+    "car maintenance (oil change reminder, tire rotation schedule, mileage log, service history)",
+    "event planning (guest list, RSVP tracker, venue search, seating chart, send invitations)",
+]
+
+_SYNTH_TOOL_PROMPT = """Generate {num_tools} realistic tool definitions for a consumer device assistant in this domain: {domain}
+
+Each tool must have:
+- "name": snake_case function name
+- "description": clear 1-sentence description of what it does
+- "parameters": dict of param_name -> {{"type": "string"|"number"|"boolean", "description": "...", "required": true|false}}
+
+Rules:
+- Tools should feel like real device/app APIs — specific, actionable, not vague
+- Mix of tools with 0-4 parameters
+- Include both action tools (do something) and query tools (get information)
+- Parameter types must be realistic (numbers for quantities, booleans for toggles, strings for names/text)
+- Use snake_case for all names
+
+Return ONLY a valid JSON array of tool objects. No markdown, no explanation."""
+
+
+_synth_stats = {"attempted": 0, "succeeded": 0, "failed_parse": 0, "failed_validate": 0, "failed_exception": 0}
+
+
+def _synthesize_tools(client_pool, rng, model, num_tools):
+    """Ask Gemini to invent novel tool definitions within a random domain."""
+    _synth_stats["attempted"] += 1
+    domain = rng.choice(_SYNTH_DOMAINS)
+    prompt = _SYNTH_TOOL_PROMPT.format(num_tools=num_tools, domain=domain)
+
+    client = client_pool.get()
+    try:
+        response = client.models.generate_content(
+            model=model, contents=prompt,
+            config={"temperature": 0.9, "max_output_tokens": 4096},
+        )
+        text = response.text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        tools = json.loads(text.strip())
+        if not isinstance(tools, list):
+            _synth_stats["failed_parse"] += 1
+            return None
+        # Validate and normalize structure to match our pool format
+        valid = []
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            if not t.get("name") or not isinstance(t.get("name"), str):
+                continue
+            if not t.get("description") or not isinstance(t.get("description"), str):
+                continue
+            # Ensure snake_case name
+            t["name"] = re.sub(r'[^a-z0-9_]', '_', t["name"].lower()).strip('_')
+            # Normalize parameters to match our schema format
+            raw_params = t.get("parameters", {})
+            if not isinstance(raw_params, dict):
+                t["parameters"] = {}
+            else:
+                normalized = {}
+                for pname, pinfo in raw_params.items():
+                    if isinstance(pinfo, dict):
+                        normalized[pname] = {
+                            "type": pinfo.get("type", "string"),
+                            "description": pinfo.get("description", ""),
+                            "required": pinfo.get("required", False),
+                        }
+                    elif isinstance(pinfo, str):
+                        # Gemini sometimes produces {"param": "description string"}
+                        normalized[pname] = {
+                            "type": "string",
+                            "description": pinfo,
+                            "required": True,
+                        }
+                t["parameters"] = normalized
+            valid.append(t)
+        if not valid:
+            _synth_stats["failed_validate"] += 1
+            return None
+        _synth_stats["succeeded"] += 1
+        return valid[:num_tools]
+    except Exception as e:
+        _synth_stats["failed_exception"] += 1
+        return None
+
+
+def _rephrase_tool_descriptions(tools, rng):
+    """Apply random description rephrasing to tool definitions."""
+    result = []
+    for t in tools:
+        t = dict(t)  # shallow copy
+        template = rng.choice(_DESC_TEMPLATES)
+        t["description"] = template(t["description"])
+        # Also occasionally rephrase parameter descriptions
+        if isinstance(t.get("parameters"), dict):
+            params = {}
+            for pname, pinfo in t["parameters"].items():
+                pinfo = dict(pinfo)
+                if rng.random() < 0.3 and "description" in pinfo:
+                    pinfo["description"] = rng.choice(_DESC_TEMPLATES)(pinfo["description"])
+                params[pname] = pinfo
+            t["parameters"] = params
+        result.append(t)
+    return result
+
+
 def generate_batch(client_pool, batch_size, rng, model):
     """Generate one batch of examples. Returns list of dicts."""
     call_type, call_desc = rng.choice(CALL_TYPES)
-    tools = _pick_tools(
-        rng,
-        force_empty=(call_type == "no_tools"),
-        few_tools=(call_type in ("multi_few_tools", "multi_long_values")),
+
+    # ~15% of batches use synthesized novel tools for generalization
+    # Only for call types that benefit from multiple tools (not few_tools types)
+    use_synth = (
+        call_type not in ("no_tools", "multi_few_tools")
+        and rng.random() < 0.15
     )
 
-    # Inject overlapping tools ~20% of the time ---
-    if tools and len(tools) >= 2 and rng.random() < 0.20:
+    if use_synth:
+        # Synthesize at least 3 tools so we get variety, up to 8
+        target = max(3, rng.choices(_TOOL_COUNTS, weights=_TOOL_WEIGHTS, k=1)[0])
+        target = min(target, 8)
+        tools = _synthesize_tools(client_pool, rng, model, target)
+        if tools is None:
+            use_synth = False
+            tools = _pick_tools(rng, force_empty=False,
+                                few_tools=(call_type in ("multi_few_tools", "multi_long_values")))
+    else:
+        tools = _pick_tools(
+            rng,
+            force_empty=(call_type == "no_tools"),
+            few_tools=(call_type in ("multi_few_tools", "multi_long_values")),
+        )
+
+    # Inject overlapping tools ~20% of the time (only for pool tools)
+    if tools and not use_synth and len(tools) >= 2 and rng.random() < 0.20:
         pair = rng.choice(_OVERLAP_PAIRS)
-        # Replace one random tool with both overlapping tools
         idx = rng.randint(0, len(tools) - 1)
         tools[idx] = pair[0]
         if len(tools) < MAX_TOOLS:
             tools.insert(idx + 1, pair[1])
         else:
-            # Replace another tool if at max
             other = (idx + 1) % len(tools)
             tools[other] = pair[1]
 
+    # Rephrase tool descriptions ~30% of the time for wording diversity
+    if tools and rng.random() < 0.30:
+        tools = _rephrase_tool_descriptions(tools, rng)
 
-    # Pick a query length bucket for this batch ---
+    # Pick a query length bucket for this batch
     query_length_hint = rng.choice(_QUERY_LENGTH_DESCS)
 
     prompt = build_prompt(batch_size, call_desc, tools, rng, query_length_hint=query_length_hint)
@@ -1433,6 +1618,7 @@ def generate_batch(client_pool, batch_size, rng, model):
             "model": model,
             "call_type": call_type,
             "num_tools": len(tools),
+            "synth_tools": use_synth,
         })
 
     return valid
@@ -1504,6 +1690,10 @@ def generate_all(num_samples, workers=8, batch_size=25, model=MODEL, client_pool
     print(f"Generated {len(deduped):,} unique examples ({len(all_examples) - len(deduped)} duplicates removed, {failed} failed batches)")
     print(f"  Call type distribution: {dict(type_counts.most_common())}")
     print(f"  Tool count distribution: {dict(sorted(tool_counts.items()))}")
+    if _synth_stats["attempted"] > 0:
+        print(f"  Tool synthesis: {_synth_stats['succeeded']}/{_synth_stats['attempted']} succeeded "
+              f"(parse_fail={_synth_stats['failed_parse']}, validate_fail={_synth_stats['failed_validate']}, "
+              f"exception={_synth_stats['failed_exception']})")
     return deduped
 
 
@@ -1664,11 +1854,33 @@ def main():
                     f.write(json.dumps(ex) + "\n")
 
         if total_generated == len(examples):
-            print("\nSample examples:")
+            # Show synthesized tool examples first (if any)
+            synth_examples = [ex for ex in examples if ex.get("synth_tools")]
+            if synth_examples:
+                print(f"\nSynthesized tool examples ({len(synth_examples)} total):")
+                for ex in synth_examples[:10]:
+                    try:
+                        tool_names = [t["name"] for t in json.loads(ex["tools"])]
+                        tools_str = ", ".join(tool_names) if tool_names else "(no tools)"
+                    except (json.JSONDecodeError, TypeError):
+                        tools_str = "(no tools)"
+                    print(f"  Tools: [{tools_str}] [SYNTH]")
+                    print(f"  Q: {ex['query']}")
+                    print(f"  A: {ex['answers'][:200]}")
+                    print()
+
+            print(f"\nSample examples:")
             sample_indices = list(range(len(examples)))
             random.shuffle(sample_indices)
             for idx in sample_indices[:100]:
                 ex = examples[idx]
+                try:
+                    tool_names = [t["name"] for t in json.loads(ex["tools"])]
+                    tools_str = ", ".join(tool_names) if tool_names else "(no tools)"
+                except (json.JSONDecodeError, TypeError):
+                    tools_str = "(no tools)"
+                synth_tag = " [SYNTH]" if ex.get("synth_tools") else ""
+                print(f"  Tools: [{tools_str}]{synth_tag}")
                 print(f"  Q: {ex['query']}")
                 print(f"  A: {ex['answers'][:200]}")
                 print()
