@@ -1454,7 +1454,7 @@ def generate_batch(client_pool, batch_size, rng, model):
     # Only for call types that benefit from multiple tools (not few_tools types)
     use_synth = (
         call_type not in ("no_tools", "multi_few_tools")
-        and rng.random() < 0.15
+        and rng.random() < 0.50
     )
 
     if use_synth:
