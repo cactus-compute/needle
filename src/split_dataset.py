@@ -16,28 +16,53 @@ from datasets import load_dataset
 
 
 HF_DATASET_REPO = "Cactus-Compute/tool-calls"
-VAL_SIZE = 10000
+VAL_PER_SOURCE = 2500
 SEED = 42
 
 
 def main(args=None):
+    val_per_source = VAL_PER_SOURCE
+    if args is not None and getattr(args, "val_per_source", None) is not None:
+        val_per_source = args.val_per_source
+
     print(f"Downloading full dataset from {HF_DATASET_REPO}...")
-    ds = load_dataset(HF_DATASET_REPO, split="train", token=True)
+    ds = load_dataset(HF_DATASET_REPO, split="train", token=True,
+                      download_mode="force_redownload",
+                      verification_mode="no_checks")
     n = len(ds)
     print(f"Total rows: {n:,}")
 
-    # Shuffle with fixed seed so validation is representative of all sources
-    ds = ds.shuffle(seed=SEED)
+    # Stratified split: equal samples per source for balanced validation
+    from collections import Counter
+    source_counts = Counter(ds["source"])
+    print(f"\nSource distribution:")
+    for src, cnt in source_counts.most_common():
+        print(f"  {src}: {cnt:,}")
 
-    val_size = min(VAL_SIZE, int(n * 0.1))
-    train_ds = ds.select(range(n - val_size))
-    val_ds = ds.select(range(n - val_size, n))
+    # Group indices by source
+    source_indices = {}
+    for i, src in enumerate(ds["source"]):
+        source_indices.setdefault(src, []).append(i)
 
-    print(f"Train: {len(train_ds):,} rows")
+    import random
+    rng = random.Random(SEED)
+
+    val_indices = []
+    for src, indices in sorted(source_indices.items()):
+        rng.shuffle(indices)
+        take = min(val_per_source, len(indices))
+        val_indices.extend(indices[:take])
+        print(f"  {src}: taking {take} for validation")
+
+    val_set = set(val_indices)
+    train_indices = [i for i in range(n) if i not in val_set]
+
+    train_ds = ds.select(train_indices)
+    val_ds = ds.select(val_indices)
+
+    print(f"\nTrain: {len(train_ds):,} rows")
     print(f"Validation: {len(val_ds):,} rows")
 
-    # Show source distribution in validation
-    from collections import Counter
     val_sources = Counter(val_ds["source"])
     print(f"\nValidation source distribution:")
     for src, cnt in val_sources.most_common():

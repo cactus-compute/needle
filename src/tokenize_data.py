@@ -75,7 +75,8 @@ def _download_synth_dataset():
     print("Downloading dataset from HuggingFace (Cactus-Compute/tool-calls)...")
     for split in ("train", "validation"):
         try:
-            ds = load_dataset("Cactus-Compute/tool-calls", split=split, token=True)
+            ds = load_dataset("Cactus-Compute/tool-calls", split=split, token=True,
+                              verification_mode="no_checks")
         except Exception as e:
             raise FileNotFoundError(
                 f"Dataset split '{split}' not found on HuggingFace (Cactus-Compute/tool-calls): {e}\n"

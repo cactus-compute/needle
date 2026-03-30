@@ -1,57 +1,144 @@
-Co-Designed Architecture & Training Recipe for Small-Scale Tool Calling
-=======================================================================
+Architecture: Attention-Only Encoder-Decoder
+============================================
 
-## 1. Thesis
+Supports main.txt sections 2.1-2.2, 3.1-3.2.
+Core architectural reasoning for the paper.
 
-No single component is novel in isolation. The contribution is a
-co-designed system: an encoder-decoder architecture trained with a
-multi-objective recipe (generation + contrastive + Matryoshka +
-structured weighting + QAT + pruning) that produces a small model
-competitive with much larger decoder-only models on tool calling.
 
-The architecture choices are interdependent:
-  - We do not need MLPs for tiny models 
-  - Structured loss weighting targets the actual error distribution 
-  - QAT provides regularisation eliminating the need for dropout 
-  - softmax is a nonlinearity, so scaled dot-product attention (softmax(QK^T/√d) · V) is nonlinear. 
+## 1. The No-FFN Argument
 
-----
+We distill Gemini's tool-calling capability into a ~25M parameter
+model. The central architectural bet: the student doesn't need FFN
+because the task it's learning (structured generation from a teacher)
+is retrieval-and-assembly, not reasoning.
 
-Our blocks (with no_feedforward=True) are essentially:                                                                                                                                                                                              
+Four observations:
 
-  # encoder:                                                                                                                                                                                                                             
-  x = x + Attention(Norm(x))
+  (1) Softmax is nonlinear. Each attention layer computes
+      softmax(QK^T/sqrt(d)) * V - a data-dependent nonlinear mixing
+      operation. An MLP transforms features element-wise; attention
+      transforms features by routing information between positions.
+      For a task that IS about routing information (query -> tool
+      alignment), attention is the right primitive.
 
-  # decoder:                                                                                                                                                                                                  
-  x = x + SelfAttn(Norm(x))                                                                                                                                                                                                         
-  x = x + CrossAttn(Norm(x))                                                                                                                                                                                                        
-                                                                                                                                                                                                                                                       
-The residual connection is the only pathway preserving information between layers. 
-Without FFN, there's no nonlinear feature transformation, each layer just incrementally mixes information via attention and adds it back.                        
-                                                                                                                                                                                                                                                      
-The argument for Kimi-style residual bypass here would be: if you remove the residual, each attention layer gets to fully rewrite the representation rather than just adding a delta. 
-In a standard transformer with FFN, the FFN does the heavy "rewriting" work and the attention residual is fine as an additive refinement. 
-But in our attention-only setup, forcing attention into an additive role may be limiting, it can only nudge the representation, never reshape it.                 
-Without FFN and without residuals, we lose the gradient highway entirely. Deep networks would struggle to train. 
-Kimi's technique likely works in models that still have FFN layers (or some other nonlinearity) providing an alternate signal path.
+  (2) Tool calling is structured retrieval-and-assembly. The model
+      must: (a) match query to tool name, (b) extract argument values
+      from the query, (c) assemble valid JSON. All three are about
+      aligning and copying between input and output - exactly what
+      cross-attention does. No step requires per-position feature
+      transformation (which is what FFN provides).
 
-With the gated residual, each line becomes:
+  (3) At small scale, FFN parameters are wasted. ~2/3 of standard
+      transformer parameters are FFN. For a <50M model on a structured
+      task, those parameters contribute less than the same budget spent
+      on more attention layers (deeper cross-attention = better
+      query-tool alignment).
 
-  # gated residual — each sublayer gate is a learnable scalar, initialized to 0
-  # sigmoid(0) = 0.5, so training starts as half-strength standard residual
-  # gate → 1 recovers the standard residual exactly
+  (4) Fewer parameters = faster inference. Removing FFN cuts per-layer
+      parameters by ~2/3, directly reducing the memory bandwidth
+      bottleneck that dominates latency on edge devices.
 
-  # encoder (per layer)
-  g = sigmoid(gate)
-  x = x + g * Attention(Norm(x))
 
-  # decoder (per layer)
+## 2. Block Structure
+
+Encoder block (x12):
+  g = sigmoid(gate)                   # learnable scalar, init=0 -> g=0.5
+  x = x + g * SelfAttn(ZCRMSNorm(x)) # GQA + RoPE + gated residual
+
+Decoder block (x12):
   g_s = sigmoid(self_attn_gate)
   g_c = sigmoid(cross_attn_gate)
+  x = x + g_s * SelfAttn(ZCRMSNorm(x))   # causal, GQA + RoPE
+  x = x + g_c * CrossAttn(ZCRMSNorm(x))  # attends to encoder output
 
-  x = x + g_s * SelfAttn(Norm(x))
-  x = x + g_c * CrossAttn(Norm(x))
+No feedforward, no activation function in the backbone. The only
+nonlinearities are softmax (attention) and sigmoid (gates).
 
-The full residual is always preserved. The gate only scales the sublayer contribution.
-At init (gate=0, g=0.5): half-strength sublayer addition.
-gate → 1 (g=1): standard residual. gate → -inf (g=0): identity, sublayer ignored.
+d=512, 8H/4KV (GQA), tied embeddings, RoPE, BPE 8192.
+
+
+## 3. Gated Residuals
+
+Without FFN, there is no per-position nonlinear rewriting per layer.
+This makes the residual connection design critical:
+
+  Standard residual (x = x + Attn(Norm(x))):
+    Attention can only ADD a delta. Without FFN to do the "rewriting,"
+    forcing attention into a purely additive role is limiting.
+
+  No residual (x = Attn(Norm(x))):
+    Each layer fully rewrites, but we lose the gradient highway. Deep
+    networks (12+ layers) will not train.
+
+  Gated residual (ours):
+    x = x + sigmoid(gate) * Attn(Norm(x))
+
+    Per-sublayer learnable scalar, initialized to 0.
+    sigmoid(0) = 0.5, so training starts with half-strength residual.
+    The model can learn to sharpen useful layers (g->1) or suppress
+    unhelpful ones (g->0) without losing gradient flow.
+
+
+## 4. ZCRMSNorm
+
+  Standard RMSNorm: x * gamma / RMS(x), gamma initialized to 1.
+  ZCRMSNorm:        x * (1 + gamma) / RMS(x), gamma initialized to 0.
+
+At init, ZCRMSNorm is identity-up-to-scale. Pairs with gated
+residuals: at init, the entire block is a damped identity + damped
+normalized attention. No component starts with a strong learned bias.
+From the nGPT / DeepSeek-V3 line of work. Applied to QK heads as
+well (QK-norm) for training stability.
+
+
+## 5. Why Encoder-Decoder
+
+  (a) Bidirectional encoding. Tools are structured objects - a
+      bidirectional encoder sees the full definition at once. A causal
+      model sees it left-to-right and must infer structure from
+      partial context.
+
+  (b) No input tokens in KV cache. Encoder-decoder uses a fixed-size
+      encoder representation for cross-attention, not re-attending the
+      full input at every generation step.
+
+  (c) Natural fit for multi-head design. The encoder output feeds the
+      decoder (generation), contrastive head (tool filtering), and
+      confidence head (cloud routing). Clean separation.
+
+
+## 6. Muon for Attention-Only
+
+Dual optimizer:
+  Muon (Q/K/V/O projections): LR 0.02, WD 0.01
+  AdamW (everything else): LR 3e-4
+
+Without FFN, the model is a deep stack of linear projections with
+softmax routing. Muon enforces orthogonality on weight updates via
+Newton-Schulz, preventing the representation collapse that can happen
+when stacking many linear layers without interleaving nonlinearities.
+
+
+## 7. Token-Level Loss Weighting
+
+Cross-entropy with structured weighting:
+  - Base (JSON structure): 1.0
+  - Tool name tokens: 2.0
+  - Argument key tokens: 1.5
+  - Argument value tokens: 4.0
+
+The model achieves ~99% JSON parse rate early in training. The actual
+errors are VALUES > NAMES > KEYS > structure. Weighting matches the
+error distribution.
+
+Auxiliary: z-loss for logit stability, contrastive loss at 0.1x.
+
+
+## 8. Ablations (maps to main.txt 4.4)
+
+  A. FFN vs No-FFN [MUST-HAVE - this is the paper]
+  B. Gated vs Standard vs No Residual [MUST-HAVE]
+  C. Encoder-Decoder vs Decoder-Only [MUST-HAVE]
+  D. Gate Value Analysis [STRONG]
+  E. Depth vs Width Scaling [STRONG]
+  F. Token-Level Weight Ablation [STRONG]

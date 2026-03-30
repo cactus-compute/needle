@@ -1,327 +1,116 @@
-Contrastive Tool Selection via Shared Encoder
-==============================================
+Tool Selection: Contrastive Filtering and Constrained Decoding
+==============================================================
+
+Supports main.txt sections 2.3, 2.5.
+Two mechanisms that narrow the output space: filtering tools before
+generation, constraining tokens during generation.
+
 
 ## 1. Problem
 
-Tool-calling models receive a set of tool definitions in-context and must
-select the right tool(s) for a given query. Two challenges:
-
-  (a) Context window pressure: with 1024 encoder tokens, fitting many
-      tool definitions alongside the query is tight. Real APIs can have
-      50-200 endpoints — they simply don't fit.
-
-  (b) Selection from large catalogs: even if tools fit, the model must
-      discriminate between semantically similar tools (e.g.,
-      search_flights vs search_hotels vs search_restaurants). This is a
-      retrieval problem, not a generation problem.
-
-  (C) The model generates JSON tool calls autoregressively. While it learns
-      JSON structure well (99-100% parse rate), it can still hallucinate
-      invalid function names or argument keys. The valid tool definitions are
-      already in the encoder input — we can constrain the decoder to only
-      produce valid names/keys at inference time.
-
-The standard approach is a separate retrieval model (e.g., embedding API)
-to pre-filter tools before passing them to the generator. This adds a
-second model, a second inference pass, and a mismatch between the
-representations used for retrieval and generation.
-
-## 2. Key Insight: Shared Encoder, Dual Use
-
-Our encoder already processes both queries and tool definitions during
-generation (encoder input = [query | <tools> | tools...]). The same
-encoder representations that attend to tools during generation can be
-repurposed for retrieval by adding a lightweight contrastive head.
-
-Architecture:
-
-  ┌─────────────┐     ┌─────────────┐
-  │  "What is   │     │ {"name":    │
-  │  the weather│     │ "get_weather│
-  │  in SF?"    │     │  "params":  │
-  │             │     │  {"location"│
-  └──────┬──────┘     │  : "string"}│
-         │            │  }          │
-         ▼            └──────┬──────┘
-  ┌──────────────┐           │
-  │              │           │
-  │   Shared     │◄──────────┘
-  │   Encoder    │
-  │   (8 layers) │
-  │              │
-  └──────┬───────┘
-         │
-    ┌────┴────┐
-    │         │
-    ▼         ▼
-  ┌─────┐  ┌─────────┐
-  │Mean │  │Contras- │
-  │Pool │  │tive     │
-  │     │  │Proj     │
-  └──┬──┘  │(d→128)  │
-     │     └────┬────┘
-     │          │
-     ▼          ▼
-  (d_model)  (128-d, L2-normalized)
-     │          │
-     ▼          ▼
-  Cross-     Cosine similarity
-  attention  for retrieval
-  in decoder
-
-The contrastive projection head is a single linear layer (d_model → 128)
-followed by L2 normalization. It's trained with CLIP-style symmetric
-cross-entropy loss: in each batch, the B queries are paired with B
-positive tools, and the B²-B in-batch negatives provide contrastive signal.
-
-This means:
-  - No separate retrieval model — same encoder, same parameters
-  - Retrieval representations are grounded in the same space used for
-    generation — what the encoder learns for cross-attention also helps
-    distinguish tools
-  - The contrastive head adds <0.01% parameters (one 512×128 matrix)
-
-
-## 3. Training Details
-
-CLIP-style loss with learnable temperature:
-
-  loss = 0.5 * (CE(q·t^T/τ, labels) + CE(t·q^T/τ, labels))
-
-  - q, t ∈ R^{B×128}, L2-normalized
-  - τ = exp(log_temp), clamped to [1/100, 100]
-  - labels = arange(B) (diagonal is positive)
-  - In-batch negatives: B-1 negatives per query, free
-
-Training schedule:
-  - Contrastive loss weighted at 0.1× text loss
-  - Computed every 100 steps (not every step — saves compute, contrastive
-    signal is less noisy so doesn't need per-step updates)
-  - Uses the same encoder parameters as text generation (shared, not frozen)
-
-Data construction:
-  - Each training example has a query, a list of tools, and the answer
-    (which tools were called)
-  - For contrastive training: extract (query, positive_tool) pairs where
-    positive_tool is any tool that was actually called
-  - Each query may have multiple positives; one is randomly sampled per batch
-  - Individual tools are tokenized separately (max 256 tokens each)
+  (a) Context pressure: 1024 encoder tokens, real deployments have
+      50-200 tools - they don't fit.
+  (b) Structural validity: the model can hallucinate invalid function
+      names or argument keys despite high JSON parse rates.
 
 
-## 4. Inference Pipeline
+## 2. Contrastive Head (Tool Filtering)
 
-Two-stage inference for large catalogs:
+Real deployments have too many tools for the context window. Rather
+than adding a separate retrieval model, we reuse the encoder: a
+lightweight MLP projects mean-pooled encoder output into a contrastive
+space for tool ranking.
 
-  Stage 1 — Retrieval:
-    encode_contrastive(query) → q_emb (128-d)
-    encode_contrastive(tools)  → t_embs (N×128)
-    scores = q_emb @ t_embs.T
-    top_k = argsort(-scores)[:k]
+  encoder -> mean_pool -> Dense(d_model/4) -> ReLU -> Dense(128) -> L2-norm
 
-  Stage 2 — Generation:
-    encoder_input = [query | <tools> | top_k_tools]
-    decoder generates tool calls with only the selected tools in context
+CLIP-style training (0.1x weight, every 1000 steps, in-batch
+negatives, learnable temperature). At inference: encode query and
+candidate tools, rank by cosine similarity, pass only top-k to the
+encoder for generation.
 
-This naturally handles the context window constraint: even with 200
-available tools, we retrieve top-5 and fit them easily in 1024 tokens.
-The retrieval and generation use the same encoder weights, so what the
-retrieval stage selects is precisely what the generation stage can
-attend to effectively.
+  - No separate retrieval model - same encoder, same parameters
+  - Tool embeddings can be precomputed and cached
+  - Contrastive head adds <0.1% parameters
+  - For small catalogs (<=5 tools): skip retrieval, pass all directly
 
-For small catalogs (≤5 tools): skip retrieval, pass all tools directly.
-The contrastive head is never used at inference in this case — it was
-only useful as a training regularizer (the shared representations
-benefit generation even without explicit retrieval).
-
 
-## 5. Why This Design
+## 3. Why MLP Instead of Linear Projection
 
-### vs. Separate retrieval model (e.g., embed API + generator)
-  - One model instead of two → simpler deployment, less memory
-  - Shared representations → retrieval is aligned with generation
-  - No train/inference distribution shift between retriever and generator
+Our encoder has NO feedforward layers. The only nonlinearities are
+softmax (attention) and sigmoid (gates). A linear contrastive
+projection can only rotate and scale the mean-pooled representation.
 
-### vs. Stuffing all tools in context
-  - Doesn't scale: 50 tools × ~50 tokens each = 2500 tokens, exceeds
-    1024 encoder context
-  - Even if they fit, attention over many irrelevant tools dilutes signal
-  - Retrieval pre-filtering gives the generator a clean, focused context
+In a standard transformer with FFN, the encoder output has been through
+N layers of nonlinear per-position processing - a linear projection
+often suffices. In our pure-attention encoder, the output has been mixed
+extensively but never nonlinearly transformed per-position.
 
-### vs. Fine-tuning a separate contrastive model
-  - The encoder is already "seeing" tools during generation training
-  - Adding a projection head extracts what it already knows
-  - Multi-task learning: contrastive loss acts as regularizer for the
-    encoder, improving generation even on in-context tools
+The MLP provides the per-position nonlinearity that the encoder lacks,
+specifically for the retrieval task. Same argument applies to the
+confidence head (cloud-fallback.txt section 3).
 
-### The regularization effect
-  Even when retrieval isn't used at inference (small catalogs), the
-  contrastive objective during training forces the encoder to build
-  discriminative representations of tools. This helps cross-attention
-  in the decoder: the encoder outputs for each tool are more distinct,
-  making it easier for the decoder to attend to the right tool.
 
+## 4. Constrained Decoding
 
-## 6. Experiment Design
+After filtering selects top-k tools, the decoder generates tool calls.
+We enforce structural validity via character-level trie-based logit
+masking:
 
-### Exp 1: Retrieval Quality [MUST-HAVE]
+A JSON state machine tracks position in the output:
+  - IN_NAME: constrain to valid tool names
+  - IN_KEY: constrain to valid parameter names per selected tool
+  - IN_VALUE: unconstrained
 
-Setup:
-  - Validation set, each example has query + tools + ground truth calls
-  - Encode query and all tools from that example contrastively
-  - Rank tools by cosine similarity, check if positive tools are in top-k
+Character-level (not token-level) because BPE tokens don't align with
+name boundaries. "get_weather" might tokenize as ["get", "_we", "ather"]
+or ["get_", "weather"]. Character-level trie works regardless of
+tokenization.
 
-Metrics:
-  | k   | Recall@k |
-  |-----|----------|
-  | 1   |          |
-  | 3   |          |
-  | 5   |          |
-  | 10  |          |
+Guarantees syntactically valid output with zero accuracy cost.
 
-  Also report MRR (mean reciprocal rank of first positive).
 
-Stratify by:
-  - Number of tools per example (harder with more tools)
-  - Number of positive tools (multi-call examples)
+## 5. The Funnel
 
-What this shows:
-  - The shared encoder produces discriminative tool representations
-  - Recall@5 should be very high (>95%) — retrieval is nearly solved
+Filtering and constrained decoding are complementary stages:
 
+  200 tools -> contrastive filter top-5 -> encode 5 tools
+  -> constrain to 5 names -> constrain to valid params per name
+  -> free-form values
 
-### Exp 2: Ablation — Generation Quality With vs Without Contrastive [MUST-HAVE]
+Each stage narrows the output space. The model's actual "choice" is
+just: which of 5 tools to call, and what values to fill in.
 
-Setup:
-  - Train two models: with contrastive loss (λ=0.1) and without (λ=0)
-  - Same architecture, same data, same hyperparameters otherwise
-  - Evaluate generation metrics on val set (no retrieval at inference)
 
-Metrics:
-  | Condition        | name_f1 | call_f1 | exact_match | value_acc |
+## 6. vs. Alternatives
 
-Hypothesis:
-  - Even without using retrieval at inference, the contrastive-trained
-    model should have better name_f1 and call_f1
-  - The regularization effect: contrastive loss forces discriminative
-    encoder representations → better cross-attention → better generation
+  vs. Separate retrieval model:
+    One model, shared representations, no distribution shift.
 
-What this shows:
-  - Contrastive learning isn't just for retrieval — it improves generation
-  - This is the key insight: one objective helps two tasks
+  vs. Stuffing all tools in context:
+    50 tools x ~50 tokens = 2500 tokens, exceeds 1024 context.
+    Even if they fit, attention dilution over irrelevant tools.
 
 
-### Exp 3: Retrieve-then-Generate vs Full Context [MUST-HAVE]
+## 7. Ablations (maps to main.txt 4.4-4.5)
 
-Setup:
-  - Create synthetic scenarios with large tool catalogs (20, 50, 100 tools)
-    by combining tools from multiple validation examples
-  - Three conditions:
-      (a) All tools in context (may truncate)
-      (b) Top-5 retrieved tools in context
-      (c) Oracle top-5 (ground truth positive tools + random negatives)
+  A. Retrieval Quality [MUST-HAVE]
+     Recall@k, MRR. Stratify by tool count.
 
-Metrics:
-  | Condition      | 20 tools      | 50 tools      | 100 tools     |
-  |                | name_f1 call_f1| name_f1 call_f1| name_f1 call_f1|
-  |----------------|---------------|---------------|---------------|
-  | All in context |               |               |               |
-  | Retrieved top-5|               |               |               |
-  | Oracle top-5   |               |               |               |
+  B. With vs Without Contrastive [MUST-HAVE]
+     lambda=0.1 vs lambda=0, generation metrics only (no retrieval
+     at inference). Tests whether contrastive training helps the
+     encoder build more discriminative tool representations.
 
-Hypothesis:
-  - With 20 tools: "all in context" works but retrieved is comparable
-  - With 50+ tools: "all in context" degrades (truncation, attention dilution)
-  - Retrieved top-5 stays close to oracle → retrieval solves the scaling problem
+  C. Retrieve-then-Generate vs Full Context [MUST-HAVE]
+     Synthetic large catalogs (20, 50, 100 tools).
+     All-in-context vs retrieved top-5 vs oracle top-5.
 
-What this shows:
-  - Retrieval is necessary for real-world tool catalogs
-  - The gap between retrieved and oracle quantifies retrieval errors
-  - The gap between all-context and retrieved quantifies context pressure
+  D. Constrained vs Unconstrained Decoding [MUST-HAVE]
+     Unconstrained vs name-only vs full constraint.
 
-
-### Exp 4: Contrastive Loss Weight Sweep [STRONG]
-
-Setup:
-  - Train models with λ ∈ {0, 0.01, 0.05, 0.1, 0.2, 0.5}
-  - Evaluate both retrieval (Recall@k) and generation (call_f1)
-
-Metrics (line plot, x=λ):
-  - Recall@5 (retrieval quality)
-  - call_f1 (generation quality)
-
-Hypothesis:
-  - λ=0: no retrieval capability, generation baseline
-  - λ=0.01-0.1: retrieval improves rapidly, generation also improves
-  - λ>0.2: retrieval saturates, generation may degrade (contrastive
-    objective starts dominating, encoder optimizes for discrimination
-    over representation)
-
-What this shows:
-  - Sweet spot exists where both tasks benefit
-  - Justifies λ=0.1 as default
-
-
-### Exp 5: Embedding Space Visualization [STRONG]
-
-Setup:
-  - Encode 500 queries and their associated tools
-  - Project to 2D via t-SNE or UMAP
-  - Color by: tool category / query intent / positive vs negative
-
-Presentation:
-  - Scatter plot showing query-tool alignment
-  - Highlight clusters where similar tools group together
-  - Show queries landing near their positive tools
-
-What this shows:
-  - Visual evidence that the shared space is semantically meaningful
-  - Queries and their positive tools are close; negatives are far
-  - Tool clusters correspond to functional categories
-
-
-### Exp 6: Retrieval Latency [STRONG]
-
-Setup:
-  - Measure time to encode and retrieve from catalogs of varying size
-  - Compare: our model's encode_contrastive vs. a separate embedding API
-
-Metrics:
-  | Catalog size | Encode time | Retrieval time | Total |
-
-What this shows:
-  - Retrieval adds negligible latency (single encoder pass + matmul)
-  - Amortization: tool embeddings can be precomputed and cached
-  - No network round-trip to a separate embedding service
-
-
-### Exp 7: Contrastive Frequency Ablation [NICE-TO-HAVE]
-
-Setup:
-  - Vary how often contrastive loss is computed: every step, every 10,
-    every 100 (current), every 500
-  - Same total training budget
-
-Metrics:
-  - Recall@5 convergence curve
-  - Final call_f1
-
-What this shows:
-  - Contrastive signal is low-noise, doesn't need per-step updates
-  - Every-100 is sufficient (saves ~50% of contrastive compute)
-  - Justifies the design choice
-
-
-### Priority
-
-Must-have (core claims):
-  1. Retrieval quality (Exp 1) — proves it works
-  2. Ablation: with/without contrastive (Exp 2) — proves dual benefit
-  3. Retrieve-then-generate scaling (Exp 3) — proves necessity
-
-Strong additions:
-  4. Loss weight sweep (Exp 4) — justifies hyperparameter
-  5. Embedding visualization (Exp 5) — intuition and visual appeal
-  6. Retrieval latency (Exp 6) — practical deployment story
-
-Nice-to-have:
-  7. Contrastive frequency ablation (Exp 7) — training efficiency
+  E. Linear vs MLP Head [STRONG]
+     Tests whether head nonlinearity matters more for attention-only
+     encoder.
+
+  F. Contrastive Weight Sweep [STRONG]
+     lambda in {0, 0.01, 0.05, 0.1, 0.2, 0.5}.

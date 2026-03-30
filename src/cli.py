@@ -122,6 +122,8 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="Preview without modifying")
 
     p = sub.add_parser("split-dataset", add_help=False)
+    p.add_argument("--val-per-source", type=int, default=None,
+                   help="Validation samples per source (default: 2500)")
 
     p = sub.add_parser("evaluate", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
