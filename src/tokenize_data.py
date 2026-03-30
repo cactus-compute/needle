@@ -70,13 +70,12 @@ def _clear_local_caches():
 
 def _download_synth_dataset():
     """Download synthesized tool-calling dataset (train + validation) from HuggingFace."""
-    from datasets import load_dataset
+    from .data import download_hf_split
 
     print("Downloading dataset from HuggingFace (Cactus-Compute/tool-calls)...")
     for split in ("train", "validation"):
         try:
-            ds = load_dataset("Cactus-Compute/tool-calls", split=split, token=True,
-                              verification_mode="no_checks")
+            ds = download_hf_split(split)
         except Exception as e:
             raise FileNotFoundError(
                 f"Dataset split '{split}' not found on HuggingFace (Cactus-Compute/tool-calls): {e}\n"

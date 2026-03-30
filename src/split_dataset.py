@@ -12,11 +12,8 @@ import os
 import shutil
 import tempfile
 
-from datasets import load_dataset
-
-
 HF_DATASET_REPO = "Cactus-Compute/tool-calls"
-VAL_PER_SOURCE = 2500
+VAL_PER_SOURCE = 2000
 SEED = 42
 
 
@@ -25,10 +22,9 @@ def main(args=None):
     if args is not None and getattr(args, "val_per_source", None) is not None:
         val_per_source = args.val_per_source
 
-    print(f"Downloading full dataset from {HF_DATASET_REPO}...")
-    ds = load_dataset(HF_DATASET_REPO, split="train", token=True,
-                      download_mode="force_redownload",
-                      verification_mode="no_checks")
+    print(f"Downloading full dataset from {HF_DATASET_REPO} (train split only)...")
+    from .data import download_hf_split
+    ds = download_hf_split("train", HF_DATASET_REPO)
     n = len(ds)
     print(f"Total rows: {n:,}")
 

@@ -236,8 +236,9 @@ def main(args):
         ds = load_from_disk(local)
         print(f"Loaded existing dataset: {len(ds)} rows")
     else:
+        from .data import download_hf_split
         print(f"Downloading from {HF_DATASET_REPO}...")
-        ds = load_dataset(HF_DATASET_REPO, split="train", token=True)
+        ds = download_hf_split("train", HF_DATASET_REPO)
         os.makedirs(local, exist_ok=True)
         ds.save_to_disk(local)
         print(f"Downloaded: {len(ds)} rows")

@@ -18,7 +18,7 @@ import os
 import random
 from collections import Counter
 
-from datasets import Dataset, concatenate_datasets, load_dataset
+from datasets import Dataset, concatenate_datasets
 from tqdm import tqdm
 
 HF_REPO = "Cactus-Compute/tool-calls"
@@ -64,8 +64,9 @@ def _trim_tools(tools_str, called_names, target_n, rng):
 
 
 def rebalance(dry_run=False):
+    from .data import download_hf_split
     print(f"Loading dataset from {HF_REPO}...")
-    ds = load_dataset(HF_REPO, split="train", token=True)
+    ds = download_hf_split("train", HF_REPO)
     print(f"Loaded {len(ds):,} examples")
 
     rng = random.Random(42)

@@ -16,6 +16,43 @@ from datasets import Audio, Dataset, load_from_disk
 from tqdm import tqdm
 import sentencepiece as spm
 
+HF_DATASET_REPO = "Cactus-Compute/tool-calls"
+
+
+def download_hf_split(split="train", repo_id=HF_DATASET_REPO):
+    """Download a dataset split from HuggingFace by reading parquet directly.
+
+    Bypasses load_dataset() which can fail when the repo README schema
+    doesn't match the actual parquet columns (e.g. after adding 'language').
+    """
+    from huggingface_hub import HfApi, hf_hub_download
+    import pyarrow.parquet as pq
+
+    api = HfApi()
+    files = api.list_repo_files(repo_id, repo_type="dataset", token=True)
+    prefix = f"data/{split}-"
+    parquet_files = sorted(f for f in files if f.startswith(prefix) and f.endswith(".parquet"))
+
+    if not parquet_files:
+        raise FileNotFoundError(
+            f"No parquet files found for split '{split}' in {repo_id} "
+            f"(looked for {prefix}*.parquet)"
+        )
+
+    tables = []
+    for pf in parquet_files:
+        local = hf_hub_download(repo_id=repo_id, filename=pf,
+                                repo_type="dataset", token=True)
+        tables.append(pq.read_table(local))
+
+    if len(tables) == 1:
+        table = tables[0]
+    else:
+        import pyarrow as pa
+        table = pa.concat_tables(tables)
+
+    return Dataset(table)
+
 import re as _re
 
 def to_snake_case(name):
@@ -216,9 +253,8 @@ def _load_split_dataset(split="train"):
             print(f"Warning: failed to load from {local_dir}: {e}")
 
     try:
-        from datasets import load_dataset as _hf_load
-        print(f"Downloading {hf_split} split from HuggingFace (Cactus-Compute/tool-calls)...")
-        ds = _hf_load("Cactus-Compute/tool-calls", split=hf_split, token=True)
+        print(f"Downloading {hf_split} split from HuggingFace ({HF_DATASET_REPO})...")
+        ds = download_hf_split(hf_split)
         os.makedirs(local_dir, exist_ok=True)
         ds.save_to_disk(local_dir)
         print(f"Loaded from HuggingFace -> {local_dir} ({len(ds)} rows)")

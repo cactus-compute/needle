@@ -25,8 +25,9 @@ def load_existing():
         ds = load_from_disk(local)
         print(f"Loaded existing dataset from disk: {len(ds)} rows")
     else:
+        from .data import download_hf_split
         print(f"Downloading existing dataset from {HF_DATASET_REPO}...")
-        ds = load_dataset(HF_DATASET_REPO, split="train", token=True)
+        ds = download_hf_split("train", HF_DATASET_REPO)
         print(f"Downloaded: {len(ds)} rows")
     return ds
 
