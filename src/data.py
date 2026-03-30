@@ -392,7 +392,7 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
             user_defined_symbols=["<tool_call>", "<tools>"],
             byte_fallback=True,
             normalization_rule_name="identity",
-            num_threads=min(64, max(1, (os.cpu_count() or 1) // 2)),
+            num_threads=min(128, max(1, (os.cpu_count() or 1) * 3 // 4)),
             train_extremely_large_corpus=False,
             minloglevel=2,
         )
@@ -523,6 +523,20 @@ def _load_cache_metadata(split):
     return None
 
 
+def _compact_json(s):
+    """Compact a JSON string (remove whitespace). Picklable for multiprocessing."""
+    try:
+        return _json.dumps(_json.loads(s), separators=(",", ":"))
+    except (ValueError, TypeError):
+        return s
+
+
+def _shuffle_tools_worker(args):
+    """Shuffle tools JSON. Picklable for multiprocessing."""
+    seed, tools_str = args
+    return _shuffle_tools_json(tools_str, seed=seed)
+
+
 def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_dec_len=DEFAULT_MAX_DEC_LEN,
                             w_name=3.0, w_value=2.0, w_key=1.5, shuffle_tools=True):
     """Prepare tool-call encoder-decoder pairs with <tool_call> task token.
@@ -547,24 +561,24 @@ def prepare_tool_call_pairs(ds, tokenizer, max_enc_len=DEFAULT_MAX_ENC_LEN, max_
     tools_texts = [ex["tools"] for ex in ds]
     ans_texts = [ex["answers"] for ex in ds]
 
-    def _compact(s):
-        try:
-            return _json.dumps(_json.loads(s), separators=(",", ":"))
-        except (ValueError, TypeError):
-            return s
+    n = len(ds)
+    num_workers = min(128, max(1, (os.cpu_count() or 1) * 3 // 4))
+    model_path = TOKENIZER_PREFIX + ".model"
+    chunk_size = max(1, n // (num_workers * 4))
 
     print("  Compacting JSON and preparing texts...")
-    ans_texts = [_compact(a) for a in ans_texts]
-    tools_texts = [_compact(t) for t in tools_texts]
+    with mp.Pool(num_workers) as pool:
+        ans_texts = list(tqdm(pool.imap(_compact_json, ans_texts, chunksize=chunk_size),
+                              total=n, desc="  Compacting answers"))
+        tools_texts = list(tqdm(pool.imap(_compact_json, tools_texts, chunksize=chunk_size),
+                                total=n, desc="  Compacting tools"))
     tool_counts = np.array([_count_tool_calls(a) for a in ans_texts], dtype=np.int32)
 
     if shuffle_tools:
-        tools_texts = [_shuffle_tools_json(t, seed=i) for i, t in enumerate(tools_texts)]
-
-    n = len(ds)
-    num_workers = min(64, max(1, (os.cpu_count() or 1) // 2))
-    model_path = TOKENIZER_PREFIX + ".model"
-    chunk_size = max(1, n // (num_workers * 4))
+        shuffle_args = list(enumerate(tools_texts))
+        with mp.Pool(num_workers) as pool:
+            tools_texts = list(tqdm(pool.imap(_shuffle_tools_worker, shuffle_args, chunksize=chunk_size),
+                                    total=n, desc="  Shuffling tools"))
 
     # Tokenize all three fields in a single pool
     all_texts = enc_texts + tools_texts + ans_texts
