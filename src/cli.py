@@ -126,6 +126,12 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="Skip upload")
     p.add_argument("--max-samples", type=int, default=None, help="Limit xlam samples")
 
+    p = sub.add_parser("translate-xlam", add_help=False)
+    p.add_argument("--max-samples", type=int, default=None, help="Limit examples to translate")
+    p.add_argument("--workers", type=int, default=8, help="Parallel Gemini calls")
+    p.add_argument("--model", type=str, default=None, help="Gemini model for translation")
+    p.add_argument("--dry-run", action="store_true", help="Translate only, skip save/upload")
+
     p = sub.add_parser("rebalance-tools", add_help=False)
     p.add_argument("--dry-run", action="store_true", help="Preview without modifying")
 
@@ -201,6 +207,11 @@ def main():
     elif args.command == "merge-xlam":
         from .merge_xlam import main as merge_main
         merge_main(args)
+    elif args.command == "translate-xlam":
+        from .translate_xlam import main as translate_main, MODEL as _TMODEL
+        if args.model is None:
+            args.model = _TMODEL
+        translate_main(args)
     elif args.command == "rebalance-tools":
         from .rebalance_tools import main as rebalance_main
         rebalance_main(args)
