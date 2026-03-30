@@ -8,6 +8,10 @@ where a French speaker's message content is also in French. Structured values
 (tool names, param keys, contact_ids, enum choices, booleans, numbers) stay
 unchanged.
 
+Examples are batched (default 10 per Gemini call) and grouped by language for
+efficiency — ~60k xlam × 24 languages = ~1.4M rows in ~144k API calls instead
+of 1.4M.
+
 Usage:
     python -m src.translate_xlam                           # translate + upload
     python -m src.translate_xlam --dry-run                 # translate only
@@ -51,9 +55,6 @@ _KEEP_ENGLISH = frozenset({
     "site", "username", "email", "to", "cc", "bcc",
     "phone", "phone_number", "js",
 })
-
-# Param types that should never be translated
-_KEEP_TYPES = frozenset({"number", "boolean"})
 
 # Enum-like params where the value is from a fixed set — keep as-is
 _ENUM_HINTS = frozenset({
@@ -119,50 +120,83 @@ def _should_translate_param(pname, pval):
     return True
 
 
-def _build_translation_prompt(query, translatable_args, language):
-    """Build a prompt to translate query + arg values in one shot."""
-    payload = {"query": query}
-    for i, (call_idx, pname, pval) in enumerate(translatable_args):
-        payload[f"arg_{i}"] = pval
+def _extract_translatable(example):
+    """Extract query + translatable arg values from an example.
 
-    return f"""Translate the following JSON values from English to {language}.
-
-RULES:
-- Translate ONLY the values, not the keys
-- Use natural, native-sounding {language} — not literal word-for-word translation
-- Use culturally appropriate names, places, and expressions where relevant
-- Keep proper nouns (brand names, app names) unchanged
-- Keep numbers, dates, and times in their original format
-- If a value is already a single common word that works in {language}, keep it
-- Return ONLY valid JSON with the same keys
-
-INPUT:
-{json.dumps(payload, ensure_ascii=False)}
-
-OUTPUT (valid JSON only, no markdown):"""
-
-
-def translate_example(client_pool, example, language, model):
-    """Translate a single example's query and free-text argument values."""
-    query = example["query"]
+    Returns (query, translatable_args) where translatable_args is a list of
+    (call_idx, param_name, param_value) tuples.
+    """
     answers = json.loads(example["answers"])
-    tools = example["tools"]  # pass through unchanged
-
-    # Collect translatable argument values
-    translatable_args = []  # (call_idx, param_name, param_value)
+    translatable_args = []
     for call_idx, call in enumerate(answers):
         args = call.get("arguments", {})
         for pname, pval in args.items():
             if _should_translate_param(pname, pval):
                 translatable_args.append((call_idx, pname, pval))
+    return example["query"], translatable_args
 
-    # Build and send translation prompt
-    prompt = _build_translation_prompt(query, translatable_args, language)
+
+def _apply_translation(example, translated_item, language):
+    """Apply a translated payload back onto an example."""
+    answers = json.loads(example["answers"])
+    query = example["query"]
+
+    new_query = translated_item.get("query", query)
+
+    # Reconstruct translatable_args to map arg_N keys back
+    _, translatable_args = _extract_translatable(example)
+    new_answers = json.loads(json.dumps(answers))  # deep copy
+    for i, (call_idx, pname, _) in enumerate(translatable_args):
+        key = f"arg_{i}"
+        if key in translated_item:
+            new_answers[call_idx]["arguments"][pname] = translated_item[key]
+
+    return {
+        "query": new_query,
+        "tools": example["tools"],
+        "answers": json.dumps(new_answers, separators=(",", ":"), ensure_ascii=False),
+        "source": "xlam-translated",
+        "model": example.get("_model_tag", ""),
+        "language": language,
+    }
+
+
+def translate_batch(client_pool, examples, language, model):
+    """Translate a batch of examples into a single language in one Gemini call.
+
+    Packs all examples into one JSON array prompt, gets back a translated array.
+    Returns list of translated example dicts (may be shorter than input on errors).
+    """
+    # Build batch payload: list of {query, arg_0, arg_1, ...} per example
+    batch_payload = []
+    for ex in examples:
+        query, translatable_args = _extract_translatable(ex)
+        item = {"query": query}
+        for i, (_, _, pval) in enumerate(translatable_args):
+            item[f"arg_{i}"] = pval
+        batch_payload.append(item)
+
+    prompt = f"""Translate each JSON object's values from English to {language}.
+
+RULES:
+- Translate ONLY the string values, not the keys
+- Use natural, native-sounding {language} — not literal word-for-word translation
+- Use culturally appropriate names, places, and expressions where relevant
+- Keep proper nouns (brand names, app names) unchanged
+- Keep numbers, dates, and times in their original format
+- If a value is already a single common word that works in {language}, keep it
+- Return a JSON array with the SAME number of objects in the SAME order
+- Each object must have the SAME keys as the input — only values change
+
+INPUT ({len(batch_payload)} items):
+{json.dumps(batch_payload, ensure_ascii=False)}
+
+OUTPUT (valid JSON array, no markdown, {len(batch_payload)} items):"""
 
     client = client_pool.get()
     response = client.models.generate_content(
         model=model, contents=prompt,
-        config={"temperature": 0.3, "max_output_tokens": 4096},
+        config={"temperature": 0.3, "max_output_tokens": 16384},
     )
 
     text = response.text.strip()
@@ -171,37 +205,23 @@ def translate_example(client_pool, example, language, model):
     if text.endswith("```"):
         text = text[:-3]
 
-    translated = json.loads(text.strip())
+    translated_batch = json.loads(text.strip())
+    if not isinstance(translated_batch, list):
+        return []
 
-    # Apply translations
-    new_query = translated.get("query", query)
-
-    new_answers = json.loads(json.dumps(answers))  # deep copy
-    for i, (call_idx, pname, _) in enumerate(translatable_args):
-        key = f"arg_{i}"
-        if key in translated:
-            new_answers[call_idx]["arguments"][pname] = translated[key]
-
-    return {
-        "query": new_query,
-        "tools": tools,
-        "answers": json.dumps(new_answers, separators=(",", ":"), ensure_ascii=False),
-        "source": "xlam-translated",
-        "model": f"{model}-translate",
-        "language": language,
-    }
-
-
-def translate_batch(client_pool, examples, languages, model):
-    """Translate a batch of examples, round-robin across languages."""
+    # Apply translations back to examples
     results = []
-    for i, ex in enumerate(examples):
-        lang = languages[i % len(languages)]
+    model_tag = f"{model}-translate"
+    for ex, translated_item in zip(examples, translated_batch):
+        if not isinstance(translated_item, dict):
+            continue
+        ex_with_tag = {**ex, "_model_tag": model_tag}
         try:
-            translated = translate_example(client_pool, ex, lang, model)
-            results.append(translated)
+            result = _apply_translation(ex_with_tag, translated_item, language)
+            results.append(result)
         except Exception:
-            pass  # skip failures silently
+            continue
+
     return results
 
 
@@ -240,43 +260,68 @@ def main(args):
             "answers": xlam_ds[i]["answers"],
         })
 
-    # Shuffle languages for each pass to get even distribution
+    # Assign languages round-robin and shuffle to decorrelate from xlam order
     rng = random.Random(42)
-    lang_assignments = []
-    for i in range(len(examples)):
-        lang_assignments.append(LANGUAGES[i % len(LANGUAGES)])
-    # Shuffle to avoid correlating language with xlam ordering
+    lang_assignments = [LANGUAGES[i % len(LANGUAGES)] for i in range(len(examples))]
     combined = list(zip(examples, lang_assignments))
     rng.shuffle(combined)
     examples, lang_assignments = zip(*combined)
     examples, lang_assignments = list(examples), list(lang_assignments)
 
-    # Translate in parallel
+    batches = []  
+    lang_buckets = {}
+    for ex, lang in zip(examples, lang_assignments):
+        if lang not in lang_buckets:
+            lang_buckets[lang] = []
+        lang_buckets[lang].append(ex)
+        if len(lang_buckets[lang]) >= args.batch_size:
+            batches.append((lang, lang_buckets[lang]))
+            lang_buckets[lang] = []
+    
+    for lang, remaining in lang_buckets.items():
+        if remaining:
+            batches.append((lang, remaining))
+
+    rng.shuffle(batches)  
+    total_examples = sum(len(b) for _, b in batches)
+    print(f"Prepared {len(batches)} batches ({total_examples} examples, batch_size={args.batch_size})")
+
+    # Translate in parallel — one future per batch
     translated = []
-    failed = 0
-    pbar = tqdm(total=len(examples), desc="Translating", unit="ex")
+    failed_batches = 0
+    failed_examples = 0
+    pbar = tqdm(total=len(batches), desc="Translating", unit="batch")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {}
-        for i, (ex, lang) in enumerate(zip(examples, lang_assignments)):
-            f = pool.submit(translate_example, client_pool, ex, lang, args.model)
-            futures[f] = i
+        for i, (lang, batch_examples) in enumerate(batches):
+            f = pool.submit(translate_batch, client_pool, batch_examples, lang, args.model)
+            futures[f] = (i, len(batch_examples))
 
         for f in concurrent.futures.as_completed(futures):
+            batch_idx, batch_len = futures[f]
             try:
-                result = f.result()
-                translated.append(result)
-            except Exception as e:
-                failed += 1
+                results = f.result()
+                translated.extend(results)
+                if len(results) < batch_len:
+                    failed_examples += batch_len - len(results)
+            except Exception:
+                failed_batches += 1
+                failed_examples += batch_len
             pbar.update(1)
-            pbar.set_postfix(translated=len(translated), failed=failed)
+            pbar.set_postfix(
+                translated=len(translated),
+                failed_batches=failed_batches,
+                failed_ex=failed_examples,
+            )
 
     pbar.close()
 
     # Stats
     from collections import Counter
     lang_counts = Counter(ex["language"] for ex in translated)
-    print(f"\nTranslated {len(translated)} examples ({failed} failed)")
+    print(f"\nTranslated {len(translated)} examples "
+          f"({failed_batches} failed batches, {failed_examples} failed examples)")
     print(f"Language distribution: {dict(lang_counts.most_common())}")
 
     # Show samples
@@ -363,6 +408,6 @@ if __name__ == "__main__":
     p.add_argument("--max-samples", type=int, default=None, help="Limit examples to translate")
     p.add_argument("--workers", type=int, default=8, help="Parallel Gemini calls")
     p.add_argument("--model", type=str, default=MODEL, help="Gemini model for translation")
-    p.add_argument("--batch-size", type=int, default=10, help="Examples per batch")
+    p.add_argument("--batch-size", type=int, default=10, help="Examples per Gemini call")
     p.add_argument("--dry-run", action="store_true", help="Translate only, skip save/upload")
     main(p.parse_args())

@@ -130,6 +130,7 @@ def main():
     p.add_argument("--max-samples", type=int, default=None, help="Limit examples to translate")
     p.add_argument("--workers", type=int, default=8, help="Parallel Gemini calls")
     p.add_argument("--model", type=str, default=None, help="Gemini model for translation")
+    p.add_argument("--batch-size", type=int, default=10, help="Examples per Gemini call")
     p.add_argument("--dry-run", action="store_true", help="Translate only, skip save/upload")
 
     p = sub.add_parser("rebalance-tools", add_help=False)
