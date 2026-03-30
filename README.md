@@ -7,50 +7,47 @@
          │       ...the tiny model to rule them all...            │
          └────────────────────────────────────────────────────────┘
 
-  Architecture                                        Training Pipeline
-  ────────────                                        ─────────────────
+  Architecture
+  ────────────
 
-                    ┌──────────────┐
-                    │  Tool Call   │                ┌──────────────────────┐
-                    └──────┬───────┘                │ Mat loss at factors  │
-                          ┌┴──────────┐             │ + INT4 QAT (g=32)   │
-                          │  Softmax  │             │ + z-loss             │
-                          └─────┬─────┘             │ + contrastive loss   │
-                    ┌─────┬─────┴─────┬─────┐       │ + token-level wt    │
-                    │  @E[:d_ff/f] for each │       └──────────┬──────────┘
-                    │  f in mat_factors     │                  │
-                    └─────┬─────┬─────┬─────┘       ┌──────────┴───────────┐
-                          ┌─────┴─────┐             │ Grad clip (norm 1.0) │
-                          │ Linear (T)│  ← tied     │ Muon  (2D kernels)   │
-                          └─────┬─────┘             │ AdamW (all else)     │
-                          ┌─────┴─────┐             │ WSD LR schedule      │
-                          │ ZCRMSNorm │             └──────────┬───────────┘
-                          └─────┬─────┘                        │
-                       ┌────────┴────────┐          ┌──────────┴───────────┐
-                       │ Decoder x N_dec │          │   Sparsification     │
-                       │┌───────────────┐│          │  cubic schedule      │
-                       ││ Masked Self   ││          │  mask every N steps  │
-                       ││ Attn + RoPE   ││          └──────────┬───────────┘
-                       │├───────────────┤│                     │
-  ┌──────────────┐     ││   Cross       ││          ┌──────────┴───────────┐
-  │ Self-Attn    │────────▶ Attention   ││          │ EMA params (β=0.999) │
-  │ Encoder      │     │├───────────────┤│          └──────────┬───────────┘
-  │  x N_enc     │     ││  Gated FFN    ││                     │
-  │              │     │└───────────────┘│          ┌──────────┴───────────┐
-  │ ┌──────────┐ │     └────────┬────────┘          │ Checkpoint           │
-  │ │Self Attn │ │        ┌─────┴─────┐             │  full params, can    │
-  │ │ + RoPE   │ │        │ Embedding │  ← shared   │  export mat slices   │
-  │ │ GQA      │ │        └─────┬─────┘             └──────────────────────┘
-  │ ├──────────┤ │      ┌───────┴───────┐
-  │ │Gated FFN │ │      │[EOS]<tool_call>│
-  │ │ SwiGLU   │ │      │ + answer      │
-  │ ├──────────┤ │      └───────────────┘
-  │ │ZCRMSNorm │ │
-  │ │ Pre-norm │ │
-  │ └──────────┘ │
-  │              │
+  Pure-attention encoder-decoder. No feedforward layers — each block is
+  just gated self-attention (encoder) or gated self + cross attention
+  (decoder). All mixing happens through attention.
+
+                                  ┌──────────────┐
+                                  │  Tool Call   │
+                                  └──────┬───────┘
+                                        ┌┴──────────┐
+                                        │  Softmax  │
+                                        └─────┬─────┘
+                                        ┌─────┴─────┐
+                                        │ Linear (T)│  ← tied
+                                        └─────┬─────┘
+                                        ┌─────┴─────┐
+                                        │ ZCRMSNorm │
+                                        └─────┬─────┘
+                                     ┌────────┴────────┐
+                                     │ Decoder x 12    │
+                                     │┌───────────────┐│
+                                     ││ ZCRMSNorm     ││
+                                     ││ Masked Self   ││
+                                     ││ Attn + RoPE   ││
+                                     ││ Gated Residual││
+                                     │├───────────────┤│
+  ┌──────────────┐                   ││ ZCRMSNorm     ││
+  │ Encoder x 12 │──────────────────────▶Cross Attn   ││
+  │              │                   ││ Gated Residual││
+  │ ┌──────────┐ │                   │└───────────────┘│
+  │ │ZCRMSNorm │ │                   └────────┬────────┘
+  │ │Self Attn │ │                      ┌─────┴─────┐
+  │ │ GQA+RoPE │ │                      │ Embedding │  ← shared
+  │ │Gated Res │ │                      └─────┬─────┘
+  │ │          │ │                    ┌───────┴───────-┐
+  │ │ (no FFN) │ │                    │[EOS]<tool_call>│
+  │ └──────────┘ │                    │ + answer       │
+  │              │                    └───────────────-┘
   │  DW Conv ↓2  │  stride-2 depthwise-separable
-  │  + Pointwise │  downsamples seq before encoder
+  │  + Pointwise │  (speech pathway only)
   └──────┬───────┘
          │
     ┌────┴──────┐    ┌──────────────┐
@@ -63,15 +60,55 @@
     │  query    │    │  waveform    │
     └───────────┘    └──────────────┘
 
-    d=512 · 8 enc / 8 dec layers · GQA (8H / 4KV) · QK-norm
-    SentencePiece BPE (8192) · SwiGLU · ZCRMSNorm · RoPE
-    strided DW conv · mat factors · INT4 QAT · Muon + AdamW
+  Heads
+  ─────
+  ┌─────────────────────────────────────────────────────────────┐
+  │                                                             │
+  │  Contrastive Head    CLIP-style tool retrieval              │
+  │    encoder → mean_pool → Dense(d_model/4) → ReLU           │
+  │    → Dense(contrastive_dim) → L2-normalize                  │
+  │    learnable temperature (log_temp)                         │
+  │                                                             │
+  │  Confidence Head     cloud routing / hybrid inference       │
+  │    encoder → mean_pool → Dense(d_model/4)                   │
+  │    → ReLU → Dense(1) → sigmoid → [0, 1]                     │
+  │    trained post-hoc on perplexity-derived labels            │
+  │    high = handle locally, low = route to cloud              │
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
+
+  Training Pipeline
+  ─────────────────
+  ┌─────────────────────────────────────────────────────────────┐
+  │  Contrastive loss + token-level weighting + z-loss          │
+  │  Grad clip (norm 1.0) · Muon (2D kernels) · AdamW (rest)    │
+  │  WSD LR schedule (warmup → hold → cosine decay)             │
+  │  Grammar-constrained decoding (trie-based token masking)    │
+  └─────────────────────────────────────────────────────────────┘
+
+    d=512 · 12 enc / 12 dec layers · GQA (8H / 4KV) · QK-norm
+    no FFN (pure attention) · gated residuals (init=0.5)
+    SentencePiece BPE (8192) · ZCRMSNorm · RoPE
     text + speech encoder · <tool_call> task routing
-    CLIP contrastive retrieval · token-level loss weighting
+    CLIP contrastive retrieval · confidence-based cloud routing
+    token-level loss weighting · grammar-constrained decoding
 
-  Data Pipeline (needle tokenize → needle train)
-  ───────────────────────────────────────────────
+  Data Pipeline (needle generate-data → needle tokenize → needle train)
+  ─────────────────────────────────────────────────────────────────────
 
+  ┌─────────────────────────────────────────────────────────────┐
+  │  needle generate-data                                       │
+  │                                                             │
+  │  Gemini synthesis → Cactus-Compute/tool-calls (HuggingFace) │
+  │  parallel workers · dedup · auto-merge · auto-upload        │
+  │                                                             │
+  │  Related:                                                   │
+  │    needle merge-xlam        merge xlam-60k into dataset     │
+  │    needle rebalance-tools   trim over-represented bins      │
+  │    needle split-dataset     create train/val splits         │
+  └─────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
   ┌─────────────────────────────────────────────────────────────┐
   │  needle tokenize                                            │
   │                                                             │
@@ -116,6 +153,51 @@
   │             ▼                          ▼                    │
   │  text + contrastive tool-call training (jax.pmap)           │
   └─────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  needle calibrate                                           │
+  │                                                             │
+  │  Freeze encoder + decoder                                   │
+  │  Compute per-example decoder perplexity                     │
+  │  Map PPL → [0,1] confidence via sigmoid calibration         │
+  │  Train confidence head (2 Dense layers, MSE loss)           │
+  │  Save calibrated checkpoint with mu, k params               │
+  └─────────────────────────────────────────────────────────────┘
+
+  Hybrid Inference (confidence-based cloud routing)
+  ─────────────────────────────────────────────────
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                                                             │
+  │  query + tools                                              │
+  │       │                                                     │
+  │       ▼                                                     │
+  │  ┌──────────┐                                               │
+  │  │ Encoder  │                                               │
+  │  └────┬─────┘                                               │
+  │       │                                                     │
+  │       ├──────────────────┐                                  │
+  │       ▼                  ▼                                  │
+  │  ┌──────────┐    ┌──────────────┐                           │
+  │  │Confidence│    │  (encoder    │                           │
+  │  │  Head    │    │   output)    │                           │
+  │  └────┬─────┘    └──────┬───────┘                           │
+  │       │                 │                                   │
+  │       ▼                 │                                   │
+  │  confidence > threshold?│                                   │
+  │       │                 │                                   │
+  │    ┌──┴──┐              │                                   │
+  │    │ yes │──────────────┤                                   │
+  │    └─────┘              ▼                                   │
+  │                  ┌──────────┐                                │
+  │                  │ Decoder  │──▶ tool calls (local)         │
+  │                  └──────────┘                                │
+  │    ┌─────┐                                                  │
+  │    │ no  │──▶ route to cloud (Gemini) ──▶ tool calls        │
+  │    └─────┘    (skip decoder entirely)                       │
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Usage
@@ -130,33 +212,37 @@ needle [command]
   ┌───────────────────────────────────────────────────────────────────┐
   │                                                                   │
   │   train                                                           │
-  │     --epochs INT             Training epochs (default: 10)        │
+  │     --epochs INT             Training epochs (default: 1)         │
   │     --batch-size INT         Batch size (default: 32)             │
   │     --lr FLOAT               AdamW learning rate (default: 3e-4)  │
   │     --muon-lr FLOAT          Muon learning rate (default: 0.02)   │
   │     --d-model INT            Model dim (default: 512)             │
   │     --num-heads INT          Attention heads (default: 8)         │
   │     --num-kv-heads INT       KV heads for GQA (default: 4)        │
-  │     --num-layers INT         Encoder layers (default: 8)          │
-  │     --num-dec-layers INT     Decoder layers (default: 8)          │
+  │     --num-layers INT         Encoder layers (default: 12)         │
+  │     --num-dec-layers INT     Decoder layers (default: 12)         │
   │     --max-enc-len INT        Max encoder seq len (default: 1024)  │
   │     --max-dec-len INT        Max decoder seq len (default: 512)   │
   │     --max-samples INT        Training samples (default: all)      │
-  │     --mat-factors INT [...]  FFN shrink factors (default: 2 4)    │
+  │     --no-feedforward         No FFN layers (default: on)           │
+  │     --feedforward            Enable FFN layers (off by default)   │
+  │     --activation STR         swiglu|drelu|geglu (if FFN enabled)  │
+  │     --mat-factors INT [...]  FFN shrink factors (if FFN enabled)  │
   │     --sparsity-ratio FLOAT   Block prune ratio (default: 0.0)     │
   │     --group-size INT         Quant/prune group size (default: 32) │
   │     --prune-interval INT     Steps between mask updates (def: 100)│
   │     --prune-start-frac FL    Start pruning at frac (def: 0.33)    │
   │     --prune-end-frac FL      Lock mask at this frac (def: 0.67)   │
-  │     --activation STR         swiglu|drelu|geglu (default: swiglu) │
   │     --warmup-ratio FLOAT     LR warmup ratio (default: 0.05)      │
   │     --decay-ratio FLOAT      LR cosine decay ratio (default: 0.05)│
-  │     --dropout FLOAT          Dropout rate (default: 0.1)          │
+  │     --dropout FLOAT          Dropout rate (default: 0.0)           │
   │     --eval-every INT         Val eval interval (default: 1000)    │
   │     --max-eval-samples INT   Val samples limit (default: 5000)    │
   │     --contrastive-weight FL  CLIP loss weight (default: 0.1)      │
   │     --contrastive-dim INT    Projection dim (default: 128)        │
-  │     --curriculum             Sort batches easy→hard by tool count │
+  │     --w-name FLOAT           Loss weight: tool names (def: 2.0)   │
+  │     --w-value FLOAT          Loss weight: arg values (def: 4.0)   │
+  │     --w-key FLOAT            Loss weight: arg keys (def: 1.5)     │
   │     --wandb                  Enable W&B logging                   │
   │     --checkpoint PATH        Resume from checkpoint               │
   │     --checkpoint-dir DIR     Checkpoint directory                 │
@@ -167,9 +253,6 @@ needle [command]
   │     --max-samples INT        Limit samples per split (dev/test)   │
   │     --max-enc-len INT        Max encoder seq len (default: 1024)  │
   │     --max-dec-len INT        Max decoder seq len (default: 512)   │
-  │     --w-name FLOAT           Loss weight: tool names (def: 3.0)   │
-  │     --w-value FLOAT          Loss weight: arg values (def: 2.0)   │
-  │     --w-key FLOAT            Loss weight: arg keys (def: 1.5)     │
   │     --shuffle-tools          Shuffle tool order (default: on)     │
   │     --no-shuffle-tools       Disable tool shuffling               │
   │     --max-tool-len INT       Max tool desc tokens (default: 256)  │
@@ -181,6 +264,7 @@ needle [command]
   │     --audio PATH [...]       Audio files for voice-to-tool-call   │
   │     --max-len INT            Max tokens to generate (default: 512)│
   │     --seed INT               Random seed (default: 0)             │
+  │     --no-constrained         Disable constrained decoding         │
   │                                                                   │
   │   eval                                                            │
   │     --checkpoint PATH        Path to model checkpoint (required)  │
@@ -191,6 +275,34 @@ needle [command]
   │     --max-gen-len INT        Max generation length (default: 512) │
   │     --throughput-runs INT    Throughput runs (default: 10)        │
   │     --tool-call-samples INT  Tool-call eval samples (default: 200)│
+  │     --no-constrained         Disable constrained decoding         │
+  │                                                                   │
+  │   calibrate                                                       │
+  │     --checkpoint PATH        Path to model checkpoint (required)  │
+  │     --output PATH            Output path (default: overwrite)     │
+  │     --batch-size INT         Batch size (default: 32)             │
+  │     --num-samples INT        Limit samples for PPL (default: all) │
+  │     --epochs INT             Training epochs (default: 10)        │
+  │     --lr FLOAT               Learning rate (default: 1e-3)        │
+  │     --k FLOAT                Sigmoid steepness (default: 3.0)     │
+  │                                                                   │
+  │   generate-data                                                   │
+  │     --num-samples INT        Samples to generate (default: 5000)  │
+  │     --batch-size INT         Examples per Gemini call (default:10)│
+  │     --workers INT            Parallel Gemini calls (default: 8)   │
+  │     --model STR              Gemini model override                │
+  │     --dry-run                Generate only, skip upload           │
+  │     --output-jsonl PATH      Also save raw generations to JSONL   │
+  │     --upload-every INT       Merge+upload interval (def: 30000)   │
+  │                                                                   │
+  │   merge-xlam                                                      │
+  │     --dry-run                Skip upload                          │
+  │     --max-samples INT        Limit xlam samples                   │
+  │                                                                   │
+  │   rebalance-tools                                                 │
+  │     --dry-run                Preview without modifying            │
+  │                                                                   │
+  │   split-dataset              Create train/val splits + upload     │
   │                                                                   │
   │   evaluate                                                        │
   │     --checkpoint PATH        Path to model checkpoint (required)  │
@@ -247,11 +359,11 @@ needle [command]
 
 ## Setup For TPU/GCP
 
-- Setup gcloud 1: download the `macOS ARM` from [here](https://docs.cloud.google.com/sdk/docs/install-sdk) and uzip.
-- Setup gcloud 2: open terminal, cd to ypur downloads and run `./google-cloud-sdk/install.sh`
-- Setup gcloud 3: restart terminal and run `gloud init`, sign in with cactus email, should prompt for project
+- Setup gcloud 1: download the `macOS ARM` from [here](https://docs.cloud.google.com/sdk/docs/install-sdk) and unzip.
+- Setup gcloud 2: open terminal, cd to your downloads and run `./google-cloud-sdk/install.sh`
+- Setup gcloud 3: restart terminal and run `gcloud init`, sign in with cactus email, should prompt for project
 - Setup gcloud 4: else, set the project with `gcloud config set project needle-488623`
-- setup gcloud 5: run `gcloud help` and read carefully
+- Setup gcloud 5: run `gcloud help` and read carefully
 
 ## Example Workflow
 
@@ -281,8 +393,12 @@ needle [command]
    huggingface-cli login
    (paste your HF token — get one at https://huggingface.co/settings/tokens)
 
-7. Use needle as you normally would locally, like training
-   needle train --wandb
+7. Full pipeline
+   needle generate-data --num-samples 5000    # synthesize training data
+   needle tokenize                            # tokenize + pack + upload
+   needle train --wandb                       # train on TPU
+   needle calibrate --checkpoint <path>       # calibrate confidence head
+   needle eval --checkpoint <path>            # evaluate
 
 8. Use tmux for long training runs (survives SSH disconnects)
    tmux new -s train          # start a named session

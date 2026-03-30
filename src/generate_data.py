@@ -1698,7 +1698,7 @@ def generate_all(num_samples, workers=8, batch_size=25, model=MODEL, client_pool
 
 
 
-LOCAL_UNIFIED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "tool_calls_unified")
+LOCAL_UNIFIED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "tool_calls_unified")
 HF_DATASET_REPO = "Cactus-Compute/tool-calls"
 UPLOAD_EVERY = 30000
 
@@ -1791,21 +1791,12 @@ def _merge_and_upload(existing, new_examples):
     import shutil as _shutil
     _shutil.rmtree(parquet_dir)
     print(f"Upload complete: {HF_DATASET_REPO}")
-    print("NOTE: Run 'python scripts/split_dataset.py' to create the validation split.")
+    print("NOTE: Run 'needle split-dataset' to create the validation split.")
 
     return merged
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Generate on-device assistant tool-calling data with Gemini")
-    parser.add_argument("--num-samples", type=int, default=5000, help="Number of samples to generate")
-    parser.add_argument("--batch-size", type=int, default=10, help="Examples per Gemini call (smaller = more tool diversity, more API calls)")
-    parser.add_argument("--workers", type=int, default=8, help="Parallel Gemini calls")
-    parser.add_argument("--model", type=str, default=MODEL, help="Gemini model")
-    parser.add_argument("--dry-run", action="store_true", help="Generate only, skip save and upload")
-    parser.add_argument("--output-jsonl", type=str, default=None, help="Also save raw generations to JSONL")
-    parser.add_argument("--upload-every", type=int, default=UPLOAD_EVERY, help="Merge+upload every N samples (default 1000)")
-    args = parser.parse_args()
+def main(args):
 
     client_pool = ClientPool(make_clients())
 
@@ -1897,4 +1888,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse as _ap
+    _p = _ap.ArgumentParser(description="Generate on-device assistant tool-calling data with Gemini")
+    _p.add_argument("--num-samples", type=int, default=500)
+    _p.add_argument("--batch-size", type=int, default=10)
+    _p.add_argument("--workers", type=int, default=8)
+    _p.add_argument("--model", type=str, default=MODEL)
+    _p.add_argument("--dry-run", action="store_true")
+    _p.add_argument("--output-jsonl", type=str, default=None)
+    _p.add_argument("--upload-every", type=int, default=UPLOAD_EVERY)
+    main(_p.parse_args())

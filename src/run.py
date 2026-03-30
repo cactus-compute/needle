@@ -180,6 +180,86 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
     return result
 
 
+def generate_with_confidence(model, params, tokenizer, query, tools="[]",
+                              max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN,
+                              seed=0, stream=True, normalize=True, constrained=True,
+                              confidence_threshold=None):
+    """Generate tool calls with confidence score.
+
+    Returns (result, confidence) where confidence is a float in [0, 1].
+    If confidence_threshold is set and confidence is below it, returns
+    (None, confidence) without running the decoder — saving compute for
+    queries that should be routed to cloud.
+    """
+    name_map = {}
+    if normalize:
+        tools, name_map = normalize_tools(tools)
+
+    enc_tokens = _build_encoder_input(tokenizer, query, tools, max_enc_len)
+    enc_input = jnp.array([enc_tokens])
+    pad_id = tokenizer.pad_token_id
+    src_mask = make_padding_mask(enc_input, pad_id)
+
+    # Get confidence + encoder output in one pass
+    confidence, encoder_out, enc_mask = model.apply(
+        {"params": params}, enc_input, src_mask=src_mask,
+        method="forward_confidence",
+    )
+    confidence_val = float(confidence[0])
+
+    # Early exit if below threshold — skip decoder entirely
+    if confidence_threshold is not None and confidence_val < confidence_threshold:
+        return None, confidence_val
+
+    # Proceed with normal decoding using already-computed encoder output
+    eos_id = tokenizer.eos_token_id
+    dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
+    dec_buffer = dec_buffer.at[0, 0].set(eos_id)
+
+    decode_fn = _get_decode_fn(model, max_gen_len)
+
+    constrained_decoder = None
+    if constrained:
+        from .constrained import build_constrained_decoder
+        constrained_decoder = build_constrained_decoder([tools], tokenizer)
+
+    if stream:
+        sys.stdout.write(f"\n")
+        sys.stdout.flush()
+
+    logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
+    generated_tokens = []
+
+    for i in range(0, max_gen_len - 1):
+        next_logits = logits[0, i]
+        if constrained_decoder and constrained_decoder.is_active(0):
+            logits_np = np.array(next_logits)
+            logits_np = constrained_decoder.constrain_logits(logits_np, 0)
+            next_token = int(np.argmax(logits_np))
+        else:
+            next_token = int(jnp.argmax(next_logits))
+        if constrained_decoder:
+            constrained_decoder.update(0, next_token)
+        if next_token == eos_id:
+            break
+        generated_tokens.append(next_token)
+        dec_buffer = dec_buffer.at[0, i + 1].set(next_token)
+        if stream:
+            sys.stdout.write(tokenizer.decode([next_token]))
+            sys.stdout.flush()
+        logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
+
+    if stream:
+        sys.stdout.write("\n")
+
+    result = tokenizer.decode(generated_tokens)
+    if result.startswith("<tool_call>"):
+        result = result[len("<tool_call>"):]
+    if normalize and name_map:
+        result = restore_tool_names(result, name_map)
+    return result, confidence_val
+
+
 def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, normalize=True, constrained=True):
     """Batch-generate tool-call outputs for multiple examples at once.
 

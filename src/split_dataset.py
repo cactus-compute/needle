@@ -20,7 +20,7 @@ VAL_SIZE = 10000
 SEED = 42
 
 
-def main():
+def main(args=None):
     print(f"Downloading full dataset from {HF_DATASET_REPO}...")
     ds = load_dataset(HF_DATASET_REPO, split="train", token=True)
     n = len(ds)

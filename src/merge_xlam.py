@@ -15,7 +15,7 @@ import sys
 
 from datasets import concatenate_datasets, load_dataset, load_from_disk
 
-LOCAL_UNIFIED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "tool_calls_unified")
+LOCAL_UNIFIED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "tool_calls_unified")
 HF_DATASET_REPO = "Cactus-Compute/tool-calls"
 
 
@@ -60,12 +60,7 @@ def check_duplicates(existing, new):
         print("No duplicate queries detected (sampled check)")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Merge xlam into unified dataset")
-    parser.add_argument("--dry-run", action="store_true", help="Skip upload")
-    parser.add_argument("--max-samples", type=int, default=None, help="Limit xlam samples")
-    args = parser.parse_args()
-
+def main(args):
     existing = load_existing()
     xlam = load_xlam(args.max_samples)
 
@@ -106,8 +101,12 @@ def main():
     print(f"\nUploading to {HF_DATASET_REPO} (train split)...")
     merged.push_to_hub(HF_DATASET_REPO, split="train", token=True)
     print(f"Upload complete: {HF_DATASET_REPO}")
-    print("NOTE: Run 'python scripts/split_dataset.py' to create the validation split.")
+    print("NOTE: Run 'needle split-dataset' to create the validation split.")
 
 
 if __name__ == "__main__":
-    main()
+    import argparse as _ap
+    _p = _ap.ArgumentParser(description="Merge xlam into unified dataset")
+    _p.add_argument("--dry-run", action="store_true", help="Skip upload")
+    _p.add_argument("--max-samples", type=int, default=None, help="Limit xlam samples")
+    main(_p.parse_args())

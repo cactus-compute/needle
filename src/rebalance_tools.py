@@ -213,8 +213,12 @@ def rebalance(dry_run=False):
     print("Done.")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", help="Preview without modifying")
-    args = parser.parse_args()
+def main(args):
     rebalance(dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    import argparse as _ap
+    _p = _ap.ArgumentParser()
+    _p.add_argument("--dry-run", action="store_true", help="Preview without modifying")
+    main(_p.parse_args())

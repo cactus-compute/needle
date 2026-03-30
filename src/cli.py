@@ -96,6 +96,33 @@ def main():
     p.add_argument("--no-constrained", action="store_true",
                    help="Disable grammar-constrained decoding for tool names/arg keys")
 
+    p = sub.add_parser("calibrate", add_help=False)
+    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--output", type=str, default=None, help="Output checkpoint path (default: overwrite input)")
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--num-samples", type=int, default=None, help="Limit training samples for PPL computation")
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--k", type=float, default=3.0, help="Sigmoid steepness for PPL→confidence mapping")
+
+    p = sub.add_parser("generate-data", add_help=False)
+    p.add_argument("--num-samples", type=int, default=5000, help="Number of samples to generate")
+    p.add_argument("--batch-size", type=int, default=10, help="Examples per Gemini call")
+    p.add_argument("--workers", type=int, default=8, help="Parallel Gemini calls")
+    p.add_argument("--model", type=str, default=None, help="Gemini model override")
+    p.add_argument("--dry-run", action="store_true", help="Generate only, skip save and upload")
+    p.add_argument("--output-jsonl", type=str, default=None, help="Also save raw generations to JSONL")
+    p.add_argument("--upload-every", type=int, default=None, help="Merge+upload every N samples")
+
+    p = sub.add_parser("merge-xlam", add_help=False)
+    p.add_argument("--dry-run", action="store_true", help="Skip upload")
+    p.add_argument("--max-samples", type=int, default=None, help="Limit xlam samples")
+
+    p = sub.add_parser("rebalance-tools", add_help=False)
+    p.add_argument("--dry-run", action="store_true", help="Preview without modifying")
+
+    p = sub.add_parser("split-dataset", add_help=False)
+
     p = sub.add_parser("evaluate", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--benchmarks", type=str, nargs="*",
@@ -151,6 +178,25 @@ def main():
     elif args.command == "eval":
         from .eval import main as eval_main_fn
         eval_main_fn(args)
+    elif args.command == "calibrate":
+        from .calibrate import main as calibrate_main
+        calibrate_main(args)
+    elif args.command == "generate-data":
+        from .generate_data import main as gendata_main, MODEL as _MODEL, UPLOAD_EVERY as _UE
+        if args.model is None:
+            args.model = _MODEL
+        if args.upload_every is None:
+            args.upload_every = _UE
+        gendata_main(args)
+    elif args.command == "merge-xlam":
+        from .merge_xlam import main as merge_main
+        merge_main(args)
+    elif args.command == "rebalance-tools":
+        from .rebalance_tools import main as rebalance_main
+        rebalance_main(args)
+    elif args.command == "split-dataset":
+        from .split_dataset import main as split_main
+        split_main(args)
     elif args.command == "evaluate":
         from .evaluate import main as eval_main
         eval_main(args)
