@@ -1251,4 +1251,23 @@ def train(args):
         print(f"\nBest checkpoint (call_f1={best_call_f1:.1%}): {best_ckpt_path}")
     print("\nTraining complete.")
 
+    # Auto-calibrate confidence head on best checkpoint
+    if getattr(args, "calibrate", True) and best_ckpt_path:
+        print(f"\n{'='*50}")
+        print(f"Running confidence head calibration on {best_ckpt_path}")
+        print(f"{'='*50}")
+        from .calibrate import main as calibrate_main
+        from argparse import Namespace
+        cal_args = Namespace(
+            checkpoint=best_ckpt_path,
+            output=best_ckpt_path,
+            batch_size=args.batch_size,
+            num_samples=getattr(args, "max_eval_samples", 5000),
+            epochs=getattr(args, "calibrate_epochs", 10),
+            lr=getattr(args, "calibrate_lr", 1e-3),
+            k=getattr(args, "calibrate_k", 3.0),
+        )
+        calibrate_main(cal_args)
+        print(f"\nCalibration complete. Checkpoint updated: {best_ckpt_path}")
+
 

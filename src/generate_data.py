@@ -889,6 +889,14 @@ CALL_TYPES = [
 
 MODEL = "gemini-3.1-flash-lite-preview"
 
+LANGUAGES = [
+    "Bulgarian", "Croatian", "Czech", "Danish", "Dutch", "English",
+    "Estonian", "Finnish", "French", "German", "Greek", "Hungarian",
+    "Italian", "Latvian", "Lithuanian", "Maltese", "Polish",
+    "Portuguese", "Romanian", "Slovak", "Slovenian", "Spanish",
+    "Swedish", "Russian", "Ukrainian",
+]
+
 MAX_TOOLS = 10
 
 _TOOL_COUNT_WEIGHTS = {
@@ -970,7 +978,7 @@ _CONTEXT_SEEDS = [
 ]
 
 
-def build_prompt(batch_size, call_desc, tools, rng, query_length_hint=None):
+def build_prompt(batch_size, call_desc, tools, rng, query_length_hint=None, language="English"):
     """Build a prompt asking Gemini to generate a batch of examples."""
     scenarios_sample = rng.sample(SCENARIOS, min(20, len(SCENARIOS)))
     scenarios_str = "\n".join(f"  - {s}" for s in scenarios_sample)
@@ -979,6 +987,17 @@ def build_prompt(batch_size, call_desc, tools, rng, query_length_hint=None):
     length_instruction = ""
     if query_length_hint:
         length_instruction = f"\n- Query length for this batch: {query_length_hint}"
+
+    if language != "English":
+        language_instruction = (
+            f"\n- LANGUAGE: ALL queries MUST be written in {language}. "
+            f"Use natural, native-sounding {language} — not literal translations from English. "
+            f"Include culturally appropriate names, places, idioms, and references for {language}-speaking users. "
+            f"Tool names and parameter keys stay in English (they are API identifiers), but string argument VALUES "
+            f"(message text, notes, search queries, labels, destinations, etc.) should be in {language} where a real user would use {language}."
+        )
+    else:
+        language_instruction = ""
 
     if tools:
         tools_section = f"AVAILABLE TOOLS:\n{json.dumps(tools, separators=(',', ':'))}"
@@ -1022,7 +1041,7 @@ USER CONTEXT HINT (use as inspiration for ~half the examples, vary the rest free
 REQUIREMENTS:
 - Each example: a "query" (user's natural language) and "answers" (JSON tool calls array)
 - This batch: {call_desc}
-- Queries should sound like real users talking to a phone/computer/watch voice assistant or typing a quick command{length_instruction}
+- Queries should sound like real users talking to a phone/computer/watch voice assistant or typing a quick command{length_instruction}{language_instruction}
 - Vary style: casual, terse, polite ("Could you please..."), conversational, indirect ("it's dark in here" meaning turn on lights)
 {tool_rules}
 - For empty call examples, answers must be []
@@ -1166,8 +1185,10 @@ def _grounding_check(pname, pval, pdesc, query, query_lower):
         return True
 
     # Extract significant words from value and query
+    # Covers Latin, Latin Extended, Cyrillic, Greek, and combining diacriticals
+    _WORD_RE = r'[\w\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u0500-\u052F]{3,}'
     val_words = set()
-    for word in re.findall(r'[a-zA-Z\u00C0-\u024F]{3,}', val.lower()):
+    for word in re.findall(_WORD_RE, val.lower()):
         if word not in _GROUNDING_STOPWORDS:
             val_words.add(word)
 
@@ -1175,7 +1196,7 @@ def _grounding_check(pname, pval, pdesc, query, query_lower):
         return True
 
     query_words = set()
-    for word in re.findall(r'[a-zA-Z\u00C0-\u024F]{3,}', query_lower):
+    for word in re.findall(_WORD_RE, query_lower):
         if word not in _GROUNDING_STOPWORDS:
             query_words.add(word)
 
@@ -1446,7 +1467,7 @@ def _rephrase_tool_descriptions(tools, rng):
     return result
 
 
-def generate_batch(client_pool, batch_size, rng, model):
+def generate_batch(client_pool, batch_size, rng, model, language="English"):
     """Generate one batch of examples. Returns list of dicts."""
     call_type, call_desc = rng.choice(CALL_TYPES)
 
@@ -1491,7 +1512,7 @@ def generate_batch(client_pool, batch_size, rng, model):
     # Pick a query length bucket for this batch
     query_length_hint = rng.choice(_QUERY_LENGTH_DESCS)
 
-    prompt = build_prompt(batch_size, call_desc, tools, rng, query_length_hint=query_length_hint)
+    prompt = build_prompt(batch_size, call_desc, tools, rng, query_length_hint=query_length_hint, language=language)
 
     # Vary temperature per batch for diversity: mostly 0.9-1.1 with occasional
     # low (more precise args) and high (more creative queries) extremes.
@@ -1523,7 +1544,7 @@ def generate_batch(client_pool, batch_size, rng, model):
         return []
 
     valid = []
-    tools_str = json.dumps(tools, separators=(",", ":"))
+    tools_str = json.dumps(tools, separators=(",", ":"), ensure_ascii=False)
     tool_name_set = {t["name"] for t in tools}
 
     # Build schema map for parameter validation: {tool_name: {param_name: {type, required}}}
@@ -1613,12 +1634,13 @@ def generate_batch(client_pool, batch_size, rng, model):
         valid.append({
             "query": query,
             "tools": tools_str,
-            "answers": json.dumps(answers, separators=(",", ":")),
+            "answers": json.dumps(answers, separators=(",", ":"), ensure_ascii=False),
             "source": "synth-gemini-assistant",
             "model": model,
             "call_type": call_type,
             "num_tools": len(tools),
             "synth_tools": use_synth,
+            "language": language,
         })
 
     return valid
@@ -1644,7 +1666,8 @@ def generate_all(num_samples, workers=8, batch_size=25, model=MODEL, client_pool
         def _submit_one():
             nonlocal submitted
             batch_rng = random.Random(rng.randint(0, 2**32))
-            f = pool.submit(generate_batch, client_pool, batch_size, batch_rng, model)
+            language = LANGUAGES[submitted % len(LANGUAGES)]
+            f = pool.submit(generate_batch, client_pool, batch_size, batch_rng, model, language=language)
             pending.add(f)
             submitted += 1
 
@@ -1690,6 +1713,8 @@ def generate_all(num_samples, workers=8, batch_size=25, model=MODEL, client_pool
     print(f"Generated {len(deduped):,} unique examples ({len(all_examples) - len(deduped)} duplicates removed, {failed} failed batches)")
     print(f"  Call type distribution: {dict(type_counts.most_common())}")
     print(f"  Tool count distribution: {dict(sorted(tool_counts.items()))}")
+    lang_counts = Counter(ex.get("language", "English") for ex in deduped)
+    print(f"  Language distribution: {dict(lang_counts.most_common())}")
     if _synth_stats["attempted"] > 0:
         print(f"  Tool synthesis: {_synth_stats['succeeded']}/{_synth_stats['attempted']} succeeded "
               f"(parse_fail={_synth_stats['failed_parse']}, validate_fail={_synth_stats['failed_validate']}, "
@@ -1700,7 +1725,7 @@ def generate_all(num_samples, workers=8, batch_size=25, model=MODEL, client_pool
 
 LOCAL_UNIFIED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "tool_calls_unified")
 HF_DATASET_REPO = "Cactus-Compute/tool-calls"
-UPLOAD_EVERY = 30000
+UPLOAD_EVERY = 100000
 
 
 def _load_existing():
@@ -1739,7 +1764,15 @@ def _merge_and_upload(existing, new_examples):
         "answers": [ex["answers"] for ex in new_examples],
         "source": [ex["source"] for ex in new_examples],
         "model": [ex["model"] for ex in new_examples],
+        "language": [ex.get("language", "English") for ex in new_examples],
     })
+    # Keep only columns that exist in the existing dataset (language may be new)
+    overlap_cols = [c for c in new_ds.column_names if c in existing.column_names]
+    extra_cols = [c for c in new_ds.column_names if c not in existing.column_names]
+    if extra_cols:
+        # Add missing columns to existing dataset with defaults
+        for col in extra_cols:
+            existing = existing.add_column(col, ["English"] * len(existing) if col == "language" else [""] * len(existing))
     new_ds = new_ds.select_columns(existing.column_names)
 
     merged = concatenate_datasets([existing, new_ds])

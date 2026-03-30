@@ -60,6 +60,14 @@ def main():
                    help="Loss weight for argument key tokens (default: 1.5)")
     p.add_argument("--no-feedforward", action=argparse.BooleanOptionalAction, default=True,
                    help="Remove feedforward layers entirely (default: True)")
+    p.add_argument("--calibrate", action=argparse.BooleanOptionalAction, default=True,
+                   help="Run confidence head calibration after training (default: True)")
+    p.add_argument("--calibrate-epochs", type=int, default=10,
+                   help="Epochs for confidence head calibration (default: 10)")
+    p.add_argument("--calibrate-lr", type=float, default=1e-3,
+                   help="Learning rate for confidence head calibration (default: 1e-3)")
+    p.add_argument("--calibrate-k", type=float, default=3.0,
+                   help="Sigmoid steepness for PPL→confidence mapping (default: 3.0)")
 
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,
