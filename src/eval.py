@@ -213,10 +213,39 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
     samples = []
     failures = []  # (query, tools, ref, pred, reasons)
 
+    def _normalize_value(v):
+        """Normalize a value for fuzzy comparison."""
+        if isinstance(v, str):
+            # Try parsing as number to handle "74.006" vs "74.0060"
+            try:
+                f = float(v)
+                # Preserve sign, normalize trailing zeros
+                v = str(f)
+            except ValueError:
+                pass
+            # Normalize time-like strings: strip leading "at ", lowercase
+            s = v.strip().lower()
+            if s.startswith("at "):
+                s = s[3:].strip()
+            # "today at 21:00" → "21:00", "tonight" is harder but normalize what we can
+            if s.startswith("today at "):
+                s = s[len("today at "):].strip()
+            return s
+        if isinstance(v, float):
+            return str(v)
+        return v
+
+    def _normalize_args(args):
+        """Normalize all argument values for comparison."""
+        if not isinstance(args, dict):
+            return args
+        return {k: _normalize_value(v) for k, v in args.items()}
+
     def call_key(c):
         if not isinstance(c, dict):
             return None
-        return json.dumps({"name": c.get("name"), "arguments": c.get("arguments")}, sort_keys=True)
+        norm_args = _normalize_args(c.get("arguments", {}))
+        return json.dumps({"name": c.get("name"), "arguments": norm_args}, sort_keys=True)
 
     for i, (ex, pred_text) in enumerate(zip(ds, all_preds)):
         ref_text = ex["answers"]
@@ -303,8 +332,8 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
         for c in pred_calls:
             if isinstance(c, dict) and "name" in c and c["name"] in ref_by_name:
                 args_total += 1
-                pa = json.dumps(c.get("arguments", {}), sort_keys=True)
-                if any(pa == json.dumps(ra, sort_keys=True) for ra in ref_by_name[c["name"]]):
+                pa = json.dumps(_normalize_args(c.get("arguments", {})), sort_keys=True)
+                if any(pa == json.dumps(_normalize_args(ra), sort_keys=True) for ra in ref_by_name[c["name"]]):
                     args_correct += 1
 
         try:
@@ -330,7 +359,9 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
                 m_keys = p_keys & r_keys
                 matched_params += len(m_keys)
                 for k in m_keys:
-                    if json.dumps(c.get("arguments", {})[k], sort_keys=True) == json.dumps(ref_args[k], sort_keys=True):
+                    pv_norm = _normalize_value(c.get("arguments", {})[k])
+                    rv_norm = _normalize_value(ref_args[k])
+                    if json.dumps(pv_norm, sort_keys=True) == json.dumps(rv_norm, sort_keys=True):
                         correct_values += 1
 
         # Diagnose failures for this example
@@ -369,7 +400,9 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
                     for k in set(pred_args.keys()) | set(ref_args.keys()):
                         pv = pred_args.get(k, "<MISSING>")
                         rv = ref_args.get(k, "<MISSING>")
-                        if json.dumps(pv, sort_keys=True) != json.dumps(rv, sort_keys=True):
+                        pv_n = _normalize_value(pv)
+                        rv_n = _normalize_value(rv)
+                        if json.dumps(pv_n, sort_keys=True) != json.dumps(rv_n, sort_keys=True):
                             reasons.append(f"value_mismatch:{cname}.{k}={json.dumps(pv)[:60]}!={json.dumps(rv)[:60]}")
 
             if ref_is_empty and not pred_is_empty:

@@ -359,6 +359,9 @@ def main(args):
         epochs=args.epochs, lr=args.lr, batch_size=args.batch_size,
     )
 
+    # Ensure params are on host (clear stale pmap sharding from training)
+    params = jax.tree.map(lambda x: jnp.array(np.array(x), dtype=x.dtype), params)
+
     # Evaluate
     evaluate_confidence(model, params, train_data, confidence_labels, perplexities)
 
