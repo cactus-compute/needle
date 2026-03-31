@@ -121,7 +121,7 @@ def _wsd_schedule(peak_value, total_steps, warmup_steps, decay_ratio=0.15):
         [
             optax.linear_schedule(0.0, peak_value, warmup_steps),
             optax.constant_schedule(peak_value),
-            optax.cosine_decay_schedule(peak_value, decay_steps, alpha=0.0),
+            optax.cosine_decay_schedule(peak_value, decay_steps, alpha=0.05),
         ],
         boundaries=[warmup_steps, warmup_steps + stable_steps],
     )
