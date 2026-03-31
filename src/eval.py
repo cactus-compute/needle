@@ -211,6 +211,7 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
     correct_values = 0
     matched_params = 0
     samples = []
+    failures = []  # (query, tools, ref, pred, reasons)
 
     def call_key(c):
         if not isinstance(c, dict):
@@ -328,6 +329,58 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
                     if json.dumps(c.get("arguments", {})[k], sort_keys=True) == json.dumps(ref_args[k], sort_keys=True):
                         correct_values += 1
 
+        # Diagnose failures for this example
+        is_exact = (ref_is_empty and pred_is_empty) or (
+            not ref_is_empty and not pred_is_empty
+            and json.dumps(pred_calls, sort_keys=True) == json.dumps(ref_calls, sort_keys=True)
+        )
+        if not is_exact and len(failures) < 50:
+            reasons = []
+            if json_parse_errors > 0 and i == total - 1:
+                # Check if this specific example had a parse error
+                try:
+                    json.loads(pred_text)
+                except (json.JSONDecodeError, TypeError):
+                    reasons.append("json_parse_error")
+
+            ex_fp_names = pred_name_set - ref_name_set
+            ex_fn_names = ref_name_set - pred_name_set
+            if ex_fp_names:
+                reasons.append(f"wrong_tools:{','.join(sorted(ex_fp_names))}")
+            if ex_fn_names:
+                reasons.append(f"missing_tools:{','.join(sorted(ex_fn_names))}")
+
+            if not ex_fp_names and not ex_fn_names and pred_name_set:
+                # Right tools but wrong args — find which values differ
+                for c in pred_calls:
+                    if not isinstance(c, dict) or "name" not in c:
+                        continue
+                    cname = c["name"]
+                    if cname not in ref_by_name:
+                        continue
+                    pred_args = c.get("arguments", {})
+                    ref_args = ref_by_name[cname][0]
+                    for k in set(pred_args.keys()) | set(ref_args.keys()):
+                        pv = pred_args.get(k, "<MISSING>")
+                        rv = ref_args.get(k, "<MISSING>")
+                        if json.dumps(pv, sort_keys=True) != json.dumps(rv, sort_keys=True):
+                            reasons.append(f"value_mismatch:{cname}.{k}={json.dumps(pv)[:60]}!={json.dumps(rv)[:60]}")
+
+            if ref_is_empty and not pred_is_empty:
+                reasons.append("false_positive:should_be_empty")
+            if not ref_is_empty and pred_is_empty:
+                reasons.append("false_negative:predicted_empty")
+
+            if not reasons:
+                reasons.append("unknown")
+
+            failures.append({
+                "query": ex["query"][:200],
+                "ref": ref_text[:300],
+                "pred": pred_text[:300],
+                "reasons": reasons,
+            })
+
     name_precision = tp_names / max(tp_names + fp_names, 1)
     name_recall = tp_names / max(tp_names + fn_names, 1)
     name_f1 = 2 * name_precision * name_recall / max(name_precision + name_recall, 1e-9)
@@ -353,6 +406,7 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
         "empty_ref_pct": empty_ref / max(total, 1),
         "empty_pred_pct": empty_pred / max(total, 1),
         "samples": samples,
+        "failures": failures,
     }
 
 
@@ -533,6 +587,14 @@ def main(args):
                     print(f"    Q: {query}")
                     print(f"    R: {ref}")
                     print(f"    P: {pred}")
+                    print()
+            if tc.get("failures"):
+                print(f"  ─── Failures ({len(tc['failures'])} captured) ───")
+                for j, fail in enumerate(tc["failures"][:15]):
+                    print(f"  [{j+1}] Q: {fail['query'][:120]}")
+                    print(f"      Ref:  {fail['ref'][:200]}")
+                    print(f"      Pred: {fail['pred'][:200]}")
+                    print(f"      Why:  {', '.join(fail['reasons'])}")
                     print()
 
     print(f"\nmeasuring throughput ({args.throughput_runs} runs)...")

@@ -62,8 +62,8 @@ def main():
                    help="Remove feedforward layers entirely (default: True)")
     p.add_argument("--calibrate", action=argparse.BooleanOptionalAction, default=True,
                    help="Run confidence head calibration after training (default: True)")
-    p.add_argument("--calibrate-epochs", type=int, default=10,
-                   help="Epochs for confidence head calibration (default: 10)")
+    p.add_argument("--calibrate-epochs", type=int, default=1,
+                   help="Epochs for confidence head calibration (default: 1)")
     p.add_argument("--calibrate-lr", type=float, default=1e-3,
                    help="Learning rate for confidence head calibration (default: 1e-3)")
     p.add_argument("--calibrate-k", type=float, default=3.0,
@@ -107,9 +107,9 @@ def main():
     p = sub.add_parser("calibrate", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--output", type=str, default=None, help="Output checkpoint path (default: overwrite input)")
-    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--num-samples", type=int, default=None, help="Limit training samples for PPL computation")
-    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--k", type=float, default=3.0, help="Sigmoid steepness for PPL→confidence mapping")
 

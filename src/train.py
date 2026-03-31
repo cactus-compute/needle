@@ -1005,6 +1005,7 @@ def train(args):
             m_missing, m_total_ref_params = 0, 0
             m_correct_values, m_matched_params = 0, 0
             m_per_count = {t: {k: 0 for k in _pc_keys} for t in range(11)}
+            m_failures = []
 
             for ex, pred_text in zip(eval_pairs, preds):
                 try:
@@ -1091,6 +1092,42 @@ def train(args):
                             if _json_mod.dumps(c.get("arguments", {})[k], sort_keys=True) == _json_mod.dumps(ref_args[k], sort_keys=True):
                                 m_correct_values += 1
 
+                # Failure diagnosis
+                is_exact = (ref_is_empty and pred_is_empty) or (
+                    not ref_is_empty and not pred_is_empty
+                    and _json_mod.dumps(pred_calls, sort_keys=True) == _json_mod.dumps(ref_calls, sort_keys=True)
+                )
+                if not is_exact and len(m_failures) < 30:
+                    reasons = []
+                    ex_fp = pred_names - ref_names
+                    ex_fn = ref_names - pred_names
+                    if ex_fp:
+                        reasons.append(f"wrong_tools:{','.join(sorted(ex_fp))}")
+                    if ex_fn:
+                        reasons.append(f"missing_tools:{','.join(sorted(ex_fn))}")
+                    if not ex_fp and not ex_fn and pred_names:
+                        for c in pred_calls:
+                            if not isinstance(c, dict) or "name" not in c or c["name"] not in ref_by_name:
+                                continue
+                            pa = c.get("arguments", {})
+                            ra = ref_by_name[c["name"]][0]
+                            for k in set(pa.keys()) | set(ra.keys()):
+                                pv, rv = pa.get(k, "<MISSING>"), ra.get(k, "<MISSING>")
+                                if _json_mod.dumps(pv, sort_keys=True) != _json_mod.dumps(rv, sort_keys=True):
+                                    reasons.append(f"{c['name']}.{k}={_json_mod.dumps(pv)[:50]}!={_json_mod.dumps(rv)[:50]}")
+                    if ref_is_empty and not pred_is_empty:
+                        reasons.append("false_positive")
+                    if not ref_is_empty and pred_is_empty:
+                        reasons.append("false_negative")
+                    if not reasons:
+                        reasons.append("unknown")
+                    m_failures.append({
+                        "query": ex["query"][:150],
+                        "ref": ref_text[:200],
+                        "pred": pred_text[:200],
+                        "reasons": reasons,
+                    })
+
             metrics = {}
             if m_n > 0:
                 metrics["n"] = m_n
@@ -1106,6 +1143,7 @@ def train(args):
                 metrics["param_haluc"] = m_halluc / max(m_total_pred_params, 1)
                 metrics["param_miss"] = m_missing / max(m_total_ref_params, 1)
                 metrics["value_acc"] = m_correct_values / max(m_matched_params, 1)
+                metrics["failures"] = m_failures
             return metrics, m_per_count
 
         pool_metrics = {}
@@ -1190,6 +1228,14 @@ def train(args):
                     ex_ = d["exact"] / d["n"]
                     pr_ = 1.0 - d["parse_err"] / d["n"]
                     print(f"  {t:>6}  {d['n']:>4}  {nf1:>7.1%}  {d['name_tp']:>4} {d['name_fp']:>4} {d['name_fn']:>4}  {cf1:>7.1%}  {d['call_tp']:>4} {d['call_fp']:>4} {d['call_fn']:>4}  {ex_:>5.1%}  {pr_:>5.1%}")
+            if metrics.get("failures"):
+                print(f"  ─── Failures ({len(metrics['failures'])} captured) ───")
+                for j, fail in enumerate(metrics["failures"][:10]):
+                    print(f"  [{j+1}] Q: {fail['query'][:120]}")
+                    print(f"      Ref:  {fail['ref'][:200]}")
+                    print(f"      Pred: {fail['pred'][:200]}")
+                    print(f"      Why:  {', '.join(fail['reasons'])}")
+                    print()
 
         _label_map = {
             "single": "Single-Call",
@@ -1261,9 +1307,9 @@ def train(args):
         cal_args = Namespace(
             checkpoint=best_ckpt_path,
             output=best_ckpt_path,
-            batch_size=args.batch_size,
-            num_samples=getattr(args, "max_eval_samples", 5000),
-            epochs=getattr(args, "calibrate_epochs", 10),
+            batch_size=args.batch_size * 4,
+            num_samples=None,  # use full dataset
+            epochs=getattr(args, "calibrate_epochs", 1),
             lr=getattr(args, "calibrate_lr", 1e-3),
             k=getattr(args, "calibrate_k", 3.0),
         )
