@@ -201,11 +201,11 @@ def _train_step_inner(model, tx, is_conf_param, params, opt_state, src, enc_seg_
     """Inner training step — separated for pmap with axis_name."""
     def loss_fn(params):
         src_mask = make_packing_mask(enc_seg_ids)
-        encoder_out = model.apply(
+        encoder_out, enc_mask = model.apply(
             {"params": params}, src, src_mask=src_mask, method="encode_text",
         )
         pred = model.apply(
-            {"params": params}, encoder_out, src_mask,
+            {"params": params}, encoder_out, enc_mask,
             method="predict_confidence",
         )
         return jnp.mean((pred - targets) ** 2)
@@ -241,11 +241,11 @@ def evaluate_confidence(model, params, train_data, confidence_labels, perplexiti
     @jax.pmap
     def predict_step(params, src, enc_seg_ids):
         src_mask = make_packing_mask(enc_seg_ids)
-        encoder_out = model.apply(
+        encoder_out, enc_mask = model.apply(
             {"params": params}, src, src_mask=src_mask, method="encode_text",
         )
         return model.apply(
-            {"params": params}, encoder_out, src_mask,
+            {"params": params}, encoder_out, enc_mask,
             method="predict_confidence",
         )
 

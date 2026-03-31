@@ -13,14 +13,19 @@ import shutil
 import tempfile
 
 HF_DATASET_REPO = "Cactus-Compute/tool-calls"
-VAL_PER_SOURCE = 2000
+VAL_PER_SOURCE = {
+    "gemini-3.1-flash-lite": 5000,
+    "xlam": 2500,
+    "xlam-translated": 2500,
+}
 SEED = 42
 
 
 def main(args=None):
-    val_per_source = VAL_PER_SOURCE
+    val_per_source = dict(VAL_PER_SOURCE)
     if args is not None and getattr(args, "val_per_source", None) is not None:
-        val_per_source = args.val_per_source
+        # CLI override applies uniformly to all sources
+        val_per_source = {k: args.val_per_source for k in val_per_source}
 
     print(f"Downloading full dataset from {HF_DATASET_REPO} (train split only)...")
     from .data import download_hf_split
@@ -46,7 +51,7 @@ def main(args=None):
     val_indices = []
     for src, indices in sorted(source_indices.items()):
         rng.shuffle(indices)
-        take = min(val_per_source, len(indices))
+        take = min(val_per_source.get(src, 0), len(indices))
         val_indices.extend(indices[:take])
         print(f"  {src}: taking {take} for validation")
 

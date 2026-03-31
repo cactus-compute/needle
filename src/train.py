@@ -1037,9 +1037,12 @@ def train(args):
                 if ref_is_empty and pred_is_empty:
                     m_exact += 1
                     pc["exact"] += 1
-                elif not ref_is_empty and not pred_is_empty and _json_mod.dumps(pred_calls, sort_keys=True) == _json_mod.dumps(ref_calls, sort_keys=True):
-                    m_exact += 1
-                    pc["exact"] += 1
+                elif not ref_is_empty and not pred_is_empty:
+                    ref_sorted = sorted([_call_key(c) for c in ref_calls if _call_key(c)])
+                    pred_sorted = sorted([_call_key(c) for c in pred_calls if _call_key(c)])
+                    if ref_sorted == pred_sorted and len(ref_sorted) == len(ref_calls) and len(pred_sorted) == len(pred_calls):
+                        m_exact += 1
+                        pc["exact"] += 1
                 ref_names = {c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c}
                 pred_names = {c["name"] for c in pred_calls if isinstance(c, dict) and "name" in c}
                 m_name_tp += len(pred_names & ref_names)
@@ -1095,7 +1098,9 @@ def train(args):
                 # Failure diagnosis
                 is_exact = (ref_is_empty and pred_is_empty) or (
                     not ref_is_empty and not pred_is_empty
-                    and _json_mod.dumps(pred_calls, sort_keys=True) == _json_mod.dumps(ref_calls, sort_keys=True)
+                    and sorted([_call_key(c) for c in ref_calls if _call_key(c)])
+                    == sorted([_call_key(c) for c in pred_calls if _call_key(c)])
+                    and len(ref_calls) == len(pred_calls)
                 )
                 if not is_exact and len(m_failures) < 30:
                     reasons = []

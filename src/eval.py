@@ -277,8 +277,12 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
 
         if ref_is_empty and pred_is_empty:
             exact_match += 1
-        elif not ref_is_empty and not pred_is_empty and json.dumps(pred_calls, sort_keys=True) == json.dumps(ref_calls, sort_keys=True):
-            exact_match += 1
+        elif not ref_is_empty and not pred_is_empty:
+            # Order-independent comparison: sort calls by their canonical key
+            ref_sorted = sorted([call_key(c) for c in ref_calls if call_key(c)])
+            pred_sorted = sorted([call_key(c) for c in pred_calls if call_key(c)])
+            if ref_sorted == pred_sorted and len(ref_sorted) == len(ref_calls) and len(pred_sorted) == len(pred_calls):
+                exact_match += 1
 
         ref_name_set = {c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c}
         pred_name_set = {c["name"] for c in pred_calls if isinstance(c, dict) and "name" in c}
@@ -332,7 +336,9 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
         # Diagnose failures for this example
         is_exact = (ref_is_empty and pred_is_empty) or (
             not ref_is_empty and not pred_is_empty
-            and json.dumps(pred_calls, sort_keys=True) == json.dumps(ref_calls, sort_keys=True)
+            and sorted([call_key(c) for c in ref_calls if call_key(c)])
+            == sorted([call_key(c) for c in pred_calls if call_key(c)])
+            and len(ref_calls) == len(pred_calls)
         )
         if not is_exact and len(failures) < 50:
             reasons = []
