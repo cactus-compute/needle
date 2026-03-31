@@ -21,7 +21,7 @@ def main():
     p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--d-model", type=int, default=640)
     p.add_argument("--num-heads", type=int, default=8)
-    p.add_argument("--num-kv-heads", type=int, default=4)
+    p.add_argument("--num-kv-heads", type=int, default=)
     p.add_argument("--num-layers", type=int, default=16)
     p.add_argument("--num-dec-layers", type=int, default=8)
     p.add_argument("--max-enc-len", type=int, default=DEFAULT_MAX_ENC_LEN)
