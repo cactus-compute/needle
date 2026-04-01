@@ -183,16 +183,42 @@ def _fake_quantize_int4(w, group_size=32):
         w_padded = jnp.pad(w, ((0, pad), (0, 0)))
     else:
         w_padded = w
-    
+
     num_groups = w_padded.shape[0] // gs
     w_grouped = w_padded.reshape(num_groups, gs, out_feat)
-    
+
     scale = jnp.max(jnp.abs(w_grouped), axis=1, keepdims=True) / 7.0
     scale = jnp.maximum(scale, 1e-8)
     w_q = jnp.clip(jnp.round(w_grouped / scale), -8, 7) * scale
-    
+
     w_q = w_q.reshape(-1, out_feat)[:in_feat]
-    
+
+    return w + jax.lax.stop_gradient(w_q - w)
+
+
+def _fake_quantize_int8(w, group_size=32):
+    """Symmetric group-wise INT8 fake quantization with STE.
+
+    Same structure as INT4 but with [-128, 127] range (8-bit signed).
+    """
+    in_feat, out_feat = w.shape
+    gs = min(group_size, in_feat)
+
+    pad = (gs - in_feat % gs) % gs
+    if pad > 0:
+        w_padded = jnp.pad(w, ((0, pad), (0, 0)))
+    else:
+        w_padded = w
+
+    num_groups = w_padded.shape[0] // gs
+    w_grouped = w_padded.reshape(num_groups, gs, out_feat)
+
+    scale = jnp.max(jnp.abs(w_grouped), axis=1, keepdims=True) / 127.0
+    scale = jnp.maximum(scale, 1e-8)
+    w_q = jnp.clip(jnp.round(w_grouped / scale), -128, 127) * scale
+
+    w_q = w_q.reshape(-1, out_feat)[:in_feat]
+
     return w + jax.lax.stop_gradient(w_q - w)
 
 
@@ -261,19 +287,21 @@ def _make_prune_mask(params, sparsity, group_size):
     return jax.tree_util.tree_map_with_path(_leaf_mask, params)
 
 
-def _quantize_params(params, group_size=32):
+def _quantize_params(params, group_size=32, precision="int4"):
     """Fake-quantize all Dense kernels in the param tree."""
+    qfn = _fake_quantize_int8 if precision == "int8" else _fake_quantize_int4
     def _maybe_quantize(path, leaf):
         name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
         if name == "kernel" and leaf.ndim == 3:
-            return jax.vmap(_fake_quantize_int4, in_axes=(0,))(leaf)
+            return jax.vmap(lambda w: qfn(w, group_size=group_size), in_axes=(0,))(leaf)
         if name == "kernel" and leaf.ndim == 2:
-            return _fake_quantize_int4(leaf, group_size=group_size)
+            return qfn(leaf, group_size=group_size)
         return leaf
     return jax.tree_util.tree_map_with_path(_maybe_quantize, params)
 
 
 _GROUP_SIZE = 32
+_PRECISION = "int4"
 _MAT_FACTORS = ()
 _MAT_FF_WIDTHS = ()
 _D_FF = 2048
@@ -297,7 +325,7 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, ffn_mask, rng, loss_mask,
                   enc_seg_ids, dec_seg_ids):
     q_params = jax.lax.cond(
         do_quantize,
-        lambda p: _quantize_params(p, group_size=_GROUP_SIZE),
+        lambda p: _quantize_params(p, group_size=_GROUP_SIZE, precision=_PRECISION),
         lambda p: p,
         params,
     )
@@ -335,7 +363,7 @@ def _contrastive_loss_fn(state, params, query_tokens, tool_tokens, rng, do_quant
     """Compute CLIP contrastive loss on query/tool pairs."""
     q_params = jax.lax.cond(
         do_quantize,
-        lambda p: _quantize_params(p, group_size=_GROUP_SIZE),
+        lambda p: _quantize_params(p, group_size=_GROUP_SIZE, precision=_PRECISION),
         lambda p: p,
         params,
     )
@@ -540,8 +568,9 @@ def train(args):
             no_feedforward=getattr(args, "no_feedforward", True),
         )
 
-    global _GROUP_SIZE, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF, _CONTRASTIVE_WEIGHT, _LOSS_WEIGHT_MAP
+    global _GROUP_SIZE, _PRECISION, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF, _CONTRASTIVE_WEIGHT, _LOSS_WEIGHT_MAP
     _GROUP_SIZE = getattr(args, "group_size", 32)
+    _PRECISION = getattr(args, "precision", "int4")
     _CONTRASTIVE_WEIGHT = getattr(args, "contrastive_weight", 0.1)
     _LOSS_WEIGHT_MAP = jnp.array([
         1.0,                                       # 0: base (boilerplate)
@@ -809,7 +838,7 @@ def train(args):
 
         eval_params = jax_utils.unreplicate(state).params
 
-        q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE)
+        q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE, precision=_PRECISION)
         mat_vl_fns = {}
         if _MAT_FACTORS:
             _apply_fn = jax_utils.unreplicate(state).apply_fn
@@ -948,8 +977,8 @@ def train(args):
             _gen_model = eval_model
             _gen_label = "full"
 
-        _mat_params = _quantize_params(_mat_params, group_size=_GROUP_SIZE)
-        _gen_label += " INT4"
+        _mat_params = _quantize_params(_mat_params, group_size=_GROUP_SIZE, precision=_PRECISION)
+        _gen_label += f" {_PRECISION.upper()}"
 
         all_preds = []
         _gen_t0 = time.perf_counter()
@@ -1194,7 +1223,7 @@ def train(args):
         print(f"  ─────────────────────────────────────")
         print(f"  Text loss      {final_loss:>12.4f}")
         print(f"  Text val ppl   {last_val_ppl:>12.2f}")
-        print(f"  Quant val ppl  {quant_val_ppl:>12.2f}  (INT4 g{_GROUP_SIZE})")
+        print(f"  Quant val ppl  {quant_val_ppl:>12.2f}  ({_PRECISION.upper()} g{_GROUP_SIZE})")
         print(f"  Sparsity       {sparsity:>11.2f}%  ({near_zero:,}/{total_params:,})")
         if mat_results:
             print(f"  ─────────────────────────────────────")

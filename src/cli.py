@@ -37,6 +37,8 @@ def main():
     p.add_argument("--max-eval-samples", type=int, default=5000)
     p.add_argument("--sparsity-ratio", type=float, default=0.0)
     p.add_argument("--group-size", type=int, default=32)
+    p.add_argument("--precision", type=str, default="int4", choices=["int4", "int8"],
+                   help="QAT precision: int4 (4-bit) or int8 (8-bit) fake quantization (default: int4)")
     p.add_argument("--prune-interval", type=int, default=100,
                    help="Steps between mask updates during gradual pruning (default: 100)")
     p.add_argument("--prune-start-frac", type=float, default=0.33,
