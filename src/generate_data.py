@@ -890,11 +890,12 @@ CALL_TYPES = [
 MODEL = "gemini-3.1-flash-lite-preview"
 
 LANGUAGES = [
-    "Bulgarian", "Croatian", "Czech", "Danish", "Dutch", "English",
-    "Estonian", "Finnish", "French", "German", "Greek", "Hungarian",
-    "Italian", "Latvian", "Lithuanian", "Maltese", "Polish",
-    "Portuguese", "Romanian", "Slovak", "Slovenian", "Spanish",
-    "Swedish", "Russian", "Ukrainian",
+    "English",
+    # "Bulgarian", "Croatian", "Czech", "Danish", "Dutch",
+    # "Estonian", "Finnish", "French", "German", "Greek", "Hungarian",
+    # "Italian", "Latvian", "Lithuanian", "Maltese", "Polish",
+    # "Portuguese", "Romanian", "Slovak", "Slovenian", "Spanish",
+    # "Swedish", "Russian", "Ukrainian",
 ]
 
 MAX_TOOLS = 10
