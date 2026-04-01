@@ -422,14 +422,14 @@ class EncoderDecoderTransformer(nn.Module):
         )
         self.log_temp = self.param("log_temp", jinit.zeros, ())
         
-        self.confidence_hidden = nn.Dense(
-            self.config.d_model // 4, dtype=self.config.jax_dtype,
-            kernel_init=default_init(), name="confidence_hidden",
-        )
-        self.confidence_out = nn.Dense(
-            1, dtype=jnp.float32,
-            kernel_init=jinit.zeros, name="confidence_out",
-        )
+        # self.confidence_hidden = nn.Dense(
+        #     self.config.d_model, dtype=self.config.jax_dtype,
+        #     kernel_init=default_init(), name="confidence_hidden",
+        # )
+        # self.confidence_out = nn.Dense(
+        #     1, dtype=jnp.float32,
+        #     kernel_init=jinit.zeros, name="confidence_out",
+        # )
 
     def _rope(self, seq_len):
         head_dim = self.config.d_model // self.config.num_heads
@@ -480,32 +480,17 @@ class EncoderDecoderTransformer(nn.Module):
         counts = jnp.maximum(jnp.sum(mask_2d, axis=1, keepdims=True), 1.0)
         return summed / counts
 
-    def predict_confidence(self, encoder_out, enc_mask):
-        """Predict confidence score [0, 1] from encoder output.
+    # def predict_confidence(self, encoder_out, enc_mask):
+    #     """Predict confidence score [0, 1] from encoder output."""
+    #     pooled = self._mean_pool(encoder_out, enc_mask)
+    #     h = nn.relu(self.confidence_hidden(pooled))
+    #     return nn.sigmoid(self.confidence_out(h)).squeeze(-1)
 
-        High confidence (→1.0) means the model can handle this query locally.
-        Low confidence (→0.0) means the query should be routed to cloud.
-
-        Args:
-            encoder_out: (B, T, d_model) encoder hidden states
-            enc_mask: (B, 1, 1, T) padding mask
-
-        Returns:
-            (B,) confidence scores in [0, 1]
-        """
-        pooled = self._mean_pool(encoder_out, enc_mask)  # (B, d_model)
-        h = nn.relu(self.confidence_hidden(pooled))       # (B, d_model // 4)
-        return nn.sigmoid(self.confidence_out(h)).squeeze(-1)  # (B,)
-
-    def forward_confidence(self, src, src_mask=None):
-        """End-to-end confidence prediction from token input.
-
-        Returns (confidence, encoder_out, enc_mask) so the caller can
-        reuse encoder output if confidence is high enough to decode.
-        """
-        encoder_out, enc_mask = self.encode_text(src, src_mask=src_mask)
-        confidence = self.predict_confidence(encoder_out, enc_mask)
-        return confidence, encoder_out, enc_mask
+    # def forward_confidence(self, src, src_mask=None):
+    #     """End-to-end confidence prediction from token input."""
+    #     encoder_out, enc_mask = self.encode_text(src, src_mask=src_mask)
+    #     confidence = self.predict_confidence(encoder_out, enc_mask)
+    #     return confidence, encoder_out, enc_mask
 
     def encode_contrastive(self, tokens, deterministic=True):
         """Encode tokens and project to L2-normalized contrastive space. Returns (B, contrastive_dim)."""
@@ -608,7 +593,6 @@ class EncoderDecoderTransformer(nn.Module):
             speech_out, speech_enc_mask = self.encode_speech(mel, src_mask=mel_mask, deterministic=True)
             _ = self._run_decoder(speech_out, tgt, tgt_mask=tgt_mask, cross_mask=speech_enc_mask)
         _ = self.encode_contrastive(src)
-        _ = self.predict_confidence(text_out, text_enc_mask)
         return jnp.zeros(())
 
 

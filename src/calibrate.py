@@ -124,13 +124,13 @@ def compute_per_example_perplexity(model, params, train_data, batch_size, max_sa
     return perplexities
 
 
-def perplexity_to_confidence(perplexities, mu=None, k=3.0):
+def perplexity_to_confidence(perplexities, mu=None, k=5.0):
     """Map perplexity values to [0, 1] confidence via sigmoid calibration.
 
     confidence = sigmoid(-k * (log(ppl) - log(mu)))
     """
     if mu is None:
-        mu = float(np.median(perplexities))
+        mu = float(np.percentile(perplexities, 80))
 
     log_ppl = np.log(np.maximum(perplexities, 1.0))
     log_mu = np.log(mu)
@@ -314,7 +314,9 @@ def main(args):
     with open(args.checkpoint, "rb") as f:
         data = pickle.load(f)
     params = jax.tree.map(lambda x: jnp.array(x, dtype=jnp.bfloat16), data["params"])
-    config = TransformerConfig(**data["config"])
+    config_dict = {k: v for k, v in data["config"].items()
+                   if k in TransformerConfig.__dataclass_fields__}
+    config = TransformerConfig(**config_dict)
     model = EncoderDecoderTransformer(config)
 
     param_count = sum(x.size for x in jax.tree.leaves(params))
@@ -322,15 +324,26 @@ def main(args):
     print(f"  Config: d={config.d_model}, heads={config.num_heads}, "
           f"layers={config.num_encoder_layers}/{config.num_decoder_layers}")
 
-    # Check if confidence head params exist; if not, initialize them
+    # Check if confidence head params need (re)initialization
+    rng = jax.random.PRNGKey(0)
+    dummy_src = jnp.ones((1, 128), dtype=jnp.int32)
+    dummy_tgt = jnp.ones((1, 128), dtype=jnp.int32)
+    init_vars = model.init({"params": rng}, dummy_src, dummy_tgt, method="init_all")
+    init_params = init_vars["params"]
+
     flat_keys = str(jax.tree.map(lambda x: x.shape, params))
-    if "confidence_hidden" not in flat_keys:
-        print("  Confidence head not found in checkpoint — initializing...")
-        rng = jax.random.PRNGKey(0)
-        dummy_src = jnp.ones((1, 128), dtype=jnp.int32)
-        dummy_tgt = jnp.ones((1, 128), dtype=jnp.int32)
-        init_vars = model.init({"params": rng}, dummy_src, dummy_tgt, method="init_all")
-        init_params = init_vars["params"]
+    needs_reinit = "confidence_hidden" not in flat_keys
+    if not needs_reinit:
+        # Check shape match
+        for key in ("confidence_hidden", "confidence_out"):
+            old_shapes = jax.tree.map(lambda x: x.shape, params[key])
+            new_shapes = jax.tree.map(lambda x: x.shape, init_params[key])
+            if str(old_shapes) != str(new_shapes):
+                needs_reinit = True
+                break
+
+    if needs_reinit:
+        print("  Confidence head shape mismatch or missing — reinitializing...")
         params = {**params, "confidence_hidden": init_params["confidence_hidden"],
                   "confidence_out": init_params["confidence_out"]}
         print("  Confidence head initialized.")

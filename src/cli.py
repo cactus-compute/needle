@@ -60,14 +60,14 @@ def main():
                    help="Loss weight for argument key tokens (default: 1.5)")
     p.add_argument("--no-feedforward", action=argparse.BooleanOptionalAction, default=True,
                    help="Remove feedforward layers entirely (default: True)")
-    p.add_argument("--calibrate", action=argparse.BooleanOptionalAction, default=True,
-                   help="Run confidence head calibration after training (default: True)")
+    p.add_argument("--calibrate", action=argparse.BooleanOptionalAction, default=False,
+                   help="Run confidence head calibration after training (default: False)")
     p.add_argument("--calibrate-epochs", type=int, default=1,
                    help="Epochs for confidence head calibration (default: 1)")
     p.add_argument("--calibrate-lr", type=float, default=1e-3,
                    help="Learning rate for confidence head calibration (default: 1e-3)")
-    p.add_argument("--calibrate-k", type=float, default=3.0,
-                   help="Sigmoid steepness for PPL→confidence mapping (default: 3.0)")
+    p.add_argument("--calibrate-k", type=float, default=5.0,
+                   help="Sigmoid steepness for PPL→confidence mapping (default: 5.0)")
 
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,
@@ -111,7 +111,7 @@ def main():
     p.add_argument("--num-samples", type=int, default=None, help="Limit training samples for PPL computation")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--k", type=float, default=3.0, help="Sigmoid steepness for PPL→confidence mapping")
+    p.add_argument("--k", type=float, default=5.0, help="Sigmoid steepness for PPL→confidence mapping")
 
     p = sub.add_parser("generate-data", add_help=False)
     p.add_argument("--num-samples", type=int, default=500, help="Number of samples to generate")
