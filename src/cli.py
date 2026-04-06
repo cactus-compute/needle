@@ -156,6 +156,8 @@ def main():
     tp.add_argument("--type", dest="accel_type", type=str, default="v6e-8")
     tp.add_argument("--version", type=str, default=None,
                     help="Software version (auto-detected from --type if omitted)")
+    tp.add_argument("--preemptible", action="store_true", default=False,
+                    help="Create a preemptible (spot) TPU VM")
 
     tp = tpu_sub.add_parser("connect", add_help=False)
     tp.add_argument("name", type=str)

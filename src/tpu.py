@@ -177,18 +177,22 @@ def _setup_git_on_instance(name, zone, git_name, git_email):
 
 def tpu_create(args):
     version = _resolve_version(args.accel_type, args.version)
-    print(f"[tpu] Accelerator: {args.accel_type}, software version: {version}")
+    preemptible = getattr(args, "preemptible", False)
+    print(f"[tpu] Accelerator: {args.accel_type}, software version: {version}"
+          f"{', preemptible' if preemptible else ''}")
 
     git_name, git_email = _collect_git_config()
 
     for zone in ZONES:
         print(f"[tpu] Trying {zone}...")
-        result = _run(
-            ["gcloud", "compute", "tpus", "tpu-vm", "create", args.name,
+        cmd = ["gcloud", "compute", "tpus", "tpu-vm", "create", args.name,
              "--zone", zone,
              "--accelerator-type", args.accel_type,
              "--version", version,
-             "--project", PROJECT],
+             "--project", PROJECT]
+        if preemptible:
+            cmd.append("--preemptible")
+        result = _run(cmd,
             check=False, capture=True,
         )
         if result.returncode == 0:
