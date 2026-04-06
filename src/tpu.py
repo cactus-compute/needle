@@ -31,15 +31,22 @@ def _resolve_version(accel_type, explicit_version):
     return "tpu-ubuntu2204-base"
 
 
-# Trillium (v6e) zones, ordered by on-demand price (cheapest first)
-# us-east1/us-east5: $2.70/chip/hr
-# europe-west4:      $2.97/chip/hr
-# asia-northeast1:   $3.24/chip/hr
+# Trillium (v6e) zones with quota, ordered by on-demand price (cheapest first)
+# us-east/us-central/us-south/us-west: $2.70/chip/hr
+# europe-west4:                        $2.97/chip/hr
+# asia:                                $3.24/chip/hr
 ZONES = [
-    "us-east1-b", "us-east1-c", "us-east1-d",
+    "us-east1-d",
     "us-east5-a", "us-east5-b",
-    "europe-west4-a",
-    "asia-northeast1-b",
+    "us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f",
+    "us-east4-c",
+    "us-south1-a", "us-south1-b", "us-south1-c",
+    "us-west1-a", "us-west1-b", "us-west1-c",
+    "europe-west4-a", "europe-west4-b", "europe-west4-c",
+    "asia-east1-a", "asia-east1-b", "asia-east1-c",
+    "asia-northeast1-a", "asia-northeast1-b", "asia-northeast1-c",
+    "asia-south1-a", "asia-south1-b", "asia-south1-c",
+    "asia-southeast1-a", "asia-southeast1-b", "asia-southeast1-c",
 ]
 
 TPU_HELP = """
@@ -204,8 +211,20 @@ def tpu_create(args):
         ]):
             print(f"[tpu] AUTH ERROR:\n{stderr}", file=sys.stderr)
             sys.exit(1)
-        first_line = stderr.splitlines()[0] if stderr else "unknown error"
-        print(f"[tpu] {zone}: {first_line}")
+        # extract "message" from JSON error, or fall back to first ERROR line
+        msg = "unknown error"
+        if stderr:
+            m = re.search(r'"message":\s*"(.+?)(?<!\\)"', stderr)
+            if m:
+                msg = m.group(1).replace('\\"', '"')
+            else:
+                for line in stderr.splitlines():
+                    if "ERROR" in line:
+                        msg = line
+                        break
+                else:
+                    msg = stderr.splitlines()[-1]
+        print(f"[tpu] {zone}: {msg}")
     print(
         f"[tpu] ERROR: could not create '{args.name}' in any zone.",
         file=sys.stderr,
