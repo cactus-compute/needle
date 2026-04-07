@@ -9,7 +9,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from tqdm import tqdm
-from flax import jax_utils
 from flax.training import train_state
 
 from .data import (
@@ -27,6 +26,26 @@ from .model import (
 )
 
 _HF_CHECKPOINT_REPO = "Cactus-Compute/checkpoints"
+
+
+def _replicate(tree):
+    """Replicate a pytree across all local devices (multi-host safe)."""
+    devices = jax.local_devices()
+    return jax.tree.map(
+        lambda x: jax.device_put_replicated(x, devices), tree)
+
+
+def _unreplicate(tree):
+    """Get a single copy from a replicated pytree (multi-host safe).
+
+    Uses addressable_shards instead of x[0] indexing, which fails
+    in multi-host pmap because the array spans devices on other hosts.
+    """
+    return jax.tree.map(
+        lambda x: jax.device_get(x.addressable_shards[0].data)
+        if hasattr(x, 'addressable_shards') and x.addressable_shards
+        else x,
+        tree)
 
 
 def _upload_checkpoint(ckpt_path):
@@ -614,9 +633,9 @@ def train(args):
         state = state.replace(params=ckpt_params)
         print(f"  Loaded checkpoint params into train state")
 
-    state = jax_utils.replicate(state)
+    state = _replicate(state)
 
-    param_count = sum(x.size for x in jax.tree.leaves(jax_utils.unreplicate(state).params))
+    param_count = sum(x.size for x in jax.tree.leaves(_unreplicate(state).params))
     decay_steps = max(1, int(total_steps * decay_ratio))
     stable_steps = total_steps - warmup_steps - decay_steps
     best_call_f1 = 0.0
@@ -665,8 +684,8 @@ def train(args):
     prune_mask = None
     gradual_sparsify_done = False
     # Dummy all-ones prune mask (replicated) — used when pruning is inactive
-    _unrep_params = jax_utils.unreplicate(state).params
-    dummy_prune_mask = jax_utils.replicate(jax.tree.map(jnp.ones_like, _unrep_params))
+    _unrep_params = _unreplicate(state).params
+    dummy_prune_mask = _replicate(jax.tree.map(jnp.ones_like, _unrep_params))
     del _unrep_params
     # Dummy contrastive arrays — used when contrastive is inactive
     dummy_cl_tokens = jnp.zeros((num_devices, args.batch_size, 128), dtype=jnp.int32)
@@ -761,25 +780,25 @@ def train(args):
                 cl_q_b, cl_t_b, cl_rngs, do_qat, do_cl, do_prune,
             )
 
-            text_loss_val = float(loss[0])
+            text_loss_val = float(loss.addressable_shards[0].data)
             text_losses.append(text_loss_val)
-            step_grad_norm = float(grad_norm[0])
+            step_grad_norm = float(grad_norm.addressable_shards[0].data)
             global_step += 1
 
             if epoch == weight_prune_epoch and not gradual_sparsify_done:
                 epoch_step += 1
                 current_sparsity = _cubic_sparsity_schedule(epoch_step, t_start, t_end, sparsity_ratio)
                 if epoch_step >= t_start and epoch_step % prune_interval == 0 and current_sparsity > 0:
-                    ema_unr = jax_utils.unreplicate(state.params)
+                    ema_unr = _unreplicate(state.params)
                     mask = _make_prune_mask(ema_unr, current_sparsity, _GROUP_SIZE)
                     del ema_unr
-                    prune_mask = jax_utils.replicate(mask)
+                    prune_mask = _replicate(mask)
                     del mask
 
             dt = time.perf_counter() - t0
             eval_every = getattr(args, "eval_every", 100)
             if is_main and (global_step % eval_every == 0 or global_step == total_steps):
-                _eval_params = jax_utils.unreplicate(state).params
+                _eval_params = _unreplicate(state).params
                 total_loss, total_toks = 0.0, 0.0
                 _val_n = count_batches(len(val_enc), args.batch_size)
                 for vb in tqdm(get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False,
@@ -832,14 +851,14 @@ def train(args):
         if epoch == weight_prune_epoch and not gradual_sparsify_done:
             gradual_sparsify_done = True
             if prune_mask is None:
-                ema_unr = jax_utils.unreplicate(state.params)
+                ema_unr = _unreplicate(state.params)
                 mask = _make_prune_mask(ema_unr, sparsity_ratio, _GROUP_SIZE)
                 del ema_unr
-                prune_mask = jax_utils.replicate(mask)
+                prune_mask = _replicate(mask)
                 del mask
             state = state.replace(
                 params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
-            final_pruned = jax.tree.map(np.array, jax_utils.unreplicate(state).params)
+            final_pruned = jax.tree.map(np.array, _unreplicate(state).params)
             total_p = sum(x.size for x in jax.tree.leaves(final_pruned))
             zero_p = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(final_pruned))
             print(f"\n  Gradual sparsification complete — mask locked.")
@@ -854,12 +873,12 @@ def train(args):
             # Non-main hosts wait here while host 0 runs eval/checkpoint
             continue
 
-        eval_params = jax_utils.unreplicate(state).params
+        eval_params = _unreplicate(state).params
 
         q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE, precision=_PRECISION)
         mat_vl_fns = {}
         if _MAT_FACTORS:
-            _apply_fn = jax_utils.unreplicate(state).apply_fn
+            _apply_fn = _unreplicate(state).apply_fn
             mat_vl_fns = {f: _make_mat_val_loss_fn(_apply_fn, fw)
                           for f, fw in zip(_MAT_FACTORS, _MAT_FF_WIDTHS)}
             del _apply_fn

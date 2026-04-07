@@ -421,7 +421,10 @@ def tpu_list(args):
 
 
 def _sync_code_to_workers(name, zone, num_workers):
-    """Tarball source code and SCP to all workers. Returns True on success."""
+    """Tarball source code and SCP to all workers. Returns True on success.
+
+    Preserves .venv, .data_cache, and checkpoints on workers if they exist.
+    """
     import tempfile
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -451,22 +454,32 @@ def _sync_code_to_workers(name, zone, num_workers):
         print("[tpu] ERROR: failed to copy tarball to workers.", file=sys.stderr)
         return False
 
-    # Extract on all workers (preserves .venv if it exists)
+    # Extract on all workers, preserving .venv/.data_cache/checkpoints
+    # 1. Move heavy dirs aside if they exist
+    # 2. Remove old source code
+    # 3. Extract fresh tarball
+    # 4. Move heavy dirs back
     print(f"[tpu] Extracting on all {num_workers} workers...")
-    result = _run_all_workers(name, zone,
-        "rm -rf /tmp/needle_new && tar -xzf /tmp/needle_sync.tar.gz -C /tmp "
-        "&& mv /tmp/needle_new 2>/dev/null; "
-        "rsync -a --exclude=.venv --exclude=.data_cache --exclude=checkpoints "
-        "/tmp/needle/ ~/needle/ "
-        "&& rm -rf /tmp/needle /tmp/needle_sync.tar.gz")
+    extract_cmd = (
+        "set -e; "
+        "cd ~; "
+        # Save heavy dirs if they exist
+        "for d in .venv .data_cache checkpoints; do "
+        "  if [ -d ~/needle/$d ]; then mv ~/needle/$d /tmp/needle_save_$d; fi; "
+        "done; "
+        # Remove old code and extract new
+        "rm -rf ~/needle; "
+        "tar -xzf /tmp/needle_sync.tar.gz -C ~; "
+        "rm -f /tmp/needle_sync.tar.gz; "
+        # Restore heavy dirs
+        "for d in .venv .data_cache checkpoints; do "
+        "  if [ -d /tmp/needle_save_$d ]; then mv /tmp/needle_save_$d ~/needle/$d; fi; "
+        "done"
+    )
+    result = _run_all_workers(name, zone, extract_cmd)
     if result.returncode != 0:
-        # Fallback: simple overwrite (rsync may not be installed)
-        result = _run_all_workers(name, zone,
-            "rm -rf ~/needle && tar -xzf /tmp/needle_sync.tar.gz -C ~ "
-            "&& rm -f /tmp/needle_sync.tar.gz")
-        if result.returncode != 0:
-            print("[tpu] ERROR: failed to extract on workers.", file=sys.stderr)
-            return False
+        print("[tpu] ERROR: failed to extract on workers.", file=sys.stderr)
+        return False
     return True
 
 
@@ -540,7 +553,9 @@ def _collect_env_exports():
     for var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "WANDB_API_KEY"):
         val = os.environ.get(var)
         if val:
-            exports.append(f"export {var}={val}")
+            # Quote value to handle special characters in tokens
+            safe_val = val.replace("'", "'\\''")
+            exports.append(f"export {var}='{safe_val}'")
     return " && ".join(exports)
 
 
@@ -558,19 +573,31 @@ def tpu_train(args):
     # Forward auth env vars to workers
     env_exports = _collect_env_exports()
     if env_exports:
+        env_count = len(env_exports.split(" && "))
+        print(f"[tpu] Forwarding {env_count} env var(s) to workers")
         train_cmd = env_exports + " && " + train_cmd
 
     if num_workers <= 1:
         print(f"[tpu] Single-host TPU. Running training directly...")
+        # Use quiet=True to avoid printing tokens, then log sanitized version
+        print(f"[tpu] $ gcloud compute tpus tpu-vm ssh {args.name} --command 'needle train ...'")
         _run(
             ["gcloud", "compute", "tpus", "tpu-vm", "ssh", args.name,
              "--zone", zone, "--project", PROJECT,
              "--command", train_cmd],
+            quiet=True,
         )
         return
 
     print(f"[tpu] Launching training on {num_workers} workers...")
-    result = _run_all_workers(args.name, zone, train_cmd)
+    # Run with quiet=True to avoid printing tokens in command log
+    result = _run(
+        ["gcloud", "compute", "tpus", "tpu-vm", "ssh", args.name,
+         "--zone", zone, "--project", PROJECT,
+         "--worker=all",
+         "--command", train_cmd],
+        check=False, quiet=True,
+    )
     if result.returncode != 0:
         print("[tpu] WARNING: training exited with errors on some workers.",
               file=sys.stderr)
