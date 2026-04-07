@@ -54,6 +54,7 @@ TPU_HELP = """
     needle tpu create NAME [--type TYPE] [--version VER]
     needle tpu connect NAME [--zone ZONE]
     needle tpu setup NAME [--zone ZONE]    setup all workers (multi-host)
+    needle tpu sync NAME [--zone ZONE]     sync code only (fast, no venv rebuild)
     needle tpu train NAME [--zone ZONE]    launch training on all workers
     needle tpu claude NAME [--zone ZONE]
     needle tpu stop NAME [--zone ZONE]
@@ -419,6 +420,56 @@ def tpu_list(args):
         print("[tpu] No instances found.")
 
 
+def _sync_code_to_workers(name, zone, num_workers):
+    """Tarball source code and SCP to all workers. Returns True on success."""
+    import tempfile
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    tarball = os.path.join(tempfile.gettempdir(), "needle_sync.tar.gz")
+    print(f"[tpu] Creating tarball (excluding .venv, .data_cache, .git)...")
+    _run(
+        ["tar", "-czf", tarball,
+         "--exclude=.venv", "--exclude=.data_cache",
+         "--exclude=__pycache__", "--exclude=.git",
+         "--exclude=*.pyc", "--exclude=checkpoints",
+         "-C", os.path.dirname(project_root),
+         os.path.basename(project_root)],
+    )
+    tar_size = os.path.getsize(tarball)
+    print(f"[tpu] Tarball: {tar_size / 1024:.0f} KB")
+
+    print(f"[tpu] Copying to all {num_workers} workers...")
+    result = _run(
+        ["gcloud", "compute", "tpus", "tpu-vm", "scp",
+         tarball, f"{name}:/tmp/needle_sync.tar.gz",
+         "--zone", zone, "--project", PROJECT,
+         "--worker=all"],
+        check=False,
+    )
+    os.remove(tarball)
+    if result.returncode != 0:
+        print("[tpu] ERROR: failed to copy tarball to workers.", file=sys.stderr)
+        return False
+
+    # Extract on all workers (preserves .venv if it exists)
+    print(f"[tpu] Extracting on all {num_workers} workers...")
+    result = _run_all_workers(name, zone,
+        "rm -rf /tmp/needle_new && tar -xzf /tmp/needle_sync.tar.gz -C /tmp "
+        "&& mv /tmp/needle_new 2>/dev/null; "
+        "rsync -a --exclude=.venv --exclude=.data_cache --exclude=checkpoints "
+        "/tmp/needle/ ~/needle/ "
+        "&& rm -rf /tmp/needle /tmp/needle_sync.tar.gz")
+    if result.returncode != 0:
+        # Fallback: simple overwrite (rsync may not be installed)
+        result = _run_all_workers(name, zone,
+            "rm -rf ~/needle && tar -xzf /tmp/needle_sync.tar.gz -C ~ "
+            "&& rm -f /tmp/needle_sync.tar.gz")
+        if result.returncode != 0:
+            print("[tpu] ERROR: failed to extract on workers.", file=sys.stderr)
+            return False
+    return True
+
+
 def tpu_setup(args):
     """Set up all workers of a multi-host TPU: sync code, install deps.
 
@@ -435,44 +486,13 @@ def tpu_setup(args):
 
     print(f"[tpu] Multi-host TPU: {num_workers} workers")
 
-    # Find the needle project root (where this script lives)
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-    # Create lightweight tarball excluding heavy dirs
-    import tempfile
-    tarball = os.path.join(tempfile.gettempdir(), "needle_sync.tar.gz")
-    print(f"[tpu] Creating tarball (excluding .venv, .data_cache, .git)...")
-    _run(
-        ["tar", "-czf", tarball,
-         "--exclude=.venv", "--exclude=.data_cache",
-         "--exclude=__pycache__", "--exclude=.git",
-         "--exclude=*.pyc", "--exclude=checkpoints",
-         "-C", os.path.dirname(project_root),
-         os.path.basename(project_root)],
-    )
-    tar_size = os.path.getsize(tarball)
-    print(f"[tpu] Tarball: {tar_size / 1024:.0f} KB")
-
-    # SCP tarball to all workers
-    print(f"[tpu] Copying to all {num_workers} workers...")
-    result = _run(
-        ["gcloud", "compute", "tpus", "tpu-vm", "scp",
-         tarball, f"{args.name}:/tmp/needle_sync.tar.gz",
-         "--zone", zone, "--project", PROJECT,
-         "--worker=all"],
-        check=False,
-    )
-    os.remove(tarball)
-    if result.returncode != 0:
-        print("[tpu] ERROR: failed to copy tarball to workers.", file=sys.stderr)
+    if not _sync_code_to_workers(args.name, zone, num_workers):
         sys.exit(1)
 
-    # Extract and install on all workers
-    print(f"[tpu] Extracting and installing on all {num_workers} workers...")
+    # Full setup: recreate venv + install jax[tpu]
+    print(f"[tpu] Running full setup on all {num_workers} workers...")
     result = _run_all_workers(args.name, zone,
-        "rm -rf ~/needle && tar -xzf /tmp/needle_sync.tar.gz -C ~ "
-        "&& rm /tmp/needle_sync.tar.gz "
-        "&& cd ~/needle && source ./setup")
+        "cd ~/needle && rm -rf .venv && source ./setup")
     if result.returncode != 0:
         print("[tpu] WARNING: setup failed on some workers.", file=sys.stderr)
 
@@ -484,6 +504,34 @@ def tpu_setup(args):
             f'git config --global user.email "{git_email}"')
 
     print(f"[tpu] All {num_workers} workers ready.")
+
+
+def tpu_sync(args):
+    """Sync code to all workers without recreating venv.
+
+    Fast alternative to `tpu setup` — just copies source code and runs
+    `pip install -e .` to pick up changes. Use when the venv already exists.
+    """
+    zone = args.zone or _detect_zone(args.name)
+    num_workers = _get_num_workers(args.name, zone)
+
+    if num_workers <= 1:
+        print(f"[tpu] Single-host TPU ({num_workers} worker). Use 'needle tpu connect' instead.")
+        return
+
+    print(f"[tpu] Multi-host TPU: {num_workers} workers (sync only)")
+
+    if not _sync_code_to_workers(args.name, zone, num_workers):
+        sys.exit(1)
+
+    # Just reinstall the package to pick up code changes
+    print(f"[tpu] Installing package on all {num_workers} workers...")
+    result = _run_all_workers(args.name, zone,
+        "cd ~/needle && .venv/bin/pip install -e . -q")
+    if result.returncode != 0:
+        print("[tpu] WARNING: pip install failed on some workers.", file=sys.stderr)
+
+    print(f"[tpu] All {num_workers} workers synced.")
 
 
 def tpu_train(args):
@@ -518,6 +566,7 @@ def tpu_dispatch(args):
         "create": tpu_create,
         "connect": tpu_connect,
         "setup": tpu_setup,
+        "sync": tpu_sync,
         "train": tpu_train,
         "claude": tpu_claude,
         "stop": tpu_stop,

@@ -167,6 +167,10 @@ def main():
     tp.add_argument("name", type=str)
     tp.add_argument("--zone", type=str, default=None)
 
+    tp = tpu_sub.add_parser("sync", add_help=False)
+    tp.add_argument("name", type=str)
+    tp.add_argument("--zone", type=str, default=None)
+
     tp = tpu_sub.add_parser("train", add_help=False)
     tp.add_argument("name", type=str)
     tp.add_argument("--zone", type=str, default=None)
