@@ -534,6 +534,16 @@ def tpu_sync(args):
     print(f"[tpu] All {num_workers} workers synced.")
 
 
+def _collect_env_exports():
+    """Collect env vars to forward to remote workers (HF_TOKEN, WANDB_API_KEY, etc)."""
+    exports = []
+    for var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "WANDB_API_KEY"):
+        val = os.environ.get(var)
+        if val:
+            exports.append(f"export {var}={val}")
+    return " && ".join(exports)
+
+
 def tpu_train(args):
     """Launch training on all workers of a multi-host TPU."""
     zone = args.zone or _detect_zone(args.name)
@@ -544,6 +554,11 @@ def tpu_train(args):
     train_cmd = "cd ~/needle && .venv/bin/needle train"
     if extra:
         train_cmd += " " + " ".join(extra)
+
+    # Forward auth env vars to workers
+    env_exports = _collect_env_exports()
+    if env_exports:
+        train_cmd = env_exports + " && " + train_cmd
 
     if num_workers <= 1:
         print(f"[tpu] Single-host TPU. Running training directly...")
