@@ -553,7 +553,11 @@ def train(args):
     val_dec_seg = val_data["packed_dec_seg"]
     print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val packed bins (memory-mapped)")
 
-    val_ds = load_tool_calls("val", max_samples=args.max_samples)
+    try:
+        val_ds = load_tool_calls("val", max_samples=args.max_samples)
+    except (FileNotFoundError, Exception) as e:
+        print(f"      WARNING: could not load val dataset for eval samples: {e}")
+        val_ds = None
 
     cl_query_tokens = train_data.get("query_only")
     cl_tool_tokens = train_data.get("tool_individual")
@@ -934,66 +938,69 @@ def train(args):
         del params_np
 
         from .run import generate_batch
-
-        val_kept = val_data["kept_indices"]
-
-        sample_rng = np.random.RandomState(epoch + 7)
-        sample_pool = sample_rng.permutation(len(val_kept))
-        display_with, display_without = [], []
-        for k in sample_pool:
-            if len(display_with) >= 4 and len(display_without) >= 1:
-                break
-            local_idx = int(val_kept[k])
-            ex = val_ds[local_idx]
-            is_empty = ex["answers"].strip() in ("", "[]")
-            if not is_empty and len(display_with) < 4:
-                display_with.append(ex)
-            elif is_empty and len(display_without) < 1:
-                display_without.append(ex)
-        display_pairs = display_with + display_without
-
         import json as _json_mod
-        tc_per_bucket = 50
-        tc_rng = np.random.RandomState(epoch + 42)
 
-        def _classify_sample(ex):
-            """Classify a sample as single or multi call."""
-            try:
-                answers = _json_mod.loads(ex["answers"])
-            except (ValueError, TypeError):
-                return "empty"
-            if not answers or not isinstance(answers, list):
-                return "empty"
-            return "single" if len(answers) == 1 else "multi"
-
-        # 2 pools: single/multi, each balanced by tool count
         _pool_names = ["single", "multi"]
-        _pool_buckets = {name: {t: [] for t in range(11)} for name in _pool_names}
+        display_pairs = []
+        eval_pools = {name: [] for name in _pool_names}
 
-        for k in range(len(val_kept)):
-            ex = val_ds[int(val_kept[k])]
-            try:
-                nc = min(len(_json_mod.loads(ex["tools"])), 10)
-            except (ValueError, TypeError):
-                nc = 0
-            call_type = _classify_sample(ex)
-            if call_type == "empty":
-                continue
-            _pool_buckets[call_type][nc].append(k)
+        if val_ds is not None:
+            val_kept = val_data["kept_indices"]
 
-        def _balanced_sample(buckets, per_bucket, rng):
-            pool = []
-            for t in range(11):
-                b = np.array(buckets[t])
-                if len(b) > 0:
-                    rng.shuffle(b)
-                    pool.extend(b[:per_bucket].tolist())
-            rng.shuffle(pool)
-            return [val_ds[int(val_kept[k])] for k in pool]
+            sample_rng = np.random.RandomState(epoch + 7)
+            sample_pool = sample_rng.permutation(len(val_kept))
+            display_with, display_without = [], []
+            for k in sample_pool:
+                if len(display_with) >= 4 and len(display_without) >= 1:
+                    break
+                local_idx = int(val_kept[k])
+                ex = val_ds[local_idx]
+                is_empty = ex["answers"].strip() in ("", "[]")
+                if not is_empty and len(display_with) < 4:
+                    display_with.append(ex)
+                elif is_empty and len(display_without) < 1:
+                    display_without.append(ex)
+            display_pairs = display_with + display_without
 
-        eval_pools = {}
-        for name in _pool_names:
-            eval_pools[name] = _balanced_sample(_pool_buckets[name], tc_per_bucket, tc_rng)
+            tc_per_bucket = 50
+            tc_rng = np.random.RandomState(epoch + 42)
+
+            def _classify_sample(ex):
+                """Classify a sample as single or multi call."""
+                try:
+                    answers = _json_mod.loads(ex["answers"])
+                except (ValueError, TypeError):
+                    return "empty"
+                if not answers or not isinstance(answers, list):
+                    return "empty"
+                return "single" if len(answers) == 1 else "multi"
+
+            # 2 pools: single/multi, each balanced by tool count
+            _pool_buckets = {name: {t: [] for t in range(11)} for name in _pool_names}
+
+            for k in range(len(val_kept)):
+                ex = val_ds[int(val_kept[k])]
+                try:
+                    nc = min(len(_json_mod.loads(ex["tools"])), 10)
+                except (ValueError, TypeError):
+                    nc = 0
+                call_type = _classify_sample(ex)
+                if call_type == "empty":
+                    continue
+                _pool_buckets[call_type][nc].append(k)
+
+            def _balanced_sample(buckets, per_bucket, rng):
+                pool = []
+                for t in range(11):
+                    b = np.array(buckets[t])
+                    if len(b) > 0:
+                        rng.shuffle(b)
+                        pool.extend(b[:per_bucket].tolist())
+                rng.shuffle(pool)
+                return [val_ds[int(val_kept[k])] for k in pool]
+
+            for name in _pool_names:
+                eval_pools[name] = _balanced_sample(_pool_buckets[name], tc_per_bucket, tc_rng)
 
         all_eval_examples = display_pairs
         _pool_offsets = {}
@@ -1248,7 +1255,7 @@ def train(args):
                     _upload_checkpoint(mat_ckpt_path)
 
         retrieval_metrics = None
-        if has_contrastive and _CONTRASTIVE_WEIGHT > 0:
+        if has_contrastive and _CONTRASTIVE_WEIGHT > 0 and val_ds is not None:
             from .eval import benchmark_retrieval
             retrieval_metrics = benchmark_retrieval(
                 eval_model, eval_params, tokenizer,
