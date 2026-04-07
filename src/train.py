@@ -498,16 +498,20 @@ def shard_batch(batch, num_devices):
 
 
 def train(args):
+    # Multi-host TPU: initialize distributed JAX before anything else.
+    # On single-host setups this is a no-op (coordinator_address is auto-detected).
+    jax.distributed.initialize()
+
     num_devices = jax.local_device_count()
 
     use_wandb = getattr(args, "wandb", False)
-    if use_wandb:
+    if use_wandb and jax.process_index() == 0:
         import wandb
         if wandb.run is None:
             wandb.init(project="needle-v1", config=vars(args))
 
     print(f"\n[1/3] Detecting devices...")
-    print(f"      {num_devices} device(s) for data-parallel training")
+    print(f"      {num_devices} local device(s), {jax.device_count()} total across {jax.process_count()} hosts")
 
     print(f"\n[2/3] Loading tokenizer...")
     tokenizer = get_tokenizer(max_samples=args.max_samples)
@@ -541,7 +545,10 @@ def train(args):
     if has_contrastive:
         print(f"      Contrastive: {len(cl_query_tokens):,} queries, {len(cl_tool_tokens):,} tools")
 
-    effective_batch_size = args.batch_size * num_devices
+    num_hosts = jax.process_count()
+    host_id = jax.process_index()
+    total_devices = jax.device_count()
+    effective_batch_size = args.batch_size * num_devices  # per-host batch for pmap
 
     resume_checkpoint = getattr(args, "checkpoint", None)
     if resume_checkpoint:
@@ -594,13 +601,15 @@ def train(args):
     rng, init_rng = jax.random.split(rng)
 
     unique_batch_size = (effective_batch_size // num_devices) * num_devices
-    text_batches_per_epoch = count_batches(len(enc_inputs), unique_batch_size)
+    # Each host processes unique_batch_size samples; total across hosts = unique_batch_size * num_hosts
+    global_batch_size = unique_batch_size * num_hosts
+    text_batches_per_epoch = count_batches(len(enc_inputs), global_batch_size)
     num_batches = text_batches_per_epoch
     total_steps = num_batches * args.epochs
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
 
-    scaled_lr = args.lr * num_devices
-    muon_lr = getattr(args, "muon_lr", 0.02) * math.sqrt(num_devices)
+    scaled_lr = args.lr * total_devices
+    muon_lr = getattr(args, "muon_lr", 0.02) * math.sqrt(total_devices)
     decay_ratio = getattr(args, "decay_ratio", 0.15)
     state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps, decay_ratio)
     val_loss_fn = _make_val_loss_fn(state.apply_fn)
@@ -617,22 +626,25 @@ def train(args):
     best_call_f1 = 0.0
     best_ckpt_path = None
 
-    print(f"\n  ─────────────────────────────────────")
-    print(f"  Parameters    {param_count:>12,}")
-    print(f"  d_model       {config.d_model:>12}")
-    print(f"  Heads         {config.num_heads:>7} ({config.num_kv_heads} KV)")
-    print(f"  Layers        {config.num_encoder_layers:>7} enc / {config.num_decoder_layers} dec")
-    print(f"  Activation    {config.activation:>12}")
-    print(f"  Dtype         {config.dtype:>12}")
-    print(f"  ─────────────────────────────────────")
-    print(f"  Devices       {num_devices:>12}")
-    print(f"  Batch         {args.batch_size:>7} x {num_devices} = {effective_batch_size}")
-    print(f"  Adam LR       {args.lr:>7} x {num_devices} = {scaled_lr}")
-    print(f"  Muon LR       {args.muon_lr:>7.4f} -> {muon_lr:.4f}")
-    print(f"  Schedule      {warmup_steps}w / {stable_steps}s / {decay_steps}d (WSD)")
-    print(f"  Total steps   {total_steps:>12,}")
-    print(f"  Epochs        {args.epochs:>12}")
-    print(f"  ─────────────────────────────────────\n")
+    is_main = host_id == 0
+    if is_main:
+        print(f"\n  ─────────────────────────────────────")
+        print(f"  Parameters    {param_count:>12,}")
+        print(f"  d_model       {config.d_model:>12}")
+        print(f"  Heads         {config.num_heads:>7} ({config.num_kv_heads} KV)")
+        print(f"  Layers        {config.num_encoder_layers:>7} enc / {config.num_decoder_layers} dec")
+        print(f"  Activation    {config.activation:>12}")
+        print(f"  Dtype         {config.dtype:>12}")
+        print(f"  ─────────────────────────────────────")
+        print(f"  Hosts         {num_hosts:>12}")
+        print(f"  Devices       {num_devices:>5}/host, {total_devices} total")
+        print(f"  Batch         {args.batch_size:>7} x {total_devices} = {global_batch_size}")
+        print(f"  Adam LR       {args.lr:>7} x {total_devices} = {scaled_lr}")
+        print(f"  Muon LR       {args.muon_lr:>7.4f} -> {muon_lr:.4f}")
+        print(f"  Schedule      {warmup_steps}w / {stable_steps}s / {decay_steps}d (WSD)")
+        print(f"  Total steps   {total_steps:>12,}")
+        print(f"  Epochs        {args.epochs:>12}")
+        print(f"  ─────────────────────────────────────\n")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     global_step = 0
@@ -642,13 +654,13 @@ def train(args):
         text_ffn_mask[None, :, :],
         (num_devices, args.batch_size, config.d_ff),
     )
-    if n_widths > 1:
+    if n_widths > 1 and is_main:
         print(f"  Mat factors   {n_widths} (full + {', '.join(str(f)+'x' for f in _MAT_FACTORS)})")
         print(f"  Mat mode      unique input ({args.batch_size}/dev, split by width)")
 
     adam_schedule = _wsd_schedule(scaled_lr, total_steps, warmup_steps)
     muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
-    tokens_per_batch = effective_batch_size * (args.max_enc_len + args.max_dec_len)
+    tokens_per_batch = global_batch_size * (args.max_enc_len + args.max_dec_len)
 
     eval_model = EncoderDecoderTransformer(config)
 
@@ -680,7 +692,7 @@ def train(args):
 
         text_losses = []
         text_batch_iter = PrefetchIterator(
-            lambda: get_batches(enc_inputs, dec_inputs, dec_targets, unique_batch_size,
+            lambda: get_batches(enc_inputs, dec_inputs, dec_targets, global_batch_size,
                                 loss_mask=train_loss_mask,
                                 enc_seg_ids=train_enc_seg,
                                 dec_seg_ids=train_dec_seg),
@@ -693,7 +705,7 @@ def train(args):
             cl_batch_iter = PrefetchIterator(
                 lambda: get_contrastive_batches(
                     cl_query_tokens, cl_tool_tokens, cl_tool_ex_idx, cl_tool_is_pos,
-                    unique_batch_size),
+                    global_batch_size),
                 prefetch=4,
             )
 
@@ -702,7 +714,11 @@ def train(args):
         for step_i in pbar:
             t0 = time.perf_counter()
 
-            src, tgt_in, tgt_out, lm, enc_seg, dec_seg = next(text_batch_iter)
+            batch = next(text_batch_iter)
+
+            # Slice this host's portion from the global batch
+            host_slice = slice(host_id * unique_batch_size, (host_id + 1) * unique_batch_size)
+            src, tgt_in, tgt_out, lm, enc_seg, dec_seg = [b[host_slice] for b in batch]
 
             # Upcast from int16/float16 storage to int32/float32 for JAX
             src = np.asarray(src, dtype=np.int32)
@@ -729,6 +745,8 @@ def train(args):
             if do_contrastive:
                 try:
                     cl_q, cl_t = next(cl_batch_iter)
+                    cl_q = cl_q[host_slice]
+                    cl_t = cl_t[host_slice]
                     cl_q_b = shard_batch(cl_q, num_devices)
                     cl_t_b = shard_batch(cl_t, num_devices)
                     rng, cl_rng = jax.random.split(rng)
@@ -764,7 +782,7 @@ def train(args):
 
             dt = time.perf_counter() - t0
             eval_every = getattr(args, "eval_every", 100)
-            if global_step % eval_every == 0 or global_step == total_steps:
+            if is_main and (global_step % eval_every == 0 or global_step == total_steps):
                 _eval_params = jax_utils.unreplicate(state).params
                 total_loss, total_toks = 0.0, 0.0
                 _val_n = count_batches(len(val_enc), args.batch_size)
@@ -796,7 +814,7 @@ def train(args):
                     postfix["sparsification"] = "done"
             pbar.set_postfix(**postfix)
 
-            if use_wandb:
+            if use_wandb and is_main:
                 log_dict = {
                     "train/text_loss": text_loss_val,
                     "train/grad_norm": step_grad_norm,
@@ -835,6 +853,10 @@ def train(args):
         epoch_avg_loss = sum(text_losses) / len(text_losses) if text_losses else float("nan")
         final_loss = text_losses[-1] if text_losses else float("nan")
         final_ppl = math.exp(min(final_loss, 20)) if not math.isnan(final_loss) else float("nan")
+
+        if not is_main:
+            # Non-main hosts wait here while host 0 runs eval/checkpoint
+            continue
 
         eval_params = jax_utils.unreplicate(state).params
 
@@ -1325,14 +1347,15 @@ def train(args):
                 log_dict["epoch/retrieval_mrr"] = retrieval_metrics["mrr"]
             wandb.log(log_dict)
 
-    if use_wandb:
+    if use_wandb and is_main:
         wandb.finish()
-    if best_ckpt_path:
+    if is_main and best_ckpt_path:
         print(f"\nBest checkpoint (call_f1={best_call_f1:.1%}): {best_ckpt_path}")
-    print("\nTraining complete.")
+    if is_main:
+        print("\nTraining complete.")
 
     # Auto-calibrate confidence head on best checkpoint
-    if getattr(args, "calibrate", True) and best_ckpt_path:
+    if is_main and getattr(args, "calibrate", True) and best_ckpt_path:
         print(f"\n{'='*50}")
         print(f"Running confidence head calibration on {best_ckpt_path}")
         print(f"{'='*50}")
