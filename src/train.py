@@ -329,7 +329,8 @@ _MAT_FF_WIDTHS = ()
 _D_FF = 2048
 _CONTRASTIVE_WEIGHT = 0.1
 # Weight map: class 0=base, 1=name, 2=value, 3=key (set from CLI args at train time)
-_LOSS_WEIGHT_MAP = jnp.array([1.0, 3.0, 2.0, 1.5], dtype=jnp.float32)
+# Use numpy at module level to avoid initializing JAX backend before jax.distributed.initialize()
+_LOSS_WEIGHT_MAP = np.array([1.0, 3.0, 2.0, 1.5], dtype=np.float32)
 
 
 def _clip_contrastive_loss(q_emb, t_emb, log_temp):

@@ -564,6 +564,13 @@ def tpu_train(args):
     zone = args.zone or _detect_zone(args.name)
     num_workers = _get_num_workers(args.name, zone)
 
+    # Kill any stale training processes that might be holding the TPU
+    # [n] trick prevents pkill from matching its own command line
+    if num_workers > 1:
+        print(f"[tpu] Killing stale processes on all workers...")
+        _run_all_workers(args.name, zone,
+            "sudo pkill -9 -f [n]eedle.train || true")
+
     # Pass through any extra args after the name
     extra = getattr(args, "train_args", [])
     train_cmd = "cd ~/needle && .venv/bin/needle train"
