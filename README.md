@@ -383,7 +383,8 @@ needle [command]
    Generate a token with 'repo' scope
 
 4. Clone the repo on your instance using your PAT
-   git clone https://<your-PAT>@github.com/cactus-compute/needle.git
+   git clone https://github.com/cactus-compute/needle.git
+   You will be rpompted for your usernme and password (PAT)
    cd needle
 
 5. Install needle (follow instruction to setup wandb)
