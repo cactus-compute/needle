@@ -313,7 +313,11 @@ needle [command]
   │     create NAME              Create TPU (auto-finds zone)         │
   │       --type STR             Accelerator (default: v6e-8)         │
   │       --version STR          TPU OS (auto-detected from --type)   │
+  │       --preemptible          Create spot/preemptible instance     │
   │     connect NAME             SSH config + connect (auto-zone)     │
+  │     setup NAME               Full setup: sync code + venv + deps  │
+  │     sync NAME                Fast sync: code (no venv rebuild)    │
+  │     train NAME [-- ARGS]     Launch training on all workers       │
   │     claude NAME              Install Claude Code on instance      │
   │     stop NAME                Stop instance (auto-zone)            │
   │     start NAME               Start stopped instance (auto-zone)   │
@@ -367,12 +371,14 @@ needle [command]
 
 ## Example Workflow
 
+### Single-host (v6e-8) — SSH into instance
+
 ```
 1. Create an instance (auto: finds zone → installs Claude Code → connects via SSH)
    needle tpu create my-experiment
    (exit with 'exit' or Ctrl+D)
 
-2. Reconnect anytime (exit with 'exit' or Ctrl+D)
+2. Reconnect anytime
    ssh my-experiment
    or VS Code: click the '><' in the bottom left → select my-experiment
 
@@ -384,21 +390,18 @@ needle [command]
 
 4. Clone the repo on your instance using your PAT
    git clone https://github.com/cactus-compute/needle.git
-   You will be rpompted for your usernme and password (PAT)
    cd needle
 
 5. Install needle (follow instruction to setup wandb)
    source ./setup
 
-6. Login to Hugging Face (required for gated datasets like xlam-60k)
+6. Login to Hugging Face (required for private datasets)
    huggingface-cli login
    (paste your HF token — get one at https://huggingface.co/settings/tokens)
 
 7. Full pipeline
-   needle generate-data --num-samples 5000    # synthesize training data
    needle tokenize                            # tokenize + pack + upload
    needle train --wandb                       # train on TPU
-   needle calibrate --checkpoint <path>       # calibrate confidence head
    needle eval --checkpoint <path>            # evaluate
 
 8. Use tmux for long training runs (survives SSH disconnects)
@@ -413,17 +416,44 @@ needle [command]
    needle tpu stop my-experiment
 
 10. (Optional) Delete instance when no longer needed
+    needle tpu delete my-experiment
+```
+
+### Multi-host (v6e-16+) — run from your Mac
+
+For multi-host TPUs (v6e-16 = 4 workers, v6e-32 = 8 workers), you drive
+everything from your Mac. The CLI syncs code and launches training across
+all workers automatically.
+
+```
+1. Set auth tokens (workers need these to download data + log metrics)
+   export HF_TOKEN=hf_...
+   export WANDB_API_KEY=...
+
+2. Add SSH key to agent (required for gcloud scp/ssh)
+   ssh-add ~/.ssh/google_compute_engine
+
+3. Create a multi-host TPU (auto: finds zone → syncs code → installs deps)
+   needle tpu create my-experiment --type v6e-16
+
+4. Launch training on all workers from your Mac
+   needle tpu train my-experiment -- --wandb --epochs 1
+
+5. After code changes, sync without rebuilding venv (fast, ~seconds)
+   needle tpu sync my-experiment
+
+6. Full re-setup if deps changed (slow, rebuilds venv)
+   needle tpu setup my-experiment
+
+7. Stop/delete when done
+   needle tpu stop my-experiment
    needle tpu delete my-experiment
 ```
 
-## Current TPU Instance
+## Current TPU Instances
 
 ```
-  Name       Zone        Type   Software         IP (ext)        Created
-  ─────────────────────────────────────────────────────────────────────────
-  henry      us-east5-a  v6e-8  v2-alpha-tpuv6e  34.186.252.53   Mar 17, 2026
-```
-
-```bash
-gcloud compute tpus tpu-vm ssh henry --zone=us-east5-a
+  Name       Zone               Type    Software         Workers
+  ──────────────────────────────────────────────────────────────────
+  large      asia-northeast1-b  v6e-16  v2-alpha-tpuv6e  4
 ```
