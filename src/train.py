@@ -783,9 +783,9 @@ def train(args):
                 cl_q_b, cl_t_b, cl_rngs, do_qat, do_cl, do_prune,
             )
 
-            text_loss_val = float(loss.addressable_shards[0].data)
+            text_loss_val = float(loss.addressable_shards[0].data[0])
             text_losses.append(text_loss_val)
-            step_grad_norm = float(grad_norm.addressable_shards[0].data)
+            step_grad_norm = float(grad_norm.addressable_shards[0].data[0])
             global_step += 1
 
             if epoch == weight_prune_epoch and not gradual_sparsify_done:
