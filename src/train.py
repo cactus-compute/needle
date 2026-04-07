@@ -498,10 +498,6 @@ def shard_batch(batch, num_devices):
 
 
 def train(args):
-    # Multi-host TPU: initialize distributed JAX before anything else.
-    # On single-host setups this is a no-op (coordinator_address is auto-detected).
-    jax.distributed.initialize()
-
     num_devices = jax.local_device_count()
 
     use_wandb = getattr(args, "wandb", False)

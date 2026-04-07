@@ -53,6 +53,8 @@ TPU_HELP = """
   tpu commands:
     needle tpu create NAME [--type TYPE] [--version VER]
     needle tpu connect NAME [--zone ZONE]
+    needle tpu setup NAME [--zone ZONE]    setup all workers (multi-host)
+    needle tpu train NAME [--zone ZONE]    launch training on all workers
     needle tpu claude NAME [--zone ZONE]
     needle tpu stop NAME [--zone ZONE]
     needle tpu start NAME [--zone ZONE]
@@ -112,6 +114,45 @@ def _update_ssh_config(path, host_name, new_block):
     with open(path, "w") as f:
         f.write(content.rstrip("\n") + "\n" if content.strip() else "")
         f.write(new_block)
+
+
+def _is_multihost(accel_type):
+    """Check if a TPU accelerator type requires multi-host setup.
+
+    v6e-1/4/8 are single-host. v6e-16+ are multi-host.
+    """
+    m = re.search(r"(\d+)$", accel_type)
+    if not m:
+        return False
+    num_chips = int(m.group(1))
+    return num_chips > 8
+
+
+def _get_num_workers(name, zone):
+    """Get the number of workers for a TPU VM."""
+    result = _run(
+        ["gcloud", "compute", "tpus", "tpu-vm", "describe", name,
+         "--zone", zone, "--project", PROJECT,
+         "--format", "json(networkEndpoints)"],
+        check=False, capture=True, quiet=True,
+    )
+    import json
+    try:
+        data = json.loads(result.stdout)
+        return len(data.get("networkEndpoints", []))
+    except (json.JSONDecodeError, TypeError):
+        return 1
+
+
+def _run_all_workers(name, zone, command):
+    """Run a command on all workers of a TPU VM."""
+    return _run(
+        ["gcloud", "compute", "tpus", "tpu-vm", "ssh", name,
+         "--zone", zone, "--project", PROJECT,
+         "--worker=all",
+         "--command", command],
+        check=False,
+    )
 
 
 def _check_tpu_health(name, zone):
@@ -199,9 +240,15 @@ def tpu_create(args):
             print(f"[tpu] SUCCESS: created '{args.name}' in {zone}")
             args.zone = zone
             _check_tpu_health(args.name, zone)
-            _setup_git_on_instance(args.name, zone, git_name, git_email)
-            tpu_claude(args)
-            tpu_connect(args)
+            if _is_multihost(args.accel_type):
+                print(f"[tpu] Multi-host TPU detected ({args.accel_type})")
+                _setup_git_on_instance(args.name, zone, git_name, git_email)
+                tpu_setup(args)
+                tpu_claude(args)
+            else:
+                _setup_git_on_instance(args.name, zone, git_name, git_email)
+                tpu_claude(args)
+                tpu_connect(args)
             return
         stderr = result.stderr.strip()
         if not stderr:
@@ -372,10 +419,106 @@ def tpu_list(args):
         print("[tpu] No instances found.")
 
 
+def tpu_setup(args):
+    """Set up all workers of a multi-host TPU: sync code, install deps.
+
+    Creates a lightweight tarball (excludes .venv, .data_cache, __pycache__,
+    .git), copies it to all workers via SCP, then runs `source ./setup`
+    on each worker to create a fresh venv with jax[tpu].
+    """
+    zone = args.zone or _detect_zone(args.name)
+    num_workers = _get_num_workers(args.name, zone)
+
+    if num_workers <= 1:
+        print(f"[tpu] Single-host TPU ({num_workers} worker). Use 'needle tpu connect' instead.")
+        return
+
+    print(f"[tpu] Multi-host TPU: {num_workers} workers")
+
+    # Find the needle project root (where this script lives)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # Create lightweight tarball excluding heavy dirs
+    import tempfile
+    tarball = os.path.join(tempfile.gettempdir(), "needle_sync.tar.gz")
+    print(f"[tpu] Creating tarball (excluding .venv, .data_cache, .git)...")
+    _run(
+        ["tar", "-czf", tarball,
+         "--exclude=.venv", "--exclude=.data_cache",
+         "--exclude=__pycache__", "--exclude=.git",
+         "--exclude=*.pyc", "--exclude=checkpoints",
+         "-C", os.path.dirname(project_root),
+         os.path.basename(project_root)],
+    )
+    tar_size = os.path.getsize(tarball)
+    print(f"[tpu] Tarball: {tar_size / 1024:.0f} KB")
+
+    # SCP tarball to all workers
+    print(f"[tpu] Copying to all {num_workers} workers...")
+    result = _run(
+        ["gcloud", "compute", "tpus", "tpu-vm", "scp",
+         tarball, f"{args.name}:/tmp/needle_sync.tar.gz",
+         "--zone", zone, "--project", PROJECT,
+         "--worker=all"],
+        check=False,
+    )
+    os.remove(tarball)
+    if result.returncode != 0:
+        print("[tpu] ERROR: failed to copy tarball to workers.", file=sys.stderr)
+        sys.exit(1)
+
+    # Extract and install on all workers
+    print(f"[tpu] Extracting and installing on all {num_workers} workers...")
+    result = _run_all_workers(args.name, zone,
+        "rm -rf ~/needle && tar -xzf /tmp/needle_sync.tar.gz -C ~ "
+        "&& rm /tmp/needle_sync.tar.gz "
+        "&& cd ~/needle && source ./setup")
+    if result.returncode != 0:
+        print("[tpu] WARNING: setup failed on some workers.", file=sys.stderr)
+
+    # Set up git config on all workers
+    git_name, git_email = _collect_git_config()
+    if git_name and git_email:
+        _run_all_workers(args.name, zone,
+            f'git config --global user.name "{git_name}" && '
+            f'git config --global user.email "{git_email}"')
+
+    print(f"[tpu] All {num_workers} workers ready.")
+
+
+def tpu_train(args):
+    """Launch training on all workers of a multi-host TPU."""
+    zone = args.zone or _detect_zone(args.name)
+    num_workers = _get_num_workers(args.name, zone)
+
+    # Pass through any extra args after the name
+    extra = getattr(args, "train_args", [])
+    train_cmd = "cd ~/needle && .venv/bin/needle train"
+    if extra:
+        train_cmd += " " + " ".join(extra)
+
+    if num_workers <= 1:
+        print(f"[tpu] Single-host TPU. Running training directly...")
+        _run(
+            ["gcloud", "compute", "tpus", "tpu-vm", "ssh", args.name,
+             "--zone", zone, "--project", PROJECT,
+             "--command", train_cmd],
+        )
+        return
+
+    print(f"[tpu] Launching training on {num_workers} workers...")
+    result = _run_all_workers(args.name, zone, train_cmd)
+    if result.returncode != 0:
+        print("[tpu] WARNING: training exited with errors on some workers.",
+              file=sys.stderr)
+
+
 def tpu_dispatch(args):
     actions = {
         "create": tpu_create,
         "connect": tpu_connect,
+        "setup": tpu_setup,
+        "train": tpu_train,
         "claude": tpu_claude,
         "stop": tpu_stop,
         "start": tpu_start,

@@ -163,6 +163,16 @@ def main():
     tp.add_argument("name", type=str)
     tp.add_argument("--zone", type=str, default=None)
 
+    tp = tpu_sub.add_parser("setup", add_help=False)
+    tp.add_argument("name", type=str)
+    tp.add_argument("--zone", type=str, default=None)
+
+    tp = tpu_sub.add_parser("train", add_help=False)
+    tp.add_argument("name", type=str)
+    tp.add_argument("--zone", type=str, default=None)
+    tp.add_argument("train_args", nargs="*", default=[],
+                    help="Extra args passed to needle train")
+
     tp = tpu_sub.add_parser("claude", add_help=False)
     tp.add_argument("name", type=str)
     tp.add_argument("--zone", type=str, default=None)
@@ -191,6 +201,8 @@ def main():
         from .tokenize_data import tokenize
         tokenize(args)
     elif args.command == "train":
+        import jax
+        jax.distributed.initialize()
         from .train import train
         train(args)
     elif args.command == "run":
