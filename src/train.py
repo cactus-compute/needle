@@ -40,12 +40,15 @@ def _unreplicate(tree):
 
     Uses addressable_shards instead of x[0] indexing, which fails
     in multi-host pmap because the array spans devices on other hosts.
+    Each shard has shape (1, ...) — we index [0] to strip the leading dim.
     """
-    return jax.tree.map(
-        lambda x: jax.device_get(x.addressable_shards[0].data)
-        if hasattr(x, 'addressable_shards') and x.addressable_shards
-        else x,
-        tree)
+    def _get_first(x):
+        if hasattr(x, 'addressable_shards') and x.addressable_shards:
+            shard = x.addressable_shards[0].data
+            # Shard has shape (1, ...) from the pmap partition; strip it
+            return jax.device_get(shard[0]) if shard.ndim > 0 else jax.device_get(shard)
+        return x
+    return jax.tree.map(_get_first, tree)
 
 
 def _upload_checkpoint(ckpt_path):
