@@ -222,10 +222,30 @@ def pretrain(args):
     muon_lr = getattr(args, "muon_lr", 0.02) * math.sqrt(total_devices)
     decay_ratio = getattr(args, "decay_ratio", 0.05)
 
+    resume_step = 0
+    resume_checkpoint = getattr(args, "checkpoint", None)
+
     print(f"\n[3/3] Initializing model...")
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
     state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps, decay_ratio)
+
+    if resume_checkpoint:
+        print(f"  Resuming from {resume_checkpoint}")
+        with open(resume_checkpoint, "rb") as f:
+            ckpt_data = pickle.load(f)
+        ckpt_params = jax.tree.map(jnp.array, ckpt_data["params"])
+        state = state.replace(params=ckpt_params)
+        del ckpt_params
+        # Use --resume-step override, else read from checkpoint, else 0
+        manual_step = getattr(args, "resume_step", None)
+        if manual_step is not None:
+            resume_step = manual_step
+        else:
+            resume_step = ckpt_data.get("pretrain_step", 0)
+        if resume_step > 0:
+            print(f"  Resuming from step {resume_step}")
+
     state = _replicate(state)
 
     param_count = sum(x.size for x in jax.tree.leaves(_unreplicate(state).params))
@@ -259,7 +279,7 @@ def pretrain(args):
         print(f"  Save every    {save_every:>12,}")
         print(f"  ─────────────────────────────────────\n")
 
-    global_step = 0
+    global_step = resume_step
 
     for epoch in range(args.epochs):
         batch_stream = _PrefetchStream(
@@ -270,7 +290,17 @@ def pretrain(args):
         )
 
         pbar = tqdm(desc=f"Pretrain epoch {epoch + 1}/{args.epochs}",
-                     total=estimated_steps, disable=not is_main)
+                     total=estimated_steps, initial=resume_step,
+                     disable=not is_main)
+
+        # Skip ahead if resuming
+        if resume_step > 0:
+            if is_main:
+                print(f"  Skipping {resume_step} batches to resume...")
+            for i, _ in enumerate(batch_stream):
+                if i + 1 >= resume_step:
+                    break
+            resume_step = 0  # only skip once
 
         for batch in batch_stream:
             if max_steps and global_step >= max_steps:
@@ -342,7 +372,8 @@ def _save_pretrain_checkpoint(state, config, checkpoint_dir, global_step):
 
     ckpt_path = os.path.join(checkpoint_dir, "needle_base.pkl")
     with open(ckpt_path, "wb") as f:
-        pickle.dump({"params": params_np, "config": config.__dict__}, f)
+        pickle.dump({"params": params_np, "config": config.__dict__,
+                      "pretrain_step": global_step}, f)
 
     param_count = sum(x.size for x in jax.tree.leaves(params_np))
     size_mb = sum(x.nbytes for x in jax.tree.leaves(params_np)) / 1e6

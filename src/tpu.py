@@ -579,18 +579,25 @@ def _tpu_run_command(args, needle_cmd="train"):
         print(f"[tpu] Forwarding {env_count} env var(s) to workers")
         train_cmd = env_exports + " && " + train_cmd
 
+    # Wrap with nohup so training survives SSH disconnects
+    log_file = f"/tmp/needle_{needle_cmd}.log"
+    train_cmd = (
+        f"nohup bash -c '{train_cmd}' > {log_file} 2>&1 &"
+        f" echo $!; sleep 1; head -5 {log_file}"
+    )
+
     if num_workers <= 1:
-        print(f"[tpu] Single-host TPU. Running directly...")
-        print(f"[tpu] $ gcloud ... --command 'needle {needle_cmd} ...'")
+        print(f"[tpu] Single-host TPU. Running in background...")
         _run(
             ["gcloud", "compute", "tpus", "tpu-vm", "ssh", args.name,
              "--zone", zone, "--project", PROJECT,
              "--command", train_cmd],
             quiet=True,
         )
+        print(f"[tpu] Running in background. Logs: ssh into worker and 'tail -f {log_file}'")
         return
 
-    print(f"[tpu] Launching 'needle {needle_cmd}' on {num_workers} workers...")
+    print(f"[tpu] Launching 'needle {needle_cmd}' on {num_workers} workers (background)...")
     result = _run(
         ["gcloud", "compute", "tpus", "tpu-vm", "ssh", args.name,
          "--zone", zone, "--project", PROJECT,
@@ -598,6 +605,8 @@ def _tpu_run_command(args, needle_cmd="train"):
          "--command", train_cmd],
         check=False, quiet=True,
     )
+    print(f"[tpu] Processes launched. Monitor with:")
+    print(f"  gcloud compute tpus tpu-vm ssh large --zone=asia-northeast1-b --worker=0 --command='tail -f {log_file}'")
     if result.returncode != 0:
         print(f"[tpu] WARNING: 'needle {needle_cmd}' exited with errors on some workers.",
               file=sys.stderr)

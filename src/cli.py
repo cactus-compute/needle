@@ -77,6 +77,10 @@ def main():
     p = sub.add_parser("pretrain", add_help=False)
     p.add_argument("--name", type=str, default="pretrain",
                    help="Experiment name for wandb (default: pretrain)")
+    p.add_argument("--checkpoint", type=str, default=None,
+                   help="Resume from checkpoint (e.g. checkpoints/needle_base.pkl)")
+    p.add_argument("--resume-step", type=int, default=None,
+                   help="Override resume step (skip this many batches)")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=3e-4)
