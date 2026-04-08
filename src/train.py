@@ -523,11 +523,12 @@ def shard_batch(batch, num_devices):
 def train(args):
     num_devices = jax.local_device_count()
 
+    experiment_name = getattr(args, "name", "baseline")
     use_wandb = getattr(args, "wandb", False)
     if use_wandb and jax.process_index() == 0:
         import wandb
         if wandb.run is None:
-            wandb.init(project="needle-v1", config=vars(args))
+            wandb.init(project="needle-v1", name=experiment_name, config=vars(args))
 
     print(f"\n[1/3] Detecting devices...")
     print(f"      {num_devices} local device(s), {jax.device_count()} total across {jax.process_count()} hosts")
@@ -878,7 +879,8 @@ def train(args):
         final_ppl = math.exp(min(final_loss, 20)) if not math.isnan(final_loss) else float("nan")
 
         if not is_main:
-            # Non-main hosts wait here while host 0 runs eval/checkpoint
+            # Wait for host 0 to finish eval/checkpoint before proceeding
+            jax.experimental.multihost_utils.sync_global_devices("epoch_eval")
             continue
 
         eval_params = _unreplicate(state).params
@@ -932,7 +934,7 @@ def train(args):
         near_zero = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(params_np))
         sparsity = near_zero / total_params * 100
 
-        ckpt_name = f"needle_{args.num_layers}_{args.d_model}_{global_step}.pkl"
+        ckpt_name = f"{experiment_name}_{args.num_layers}_{args.d_model}_{global_step}.pkl"
         ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
         with open(ckpt_path, "wb") as f:
             pickle.dump({"params": params_np, "config": config.__dict__}, f)
@@ -1237,9 +1239,9 @@ def train(args):
         if _best_metric > best_call_f1:
             best_call_f1 = _best_metric
             if config.no_feedforward:
-                best_ckpt_path = os.path.join(args.checkpoint_dir, f"needle_{args.num_layers}_{args.d_model}_best.pkl")
+                best_ckpt_path = os.path.join(args.checkpoint_dir, f"{experiment_name}_{args.num_layers}_{args.d_model}_best.pkl")
             else:
-                best_ckpt_path = os.path.join(args.checkpoint_dir, f"needle_{args.num_layers}_{args.d_model}_{config.d_ff}_best.pkl")
+                best_ckpt_path = os.path.join(args.checkpoint_dir, f"{experiment_name}_{args.num_layers}_{args.d_model}_{config.d_ff}_best.pkl")
             import shutil as _shutil
             _shutil.copy2(ckpt_path, best_ckpt_path)
             print(f"  ** New best single call_f1={best_call_f1:.1%} → {best_ckpt_path}")
@@ -1250,7 +1252,7 @@ def train(args):
                     d_ff_sub = config.d_ff // factor
                     mat_ckpt_path = os.path.join(
                         args.checkpoint_dir,
-                        f"needle_{args.num_layers}_{args.d_model}_{d_ff_sub}_best.pkl",
+                        f"{experiment_name}_{args.num_layers}_{args.d_model}_{d_ff_sub}_best.pkl",
                     )
                     export_submodel(best_ckpt_path, factor, mat_ckpt_path)
                     _upload_checkpoint(mat_ckpt_path)
@@ -1372,6 +1374,9 @@ def train(args):
                     log_dict[f"epoch/retrieval_recall@{k}"] = v
                 log_dict["epoch/retrieval_mrr"] = retrieval_metrics["mrr"]
             wandb.log(log_dict)
+
+        # Sync with non-main hosts that are waiting at the barrier
+        jax.experimental.multihost_utils.sync_global_devices("epoch_eval")
 
     if use_wandb and is_main:
         wandb.finish()

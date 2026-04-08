@@ -14,6 +14,8 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     p = sub.add_parser("train", add_help=False)
+    p.add_argument("--name", type=str, default="baseline",
+                   help="Experiment name for checkpoints and wandb (default: baseline)")
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=32)
@@ -174,7 +176,7 @@ def main():
     tp = tpu_sub.add_parser("train", add_help=False)
     tp.add_argument("name", type=str)
     tp.add_argument("--zone", type=str, default=None)
-    tp.add_argument("train_args", nargs="*", default=[],
+    tp.add_argument("train_args", nargs=argparse.REMAINDER,
                     help="Extra args passed to needle train")
 
     tp = tpu_sub.add_parser("claude", add_help=False)

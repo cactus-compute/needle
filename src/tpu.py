@@ -454,11 +454,6 @@ def _sync_code_to_workers(name, zone, num_workers):
         print("[tpu] ERROR: failed to copy tarball to workers.", file=sys.stderr)
         return False
 
-    # Extract on all workers, preserving .venv/.data_cache/checkpoints
-    # 1. Move heavy dirs aside if they exist
-    # 2. Remove old source code
-    # 3. Extract fresh tarball
-    # 4. Move heavy dirs back
     print(f"[tpu] Extracting on all {num_workers} workers...")
     extract_cmd = (
         "set -e; "
@@ -564,15 +559,14 @@ def tpu_train(args):
     zone = args.zone or _detect_zone(args.name)
     num_workers = _get_num_workers(args.name, zone)
 
-    # Kill any stale training processes that might be holding the TPU
-    # [n] trick prevents pkill from matching its own command line
     if num_workers > 1:
         print(f"[tpu] Killing stale processes on all workers...")
         _run_all_workers(args.name, zone,
             "sudo pkill -9 -f [n]eedle.train || true")
 
-    # Pass through any extra args after the name
     extra = getattr(args, "train_args", [])
+    if extra and extra[0] == "--":
+        extra = extra[1:]
     train_cmd = "cd ~/needle && .venv/bin/needle train"
     if extra:
         train_cmd += " " + " ".join(extra)
