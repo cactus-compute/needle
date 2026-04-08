@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 
 from .data import DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN
@@ -72,6 +73,33 @@ def main():
                    help="Learning rate for confidence head calibration (default: 1e-3)")
     p.add_argument("--calibrate-k", type=float, default=5.0,
                    help="Sigmoid steepness for PPL→confidence mapping (default: 5.0)")
+
+    p = sub.add_parser("pretrain", add_help=False)
+    p.add_argument("--name", type=str, default="pretrain",
+                   help="Experiment name for wandb (default: pretrain)")
+    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--muon-lr", type=float, default=0.02)
+    p.add_argument("--d-model", type=int, default=512)
+    p.add_argument("--num-heads", type=int, default=8)
+    p.add_argument("--num-kv-heads", type=int, default=4)
+    p.add_argument("--num-layers", type=int, default=12)
+    p.add_argument("--num-dec-layers", type=int, default=8)
+    p.add_argument("--max-enc-len", type=int, default=DEFAULT_MAX_ENC_LEN)
+    p.add_argument("--max-dec-len", type=int, default=DEFAULT_MAX_DEC_LEN)
+    p.add_argument("--warmup-ratio", type=float, default=0.05)
+    p.add_argument("--decay-ratio", type=float, default=0.05)
+    p.add_argument("--wandb", action="store_true")
+    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="Stop after N steps (default: full epoch)")
+    p.add_argument("--save-every", type=int, default=1000,
+                   help="Save and upload checkpoint every N steps (default: 1000)")
+    p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    p.add_argument("--activation", type=str, default="swiglu", choices=["drelu", "swiglu", "geglu"])
+    p.add_argument("--no-feedforward", action=argparse.BooleanOptionalAction, default=True)
 
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,
@@ -179,6 +207,12 @@ def main():
     tp.add_argument("train_args", nargs=argparse.REMAINDER,
                     help="Extra args passed to needle train")
 
+    tp = tpu_sub.add_parser("pretrain", add_help=False)
+    tp.add_argument("name", type=str)
+    tp.add_argument("--zone", type=str, default=None)
+    tp.add_argument("train_args", nargs=argparse.REMAINDER,
+                    help="Extra args passed to needle pretrain")
+
     tp = tpu_sub.add_parser("claude", add_help=False)
     tp.add_argument("name", type=str)
     tp.add_argument("--zone", type=str, default=None)
@@ -206,9 +240,16 @@ def main():
     if args.command == "tokenize":
         from .tokenize_data import tokenize
         tokenize(args)
+    elif args.command == "pretrain":
+        import jax
+        if os.path.exists("/dev/accel0"):
+            jax.distributed.initialize()
+        from .pretrain import pretrain
+        pretrain(args)
     elif args.command == "train":
         import jax
-        jax.distributed.initialize()
+        if os.path.exists("/dev/accel0"):
+            jax.distributed.initialize()
         from .train import train
         train(args)
     elif args.command == "run":

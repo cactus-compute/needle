@@ -56,6 +56,7 @@ TPU_HELP = """
     needle tpu setup NAME [--zone ZONE]    setup all workers (multi-host)
     needle tpu sync NAME [--zone ZONE]     sync code only (fast, no venv rebuild)
     needle tpu train NAME [--zone ZONE]    launch training on all workers
+    needle tpu pretrain NAME [--zone ZONE] launch pretraining on all workers
     needle tpu claude NAME [--zone ZONE]
     needle tpu stop NAME [--zone ZONE]
     needle tpu start NAME [--zone ZONE]
@@ -554,20 +555,20 @@ def _collect_env_exports():
     return " && ".join(exports)
 
 
-def tpu_train(args):
-    """Launch training on all workers of a multi-host TPU."""
+def _tpu_run_command(args, needle_cmd="train"):
+    """Launch a needle command on all workers of a multi-host TPU."""
     zone = args.zone or _detect_zone(args.name)
     num_workers = _get_num_workers(args.name, zone)
 
     if num_workers > 1:
         print(f"[tpu] Killing stale processes on all workers...")
         _run_all_workers(args.name, zone,
-            "sudo pkill -9 -f [n]eedle.train || true")
+            "sudo pkill -9 -f [n]eedle || true")
 
     extra = getattr(args, "train_args", [])
     if extra and extra[0] == "--":
         extra = extra[1:]
-    train_cmd = "cd ~/needle && .venv/bin/needle train"
+    train_cmd = f"cd ~/needle && .venv/bin/needle {needle_cmd}"
     if extra:
         train_cmd += " " + " ".join(extra)
 
@@ -579,9 +580,8 @@ def tpu_train(args):
         train_cmd = env_exports + " && " + train_cmd
 
     if num_workers <= 1:
-        print(f"[tpu] Single-host TPU. Running training directly...")
-        # Use quiet=True to avoid printing tokens, then log sanitized version
-        print(f"[tpu] $ gcloud compute tpus tpu-vm ssh {args.name} --command 'needle train ...'")
+        print(f"[tpu] Single-host TPU. Running directly...")
+        print(f"[tpu] $ gcloud ... --command 'needle {needle_cmd} ...'")
         _run(
             ["gcloud", "compute", "tpus", "tpu-vm", "ssh", args.name,
              "--zone", zone, "--project", PROJECT,
@@ -590,8 +590,7 @@ def tpu_train(args):
         )
         return
 
-    print(f"[tpu] Launching training on {num_workers} workers...")
-    # Run with quiet=True to avoid printing tokens in command log
+    print(f"[tpu] Launching 'needle {needle_cmd}' on {num_workers} workers...")
     result = _run(
         ["gcloud", "compute", "tpus", "tpu-vm", "ssh", args.name,
          "--zone", zone, "--project", PROJECT,
@@ -600,8 +599,18 @@ def tpu_train(args):
         check=False, quiet=True,
     )
     if result.returncode != 0:
-        print("[tpu] WARNING: training exited with errors on some workers.",
+        print(f"[tpu] WARNING: 'needle {needle_cmd}' exited with errors on some workers.",
               file=sys.stderr)
+
+
+def tpu_train(args):
+    """Launch 'needle train' on all workers."""
+    _tpu_run_command(args, needle_cmd="train")
+
+
+def tpu_pretrain(args):
+    """Launch 'needle pretrain' on all workers."""
+    _tpu_run_command(args, needle_cmd="pretrain")
 
 
 def tpu_dispatch(args):
@@ -611,6 +620,7 @@ def tpu_dispatch(args):
         "setup": tpu_setup,
         "sync": tpu_sync,
         "train": tpu_train,
+        "pretrain": tpu_pretrain,
         "claude": tpu_claude,
         "stop": tpu_stop,
         "start": tpu_start,
