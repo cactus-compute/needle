@@ -878,68 +878,72 @@ def train(args):
         final_loss = text_losses[-1] if text_losses else float("nan")
         final_ppl = math.exp(min(final_loss, 20)) if not math.isnan(final_loss) else float("nan")
 
-        if not is_main:
-            # Wait for host 0 to finish eval/checkpoint before proceeding
-            jax.experimental.multihost_utils.sync_global_devices("epoch_eval")
-            continue
-
+        # ── All hosts: unreplicate params for eval ──
         eval_params = _unreplicate(state).params
 
-        q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE, precision=_PRECISION)
-        mat_vl_fns = {}
-        if _MAT_FACTORS:
-            _apply_fn = _unreplicate(state).apply_fn
-            mat_vl_fns = {f: _make_mat_val_loss_fn(_apply_fn, fw)
-                          for f, fw in zip(_MAT_FACTORS, _MAT_FF_WIDTHS)}
-            del _apply_fn
-
-        full_loss, full_toks = 0.0, 0.0
-        q_loss, q_toks = 0.0, 0.0
-        mat_accum = {f: [0.0, 0.0] for f in _MAT_FACTORS}
-
-        _val_n = count_batches(len(val_enc), args.batch_size)
-        _val_bar = tqdm(get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size,
-                              shuffle=False, loss_mask=val_loss_mask,
-                              enc_seg_ids=val_enc_seg, dec_seg_ids=val_dec_seg),
-                        total=_val_n, desc="  eval val loss", leave=False)
-        for vb in _val_bar:
-            src, dec_in, dec_tgt, lm, es, ds = vb
-            src = jnp.asarray(src, dtype=jnp.int32)
-            dec_in = jnp.asarray(dec_in, dtype=jnp.int32)
-            dec_tgt = jnp.asarray(dec_tgt, dtype=jnp.int32)
-            lm = jnp.asarray(lm, dtype=jnp.float32)
-            es = jnp.asarray(es, dtype=jnp.int32)
-            ds = jnp.asarray(ds, dtype=jnp.int32)
-            vl, vt = val_loss_fn(eval_params, src, dec_in, dec_tgt, lm, es, ds)
-            full_loss += float(vl); full_toks += float(vt)
-            vl, vt = val_loss_fn(q_params, src, dec_in, dec_tgt, lm, es, ds)
-            q_loss += float(vl); q_toks += float(vt)
-            for f, fn in mat_vl_fns.items():
-                vl, vt = fn(eval_params, src, dec_in, dec_tgt, lm, es, ds)
-                mat_accum[f][0] += float(vl)
-                mat_accum[f][1] += float(vt)
-
-        last_val_ppl = float(math.exp(min(full_loss / max(full_toks, 1), 20)))
-        quant_val_ppl = float(math.exp(min(q_loss / max(q_toks, 1), 20)))
-        del q_params
-
+        # ── Host 0 only: val PPL + checkpoint save (fast) ──
+        quant_val_ppl = 0.0
         mat_results = {}
-        for f in _MAT_FACTORS:
-            avg = mat_accum[f][0] / max(mat_accum[f][1], 1)
-            mat_results[f] = (float(math.exp(min(avg, 20))),
-                              _estimate_mat_params(config, f), config.d_ff // f)
+        sparsity = 0.0
+        total_params = near_zero = 0
+        ckpt_path = ""
 
-        params_np = jax.tree.map(lambda x: np.array(x).astype(np.float16), eval_params)
-        total_params = sum(x.size for x in jax.tree.leaves(params_np))
-        near_zero = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(params_np))
-        sparsity = near_zero / total_params * 100
+        if is_main:
+            q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE, precision=_PRECISION)
+            mat_vl_fns = {}
+            if _MAT_FACTORS:
+                _apply_fn = _unreplicate(state).apply_fn
+                mat_vl_fns = {f: _make_mat_val_loss_fn(_apply_fn, fw)
+                              for f, fw in zip(_MAT_FACTORS, _MAT_FF_WIDTHS)}
+                del _apply_fn
 
-        ckpt_name = f"{experiment_name}_{args.num_layers}_{args.d_model}_{global_step}.pkl"
-        ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
-        with open(ckpt_path, "wb") as f:
-            pickle.dump({"params": params_np, "config": config.__dict__}, f)
-        del params_np
+            full_loss, full_toks = 0.0, 0.0
+            q_loss, q_toks = 0.0, 0.0
+            mat_accum = {f: [0.0, 0.0] for f in _MAT_FACTORS}
 
+            _val_n = count_batches(len(val_enc), args.batch_size)
+            _val_bar = tqdm(get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size,
+                                  shuffle=False, loss_mask=val_loss_mask,
+                                  enc_seg_ids=val_enc_seg, dec_seg_ids=val_dec_seg),
+                            total=_val_n, desc="  eval val loss", leave=False)
+            for vb in _val_bar:
+                src, dec_in, dec_tgt, lm, es, ds = vb
+                src = jnp.asarray(src, dtype=jnp.int32)
+                dec_in = jnp.asarray(dec_in, dtype=jnp.int32)
+                dec_tgt = jnp.asarray(dec_tgt, dtype=jnp.int32)
+                lm = jnp.asarray(lm, dtype=jnp.float32)
+                es = jnp.asarray(es, dtype=jnp.int32)
+                ds = jnp.asarray(ds, dtype=jnp.int32)
+                vl, vt = val_loss_fn(eval_params, src, dec_in, dec_tgt, lm, es, ds)
+                full_loss += float(vl); full_toks += float(vt)
+                vl, vt = val_loss_fn(q_params, src, dec_in, dec_tgt, lm, es, ds)
+                q_loss += float(vl); q_toks += float(vt)
+                for f, fn in mat_vl_fns.items():
+                    vl, vt = fn(eval_params, src, dec_in, dec_tgt, lm, es, ds)
+                    mat_accum[f][0] += float(vl)
+                    mat_accum[f][1] += float(vt)
+
+            last_val_ppl = float(math.exp(min(full_loss / max(full_toks, 1), 20)))
+            quant_val_ppl = float(math.exp(min(q_loss / max(q_toks, 1), 20)))
+            del q_params
+
+            for f in _MAT_FACTORS:
+                avg = mat_accum[f][0] / max(mat_accum[f][1], 1)
+                mat_results[f] = (float(math.exp(min(avg, 20))),
+                                  _estimate_mat_params(config, f), config.d_ff // f)
+
+            params_np = jax.tree.map(lambda x: np.array(x).astype(np.float16), eval_params)
+            total_params = sum(x.size for x in jax.tree.leaves(params_np))
+            near_zero = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(params_np))
+            sparsity = near_zero / total_params * 100
+
+            ckpt_name = f"{experiment_name}_{args.num_layers}_{args.d_model}_{global_step}.pkl"
+            ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
+            with open(ckpt_path, "wb") as f:
+                pickle.dump({"params": params_np, "config": config.__dict__}, f)
+            del params_np
+
+        # ── All hosts: distributed generation eval ──
         from .run import generate_batch
         import json as _json_mod
 
@@ -969,7 +973,6 @@ def train(args):
             tc_rng = np.random.RandomState(epoch + 42)
 
             def _classify_sample(ex):
-                """Classify a sample as single or multi call."""
                 try:
                     answers = _json_mod.loads(ex["answers"])
                 except (ValueError, TypeError):
@@ -978,9 +981,7 @@ def train(args):
                     return "empty"
                 return "single" if len(answers) == 1 else "multi"
 
-            # 2 pools: single/multi, each balanced by tool count
             _pool_buckets = {name: {t: [] for t in range(11)} for name in _pool_names}
-
             for k in range(len(val_kept)):
                 ex = val_ds[int(val_kept[k])]
                 try:
@@ -1012,9 +1013,8 @@ def train(args):
             all_eval_examples = all_eval_examples + eval_pools[name]
         eval_gen_len = min(args.max_dec_len, 512)
         _EVAL_BATCH = 32
-        _n_chunks = (len(all_eval_examples) + _EVAL_BATCH - 1) // _EVAL_BATCH
 
-        # Use smallest matryoshka slice for generation eval if available
+        # Prepare generation model (all hosts)
         if _MAT_FACTORS:
             from .export import slice_params
             _max_factor = max(_MAT_FACTORS)
@@ -1030,12 +1030,22 @@ def train(args):
         _mat_params = _quantize_params(_mat_params, group_size=_GROUP_SIZE, precision=_PRECISION)
         _gen_label += f" {_PRECISION.upper()}"
 
-        all_preds = []
+        # Split eval examples across hosts — each host generates its slice
+        total_eval = len(all_eval_examples)
+        per_host_eval = (total_eval + num_hosts - 1) // num_hosts
+        my_eval_start = host_id * per_host_eval
+        my_eval_end = min(my_eval_start + per_host_eval, total_eval)
+        my_eval_examples = all_eval_examples[my_eval_start:my_eval_end]
+        _my_n_chunks = (len(my_eval_examples) + _EVAL_BATCH - 1) // _EVAL_BATCH
+
+        my_preds = []
         _gen_t0 = time.perf_counter()
-        for _ei in tqdm(range(0, len(all_eval_examples), _EVAL_BATCH),
-                        total=_n_chunks, desc=f"  eval generate ({_gen_label})", leave=False):
-            _chunk = all_eval_examples[_ei:_ei + _EVAL_BATCH]
-            all_preds.extend(generate_batch(
+        for _ei in tqdm(range(0, len(my_eval_examples), _EVAL_BATCH),
+                        total=_my_n_chunks,
+                        desc=f"  eval generate h{host_id} ({_gen_label})",
+                        leave=False, disable=not is_main):
+            _chunk = my_eval_examples[_ei:_ei + _EVAL_BATCH]
+            my_preds.extend(generate_batch(
                 _gen_model, _mat_params, tokenizer,
                 [ex["query"] for ex in _chunk],
                 [ex["tools"] for ex in _chunk],
@@ -1044,9 +1054,33 @@ def train(args):
                 constrained=False,
             ))
         _gen_elapsed = time.perf_counter() - _gen_t0
+        del _mat_params
+
+        # All-gather predictions across hosts via padded token ID arrays
+        _MAX_PRED_TOKENS = eval_gen_len
+        pred_ids = np.zeros((per_host_eval, _MAX_PRED_TOKENS), dtype=np.int32)
+        for i, p in enumerate(my_preds):
+            toks = tokenizer.encode(p)[:_MAX_PRED_TOKENS]
+            pred_ids[i, :len(toks)] = toks
+        all_pred_ids = jax.experimental.multihost_utils.process_allgather(
+            jnp.array(pred_ids), tiled=True)
+        all_pred_ids = np.array(all_pred_ids)[:total_eval]
+
+        # Decode predictions on all hosts (cheap), metrics computed on host 0
+        all_preds = []
+        for row in all_pred_ids:
+            nonzero = np.nonzero(row)[0]
+            if len(nonzero) > 0:
+                all_preds.append(tokenizer.decode(row[:nonzero[-1] + 1].tolist()))
+            else:
+                all_preds.append("")
         _gen_total_toks = sum(len(tokenizer.encode(p)) for p in all_preds)
         _gen_tok_per_sec = _gen_total_toks / max(_gen_elapsed, 1e-6)
-        del _mat_params
+
+        # ── Non-main hosts: done with this epoch ──
+        if not is_main:
+            jax.experimental.multihost_utils.sync_global_devices("epoch_eval")
+            continue
 
         display_preds = all_preds[:len(display_pairs)]
         pool_preds = {}
