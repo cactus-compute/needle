@@ -47,7 +47,9 @@ def _stream_batches(tokenizer, batch_size, max_enc_len, max_dec_len, seed=42):
     from datasets import load_dataset
 
     ds = load_dataset(_HF_PRETRAIN_REPO, split="train", streaming=True)
-    ds = ds.shuffle(seed=seed, buffer_size=10000)
+    # Small shuffle buffer so first batch yields quickly on resume.
+    # Dataset is already split across 500 shards so it's already partially shuffled.
+    ds = ds.shuffle(seed=seed, buffer_size=1000)
 
     tools_sep_id = TOOLS_ID
     eos_id = EOS_ID
@@ -191,20 +193,50 @@ def pretrain(args):
     print(f"\n[2/3] Loading tokenizer...")
     tokenizer = get_tokenizer()
 
-    config = TransformerConfig(
-        d_model=args.d_model,
-        num_heads=args.num_heads,
-        num_kv_heads=getattr(args, "num_kv_heads", None) or args.num_heads,
-        num_encoder_layers=args.num_layers,
-        num_decoder_layers=getattr(args, "num_dec_layers", args.num_layers),
-        d_ff=getattr(args, "d_ff", None) or args.d_model * 4,
-        max_seq_len=max(args.max_enc_len, args.max_dec_len),
-        dtype=args.dtype,
-        activation=getattr(args, "activation", "swiglu"),
-        no_feedforward=getattr(args, "no_feedforward", True),
-        contrastive_dim=getattr(args, "contrastive_dim", 128),
-        enable_speech=False,
-    )
+    # If resuming, download checkpoint from HF if not local, then load config
+    resume_checkpoint_arg = getattr(args, "checkpoint", None)
+    _preloaded_ckpt = None
+    if resume_checkpoint_arg:
+        if not os.path.exists(resume_checkpoint_arg):
+            print(f"  Checkpoint not found locally, downloading from HF...", flush=True)
+            try:
+                from huggingface_hub import hf_hub_download
+                local_dir = os.path.dirname(resume_checkpoint_arg) or "checkpoints"
+                os.makedirs(local_dir, exist_ok=True)
+                local_path = hf_hub_download(
+                    repo_id="Cactus-Compute/checkpoints",
+                    filename=os.path.basename(resume_checkpoint_arg),
+                    repo_type="model",
+                    local_dir=local_dir,
+                )
+                resume_checkpoint_arg = local_path
+                print(f"  Downloaded to {local_path}", flush=True)
+            except Exception as e:
+                print(f"  ERROR downloading checkpoint: {e}", flush=True)
+                return
+
+        print(f"  Pre-loading config from {resume_checkpoint_arg}", flush=True)
+        with open(resume_checkpoint_arg, "rb") as f:
+            _preloaded_ckpt = pickle.load(f)
+        config = TransformerConfig(**_preloaded_ckpt["config"])
+        print(f"  Config from ckpt: d={config.d_model}, "
+              f"heads={config.num_heads}, layers={config.num_encoder_layers}/{config.num_decoder_layers}",
+              flush=True)
+    else:
+        config = TransformerConfig(
+            d_model=args.d_model,
+            num_heads=args.num_heads,
+            num_kv_heads=getattr(args, "num_kv_heads", None) or args.num_heads,
+            num_encoder_layers=args.num_layers,
+            num_decoder_layers=getattr(args, "num_dec_layers", args.num_layers),
+            d_ff=getattr(args, "d_ff", None) or args.d_model * 4,
+            max_seq_len=max(args.max_enc_len, args.max_dec_len),
+            dtype=args.dtype,
+            activation=getattr(args, "activation", "swiglu"),
+            no_feedforward=getattr(args, "no_feedforward", True),
+            contrastive_dim=getattr(args, "contrastive_dim", 128),
+            enable_speech=False,
+        )
 
     effective_batch_size = args.batch_size * num_devices
     global_batch_size = effective_batch_size * num_hosts
@@ -223,35 +255,40 @@ def pretrain(args):
     decay_ratio = getattr(args, "decay_ratio", 0.05)
 
     resume_step = 0
-    resume_checkpoint = getattr(args, "checkpoint", None)
+    resume_checkpoint = resume_checkpoint_arg
+    ckpt_data = _preloaded_ckpt
 
     print(f"\n[3/3] Initializing model...")
     rng = jax.random.PRNGKey(args.seed)
     rng, init_rng = jax.random.split(rng)
     state = create_train_state(init_rng, config, scaled_lr, muon_lr, total_steps, warmup_steps, decay_ratio)
 
-    if resume_checkpoint:
-        print(f"  Resuming from {resume_checkpoint}")
-        with open(resume_checkpoint, "rb") as f:
-            ckpt_data = pickle.load(f)
+    if resume_checkpoint and ckpt_data is not None:
+        print(f"  Resuming from {resume_checkpoint}", flush=True)
         ckpt_params = jax.tree.map(jnp.array, ckpt_data["params"])
         state = state.replace(params=ckpt_params)
         del ckpt_params
-        # Use --resume-step override, else read from checkpoint, else 0
+        print(f"  Loaded checkpoint params", flush=True)
+    # Use --resume-step override, else read from checkpoint, else 0
+    if ckpt_data is not None:
         manual_step = getattr(args, "resume_step", None)
         if manual_step is not None:
             resume_step = manual_step
         else:
             resume_step = ckpt_data.get("pretrain_step", 0)
         if resume_step > 0:
-            print(f"  Resuming from step {resume_step}")
+            print(f"  Resuming from step {resume_step}", flush=True)
 
+    print(f"  Replicating state across {num_devices} local devices...", flush=True)
     state = _replicate(state)
+    print(f"  Replicated.", flush=True)
 
     param_count = sum(x.size for x in jax.tree.leaves(_unreplicate(state).params))
+    print(f"  Params: {param_count:,}", flush=True)
 
     global _p_pretrain_step
     _p_pretrain_step = _make_p_pretrain_step()
+    print(f"  pmap ready.", flush=True)
 
     save_every = getattr(args, "save_every", 1000)
     checkpoint_dir = getattr(args, "checkpoint_dir", "checkpoints")
@@ -282,25 +319,19 @@ def pretrain(args):
     global_step = resume_step
 
     for epoch in range(args.epochs):
+        # Use a different seed on resume to get fresh data ordering
+        # (avoids re-seeing exactly the same examples we saw before the crash)
+        stream_seed = args.seed + epoch + resume_step
         batch_stream = _PrefetchStream(
             lambda: _stream_batches(tokenizer, global_batch_size,
                                     args.max_enc_len, args.max_dec_len,
-                                    seed=args.seed + epoch),
+                                    seed=stream_seed),
             prefetch=8,
         )
 
         pbar = tqdm(desc=f"Pretrain epoch {epoch + 1}/{args.epochs}",
                      total=estimated_steps, initial=resume_step,
                      disable=not is_main)
-
-        # Skip ahead if resuming
-        if resume_step > 0:
-            if is_main:
-                print(f"  Skipping {resume_step} batches to resume...")
-            for i, _ in enumerate(batch_stream):
-                if i + 1 >= resume_step:
-                    break
-            resume_step = 0  # only skip once
 
         for batch in batch_stream:
             if max_steps and global_step >= max_steps:

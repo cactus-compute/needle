@@ -568,7 +568,8 @@ def _tpu_run_command(args, needle_cmd="train"):
     extra = getattr(args, "train_args", [])
     if extra and extra[0] == "--":
         extra = extra[1:]
-    train_cmd = f"cd ~/needle && .venv/bin/needle {needle_cmd}"
+
+    train_cmd = f"cd ~/needle && PYTHONUNBUFFERED=1 .venv/bin/needle {needle_cmd}"
     if extra:
         train_cmd += " " + " ".join(extra)
 
