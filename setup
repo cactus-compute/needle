@@ -67,20 +67,48 @@ echo "Installing dependencies..."
 pip install --upgrade pip -q
 pip install -e . -q
 
-echo "Installing jax[tpu]..."
-pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-
-# Load TPU kernel modules if not already loaded
-if ! ls /dev/accel* &>/dev/null 2>&1; then
-    echo "Loading TPU kernel modules..."
-    for mod in gasket tpu_common tpu_v2 tpu_v3 tpu_v4 tpu_v4_lite; do
-        sudo modprobe "$mod" 2>/dev/null || true
-    done
+# Detect accelerator and install the matching JAX build
+ACCELERATOR="cpu"
+if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+    ACCELERATOR="gpu"
+elif ls /dev/accel* &>/dev/null 2>&1 || [ -n "$TPU_NAME" ] || [ -d /sys/class/accel ]; then
+    ACCELERATOR="tpu"
 fi
 
-if ls /dev/accel* &>/dev/null 2>&1; then
-    echo "TPU devices: $(ls /dev/accel* 2>/dev/null | wc -w) chip(s)"
-fi
+case "$ACCELERATOR" in
+    gpu)
+        echo "Detected NVIDIA GPU. Installing jax[cuda12]..."
+        pip install -U "jax[cuda12]"
+        # GPU-friendly defaults: silence XLA autotuner spam, cache compiled
+        # kernels across runs, and let JAX claim most of HBM.
+        export TF_CPP_MIN_LOG_LEVEL=2
+        export JAX_COMPILATION_CACHE_DIR="$HOME/.cache/jax"
+        export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
+        mkdir -p "$JAX_COMPILATION_CACHE_DIR"
+        ;;
+    tpu)
+        echo "Detected TPU. Installing jax[tpu]..."
+        pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+        # Load TPU kernel modules if not already loaded
+        if ! ls /dev/accel* &>/dev/null 2>&1; then
+            echo "Loading TPU kernel modules..."
+            for mod in gasket tpu_common tpu_v2 tpu_v3 tpu_v4 tpu_v4_lite; do
+                sudo modprobe "$mod" 2>/dev/null || true
+            done
+        fi
+        if ls /dev/accel* &>/dev/null 2>&1; then
+            echo "TPU devices: $(ls /dev/accel* 2>/dev/null | wc -w) chip(s)"
+        fi
+        ;;
+    *)
+        echo "No GPU or TPU detected. Installing CPU-only jax..."
+        pip install -U jax
+        ;;
+esac
+
+# Sanity check: report the JAX backend that was actually selected
+python -c "import jax; print('JAX devices:', jax.devices())" 2>/dev/null || \
+    echo "Warning: jax import failed; check the install above."
 
 if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
     echo "Enabling transparent hugepages..."

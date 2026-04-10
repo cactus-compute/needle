@@ -154,7 +154,7 @@ def _train_step(state, src, tgt_in, tgt_out, enc_seg_ids, dec_seg_ids, prune_mas
 
 
 def _make_p_train_step():
-    return jax.pmap(_train_step, axis_name="batch", donate_argnums=(0, 1))
+    return jax.pmap(_train_step, axis_name="batch", donate_argnums=(0,))
 
 
 def _make_val_loss_fn(apply_fn):
