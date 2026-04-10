@@ -499,7 +499,11 @@ class EncoderDecoderTransformer(nn.Module):
         pooled = self._mean_pool(encoder_out, enc_mask)
         h = nn.relu(self.contrastive_hidden(pooled))
         projected = self.contrastive_proj(h)
-        return projected / jnp.maximum(jnp.linalg.norm(projected, axis=-1, keepdims=True), 1e-8)
+        # Safe L2 normalize: sqrt(sum² + eps²) has smooth gradient at origin,
+        # whereas max(norm, eps) NaNs in the backward pass when projected == 0
+        # (which happens after pretrain decays contrastive weights to ~0).
+        denom = jnp.sqrt(jnp.sum(projected.astype(jnp.float32) ** 2, axis=-1, keepdims=True) + 1e-12)
+        return (projected / denom.astype(projected.dtype))
 
     def forward_contrastive(self, query_tokens, tool_tokens, deterministic=True):
         """Encode query and tool tokens, return (q_emb, t_emb, log_temp)."""

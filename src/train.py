@@ -280,11 +280,23 @@ def train(args):
 
     resume_checkpoint = getattr(args, "checkpoint", None)
     if resume_checkpoint:
+        if not os.path.exists(resume_checkpoint):
+            print(f"  Checkpoint not found locally, downloading from HF...", flush=True)
+            from huggingface_hub import hf_hub_download
+            local_dir = os.path.dirname(resume_checkpoint) or "checkpoints"
+            os.makedirs(local_dir, exist_ok=True)
+            resume_checkpoint = hf_hub_download(
+                repo_id="Cactus-Compute/checkpoints",
+                filename=os.path.basename(resume_checkpoint),
+                repo_type="model",
+                local_dir=local_dir,
+            )
+            print(f"  Downloaded to {resume_checkpoint}", flush=True)
         print(f"Resuming from checkpoint: {resume_checkpoint}")
         with open(resume_checkpoint, "rb") as f:
             ckpt_data = pickle.load(f)
-        ckpt_params = jax.tree.map(jnp.array, ckpt_data["params"])
         config = TransformerConfig(**ckpt_data["config"])
+        ckpt_params = jax.tree.map(jnp.array, ckpt_data["params"])
         print(f"  Config: d={config.d_model}, heads={config.num_heads}, layers={config.num_encoder_layers}/{config.num_decoder_layers}")
     else:
         config = TransformerConfig(
@@ -343,6 +355,12 @@ def train(args):
     val_loss_fn = _make_val_loss_fn(state.apply_fn)
 
     if resume_checkpoint:
+        # Cast each loaded leaf to the dtype of the freshly-initialized param
+        # (most weights -> bf16, scalars like log_temp stay fp32)
+        ckpt_params = jax.tree.map(
+            lambda ref, loaded: jnp.asarray(loaded, dtype=ref.dtype),
+            state.params, ckpt_params,
+        )
         state = state.replace(params=ckpt_params)
         print(f"  Loaded checkpoint params into train state")
 
@@ -466,9 +484,9 @@ def train(args):
             rng, text_rng = jax.random.split(rng)
             text_rngs = jax.random.split(text_rng, num_devices)
 
-            do_qat = jnp.broadcast_to(jnp.array(global_step % 100 == 0), (num_devices,))
+            do_qat = jnp.broadcast_to(jnp.array(global_step > 0 and global_step % 100 == 0), (num_devices,))
 
-            do_contrastive = cl_batch_iter is not None and global_step % 1000 == 0
+            do_contrastive = cl_batch_iter is not None and global_step > 0 and global_step % 1000 == 0
             cl_q_b, cl_t_b, cl_rngs = dummy_cl_tokens, dummy_cl_tokens, dummy_cl_rng
             if do_contrastive:
                 try:
