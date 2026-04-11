@@ -4,8 +4,6 @@ import re
 import sys
 import threading
 
-from .data import DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN
-
 HELP = """Check the readme"""
 
 
@@ -94,6 +92,18 @@ def _install_xla_log_filter():
 
     t = threading.Thread(target=pump, daemon=True, name="xla-log-filter")
     t.start()
+
+
+# Install the stderr filter BEFORE importing anything that might transitively
+# initialize jax/XLA. In particular, `.data` imports `datasets`, which probes
+# for jax at import time and fully loads it if present — that initializes XLA's
+# C++ absl logging and captures fd 2 before we get a chance to redirect it.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+_install_xla_log_filter()
+
+from .data import DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN
+
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
@@ -339,18 +349,12 @@ def main():
         from .tokenize_data import tokenize
         tokenize(args)
     elif args.command == "pretrain":
-        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-        os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
-        _install_xla_log_filter()
         import jax
         if os.path.exists("/dev/accel0"):
             jax.distributed.initialize()
         from .pretrain import pretrain
         pretrain(args)
     elif args.command == "train":
-        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-        os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
-        _install_xla_log_filter()
         import jax
         if os.path.exists("/dev/accel0"):
             jax.distributed.initialize()
