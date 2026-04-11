@@ -94,10 +94,6 @@ def _install_xla_log_filter():
     t.start()
 
 
-# Install the stderr filter BEFORE importing anything that might transitively
-# initialize jax/XLA. In particular, `.data` imports `datasets`, which probes
-# for jax at import time and fully loads it if present — that initializes XLA's
-# C++ absl logging and captures fd 2 before we get a chance to redirect it.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 _install_xla_log_filter()
@@ -123,7 +119,7 @@ def main():
                         "(e.g. needle_base.pkl). Uses CLI config; partial-loads "
                         "matching params, random-inits the rest.")
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--d-model", type=int, default=512)
