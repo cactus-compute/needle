@@ -23,7 +23,10 @@ from .model import (
     make_cross_packing_mask,
 )
 from .optim import create_train_state, _wsd_schedule
-from .distributed import _replicate, _unreplicate, shard_batch, _upload_checkpoint
+from .distributed import (
+    _replicate, _unreplicate, shard_batch, _upload_checkpoint,
+    load_pretrained_params, partial_load_params,
+)
 from .quantize import (
     _quantize_params, _cubic_sparsity_schedule, _make_prune_mask,
 )
@@ -363,6 +366,25 @@ def train(args):
         )
         state = state.replace(params=ckpt_params)
         print(f"  Loaded checkpoint params into train state")
+
+    init_from = getattr(args, "init_from", None)
+    if init_from and not resume_checkpoint:
+        print(f"\n  Initializing from pretrained base: {init_from}")
+        loaded_params, _loaded_cfg, local_path = load_pretrained_params(init_from)
+        merged, stats = partial_load_params(state.params, loaded_params)
+        state = state.replace(params=merged)
+        total = stats["loaded"] + stats["random_init"]
+        print(f"  [init-from] {stats['loaded']}/{total} leaves loaded from {os.path.basename(local_path)}, "
+              f"{stats['random_init']} kept at random init")
+        if stats["shape_mismatches"]:
+            print(f"  [init-from] {len(stats['shape_mismatches'])} shape mismatch(es):")
+            for path, loaded_shape, init_shape in stats["shape_mismatches"][:8]:
+                print(f"    {'/'.join(path)}: ckpt={loaded_shape} vs init={init_shape}")
+            if len(stats["shape_mismatches"]) > 8:
+                print(f"    ... ({len(stats['shape_mismatches']) - 8} more)")
+        if stats["extra_in_ckpt"]:
+            print(f"  [init-from] {len(stats['extra_in_ckpt'])} extra leaf(s) in ckpt (ignored)")
+        del loaded_params, merged
 
     state = _replicate(state)
 

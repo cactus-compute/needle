@@ -106,7 +106,12 @@ def main():
     p = sub.add_parser("train", add_help=False)
     p.add_argument("--name", type=str, default="baseline",
                    help="Experiment name for checkpoints and wandb (default: baseline)")
-    p.add_argument("--checkpoint", type=str, default=None)
+    p.add_argument("--checkpoint", type=str, default=None,
+                   help="Full resume: adopts checkpoint's config and step counter")
+    p.add_argument("--init-from", type=str, default=None,
+                   help="Initialize params from a pretrained base on HF "
+                        "(e.g. needle_base.pkl). Uses CLI config; partial-loads "
+                        "matching params, random-inits the rest.")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
