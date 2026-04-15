@@ -205,6 +205,31 @@ def main():
     p.add_argument("--activation", type=str, default="swiglu", choices=["drelu", "swiglu", "geglu"])
     p.add_argument("--no-feedforward", action=argparse.BooleanOptionalAction, default=True)
 
+    p = sub.add_parser("grpo", add_help=False)
+    p.add_argument("--checkpoint", type=str, default="checkpoints/needle.pkl",
+                   help="SFT checkpoint to init both policy and reference (default: checkpoints/needle.pkl)")
+    p.add_argument("--name", type=str, default="grpo")
+    p.add_argument("--batch-size", type=int, default=16,
+                   help="Prompts per step (B)")
+    p.add_argument("--k", type=int, default=4,
+                   help="Samples per prompt (K)")
+    p.add_argument("--lr", type=float, default=1e-6)
+    p.add_argument("--beta", type=float, default=0.04,
+                   help="KL penalty weight against frozen reference")
+    p.add_argument("--max-steps", type=int, default=5000)
+    p.add_argument("--max-enc-len", type=int, default=DEFAULT_MAX_ENC_LEN)
+    p.add_argument("--max-gen-len", type=int, default=DEFAULT_MAX_GEN_LEN)
+    p.add_argument("--eval-every", type=int, default=100,
+                   help="Run quick val PPL every N steps (default: 100)")
+    p.add_argument("--eval-batch-size", type=int, default=32,
+                   help="Batch size for val PPL eval")
+    p.add_argument("--tool-call-samples", type=int, default=100,
+                   help="Samples for stratified tool-call benchmark at save time (split evenly single/multi)")
+    p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    p.add_argument("--wandb", action="store_true")
+    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
+    p.add_argument("--seed", type=int, default=42)
+
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,
                    help="Limit samples per split (for dev/test)")
@@ -356,6 +381,12 @@ def main():
             jax.distributed.initialize()
         from .train import train
         train(args)
+    elif args.command == "grpo":
+        import jax
+        if os.path.exists("/dev/accel0"):
+            jax.distributed.initialize()
+        from .grpo import grpo
+        grpo(args)
     elif args.command == "run":
         from .run import main as run_main
         run_main(args)
