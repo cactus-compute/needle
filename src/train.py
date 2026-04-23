@@ -362,6 +362,29 @@ def _make_val_loss_fn(apply_fn):
     return val_loss_batch
 
 
+def _make_slot_val_loss_fn(apply_fn, m_prime, num_memory_slots):
+    """Val loss using only the first m_prime memory slots."""
+    keep = jnp.asarray(
+        [1.0] * m_prime + [0.0] * (num_memory_slots - m_prime),
+        dtype=jnp.float32,
+    )
+
+    @jax.jit
+    def val_loss_batch(params, src, tgt_in, tgt_out, causal_mask):
+        pad_id = 0
+        src_mask = make_padding_mask(src, pad_id)
+        tgt_mask = causal_mask & make_padding_mask(tgt_in, pad_id)
+        logits = apply_fn(
+            {"params": params}, src, tgt_in,
+            src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=src_mask,
+            slot_keep=keep,
+        )
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tgt_out)
+        mask = (tgt_out != pad_id).astype(jnp.float32)
+        return jnp.sum(loss * mask), jnp.sum(mask)
+    return val_loss_batch
+
+
 def _make_mrl_val_loss_fn(apply_fn, mrl_dim):
     """Val loss using truncated decoder hidden states and embedding at dimension mrl_dim."""
     @jax.jit
@@ -715,6 +738,23 @@ def train(args):
                 mrl_results[d_prime] = (mrl_ppl, mrl_params)
             del apply_fn
 
+        # Slot-MRL per-M' evaluation
+        slot_results = {}
+        if getattr(config, "slot_mrl_dims", None) and config.encoder_type == "memory_mixer":
+            apply_fn = jax_utils.unreplicate(state).apply_fn
+            for m_prime in sorted(set(config.slot_mrl_dims)):
+                if m_prime > config.num_memory_slots:
+                    continue
+                slot_vl_fn = _make_slot_val_loss_fn(apply_fn, m_prime, config.num_memory_slots)
+                s_total_loss, s_total_toks = 0.0, 0.0
+                for vb in get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size, shuffle=False):
+                    vl, vt = slot_vl_fn(eval_params, vb[0], vb[1], vb[2], val_causal)
+                    s_total_loss += float(vl)
+                    s_total_toks += float(vt)
+                avg = s_total_loss / max(s_total_toks, 1)
+                slot_results[m_prime] = float(math.exp(min(avg, 20)))
+            del apply_fn
+
         # Sparsity + checkpoint — move to CPU, reuse single copy
         params_np = jax.tree.map(np.array, eval_params)
         del eval_params  # free device memory
@@ -754,6 +794,13 @@ def train(args):
             for d_prime in sorted(mrl_results.keys(), reverse=True):
                 mrl_ppl, mrl_params = mrl_results[d_prime]
                 print(f"  {d_prime:>6}  {mrl_ppl:>10.2f}  {mrl_params:>12,}")
+        if slot_results:
+            print(f"  ─────────────────────────────────────")
+            print(f"  Slot-MRL (active memory slots):")
+            print(f"  {'M':>6}  {'val ppl':>10}")
+            print(f"  {config.num_memory_slots:>6}  {last_val_ppl:>10.2f}  (full)")
+            for m_prime in sorted(slot_results.keys(), reverse=True):
+                print(f"  {m_prime:>6}  {slot_results[m_prime]:>10.2f}")
         print(f"  ─────────────────────────────────────")
         print(f"  Throughput     {tp['tokens_per_second']:>10.1f} tok/s")
         print(f"  Latency        {tp['avg_latency_s']:>11.3f}s")
@@ -779,6 +826,8 @@ def train(args):
             for d_prime, (mrl_ppl, mrl_params) in mrl_results.items():
                 log_dict[f"epoch/mrl_ppl_d{d_prime}"] = mrl_ppl
                 log_dict[f"epoch/mrl_params_d{d_prime}"] = mrl_params
+            for m_prime, m_ppl in slot_results.items():
+                log_dict[f"epoch/slot_ppl_m{m_prime}"] = m_ppl
             wandb.log(log_dict)
 
     if use_wandb:
