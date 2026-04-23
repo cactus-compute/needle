@@ -44,6 +44,7 @@ class TransformerConfig:
     dtype: str = "bfloat16"
     activation: str = "drelu"
     num_memory_slots: int = 64
+    encoder_type: str = "memory_mixer"  # "memory_mixer" | "vanilla"
 
     @property
     def jax_dtype(self):
@@ -181,6 +182,55 @@ class MLPMixer(nn.Module):
         return s
 
 
+class EncoderBlock(nn.Module):
+    num_heads: int
+    num_kv_heads: int
+    d_model: int
+    d_ff: int
+    num_layers: int
+    dtype: jnp.dtype = jnp.bfloat16
+    activation: str = "drelu"
+
+    @nn.compact
+    def __call__(self, x, mask=None, rope=None):
+        residual = x
+        x = ZCRMSNorm(dtype=self.dtype)(x)
+        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype)(
+            x, x, mask=mask, rope=rope
+        )
+        x = x + residual
+
+        residual = x
+        x = ZCRMSNorm(dtype=self.dtype)(x)
+        x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x)
+        x = x + residual
+
+        return x
+
+
+class VanillaEncoder(nn.Module):
+    """Plain self-attention transformer encoder (pre-MemoryMixer baseline)."""
+    config: TransformerConfig
+
+    @nn.compact
+    def __call__(self, x, mask=None, rope=None):
+        cfg = self.config
+        dt = cfg.jax_dtype
+        x = x.astype(dt)
+
+        # Self-attention uses square (B,1,T,T) mask. Incoming mask is padding (B,1,1,T).
+        if mask is not None:
+            mask = mask & mask.transpose(0, 1, 3, 2)
+
+        for i in range(cfg.num_encoder_layers):
+            x = EncoderBlock(
+                cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff, cfg.total_layers, dt, cfg.activation, name=f"block_{i}"
+            )(x, mask=mask, rope=rope)
+
+        x = ZCRMSNorm(dtype=dt, name="final_norm")(x)
+        return x
+
+
 class MemoryMixerBlock(nn.Module):
     """Block 4a: Pack (cross-attn S←X with RoPE on keys) → Mix (MLP-Mixer) → Local Update (MLP)."""
     num_heads: int
@@ -297,7 +347,10 @@ class EncoderDecoderTransformer(nn.Module):
     def setup(self):
         self.embedding = nn.Embed(self.config.vocab_size, self.config.d_model, embedding_init=jinit.normal(stddev=0.02))
         self.embed_scale = math.sqrt(self.config.d_model)
-        self.encoder = MemoryMixerEncoder(self.config)
+        if self.config.encoder_type == "vanilla":
+            self.encoder = VanillaEncoder(self.config)
+        else:
+            self.encoder = MemoryMixerEncoder(self.config)
         self.decoder = Decoder(self.config)
 
     def _rope(self, seq_len):
@@ -320,8 +373,9 @@ class EncoderDecoderTransformer(nn.Module):
 
     def __call__(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None):
         encoder_out = self.encode(src, src_mask=src_mask)
+        dec_cross_mask = cross_mask if self.config.encoder_type == "vanilla" else None
         logits = self.decode(
-            tgt, encoder_out, self_mask=tgt_mask
+            tgt, encoder_out, self_mask=tgt_mask, cross_mask=dec_cross_mask
         )
         return logits
 
@@ -329,7 +383,8 @@ class EncoderDecoderTransformer(nn.Module):
         encoder_out = self.encode(src, src_mask=src_mask)
         x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
-        x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=None, rope=rope)
+        dec_cross_mask = cross_mask if self.config.encoder_type == "vanilla" else None
+        x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=dec_cross_mask, rope=rope)
         x_f32 = x.astype(jnp.float32)
         emb = self.embedding.embedding 
         logits = x_f32 @ emb.T
@@ -340,10 +395,13 @@ class EncoderDecoderTransformer(nn.Module):
                 if d < self.config.d_model:
                     mrl_logits.append(x_f32[..., :d] @ emb[:, :d].T)
 
-        s = encoder_out.astype(jnp.float32)
-        gram = jnp.matmul(s, s.transpose(0, 2, 1))
-        diag_sq = jnp.sum(jnp.diagonal(gram, axis1=1, axis2=2) ** 2)
-        slot_div = (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
+        if self.config.encoder_type == "vanilla":
+            slot_div = jnp.float32(0.0)
+        else:
+            s = encoder_out.astype(jnp.float32)
+            gram = jnp.matmul(s, s.transpose(0, 2, 1))
+            diag_sq = jnp.sum(jnp.diagonal(gram, axis1=1, axis2=2) ** 2)
+            slot_div = (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
         return logits, slot_div, mrl_logits
 
 

@@ -456,6 +456,7 @@ def train(args):
             dtype=args.dtype,
             activation=getattr(args, "activation", "drelu"),
             num_memory_slots=getattr(args, "num_memory_slots", 64),
+            encoder_type=getattr(args, "encoder", "memory_mixer"),
         )
 
     global _GROUP_SIZE, _MRL_DIMS
