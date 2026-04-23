@@ -109,9 +109,16 @@ def load_pretrained_params(path_or_name):
 
 def _replicate(tree):
     """Replicate a pytree across all local devices (multi-host safe)."""
-    devices = jax.local_devices()
-    return jax.tree.map(
-        lambda x: jax.device_put_replicated(x, devices), tree)
+    devices = np.array(jax.local_devices())
+    n = len(devices)
+    mesh = jax.sharding.Mesh(devices, ("d",))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("d"))
+
+    def _rep(x):
+        x = jnp.asarray(x)
+        return jax.device_put(jnp.broadcast_to(x, (n,) + x.shape), sharding)
+
+    return jax.tree.map(_rep, tree)
 
 
 def _unreplicate(tree):
