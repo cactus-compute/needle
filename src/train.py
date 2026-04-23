@@ -13,7 +13,13 @@ from tqdm import tqdm
 from flax import jax_utils
 from flax.training import train_state
 
-from .data import get_batches, get_tokenizer, load_tinystories, prepare_encoder_decoder_pairs
+from .data import (
+    get_batches,
+    get_tokenizer,
+    load_text_dataset,
+    prepare_encoder_decoder_pairs,
+    DATASET_SPECS,
+)
 from .model import (
     EncoderDecoderTransformer,
     TransformerConfig,
@@ -285,7 +291,7 @@ _GROUP_SIZE = 32
 _MRL_DIMS = ()
 
 
-def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
+def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask, slot_keep):
     pad_id = 0
     ema_decay = 0.999
 
@@ -302,6 +308,7 @@ def _train_step(state, ema_params, src, tgt_in, tgt_out, causal_mask):
             tgt_mask=tgt_mask,
             cross_mask=cross_mask,
             mrl_dims=_MRL_DIMS if _MRL_DIMS else None,
+            slot_keep=slot_keep,
             method="forward_with_aux",
         )
 
@@ -416,19 +423,27 @@ def train(args):
     print(f"\n[1/4] Detecting devices...")
     print(f"      {num_devices} device(s) for data-parallel training")
 
-    print(f"\n[2/4] Loading tokenizer...")
-    tokenizer = get_tokenizer(max_samples=args.max_samples)
+    dataset_name = getattr(args, "dataset", "tinystories")
+    eval_samples = getattr(args, "max_eval_samples", None) or max(500, args.max_samples // 20)
 
-    print(f"\n[3/4] Loading TinyStories dataset...")
-    ds = load_tinystories("train", max_samples=args.max_samples)
-    val_ds = load_tinystories("validation", max_samples=getattr(args, "max_eval_samples", None))
+    print(f"\n[2/4] Loading tokenizer (dataset={dataset_name})...")
+    tokenizer = get_tokenizer(max_samples=args.max_samples, dataset=dataset_name)
+
+    print(f"\n[3/4] Loading {dataset_name} dataset...")
+    if DATASET_SPECS[dataset_name]["streaming"]:
+        full = load_text_dataset(dataset_name, split="train", max_samples=args.max_samples + eval_samples)
+        ds = full.select(range(args.max_samples))
+        val_ds = full.select(range(args.max_samples, len(full)))
+    else:
+        ds = load_text_dataset(dataset_name, split="train", max_samples=args.max_samples)
+        val_ds = load_text_dataset(dataset_name, split="validation", max_samples=eval_samples)
 
     print(f"\n[4/4] Preparing encoder-decoder pairs...")
     enc_inputs, dec_inputs, dec_targets = prepare_encoder_decoder_pairs(
-        ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
+        ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len, dataset=dataset_name
     )
     val_enc, val_dec_in, val_dec_tgt = prepare_encoder_decoder_pairs(
-        val_ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len
+        val_ds, tokenizer, max_enc_len=args.max_enc_len, max_dec_len=args.max_dec_len, dataset=dataset_name
     )
     val_enc = np.array(val_enc)
     val_dec_in = np.array(val_dec_in)
@@ -457,6 +472,7 @@ def train(args):
             activation=getattr(args, "activation", "drelu"),
             num_memory_slots=getattr(args, "num_memory_slots", 64),
             encoder_type=getattr(args, "encoder", "memory_mixer"),
+            slot_mrl_dims=tuple(getattr(args, "slot_mrl_dims", []) or []),
         )
 
     global _GROUP_SIZE, _MRL_DIMS
@@ -517,6 +533,13 @@ def train(args):
         make_causal_mask(args.max_dec_len),
         (num_devices, 1, args.max_dec_len, args.max_dec_len),
     )
+
+    slot_mrl_dims = tuple(config.slot_mrl_dims or ())
+    slot_mrl_active = len(slot_mrl_dims) > 0 and config.encoder_type == "memory_mixer"
+    if slot_mrl_active:
+        print(f"  Slot-MRL      {list(slot_mrl_dims)} (sampled uniformly each step)")
+    full_slot_keep = jnp.ones((num_devices, config.num_memory_slots), dtype=jnp.float32)
+    slot_rng = np.random.default_rng(args.seed + 1)
 
     adam_schedule = _wsd_schedule(scaled_lr, total_steps, warmup_steps)
     muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
@@ -601,6 +624,14 @@ def train(args):
         for src, tgt_in, tgt_out in pbar:
             t0 = time.perf_counter()
 
+            if slot_mrl_active:
+                m_prime = int(slot_rng.choice(slot_mrl_dims))
+                keep = np.zeros(config.num_memory_slots, dtype=np.float32)
+                keep[:m_prime] = 1.0
+                slot_keep = jnp.broadcast_to(jnp.asarray(keep), (num_devices, config.num_memory_slots))
+            else:
+                slot_keep = full_slot_keep
+
             state, ema_params, loss, grad_norm = p_train_step(
                 state,
                 ema_params,
@@ -608,6 +639,7 @@ def train(args):
                 shard_batch(tgt_in, num_devices),
                 shard_batch(tgt_out, num_devices),
                 causal_mask,
+                slot_keep,
             )
 
             if prune_mask is not None:

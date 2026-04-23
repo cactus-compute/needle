@@ -137,6 +137,9 @@ def main():
     p.add_argument("--activation", type=str, default="drelu", choices=["drelu", "swiglu", "geglu"])
     p.add_argument("--num-memory-slots", type=int, default=64)
     p.add_argument("--encoder", type=str, default="memory_mixer", choices=["memory_mixer", "vanilla"])
+    p.add_argument("--dataset", type=str, default="fineweb_edu", choices=["tinystories", "fineweb_edu"])
+    p.add_argument("--slot-mrl-dims", type=int, nargs="*", default=[],
+                   help="Active slot counts for slot-matryoshka sampling (e.g. 64 32 16 8). Empty = disabled.")
     p.add_argument("--mrl-dims", type=int, nargs="*", default=[512, 256, 128, 64],
                    help="MRL dimension pruning targets (default: 512 256 128 64)")
 

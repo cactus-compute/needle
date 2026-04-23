@@ -9,9 +9,50 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 import numpy as np
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from tqdm import tqdm
 import sentencepiece as spm
+
+
+DATASET_SPECS = {
+    "tinystories": {
+        "path": "roneneldan/TinyStories",
+        "name": None,
+        "text_key": "text",
+        "streaming": False,
+    },
+    "fineweb_edu": {
+        "path": "HuggingFaceFW/fineweb-edu",
+        "name": "sample-10BT",
+        "text_key": "text",
+        "streaming": True,
+    },
+}
+
+
+def _load_text_dataset(dataset_name, split="train", max_samples=None):
+    """Return a non-streaming Dataset with a 'text' column, regardless of source."""
+    if dataset_name not in DATASET_SPECS:
+        raise ValueError(f"Unknown dataset: {dataset_name}. Options: {list(DATASET_SPECS)}")
+    spec = DATASET_SPECS[dataset_name]
+
+    if spec["streaming"]:
+        ds = load_dataset(spec["path"], name=spec["name"], split=split, streaming=True)
+        if max_samples is None:
+            raise ValueError(f"max_samples required for streaming dataset '{dataset_name}'")
+        texts = []
+        for row in tqdm(ds.take(max_samples), total=max_samples, desc=f"Streaming {dataset_name}"):
+            t = row[spec["text_key"]]
+            if t and t.strip():
+                texts.append(t)
+        return Dataset.from_dict({"text": texts})
+
+    ds = load_dataset(spec["path"], name=spec["name"], split=split)
+    if max_samples:
+        ds = ds.select(range(min(max_samples, len(ds))))
+    if spec["text_key"] != "text":
+        ds = ds.rename_column(spec["text_key"], "text")
+    return ds
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".data_cache")
 TOKENIZER_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tokenizer")
@@ -63,8 +104,8 @@ class NeedleTokenizer:
         return {"input_ids": all_ids}
 
 
-def train_tokenizer(vocab_size=8192, max_samples=None):
-    """Train a SentencePiece BPE tokenizer on TinyStories."""
+def train_tokenizer(vocab_size=8192, max_samples=None, dataset="tinystories"):
+    """Train a SentencePiece BPE tokenizer on the selected dataset."""
     model_path = TOKENIZER_PREFIX + ".model"
     if os.path.exists(model_path):
         print(f"Tokenizer already exists at {model_path}")
@@ -72,9 +113,8 @@ def train_tokenizer(vocab_size=8192, max_samples=None):
 
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
 
-    ds = load_dataset("roneneldan/TinyStories", split="train")
-    if max_samples:
-        ds = ds.select(range(min(max_samples, len(ds))))
+    tok_samples = max_samples or 200_000
+    ds = _load_text_dataset(dataset, split="train", max_samples=tok_samples)
 
     print(f"Training SentencePiece BPE tokenizer (vocab_size={vocab_size}, samples={len(ds):,})...")
 
@@ -106,18 +146,19 @@ def train_tokenizer(vocab_size=8192, max_samples=None):
     return model_path
 
 
-def get_tokenizer(max_samples=None):
+def get_tokenizer(max_samples=None, dataset="tinystories"):
     model_path = TOKENIZER_PREFIX + ".model"
     if not os.path.exists(model_path):
-        train_tokenizer(max_samples=max_samples)
+        train_tokenizer(max_samples=max_samples, dataset=dataset)
     return NeedleTokenizer(model_path)
 
 
 def load_tinystories(split="train", max_samples=None):
-    ds = load_dataset("roneneldan/TinyStories", split=split)
-    if max_samples:
-        ds = ds.select(range(min(max_samples, len(ds))))
-    return ds
+    return _load_text_dataset("tinystories", split=split, max_samples=max_samples)
+
+
+def load_text_dataset(dataset="tinystories", split="train", max_samples=None):
+    return _load_text_dataset(dataset, split=split, max_samples=max_samples)
 
 
 def _tokenizer_hash():
@@ -129,15 +170,15 @@ def _tokenizer_hash():
     return "none"
 
 
-def _cache_key(n_samples, max_enc_len, max_dec_len):
+def _cache_key(dataset, n_samples, max_enc_len, max_dec_len):
     tok_hash = _tokenizer_hash()
-    key = f"tinystories_{tok_hash}_{n_samples}_{max_enc_len}_{max_dec_len}"
+    key = f"{dataset}_{tok_hash}_{n_samples}_{max_enc_len}_{max_dec_len}"
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
-def prepare_encoder_decoder_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=128, split_ratio=0.3):
+def prepare_encoder_decoder_pairs(ds, tokenizer, max_enc_len=128, max_dec_len=128, split_ratio=0.3, dataset="tinystories"):
 
-    cache_id = _cache_key(len(ds), max_enc_len, max_dec_len)
+    cache_id = _cache_key(dataset, len(ds), max_enc_len, max_dec_len)
     cache_path = os.path.join(CACHE_DIR, cache_id)
     if os.path.exists(cache_path + "_enc.npy"):
         print(f"Loading cached data ({cache_id})...")

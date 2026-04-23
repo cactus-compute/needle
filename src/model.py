@@ -45,6 +45,7 @@ class TransformerConfig:
     activation: str = "drelu"
     num_memory_slots: int = 64
     encoder_type: str = "memory_mixer"  # "memory_mixer" | "vanilla"
+    slot_mrl_dims: tuple = ()  # e.g. (64, 32, 16, 8); empty = disabled
 
     @property
     def jax_dtype(self):
@@ -371,22 +372,44 @@ class EncoderDecoderTransformer(nn.Module):
         logits = x.astype(jnp.float32) @ self.embedding.embedding.T
         return logits
 
-    def __call__(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None):
+    def _apply_slot_mask(self, encoder_out, slot_keep):
+        """Zero out inactive slots (MemoryMixer only). slot_keep: (M,) float {0,1}."""
+        if slot_keep is None or self.config.encoder_type == "vanilla":
+            return encoder_out
+        m = slot_keep.astype(encoder_out.dtype)[None, :, None]
+        return encoder_out * m
+
+    def _slot_cross_mask(self, tgt_len, slot_keep):
+        """Build (1,1,T_tgt,M) cross mask from a (M,) slot-keep vector."""
+        if slot_keep is None:
+            return None
+        return jnp.broadcast_to(slot_keep.astype(jnp.bool_)[None, None, None, :],
+                                (1, 1, tgt_len, slot_keep.shape[0]))
+
+    def __call__(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, slot_keep=None):
         encoder_out = self.encode(src, src_mask=src_mask)
-        dec_cross_mask = cross_mask if self.config.encoder_type == "vanilla" else None
+        if self.config.encoder_type == "vanilla":
+            dec_cross_mask = cross_mask
+        else:
+            encoder_out = self._apply_slot_mask(encoder_out, slot_keep)
+            dec_cross_mask = self._slot_cross_mask(tgt.shape[1], slot_keep)
         logits = self.decode(
             tgt, encoder_out, self_mask=tgt_mask, cross_mask=dec_cross_mask
         )
         return logits
 
-    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mrl_dims=None):
+    def forward_with_aux(self, src, tgt, src_mask=None, tgt_mask=None, cross_mask=None, mrl_dims=None, slot_keep=None):
         encoder_out = self.encode(src, src_mask=src_mask)
+        if self.config.encoder_type == "vanilla":
+            dec_cross_mask = cross_mask
+        else:
+            encoder_out = self._apply_slot_mask(encoder_out, slot_keep)
+            dec_cross_mask = self._slot_cross_mask(tgt.shape[1], slot_keep)
         x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
-        dec_cross_mask = cross_mask if self.config.encoder_type == "vanilla" else None
         x = self.decoder(x, encoder_out, self_mask=tgt_mask, cross_mask=dec_cross_mask, rope=rope)
         x_f32 = x.astype(jnp.float32)
-        emb = self.embedding.embedding 
+        emb = self.embedding.embedding
         logits = x_f32 @ emb.T
 
         mrl_logits = []
@@ -398,10 +421,17 @@ class EncoderDecoderTransformer(nn.Module):
         if self.config.encoder_type == "vanilla":
             slot_div = jnp.float32(0.0)
         else:
-            s = encoder_out.astype(jnp.float32)
+            s = encoder_out.astype(jnp.float32)  # already masked
             gram = jnp.matmul(s, s.transpose(0, 2, 1))
             diag_sq = jnp.sum(jnp.diagonal(gram, axis1=1, axis2=2) ** 2)
-            slot_div = (jnp.sum(gram ** 2) - diag_sq) / s.shape[0]
+            if slot_keep is None:
+                denom = s.shape[0]
+            else:
+                active = jnp.sum(slot_keep)
+                denom = s.shape[0] * jnp.maximum(active * active, 1.0)
+                denom = denom / jnp.maximum((s.shape[1] * s.shape[1]), 1.0)
+                denom = jnp.maximum(denom, 1.0)
+            slot_div = (jnp.sum(gram ** 2) - diag_sq) / denom
         return logits, slot_div, mrl_logits
 
 
