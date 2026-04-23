@@ -107,9 +107,20 @@ class NeedleTokenizer:
 def train_tokenizer(vocab_size=8192, max_samples=None, dataset="tinystories"):
     """Train a SentencePiece BPE tokenizer on the selected dataset."""
     model_path = TOKENIZER_PREFIX + ".model"
+    stamp_path = TOKENIZER_PREFIX + ".dataset"
     if os.path.exists(model_path):
-        print(f"Tokenizer already exists at {model_path}")
-        return model_path
+        existing = open(stamp_path).read().strip() if os.path.exists(stamp_path) else None
+        if existing == dataset:
+            print(f"Tokenizer already exists at {model_path} (dataset={dataset})")
+            return model_path
+        print(
+            f"Tokenizer at {model_path} was trained on '{existing}', "
+            f"but this run requests '{dataset}'. Retraining."
+        )
+        os.remove(model_path)
+        vocab_file = TOKENIZER_PREFIX + ".vocab"
+        if os.path.exists(vocab_file):
+            os.remove(vocab_file)
 
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
 
@@ -142,13 +153,21 @@ def train_tokenizer(vocab_size=8192, max_samples=None, dataset="tinystories"):
     )
 
     os.remove(corpus_path)
+    with open(TOKENIZER_PREFIX + ".dataset", "w") as f:
+        f.write(dataset)
     print(f"Tokenizer saved to {model_path}")
     return model_path
 
 
 def get_tokenizer(max_samples=None, dataset="tinystories"):
     model_path = TOKENIZER_PREFIX + ".model"
-    if not os.path.exists(model_path):
+    stamp_path = TOKENIZER_PREFIX + ".dataset"
+    existing = (
+        open(stamp_path).read().strip()
+        if os.path.exists(model_path) and os.path.exists(stamp_path)
+        else None
+    )
+    if not os.path.exists(model_path) or existing != dataset:
         train_tokenizer(max_samples=max_samples, dataset=dataset)
     return NeedleTokenizer(model_path)
 

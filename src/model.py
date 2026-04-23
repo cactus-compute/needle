@@ -367,7 +367,7 @@ class EncoderDecoderTransformer(nn.Module):
         x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
         x = self.decoder(
-            x, encoder_out, self_mask=self_mask, cross_mask=None, rope=rope
+            x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope
         )
         logits = x.astype(jnp.float32) @ self.embedding.embedding.T
         return logits
