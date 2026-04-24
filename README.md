@@ -65,7 +65,7 @@
   ┌─────────────────────────────────────────────────────────────┐
   │                                                             │
   │  Contrastive Head    CLIP-style tool retrieval              │
-  │    encoder → mean_pool → Dense(d_model/4) → ReLU           │
+  │    encoder → mean_pool → Dense(d_model/4) → ReLU            │
   │    → Dense(contrastive_dim) → L2-normalize                  │
   │    learnable temperature (log_temp)                         │
   │                                                             │
@@ -101,11 +101,6 @@
   │                                                             │
   │  Gemini synthesis → Cactus-Compute/tool-calls (HuggingFace) │
   │  parallel workers · dedup · auto-merge · auto-upload        │
-  │                                                             │
-  │  Related:                                                   │
-  │    needle merge-xlam        merge xlam-60k into dataset     │
-  │    needle rebalance-tools   trim over-represented bins      │
-  │    needle split-dataset     create train/val splits         │
   └─────────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -153,17 +148,6 @@
   │             ▼                          ▼                    │
   │  text + contrastive tool-call training (jax.pmap)           │
   └─────────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-  ┌─────────────────────────────────────────────────────────────┐
-  │  needle calibrate                                           │
-  │                                                             │
-  │  Freeze encoder + decoder                                   │
-  │  Compute per-example decoder perplexity                     │
-  │  Map PPL → [0,1] confidence via sigmoid calibration         │
-  │  Train confidence head (2 Dense layers, MSE loss)           │
-  │  Save calibrated checkpoint with mu, k params               │
-  └─────────────────────────────────────────────────────────────┘
 
   Hybrid Inference (confidence-based cloud routing)
   ─────────────────────────────────────────────────
@@ -190,9 +174,9 @@
   │    ┌──┴──┐              │                                   │
   │    │ yes │──────────────┤                                   │
   │    └─────┘              ▼                                   │
-  │                  ┌──────────┐                                │
+  │                  ┌──────────┐                               │
   │                  │ Decoder  │──▶ tool calls (local)         │
-  │                  └──────────┘                                │
+  │                  └──────────┘                               │
   │    ┌─────┐                                                  │
   │    │ no  │──▶ route to cloud (Gemini) ──▶ tool calls        │
   │    └─────┘    (skip decoder entirely)                       │
@@ -214,7 +198,7 @@ needle [command]
   │   train                                                           │
   │     --epochs INT             Training epochs (default: 1)         │
   │     --batch-size INT         Batch size (default: 32)             │
-  │     --lr FLOAT               AdamW learning rate (default: 3e-4)  │
+  │     --lr FLOAT               AdamW learning rate (default: 3e-5)  │
   │     --muon-lr FLOAT          Muon learning rate (default: 0.02)   │
   │     --d-model INT            Model dim (default: 512)             │
   │     --num-heads INT          Attention heads (default: 8)         │
@@ -224,7 +208,7 @@ needle [command]
   │     --max-enc-len INT        Max encoder seq len (default: 1024)  │
   │     --max-dec-len INT        Max decoder seq len (default: 512)   │
   │     --max-samples INT        Training samples (default: all)      │
-  │     --no-feedforward         No FFN layers (default: on)           │
+  │     --no-feedforward         No FFN layers (default: on)          │
   │     --feedforward            Enable FFN layers (off by default)   │
   │     --activation STR         swiglu|drelu|geglu (if FFN enabled)  │
   │     --mat-factors INT [...]  FFN shrink factors (if FFN enabled)  │
@@ -235,7 +219,7 @@ needle [command]
   │     --prune-end-frac FL      Lock mask at this frac (def: 0.67)   │
   │     --warmup-ratio FLOAT     LR warmup ratio (default: 0.05)      │
   │     --decay-ratio FLOAT      LR cosine decay ratio (default: 0.05)│
-  │     --dropout FLOAT          Dropout rate (default: 0.0)           │
+  │     --dropout FLOAT          Dropout rate (default: 0.0)          │
   │     --eval-every INT         Val eval interval (default: 1000)    │
   │     --max-eval-samples INT   Val samples limit (default: 5000)    │
   │     --contrastive-weight FL  CLIP loss weight (default: 0.1)      │
@@ -277,15 +261,6 @@ needle [command]
   │     --tool-call-samples INT  Tool-call eval samples (default: 200)│
   │     --no-constrained         Disable constrained decoding         │
   │                                                                   │
-  │   calibrate                                                       │
-  │     --checkpoint PATH        Path to model checkpoint (required)  │
-  │     --output PATH            Output path (default: overwrite)     │
-  │     --batch-size INT         Batch size (default: 32)             │
-  │     --num-samples INT        Limit samples for PPL (default: all) │
-  │     --epochs INT             Training epochs (default: 10)        │
-  │     --lr FLOAT               Learning rate (default: 1e-3)        │
-  │     --k FLOAT                Sigmoid steepness (default: 3.0)     │
-  │                                                                   │
   │   generate-data                                                   │
   │     --num-samples INT        Samples to generate (default: 5000)  │
   │     --batch-size INT         Examples per Gemini call (default:10)│
@@ -294,15 +269,6 @@ needle [command]
   │     --dry-run                Generate only, skip upload           │
   │     --output-jsonl PATH      Also save raw generations to JSONL   │
   │     --upload-every INT       Merge+upload interval (def: 30000)   │
-  │                                                                   │
-  │   merge-xlam                                                      │
-  │     --dry-run                Skip upload                          │
-  │     --max-samples INT        Limit xlam samples                   │
-  │                                                                   │
-  │   rebalance-tools                                                 │
-  │     --dry-run                Preview without modifying            │
-  │                                                                   │
-  │   split-dataset              Create train/val splits + upload     │
   │                                                                   │
   │   evaluate                                                        │
   │     --checkpoint PATH        Path to model checkpoint (required)  │
@@ -390,21 +356,13 @@ needle [command]
 
 4. Clone the repo on your instance using your PAT
    git clone https://github.com/cactus-compute/needle.git
-   cd needle
+   cd needle && source ./setup
 
-5. Install needle (follow instruction to setup wandb)
-   source ./setup
-
-6. Login to Hugging Face (required for private datasets)
-   huggingface-cli login
+5. Login to Hugging Face (required for private datasets)
+   hf auth login
    (paste your HF token — get one at https://huggingface.co/settings/tokens)
 
-7. Full pipeline
-   needle tokenize                            # tokenize + pack + upload
-   needle train --wandb                       # train on TPU
-   needle eval --checkpoint <path>            # evaluate
-
-8. Use tmux for long training runs (survives SSH disconnects)
+6. Use tmux for long training runs (survives SSH disconnects)
    tmux new -s train          # start a named session
    needle train --wandb       # run training inside it
    Ctrl+B, then D             # detach (keeps running)
@@ -448,12 +406,4 @@ all workers automatically.
 7. Stop/delete when done
    needle tpu stop my-experiment
    needle tpu delete my-experiment
-```
-
-## Current TPU Instances
-
-```
-  Name       Zone               Type    Software         Workers
-  ──────────────────────────────────────────────────────────────────
-  large      asia-northeast1-b  v6e-16  v2-alpha-tpuv6e  4
 ```

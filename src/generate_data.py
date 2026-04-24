@@ -1826,7 +1826,6 @@ def _merge_and_upload(existing, new_examples):
     import shutil as _shutil
     _shutil.rmtree(parquet_dir)
     print(f"Upload complete: {HF_DATASET_REPO}")
-    print("NOTE: Run 'needle split-dataset' to create the validation split.")
 
     return merged
 

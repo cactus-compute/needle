@@ -120,7 +120,7 @@ def main():
                         "matching params, random-inits the rest.")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--d-model", type=int, default=512)
     p.add_argument("--num-heads", type=int, default=8)
@@ -165,14 +165,6 @@ def main():
                    help="Loss weight for argument key tokens (default: 1.5)")
     p.add_argument("--no-feedforward", action=argparse.BooleanOptionalAction, default=True,
                    help="Remove feedforward layers entirely (default: True)")
-    p.add_argument("--calibrate", action=argparse.BooleanOptionalAction, default=False,
-                   help="Run confidence head calibration after training (default: False)")
-    p.add_argument("--calibrate-epochs", type=int, default=1,
-                   help="Epochs for confidence head calibration (default: 1)")
-    p.add_argument("--calibrate-lr", type=float, default=1e-3,
-                   help="Learning rate for confidence head calibration (default: 1e-3)")
-    p.add_argument("--calibrate-k", type=float, default=5.0,
-                   help="Sigmoid steepness for PPL→confidence mapping (default: 5.0)")
 
     p = sub.add_parser("pretrain", add_help=False)
     p.add_argument("--name", type=str, default="pretrain",
@@ -204,31 +196,6 @@ def main():
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--activation", type=str, default="swiglu", choices=["drelu", "swiglu", "geglu"])
     p.add_argument("--no-feedforward", action=argparse.BooleanOptionalAction, default=True)
-
-    p = sub.add_parser("grpo", add_help=False)
-    p.add_argument("--checkpoint", type=str, default="checkpoints/needle.pkl",
-                   help="SFT checkpoint to init both policy and reference (default: checkpoints/needle.pkl)")
-    p.add_argument("--name", type=str, default="grpo")
-    p.add_argument("--batch-size", type=int, default=16,
-                   help="Prompts per step (B)")
-    p.add_argument("--k", type=int, default=4,
-                   help="Samples per prompt (K)")
-    p.add_argument("--lr", type=float, default=1e-6)
-    p.add_argument("--beta", type=float, default=0.04,
-                   help="KL penalty weight against frozen reference")
-    p.add_argument("--max-steps", type=int, default=5000)
-    p.add_argument("--max-enc-len", type=int, default=DEFAULT_MAX_ENC_LEN)
-    p.add_argument("--max-gen-len", type=int, default=DEFAULT_MAX_GEN_LEN)
-    p.add_argument("--eval-every", type=int, default=100,
-                   help="Run quick val PPL every N steps (default: 100)")
-    p.add_argument("--eval-batch-size", type=int, default=32,
-                   help="Batch size for val PPL eval")
-    p.add_argument("--tool-call-samples", type=int, default=100,
-                   help="Samples for stratified tool-call benchmark at save time (split evenly single/multi)")
-    p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    p.add_argument("--wandb", action="store_true")
-    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
-    p.add_argument("--seed", type=int, default=42)
 
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,
@@ -265,15 +232,6 @@ def main():
     p.add_argument("--no-constrained", action="store_true",
                    help="Disable grammar-constrained decoding for tool names/arg keys")
 
-    p = sub.add_parser("calibrate", add_help=False)
-    p.add_argument("--checkpoint", type=str, required=True)
-    p.add_argument("--output", type=str, default=None, help="Output checkpoint path (default: overwrite input)")
-    p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--num-samples", type=int, default=None, help="Limit training samples for PPL computation")
-    p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--k", type=float, default=5.0, help="Sigmoid steepness for PPL→confidence mapping")
-
     p = sub.add_parser("generate-data", add_help=False)
     p.add_argument("--num-samples", type=int, default=500, help="Number of samples to generate")
     p.add_argument("--batch-size", type=int, default=25, help="Examples per Gemini call")
@@ -282,24 +240,6 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="Generate only, skip save and upload")
     p.add_argument("--output-jsonl", type=str, default=None, help="Also save raw generations to JSONL")
     p.add_argument("--upload-every", type=int, default=None, help="Merge+upload every N samples")
-
-    p = sub.add_parser("merge-xlam", add_help=False)
-    p.add_argument("--dry-run", action="store_true", help="Skip upload")
-    p.add_argument("--max-samples", type=int, default=None, help="Limit xlam samples")
-
-    p = sub.add_parser("translate-xlam", add_help=False)
-    p.add_argument("--max-samples", type=int, default=None, help="Limit examples to translate")
-    p.add_argument("--workers", type=int, default=8, help="Parallel Gemini calls")
-    p.add_argument("--model", type=str, default=None, help="Gemini model for translation")
-    p.add_argument("--batch-size", type=int, default=10, help="Examples per Gemini call")
-    p.add_argument("--dry-run", action="store_true", help="Translate only, skip save/upload")
-
-    p = sub.add_parser("rebalance-tools", add_help=False)
-    p.add_argument("--dry-run", action="store_true", help="Preview without modifying")
-
-    p = sub.add_parser("split-dataset", add_help=False)
-    p.add_argument("--val-per-source", type=int, default=None,
-                   help="Validation samples per source (default: 2500)")
 
     p = sub.add_parser("evaluate", add_help=False)
     p.add_argument("--checkpoint", type=str, required=True)
@@ -381,21 +321,12 @@ def main():
             jax.distributed.initialize()
         from .train import train
         train(args)
-    elif args.command == "grpo":
-        import jax
-        if os.path.exists("/dev/accel0"):
-            jax.distributed.initialize()
-        from .grpo import grpo
-        grpo(args)
     elif args.command == "run":
         from .run import main as run_main
         run_main(args)
     elif args.command == "eval":
         from .eval import main as eval_main_fn
         eval_main_fn(args)
-    elif args.command == "calibrate":
-        from .calibrate import main as calibrate_main
-        calibrate_main(args)
     elif args.command == "generate-data":
         from .generate_data import main as gendata_main, MODEL as _MODEL, UPLOAD_EVERY as _UE
         if args.model is None:
@@ -403,20 +334,6 @@ def main():
         if args.upload_every is None:
             args.upload_every = _UE
         gendata_main(args)
-    elif args.command == "merge-xlam":
-        from .merge_xlam import main as merge_main
-        merge_main(args)
-    elif args.command == "translate-xlam":
-        from .translate_xlam import main as translate_main, MODEL as _TMODEL
-        if args.model is None:
-            args.model = _TMODEL
-        translate_main(args)
-    elif args.command == "rebalance-tools":
-        from .rebalance_tools import main as rebalance_main
-        rebalance_main(args)
-    elif args.command == "split-dataset":
-        from .split_dataset import main as split_main
-        split_main(args)
     elif args.command == "evaluate":
         from .evaluate import main as eval_main
         eval_main(args)
