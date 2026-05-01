@@ -1,5 +1,6 @@
 import math
-from typing import NamedTuple
+from typing import Callable, NamedTuple
+from flax import struct
 import jax
 import jax.numpy as jnp
 import optax
@@ -80,6 +81,8 @@ def _wsd_schedule(peak_value, total_steps, warmup_steps, decay_ratio=0.15):
         boundaries=[warmup_steps, warmup_steps + stable_steps],
     )
 
+class NeedleTrainState(train_state.TrainState):                                                                                                                                   
+    encode_fn: Callable = struct.field(pytree_node=False)
 
 def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_steps, decay_ratio=0.15):
     model = EncoderDecoderTransformer(config)
@@ -116,8 +119,9 @@ def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_
             _param_labels,
         ),
     )
-    return train_state.TrainState.create(
+    return NeedleTrainState.create(
         apply_fn=model.apply,
+        encode_fn=model.encode_reconstruct,
         params=variables["params"],
         tx=tx,
     )
