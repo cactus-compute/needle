@@ -31,6 +31,7 @@ from .model import (
 )
 from .optim import create_train_state, _wsd_schedule
 from .distributed import _replicate, _unreplicate, shard_batch, _upload_checkpoint
+from .data import corrupt_inputs
 
 _HF_PRETRAIN_REPO = "PleIAs/SYNTH"
 
@@ -141,6 +142,10 @@ def _pretrain_step(state, src, tgt_in, tgt_out, rng):
     """Simple CE loss train step for pretraining. No QAT, no contrastive, no pruning."""
 
     def loss_fn(params):
+        L_z = 1e-4
+        L_corrupt = 0.5
+        src_corrupt, corrupt_mask = corrupt_inputs(src, rng)
+
         src_mask = make_padding_mask(src, PAD_ID)
         tgt_mask = make_causal_mask(tgt_in.shape[1]) & make_padding_mask(tgt_in, PAD_ID)
         cross_mask = src_mask
@@ -156,8 +161,16 @@ def _pretrain_step(state, src, tgt_in, tgt_out, rng):
         ce = jnp.sum(
             optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * padding_mask
         ) / num_tokens
-        z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
-        return ce + z_loss
+        z_loss = jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
+
+        corrupt_z, _ = state.apply_fn({"params": params}, src_corrupt, src_mask=src_mask, method=state.encode_fn)
+        corrupt_z_f32 = corrupt_z.astype(jnp.float32)
+
+        corrupt_ce = jnp.sum(
+            optax.softmax_cross_entropy_with_integer_labels(corrupt_z_f32, src) * corrupt_mask
+        ) / jnp.maximum(jnp.sum(corrupt_mask), 1.0)
+
+        return ce + L_z * z_loss + L_corrupt * corrupt_ce
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
     grads = jax.lax.pmean(grads, axis_name="batch")

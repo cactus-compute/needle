@@ -4,6 +4,7 @@ import multiprocessing as mp
 import os
 import queue
 import threading
+
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
@@ -12,6 +13,8 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 import numpy as np
+import jax
+import jax.numpy as jnp
 from datasets import Audio, Dataset, load_from_disk
 from tqdm import tqdm
 import sentencepiece as spm
@@ -594,6 +597,15 @@ def _build_contrastive_arrays(ds, enc_texts, tools_texts, all_enc_tokens, cache_
     np.save(cache_path + "_tool_ex_idx.npy", np.array(tool_ex_idx, dtype=np.int32))
     np.save(cache_path + "_tool_is_pos.npy", np.array(tool_is_pos, dtype=np.bool_))
     print(f"  Contrastive: {len(query_seqs)} queries, {len(tool_ex_idx)} individual tools")
+    
+
+def corrupt_inputs(src_inputs, rng):
+      tools_positions = jnp.argmax(src_inputs == TOOLS_ID, axis=-1)
+      seq_positions = jnp.arange(src_inputs.shape[1])[None, :]  # [1, seq_len]
+      seed_text_mask = seq_positions > tools_positions[:, None]  # [batch, seq_len]
+      corruption_mask = jax.random.bernoulli(rng, p=0.15, shape=src_inputs.shape) & seed_text_mask
+      corrupted_inputs = jnp.where(corruption_mask, UNK_ID, src_inputs)
+      return corrupted_inputs, corruption_mask
 
 
 def get_contrastive_batches(query_tokens, tool_tokens, tool_ex_idx, tool_is_pos, batch_size):

@@ -412,6 +412,8 @@ class EncoderDecoderTransformer(nn.Module):
                 self.config.d_model, dtype=self.config.jax_dtype, name="speech_subsample")
         self.encoder = Encoder(self.config)
         self.decoder = Decoder(self.config)
+        self.corrupt_projector = EncoderBlock(
+            self.config.num_heads, self.config.num_kv_heads, self.config.d_model, self.config.d_ff, dtype=self.config.jax_dtype)
         self.contrastive_hidden = nn.Dense(
             self.config.d_model // 4, dtype=self.config.jax_dtype,
             kernel_init=default_init(), name="contrastive_hidden",
@@ -443,6 +445,13 @@ class EncoderDecoderTransformer(nn.Module):
     def encode(self, src, src_mask=None):
         """Backward-compatible alias for encode_text."""
         return self.encode_text(src, src_mask=src_mask)
+    
+    def encode_reconstruct(self, src, src_mask=None, ffn_mask=None, deterministic=True):
+        """Encode for reconstruction loss: apply additional corruption projector."""
+        encoder_out, enc_mask = self.encode_text(src, src_mask=src_mask, ffn_mask=ffn_mask, deterministic=deterministic)
+        corrupt_z = self.corrupt_projector(encoder_out, mask=enc_mask, rope=self._rope(encoder_out.shape[1]), ffn_mask=ffn_mask, deterministic=deterministic)
+        corrupt_logits = corrupt_z @ self.embedding.embedding.T
+        return corrupt_logits, enc_mask
 
     def encode_speech(self, mel, src_mask=None, ffn_mask=None, deterministic=True):
         assert self.config.enable_speech, "Speech is disabled in config"
