@@ -9,5 +9,6 @@ wandb
 pyyaml
 sentencepiece
 google-cloud-texttospeech
+google-genai
 audiomentations
 gcsfs

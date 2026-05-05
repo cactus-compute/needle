@@ -262,11 +262,13 @@ def train(args):
     val_dec_seg = val_data["packed_dec_seg"]
     print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val packed bins (memory-mapped)")
 
-    try:
-        val_ds = load_tool_calls("val", max_samples=args.max_samples)
-    except (FileNotFoundError, Exception) as e:
-        print(f"      WARNING: could not load val dataset for eval samples: {e}")
-        val_ds = None
+    val_ds = getattr(args, "val_ds", None)
+    if val_ds is None:
+        try:
+            val_ds = load_tool_calls("val", max_samples=args.max_samples)
+        except (FileNotFoundError, Exception) as e:
+            print(f"      WARNING: could not load val dataset for eval samples: {e}")
+            val_ds = None
 
     cl_query_tokens = train_data.get("query_only")
     cl_tool_tokens = train_data.get("tool_individual")

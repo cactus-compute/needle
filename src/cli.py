@@ -247,6 +247,11 @@ def main():
                    choices=["wikitext2", "lambada", "hellaswag", "arc_easy"])
     p.add_argument("--max-samples", type=int, default=500)
 
+    p = sub.add_parser("ui", add_help=False)
+    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--port", type=int, default=7860)
+    p.add_argument("--host", type=str, default="127.0.0.1")
+
     p = sub.add_parser("tpu", add_help=False)
     tpu_sub = p.add_subparsers(dest="tpu_action")
 
@@ -337,6 +342,9 @@ def main():
     elif args.command == "evaluate":
         from .evaluate import main as eval_main
         eval_main(args)
+    elif args.command == "ui":
+        from .ui.server import main as ui_main
+        ui_main(args)
     elif args.command == "tpu":
         from .tpu import tpu_dispatch
         tpu_dispatch(args)
