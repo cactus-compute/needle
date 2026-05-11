@@ -327,6 +327,10 @@ needle [command]
   └────────────────────┴──────────┴──────────┴──────────┘
 ```
 
+## Finetuning
+
+See [src/ui/README.md](src/ui/README.md) for finetuning needle on your own tools, via the web UI or CLI.
+
 ## Setup For TPU/GCP
 
 - Setup gcloud 1: download the `macOS ARM` from [here](https://docs.cloud.google.com/sdk/docs/install-sdk) and unzip.

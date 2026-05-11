@@ -223,8 +223,8 @@ def finetune_local(args):
         raise ValueError("finetune requires at least 3 examples for train/val/test splits")
 
     from .tokenizer import DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN
-    max_enc_len = DEFAULT_MAX_ENC_LEN
-    max_dec_len = DEFAULT_MAX_DEC_LEN
+    max_enc_len = getattr(args, "max_enc_len", None) or DEFAULT_MAX_ENC_LEN
+    max_dec_len = getattr(args, "max_dec_len", None) or DEFAULT_MAX_DEC_LEN
 
     _owns_cache = args.cache_dir is None
     cache_dir = args.cache_dir or tempfile.mkdtemp(prefix="needle-finetune-cache-")
@@ -232,19 +232,18 @@ def finetune_local(args):
 
     train_examples, val_examples, test_examples = _per_tool_split(examples)
 
-    # If not enough data for 3-way split, merge test into val
-    if len(train_examples) == 0 and len(test_examples) > 0:
-        val_examples = val_examples + test_examples
-        test_examples = list(val_examples)  # test = val (same data)
-        train_remaining = []
-        # Steal half of val for train
-        for i in range(0, len(val_examples), 2):
-            if i + 1 < len(val_examples):
-                train_remaining.append(val_examples[i])
-        if train_remaining:
-            train_examples = train_remaining
-            val_examples = [ex for ex in val_examples if ex not in train_remaining]
-            test_examples = list(val_examples)
+    if len(train_examples) == 0:
+        all_avail = val_examples + test_examples
+        random.Random(42).shuffle(all_avail)
+        n = len(all_avail)
+        n_test = max(1, n // 5)
+        n_val = max(1, n // 5)
+        n_train = n - n_val - n_test
+        if n_train <= 0:
+            raise ValueError(f"Not enough data ({n} examples) for train/val/test splits")
+        test_examples = all_avail[:n_test]
+        val_examples = all_avail[n_test:n_test + n_val]
+        train_examples = all_avail[n_test + n_val:]
 
     if len(train_examples) == 0:
         raise ValueError("Not enough data — need at least 3 examples per tool for train/val/test splits")
@@ -275,7 +274,6 @@ def finetune_local(args):
 
         from datasets import Dataset as _Dataset
         val_ds = _Dataset.from_list(val_examples)
-        test_ds = _Dataset.from_list(test_examples)
 
         # Base model eval on TEST set (never seen by model)
         from .run import load_checkpoint
@@ -311,10 +309,10 @@ def finetune_local(args):
             warmup_ratio=0.05, decay_ratio=0.05, wandb=False,
             dtype=cfg.get("dtype", "bfloat16"),
             checkpoint_dir=args.checkpoint_dir, seed=42,
-            eval_every=max(1, approx_steps), max_eval_samples=min(val_kept, 200),
+            eval_every=max(1, approx_steps), max_eval_samples=min(val_kept, 50),
             sparsity_ratio=0.0, group_size=32, precision="int4",
             prune_interval=100, prune_start_frac=0.33, prune_end_frac=0.67,
-            activation=cfg.get("activation", "swiglu"),
+            activation=cfg.get("activation", "drelu"),
             mat_factors=[2, 4], dropout=0.0,
             contrastive_weight=0.1,
             contrastive_dim=cfg.get("contrastive_dim", 128),
@@ -356,4 +354,6 @@ if __name__ == "__main__":
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--cache-dir", type=str, default=None)
+    p.add_argument("--max-enc-len", type=int, default=None)
+    p.add_argument("--max-dec-len", type=int, default=None)
     finetune_local(p.parse_args())
