@@ -31,9 +31,6 @@ from ..model.quantize import _quantize_params
 
 
 _PRECISION = "int4"
-_MAT_FACTORS = ()
-_MAT_FF_WIDTHS = ()
-_D_FF = 2048
 _CONTRASTIVE_WEIGHT = 0.1
 # Weight map: class 0=base, 1=name, 2=value, 3=key (set from CLI args at train time)
 # Use numpy at module level to avoid initializing JAX backend before jax.distributed.initialize()
@@ -51,7 +48,7 @@ def _clip_contrastive_loss(q_emb, t_emb, log_temp):
     return (jnp.mean(loss_q) + jnp.mean(loss_t)) / 2.0
 
 
-def _text_loss_fn(state, params, src, tgt_in, tgt_out, ffn_mask, rng, loss_mask, do_quantize,
+def _text_loss_fn(state, params, src, tgt_in, tgt_out, rng, loss_mask, do_quantize,
                   enc_seg_ids, dec_seg_ids):
     q_params = jax.lax.cond(
         do_quantize,
@@ -59,9 +56,6 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, ffn_mask, rng, loss_mask,
         lambda p: p,
         params,
     )
-    # Segment-aware masks work for both packed and non-packed batches.
-    # Non-packed: seg_id=1 for all non-padding tokens → equivalent to padding mask + causal.
-    # Packed: seg_id=1,2,3... per sub-sequence → block-diagonal attention.
     src_mask = make_packing_mask(enc_seg_ids)
     tgt_mask = make_causal_packing_mask(dec_seg_ids)
     cross_mask = make_cross_packing_mask(enc_seg_ids, dec_seg_ids)
@@ -69,7 +63,6 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, ffn_mask, rng, loss_mask,
         {"params": q_params},
         src, tgt_in, src_mask=src_mask, tgt_mask=tgt_mask,
         cross_mask=cross_mask,
-        ffn_mask=ffn_mask,
         deterministic=False,
         method="forward_masked",
         rngs={"dropout": rng},
@@ -108,29 +101,11 @@ def _contrastive_loss_fn(state, params, query_tokens, tool_tokens, rng, do_quant
 
 
 
-def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
-    """Build (batch, d_ff) prefix mask: batch split equally across widths.
-
-    First 1/N = full width (all ones), remaining 1/N sections = mat widths.
-    """
-    n_widths = 1 + len(mat_ff_widths)  # full + mat widths
-    per_width = batch_size // n_widths
-    arange = jnp.arange(d_ff)
-    rows = [jnp.ones((per_width, d_ff), dtype=jnp.bfloat16)]  # full width
-    for k in mat_ff_widths:
-        rows.append((arange[None, :] < k).astype(jnp.bfloat16).repeat(per_width, axis=0))
-    # Handle remainder (assign to full width)
-    remainder = batch_size - per_width * n_widths
-    if remainder > 0:
-        rows.append(jnp.ones((remainder, d_ff), dtype=jnp.bfloat16))
-    return jnp.concatenate(rows, axis=0)
-
-
-def _train_step(state, src, tgt_in, tgt_out, enc_seg_ids, dec_seg_ids, ffn_mask, rng, loss_mask, query_tokens, tool_tokens, cl_rng, do_quantize, do_contrastive):
+def _train_step(state, src, tgt_in, tgt_out, enc_seg_ids, dec_seg_ids, rng, loss_mask, query_tokens, tool_tokens, cl_rng, do_quantize, do_contrastive):
     """Unified train step with boolean flag for contrastive loss."""
 
     def combined_loss(p):
-        text_loss = _text_loss_fn(state, p, src, tgt_in, tgt_out, ffn_mask, rng, loss_mask, do_quantize,
+        text_loss = _text_loss_fn(state, p, src, tgt_in, tgt_out, rng, loss_mask, do_quantize,
                                   enc_seg_ids, dec_seg_ids)
         cl_loss = jax.lax.cond(
             do_contrastive,
@@ -166,50 +141,6 @@ def _make_val_loss_fn(apply_fn):
         padding_mask = (dec_seg_ids > 0).astype(jnp.float32)
         return jnp.sum(loss * padding_mask), jnp.sum(padding_mask)
     return val_loss_batch
-
-
-def _make_mat_val_loss_fn(apply_fn, ff_width):
-    """Val loss for matryoshka sub-model at given FFN width."""
-    @jax.jit
-    def val_loss_batch(params, src, tgt_in, tgt_out, loss_mask, enc_seg_ids, dec_seg_ids):
-        src_mask = make_packing_mask(enc_seg_ids)
-        tgt_mask = make_causal_packing_mask(dec_seg_ids)
-        cross_mask = make_cross_packing_mask(enc_seg_ids, dec_seg_ids)
-        logits, _, mat_logits = apply_fn(
-            {"params": params}, src, tgt_in,
-            src_mask=src_mask, tgt_mask=tgt_mask, cross_mask=cross_mask,
-            mat_ff_widths=(ff_width,),
-            method="forward_with_aux",
-        )
-        trunc_logits = mat_logits[0].astype(jnp.float32)
-        loss = optax.softmax_cross_entropy_with_integer_labels(trunc_logits, tgt_out)
-        padding_mask = (dec_seg_ids > 0).astype(jnp.float32)
-        return jnp.sum(loss * padding_mask), jnp.sum(padding_mask)
-    return val_loss_batch
-
-
-def _estimate_mat_params(config, matryoshka_factor):
-    """Estimate parameter count of a sub-model at a given matryoshka factor.
-
-    matryoshka_factor: how many times smaller the FFN widths are (e.g. 2 = half width).
-    Embedding and attention weights are unchanged.
-    """
-    d = config.d_model
-    v = config.vocab_size
-    n_enc = config.num_encoder_layers
-    n_dec = config.num_decoder_layers
-    kv_dim = config.num_kv_heads * (d // config.num_heads)
-    d_ff = config.d_ff // matryoshka_factor
-
-    emb = v * d
-    attn = d * d + d * kv_dim * 2 + d * d
-    ffn = d * d_ff * 3
-    enc_block = attn + ffn
-    dec_block = attn * 2 + ffn
-    total = emb + n_enc * enc_block + n_dec * dec_block
-    return int(total)
-
-
 
 
 def train(args):
@@ -298,13 +229,11 @@ def train(args):
             d_ff=getattr(args, "d_ff", None) or args.d_model * 4,
             max_seq_len=max(args.max_enc_len, args.max_dec_len),
             dtype=args.dtype,
-            activation=getattr(args, "activation", "drelu"),
             num_memory_slots=getattr(args, "num_memory_slots", 64),
             contrastive_dim=getattr(args, "contrastive_dim", 128),
-            no_feedforward=getattr(args, "no_feedforward", True),
         )
 
-    global _PRECISION, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF, _CONTRASTIVE_WEIGHT, _LOSS_WEIGHT_MAP
+    global _PRECISION, _CONTRASTIVE_WEIGHT, _LOSS_WEIGHT_MAP
     _PRECISION = getattr(args, "precision", "int4")
     _CONTRASTIVE_WEIGHT = getattr(args, "contrastive_weight", 0.1)
     _LOSS_WEIGHT_MAP = jnp.array([
@@ -313,15 +242,6 @@ def train(args):
         getattr(args, "w_value", 4.0),             # 2: argument value
         getattr(args, "w_key", 1.5),               # 3: argument key
     ], dtype=jnp.float32)
-    _D_FF = config.d_ff
-    mat_factors_raw = getattr(args, "mat_factors", None)
-    if mat_factors_raw and not config.no_feedforward:
-        _MAT_FACTORS = tuple(f for f in mat_factors_raw if f > 1)
-        _MAT_FF_WIDTHS = tuple(config.d_ff // f for f in _MAT_FACTORS)
-    else:
-        _MAT_FACTORS = ()
-        _MAT_FF_WIDTHS = ()
-    n_widths = 1 + len(_MAT_FF_WIDTHS) if _MAT_FF_WIDTHS else 1
     p_train_step = _make_p_train_step()
 
     np.random.seed(args.seed)
@@ -386,7 +306,6 @@ def train(args):
         print(f"  d_model       {config.d_model:>12}")
         print(f"  Heads         {config.num_heads:>7} ({config.num_kv_heads} KV)")
         print(f"  Layers        {config.num_encoder_layers:>7} enc / {config.num_decoder_layers} dec")
-        print(f"  Activation    {config.activation:>12}")
         print(f"  Dtype         {config.dtype:>12}")
         print(f"  ─────────────────────────────────────")
         print(f"  Hosts         {num_hosts:>12}")
@@ -401,15 +320,6 @@ def train(args):
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     global_step = 0
-
-    text_ffn_mask = _make_ffn_mask(args.batch_size, config.d_ff, _MAT_FF_WIDTHS)
-    text_ffn_mask = jnp.broadcast_to(
-        text_ffn_mask[None, :, :],
-        (num_devices, args.batch_size, config.d_ff),
-    )
-    if n_widths > 1 and is_main:
-        print(f"  Mat factors   {n_widths} (full + {', '.join(str(f)+'x' for f in _MAT_FACTORS)})")
-        print(f"  Mat mode      unique input ({args.batch_size}/dev, split by width)")
 
     adam_schedule = _wsd_schedule(scaled_lr, total_steps, warmup_steps)
     muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
@@ -492,7 +402,7 @@ def train(args):
 
             state, loss, grad_norm = p_train_step(
                 state, src_b, tgt_in_b, tgt_out_b, enc_seg_b, dec_seg_b,
-                text_ffn_mask, text_rngs, lm_b,
+                text_rngs, lm_b,
                 cl_q_b, cl_t_b, cl_rngs, do_qat, do_cl,
             )
 
@@ -556,22 +466,14 @@ def train(args):
 
         # ── Host 0 only: val PPL + checkpoint save (fast) ──
         quant_val_ppl = 0.0
-        mat_results = {}
         total_params = 0
         ckpt_path = ""
 
         if is_main:
             q_params = _quantize_params(eval_params, precision=_PRECISION)
-            mat_vl_fns = {}
-            if _MAT_FACTORS:
-                _apply_fn = _unreplicate(state).apply_fn
-                mat_vl_fns = {f: _make_mat_val_loss_fn(_apply_fn, fw)
-                              for f, fw in zip(_MAT_FACTORS, _MAT_FF_WIDTHS)}
-                del _apply_fn
 
             full_loss, full_toks = 0.0, 0.0
             q_loss, q_toks = 0.0, 0.0
-            mat_accum = {f: [0.0, 0.0] for f in _MAT_FACTORS}
 
             _val_n = count_batches(len(val_enc), args.batch_size)
             _val_bar = tqdm(get_batches(val_enc, val_dec_in, val_dec_tgt, args.batch_size,
@@ -590,19 +492,9 @@ def train(args):
                 full_loss += float(vl); full_toks += float(vt)
                 vl, vt = val_loss_fn(q_params, src, dec_in, dec_tgt, lm, es, ds)
                 q_loss += float(vl); q_toks += float(vt)
-                for f, fn in mat_vl_fns.items():
-                    vl, vt = fn(eval_params, src, dec_in, dec_tgt, lm, es, ds)
-                    mat_accum[f][0] += float(vl)
-                    mat_accum[f][1] += float(vt)
-
             last_val_ppl = float(math.exp(min(full_loss / max(full_toks, 1), 20)))
             quant_val_ppl = float(math.exp(min(q_loss / max(q_toks, 1), 20)))
             del q_params
-
-            for f in _MAT_FACTORS:
-                avg = mat_accum[f][0] / max(mat_accum[f][1], 1)
-                mat_results[f] = (float(math.exp(min(avg, 20))),
-                                  _estimate_mat_params(config, f), config.d_ff // f)
 
             params_np = jax.tree.map(lambda x: np.array(x).astype(np.float16), eval_params)
             total_params = sum(x.size for x in jax.tree.leaves(params_np))
@@ -685,20 +577,9 @@ def train(args):
         _EVAL_BATCH = 32
 
         # Prepare generation model (all hosts)
-        if _MAT_FACTORS:
-            from ..model.export import slice_params
-            _max_factor = max(_MAT_FACTORS)
-            _mat_params, _mat_config = slice_params(eval_params, config, _max_factor)
-            _mat_params = jax.tree.map(jnp.array, _mat_params)
-            _gen_model = EncoderDecoderTransformer(_mat_config)
-            _gen_label = f"{_max_factor}x (d_ff={_mat_config.d_ff})"
-        else:
-            _mat_params = eval_params
-            _gen_model = eval_model
-            _gen_label = "full"
-
-        _mat_params = _quantize_params(_mat_params, precision=_PRECISION)
-        _gen_label += f" {_PRECISION.upper()}"
+        _gen_params = _quantize_params(eval_params, precision=_PRECISION)
+        _gen_model = eval_model
+        _gen_label = f"full {_PRECISION.upper()}"
 
         # Split eval examples across hosts — each host generates its slice
         total_eval = len(all_eval_examples)
@@ -716,7 +597,7 @@ def train(args):
                         leave=False, disable=not is_main):
             _chunk = my_eval_examples[_ei:_ei + _EVAL_BATCH]
             my_preds.extend(generate_batch(
-                _gen_model, _mat_params, tokenizer,
+                _gen_model, _gen_params, tokenizer,
                 [ex["query"] for ex in _chunk],
                 [ex["tools"] for ex in _chunk],
                 max_gen_len=eval_gen_len,
@@ -724,7 +605,7 @@ def train(args):
                 constrained=False,
             ))
         _gen_elapsed = time.perf_counter() - _gen_t0
-        del _mat_params
+        del _gen_params
 
         # All-gather predictions across hosts via padded token ID arrays
         _MAX_PRED_TOKENS = eval_gen_len
@@ -942,24 +823,11 @@ def train(args):
         _best_metric = pool_metrics.get("single", {}).get("call_f1", 0)
         if _best_metric > best_call_f1:
             best_call_f1 = _best_metric
-            if config.no_feedforward:
-                best_ckpt_path = os.path.join(args.checkpoint_dir, f"{experiment_name}_{args.num_layers}_{args.d_model}_best.pkl")
-            else:
-                best_ckpt_path = os.path.join(args.checkpoint_dir, f"{experiment_name}_{args.num_layers}_{args.d_model}_{config.d_ff}_best.pkl")
+            best_ckpt_path = os.path.join(args.checkpoint_dir, f"{experiment_name}_{args.num_layers}_{args.d_model}_best.pkl")
             import shutil as _shutil
             _shutil.copy2(ckpt_path, best_ckpt_path)
             print(f"  ** New best single call_f1={best_call_f1:.1%} → {best_ckpt_path}")
             _upload_checkpoint(best_ckpt_path)
-            if _MAT_FACTORS:
-                from ..model.export import export_submodel
-                for factor in _MAT_FACTORS:
-                    d_ff_sub = config.d_ff // factor
-                    mat_ckpt_path = os.path.join(
-                        args.checkpoint_dir,
-                        f"{experiment_name}_{args.num_layers}_{args.d_model}_{d_ff_sub}_best.pkl",
-                    )
-                    export_submodel(best_ckpt_path, factor, mat_ckpt_path)
-                    _upload_checkpoint(mat_ckpt_path)
 
         retrieval_metrics = None
         if has_contrastive and _CONTRASTIVE_WEIGHT > 0 and val_ds is not None:
@@ -978,14 +846,6 @@ def train(args):
         print(f"  Text loss      {final_loss:>12.4f}")
         print(f"  Text val ppl   {last_val_ppl:>12.2f}")
         print(f"  Quant val ppl  {quant_val_ppl:>12.2f}  ({_PRECISION.upper()})")
-        if mat_results:
-            print(f"  ─────────────────────────────────────")
-            print(f"  Matryoshka sub-models:")
-            print(f"  {'factor':>6}  {'d_ff':>6}  {'val ppl':>10}  {'params':>12}")
-            print(f"  {'1x':>6}  {config.d_ff:>6}  {last_val_ppl:>10.2f}  {total_params:>12,}  (full)")
-            for factor in sorted(mat_results.keys()):
-                mat_ppl, mat_params, ff_w = mat_results[factor]
-                print(f"  {str(factor)+'x':>6}  {ff_w:>6}  {mat_ppl:>10.2f}  {mat_params:>12,}")
         def _print_tc_metrics(label, metrics, pc):
             if not metrics:
                 return
@@ -1061,9 +921,6 @@ def train(args):
                 "epoch/quant_val_ppl": quant_val_ppl,
                 "epoch": epoch + 1,
             }
-            for factor, (mat_ppl, mat_params, _) in mat_results.items():
-                log_dict[f"epoch/mat_ppl_{factor}x"] = mat_ppl
-                log_dict[f"epoch/mat_params_{factor}x"] = mat_params
             for name in _pool_names:
                 m = pool_metrics.get(name)
                 if not m:

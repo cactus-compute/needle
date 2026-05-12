@@ -10,7 +10,7 @@ import numpy as np
 
 from ..dataset.dataset import get_tokenizer, to_snake_case, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_GEN_LEN
 from .architecture import (
-    EncoderDecoderTransformer,
+    SimpleAttentionNetwork,
     TransformerConfig,
     make_causal_mask,
     make_padding_mask,
@@ -269,7 +269,7 @@ def main(args):
     print(f"Loading checkpoint: {args.checkpoint}")
     params, config = load_checkpoint(args.checkpoint)
 
-    model = EncoderDecoderTransformer(config)
+    model = SimpleAttentionNetwork(config)
     tokenizer = get_tokenizer()
 
     param_count = sum(x.size for x in jax.tree.leaves(params))

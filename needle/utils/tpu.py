@@ -4,7 +4,27 @@ import re
 import subprocess
 import sys
 
-PROJECT = "needle-488623"
+def _get_project():
+    """Get GCP project from gcloud config or NEEDLE_GCP_PROJECT env var."""
+    proj = os.environ.get("NEEDLE_GCP_PROJECT")
+    if proj:
+        return proj
+    result = subprocess.run(
+        ["gcloud", "config", "get-value", "project"],
+        capture_output=True, text=True,
+    )
+    proj = result.stdout.strip()
+    if proj and proj != "(unset)":
+        return proj
+    print(
+        "[tpu] ERROR: no GCP project set. Either run 'gcloud config set project <PROJECT>' "
+        "or set NEEDLE_GCP_PROJECT environment variable.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+PROJECT = None  # resolved lazily
 
 VERSION_FOR_TYPE = {
     "v6e":        "v2-alpha-tpuv6e",
@@ -624,6 +644,8 @@ def tpu_pretrain(args):
 
 
 def tpu_dispatch(args):
+    global PROJECT
+    PROJECT = _get_project()
     actions = {
         "create": tpu_create,
         "connect": tpu_connect,

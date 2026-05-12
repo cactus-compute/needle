@@ -586,7 +586,7 @@ def _start_finetune(tools_json, api_key):
             proc = subprocess.Popen(
                 [
                     python, "-u",
-                    "-m", "src.training.finetune",
+                    "-m", "needle.training.finetune",
                     str(data_file),
                     "--epochs", str(_EPOCHS),
                     "--batch-size", str(batch_size),

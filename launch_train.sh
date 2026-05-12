@@ -7,9 +7,14 @@
 
 set -euo pipefail
 
-TPU_NAME="large"
-ZONE="asia-northeast1-b"
-PROJECT="needle-488623"
+TPU_NAME="${TPU_NAME:-large}"
+ZONE="${ZONE:-asia-northeast1-b}"
+PROJECT="${PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
+
+if [ -z "$PROJECT" ] || [ "$PROJECT" = "(unset)" ]; then
+  echo "[launch] ERROR: no GCP project set. Run 'gcloud config set project <PROJECT>' or export PROJECT=..."
+  exit 1
+fi
 
 TRAIN_ARGS="${@}"
 

@@ -23,10 +23,10 @@ tpu = ["jax[tpu]"]
 gpu = ["jax[cuda12]"]
 
 [project.scripts]
-needle = "src.cli:main"
+needle = "needle.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["src*"]
+include = ["needle*"]
 
 [build-system]
 requires = ["setuptools>=68.0"]

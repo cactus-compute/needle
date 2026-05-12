@@ -323,7 +323,7 @@ class Decoder(nn.Module):
         return x
 
 
-class EncoderDecoderTransformer(nn.Module):
+class SimpleAttentionNetwork(nn.Module):
     """Encoder-decoder transformer with shared embeddings, tied output, RoPE, and bfloat16."""
     config: TransformerConfig
 

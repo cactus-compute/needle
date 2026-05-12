@@ -211,9 +211,28 @@ def _emit(tag, data):
     print(f"{tag}:{json.dumps(data)}", flush=True)
 
 
+def _resolve_checkpoint(path):
+    """Resolve checkpoint path, downloading from HuggingFace if needed."""
+    if path and os.path.exists(path):
+        return path
+    from huggingface_hub import hf_hub_download
+    local_dir = "checkpoints"
+    os.makedirs(local_dir, exist_ok=True)
+    filename = os.path.basename(path) if path else "needle.pkl"
+    local_path = os.path.join(local_dir, filename)
+    if os.path.exists(local_path):
+        return local_path
+    print(f"Downloading {filename} from Cactus-Compute/needle...")
+    return hf_hub_download(
+        repo_id="Cactus-Compute/needle",
+        filename=filename,
+        repo_type="model",
+        local_dir=local_dir,
+    )
+
+
 def finetune_local(args):
-    if not args.checkpoint:
-        raise ValueError("--checkpoint is required: finetune needs a base model to start from")
+    args.checkpoint = _resolve_checkpoint(args.checkpoint)
 
     with open(args.jsonl_path) as f:
         examples = [json.loads(line) for line in f if line.strip()]
@@ -310,14 +329,10 @@ def finetune_local(args):
             dtype=cfg.get("dtype", "bfloat16"),
             checkpoint_dir=args.checkpoint_dir, seed=42,
             eval_every=max(1, approx_steps), max_eval_samples=min(val_kept, 50),
-            precision="int4",
-            activation=cfg.get("activation", "drelu"),
-            mat_factors=[2, 4], dropout=0.0,
             contrastive_weight=0.1,
             contrastive_dim=cfg.get("contrastive_dim", 128),
             num_memory_slots=cfg.get("num_memory_slots", 64),
             w_name=2.0, w_value=4.0, w_key=1.5,
-            no_feedforward=cfg.get("no_feedforward", True),
             val_ds=val_ds,
         )
 
@@ -350,7 +365,7 @@ if __name__ == "__main__":
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--cache-dir", type=str, default=None)
     p.add_argument("--max-enc-len", type=int, default=None)
     p.add_argument("--max-dec-len", type=int, default=None)

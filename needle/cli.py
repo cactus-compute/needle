@@ -138,13 +138,6 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--max-eval-samples", type=int, default=5000)
-    p.add_argument("--precision", type=str, default="int4", choices=["int4", "int8"],
-                   help="QAT precision: int4 (4-bit) or int8 (8-bit) fake quantization (default: int4)")
-    p.add_argument("--activation", type=str, default="swiglu", choices=["drelu", "swiglu", "geglu"])
-    p.add_argument("--mat-factors", type=int, nargs="*", default=[2, 4],
-                   help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4)")
-    p.add_argument("--dropout", type=float, default=0.0,
-                   help="Dropout rate for residual connections (default: 0.0)")
     p.add_argument("--contrastive-weight", type=float, default=0.1,
                    help="Weight for CLIP-style contrastive loss (default: 0.1)")
     p.add_argument("--contrastive-dim", type=int, default=128,
@@ -155,8 +148,6 @@ def main():
                    help="Loss weight for argument value tokens (default: 4.0)")
     p.add_argument("--w-key", type=float, default=1.5,
                    help="Loss weight for argument key tokens (default: 1.5)")
-    p.add_argument("--no-feedforward", action=argparse.BooleanOptionalAction, default=True,
-                   help="Remove feedforward layers entirely (default: True)")
 
     p = sub.add_parser("pretrain", add_help=False)
     p.add_argument("--name", type=str, default="pretrain",
@@ -186,8 +177,6 @@ def main():
     p.add_argument("--save-every", type=int, default=1000,
                    help="Save and upload checkpoint every N steps (default: 1000)")
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    p.add_argument("--activation", type=str, default="swiglu", choices=["drelu", "swiglu", "geglu"])
-    p.add_argument("--no-feedforward", action=argparse.BooleanOptionalAction, default=True)
 
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,
@@ -238,7 +227,18 @@ def main():
                    choices=["wikitext2", "lambada", "hellaswag", "arc_easy"])
     p.add_argument("--max-samples", type=int, default=500)
 
-    p = sub.add_parser("ui", add_help=False)
+    p = sub.add_parser("finetune", add_help=False)
+    p.add_argument("jsonl_path", type=str, help="Path to JSONL training data")
+    p.add_argument("--checkpoint", type=str, default=None,
+                   help="Base model checkpoint (auto-downloads from HuggingFace if omitted)")
+    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    p.add_argument("--cache-dir", type=str, default=None)
+    p.add_argument("--max-enc-len", type=int, default=None)
+    p.add_argument("--max-dec-len", type=int, default=None)
+
+    p = sub.add_parser("playground", add_help=False)
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--host", type=str, default="127.0.0.1")
@@ -330,7 +330,10 @@ def main():
         if args.upload_every is None:
             args.upload_every = _UE
         gendata_main(args)
-    elif args.command == "ui":
+    elif args.command == "finetune":
+        from .training.finetune import finetune_local
+        finetune_local(args)
+    elif args.command == "playground":
         from .ui.server import main as ui_main
         ui_main(args)
     elif args.command == "tpu":
