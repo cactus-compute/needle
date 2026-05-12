@@ -96,9 +96,8 @@ class ToolConstraints:
             params = tool.get("parameters", {})
             if isinstance(params, dict):
                 param_trie = Trie()
-                props = params.get("properties")
-                if isinstance(props, dict):
-                    for key in props:
+                for key, val in params.items():
+                    if isinstance(val, dict):
                         param_trie.insert(key)
                 self.param_tries[name] = param_trie
 
