@@ -296,10 +296,10 @@ def finetune_local(args):
 
         # Base model eval on TEST set (never seen by model)
         from ..model.run import load_checkpoint
-        from ..model.architecture import EncoderDecoderTransformer
+        from ..model.architecture import SimpleAttentionNetwork
         print(f"Evaluating base model on {len(test_examples)} test examples...")
         base_params, base_config = load_checkpoint(args.checkpoint)
-        base_model = EncoderDecoderTransformer(base_config)
+        base_model = SimpleAttentionNetwork(base_config)
         base_metrics = _quick_tool_eval(
             base_model, base_params, tokenizer, test_examples,
             max_gen_len=min(max_dec_len, 512), max_enc_len=max_enc_len,
@@ -344,7 +344,7 @@ def finetune_local(args):
         if best_path and os.path.exists(best_path) and test_examples:
             print(f"Evaluating finetuned model on {len(test_examples)} test examples...")
             ft_params, ft_config = load_checkpoint(best_path)
-            ft_model = EncoderDecoderTransformer(ft_config)
+            ft_model = SimpleAttentionNetwork(ft_config)
             ft_metrics = _quick_tool_eval(
                 ft_model, ft_params, tokenizer, test_examples,
                 max_gen_len=min(max_dec_len, 512), max_enc_len=max_enc_len,

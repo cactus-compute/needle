@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 from ..dataset.tokenizer import get_tokenizer, EOS_ID, TOOLS_ID, PAD_ID
 from ..model.architecture import (
-    EncoderDecoderTransformer,
+    SimpleAttentionNetwork,
     TransformerConfig,
     make_padding_mask,
     make_causal_mask,

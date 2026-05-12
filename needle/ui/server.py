@@ -457,12 +457,12 @@ def _run_generate(query, tools, seed, max_gen_len, constrained):
 def _load_checkpoint(path, display_name=None):
     global _model, _params, _tokenizer, _current_model, _current_model_path
     from ..dataset.dataset import get_tokenizer
-    from ..model.architecture import EncoderDecoderTransformer
+    from ..model.architecture import SimpleAttentionNetwork
     from ..model.run import load_checkpoint
 
     with _lock:
         _params, config = load_checkpoint(path)
-        _model = EncoderDecoderTransformer(config)
+        _model = SimpleAttentionNetwork(config)
         _tokenizer = get_tokenizer()
         _current_model = display_name or Path(path).name
         _current_model_path = path
@@ -763,13 +763,13 @@ def _resolve_checkpoint(checkpoint_arg):
 def main(args):
     global _model, _params, _tokenizer, _current_model, _current_model_path
     from ..dataset.dataset import get_tokenizer
-    from ..model.architecture import EncoderDecoderTransformer
+    from ..model.architecture import SimpleAttentionNetwork
     from ..model.run import load_checkpoint
 
     checkpoint_path = _resolve_checkpoint(args.checkpoint)
     print(f"Loading checkpoint: {checkpoint_path}", file=sys.stderr)
     _params, config = load_checkpoint(checkpoint_path)
-    _model = EncoderDecoderTransformer(config)
+    _model = SimpleAttentionNetwork(config)
     _tokenizer = get_tokenizer()
     _current_model = Path(checkpoint_path).name
     _current_model_path = checkpoint_path

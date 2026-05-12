@@ -89,10 +89,10 @@ Opens a web UI at http://127.0.0.1:7860 where you can test and finetune on your 
 ## Usage (Python)
 
 ```python
-from needle import load_checkpoint, generate, EncoderDecoderTransformer, get_tokenizer
+from needle import load_checkpoint, generate, SimpleAttentionNetwork, get_tokenizer
 
 params, config = load_checkpoint("checkpoints/needle.pkl")
-model = EncoderDecoderTransformer(config)
+model = SimpleAttentionNetwork(config)
 tokenizer = get_tokenizer()
 
 result = generate(

@@ -9,7 +9,7 @@ import optax
 
 from ..dataset.dataset import get_tokenizer, load_tool_calls, load_prepared_data, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN
 from ..model.architecture import (
-    EncoderDecoderTransformer,
+    SimpleAttentionNetwork,
     TransformerConfig,
     make_causal_mask,
     make_causal_packing_mask,
@@ -540,7 +540,7 @@ def main(args):
     import json as _json_mod
 
     params, config = load_checkpoint(args.checkpoint)
-    model = EncoderDecoderTransformer(config)
+    model = SimpleAttentionNetwork(config)
     tokenizer = get_tokenizer()
 
     param_count = sum(x.size for x in jax.tree.leaves(params))
