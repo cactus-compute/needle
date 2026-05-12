@@ -738,23 +738,19 @@ _HF_MODEL_FILE = "needle.pkl"
 
 
 def _resolve_checkpoint(checkpoint_arg):
-    """Resolve checkpoint path: download from HuggingFace if not provided or not local."""
-    if checkpoint_arg and os.path.exists(checkpoint_arg):
-        return checkpoint_arg
+    """Resolve checkpoint path: always download from HuggingFace to ensure freshness."""
     from huggingface_hub import hf_hub_download
     local_dir = "checkpoints"
     os.makedirs(local_dir, exist_ok=True)
     filename = os.path.basename(checkpoint_arg) if checkpoint_arg else _HF_MODEL_FILE
     repo = _HF_MODEL_REPO
-    local_path = os.path.join(local_dir, filename)
-    if os.path.exists(local_path):
-        return local_path
     print(f"Downloading {filename} from {repo}...", file=sys.stderr)
     path = hf_hub_download(
         repo_id=repo,
         filename=filename,
         repo_type="model",
         local_dir=local_dir,
+        force_download=True,
     )
     print(f"Downloaded to {path}", file=sys.stderr)
     return path

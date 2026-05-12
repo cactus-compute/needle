@@ -212,22 +212,18 @@ def _emit(tag, data):
 
 
 def _resolve_checkpoint(path):
-    """Resolve checkpoint path, downloading from HuggingFace if needed."""
-    if path and os.path.exists(path):
-        return path
+    """Resolve checkpoint path, always downloading from HuggingFace to ensure freshness."""
     from huggingface_hub import hf_hub_download
     local_dir = "checkpoints"
     os.makedirs(local_dir, exist_ok=True)
     filename = os.path.basename(path) if path else "needle.pkl"
-    local_path = os.path.join(local_dir, filename)
-    if os.path.exists(local_path):
-        return local_path
     print(f"Downloading {filename} from Cactus-Compute/needle...")
     return hf_hub_download(
         repo_id="Cactus-Compute/needle",
         filename=filename,
         repo_type="model",
         local_dir=local_dir,
+        force_download=True,
     )
 
 
