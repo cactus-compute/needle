@@ -1,6 +1,6 @@
 # Needle
 
-<img src="assets/banner.png" alt="Logo" style="border-radius: 30px; width: 70%;">
+<img src="assets/banner.png" alt="Logo" style="border-radius: 30px; width: 100%;">
 
 We distilled Gemini 3.1 into a 26m parameter "[Simple Attention Network](docs/simple_attention_networks.md)" that you can even finetune locally on your Mac/PC.
 In production, Needle runs on [Cactus](https://github.com/cactus-compute/cactus) at 6000 toks/sec prefill and 1200 decode speed. 
