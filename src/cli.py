@@ -98,7 +98,7 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 _install_xla_log_filter()
 
-from .data import DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN
+from .dataset.tokenizer import DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN
 
 
 def main():
@@ -138,16 +138,8 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--max-eval-samples", type=int, default=5000)
-    p.add_argument("--sparsity-ratio", type=float, default=0.0)
-    p.add_argument("--group-size", type=int, default=32)
     p.add_argument("--precision", type=str, default="int4", choices=["int4", "int8"],
                    help="QAT precision: int4 (4-bit) or int8 (8-bit) fake quantization (default: int4)")
-    p.add_argument("--prune-interval", type=int, default=100,
-                   help="Steps between mask updates during gradual pruning (default: 100)")
-    p.add_argument("--prune-start-frac", type=float, default=0.33,
-                   help="Fraction of epoch to train before starting gradual pruning (default: 0.33)")
-    p.add_argument("--prune-end-frac", type=float, default=0.67,
-                   help="Fraction of epoch at which pruning finishes and mask locks (default: 0.67)")
     p.add_argument("--activation", type=str, default="swiglu", choices=["drelu", "swiglu", "geglu"])
     p.add_argument("--mat-factors", type=int, nargs="*", default=[2, 4],
                    help="Matryoshka FFN shrink factors, e.g. 2=half width (default: 2 4)")
@@ -213,7 +205,6 @@ def main():
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--query", type=str, default=None, help="Query text for tool-call generation")
     p.add_argument("--tools", type=str, default=None, help="Tools JSON for tool-call generation")
-    p.add_argument("--audio", type=str, nargs="*", help="Audio file paths for voice-to-tool-call")
     p.add_argument("--max-len", type=int, default=512)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-constrained", action="store_true",
@@ -246,6 +237,11 @@ def main():
     p.add_argument("--benchmarks", type=str, nargs="*",
                    choices=["wikitext2", "lambada", "hellaswag", "arc_easy"])
     p.add_argument("--max-samples", type=int, default=500)
+
+    p = sub.add_parser("ui", add_help=False)
+    p.add_argument("--checkpoint", type=str, default=None)
+    p.add_argument("--port", type=int, default=7860)
+    p.add_argument("--host", type=str, default="127.0.0.1")
 
     p = sub.add_parser("tpu", add_help=False)
     tpu_sub = p.add_subparsers(dest="tpu_action")
@@ -307,36 +303,36 @@ def main():
         sys.exit(0)
 
     if args.command == "tokenize":
-        from .tokenize_data import tokenize
+        from .dataset.tokenize import tokenize
         tokenize(args)
     elif args.command == "pretrain":
         import jax
         if os.path.exists("/dev/accel0"):
             jax.distributed.initialize()
-        from .pretrain import pretrain
+        from .training.pretrain import pretrain
         pretrain(args)
     elif args.command == "train":
         import jax
         if os.path.exists("/dev/accel0"):
             jax.distributed.initialize()
-        from .train import train
+        from .training.train import train
         train(args)
     elif args.command == "run":
-        from .run import main as run_main
+        from .model.run import main as run_main
         run_main(args)
     elif args.command == "eval":
-        from .eval import main as eval_main_fn
+        from .training.eval import main as eval_main_fn
         eval_main_fn(args)
     elif args.command == "generate-data":
-        from .generate_data import main as gendata_main, MODEL as _MODEL, UPLOAD_EVERY as _UE
+        from .dataset.generate import main as gendata_main, MODEL as _MODEL, UPLOAD_EVERY as _UE
         if args.model is None:
             args.model = _MODEL
         if args.upload_every is None:
             args.upload_every = _UE
         gendata_main(args)
-    elif args.command == "evaluate":
-        from .evaluate import main as eval_main
-        eval_main(args)
+    elif args.command == "ui":
+        from .ui.server import main as ui_main
+        ui_main(args)
     elif args.command == "tpu":
-        from .tpu import tpu_dispatch
+        from .utils.tpu import tpu_dispatch
         tpu_dispatch(args)

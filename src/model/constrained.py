@@ -3,16 +3,24 @@
 Constrains the decoder to only produce valid tool names and argument keys
 by tracking position in the output JSON and masking invalid tokens via a
 character-level trie built from the tool definitions.
+
+Needle output format (compact JSON, no spaces):
+  [{"name":"tool_name","arguments":{"key1":value1,"key2":value2}}]
+
+Constrained regions:
+  - Tool names after "name":" are constrained to known tool names
+  - Argument keys after "arguments":{ are constrained to known param names
+  - Argument values are unconstrained (strings, numbers, booleans, objects)
 """
 
 import json
 import logging
-import warnings
 from enum import Enum, auto
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
 
 class TrieNode:
     __slots__ = ("children", "is_terminal")
@@ -57,12 +65,17 @@ class Trie:
         _dfs(self.root, [])
         return result
 
+
 class ToolConstraints:
-    """Holds one name trie and one param trie per function, built from tool JSON."""
+    """Holds one name trie and one param trie per function, built from tool JSON.
+
+    Extracts property names from JSON Schema ``parameters.properties``,
+    not from the schema-level keys (``type``, ``properties``, ``required``).
+    """
 
     def __init__(self, tools_json: str):
         self.name_trie = Trie()
-        self.param_tries: dict[str, Trie] = {} 
+        self.param_tries: dict[str, Trie] = {}
 
         try:
             tools = json.loads(tools_json)
@@ -83,8 +96,10 @@ class ToolConstraints:
             params = tool.get("parameters", {})
             if isinstance(params, dict):
                 param_trie = Trie()
-                for key in params:
-                    param_trie.insert(key)
+                props = params.get("properties")
+                if isinstance(props, dict):
+                    for key in props:
+                        param_trie.insert(key)
                 self.param_tries[name] = param_trie
 
     def get_param_trie(self, function_name: str) -> Trie | None:
@@ -98,24 +113,29 @@ class JsonState(Enum):
 
 
 class JsonStateMachine:
-    """Tracks position in output JSON to know when to constrain decoding.
+    """Tracks position in needle's compact JSON output to constrain decoding.
 
-    Transitions:
-      - ``"name":"`` suffix → IN_NAME
-      - ``"arguments":{`` suffix → sets in_arguments; then ``{"`` or ``,"``
-        at nesting depth 0 → IN_ARG_KEY
-      - Closing ``"`` while in constrained state → FREE
+    Needle format: ``[{"name":"TOOL","arguments":{"key":val,...}},...]``
+
+    Constrained spans:
+      - After ``"name":"`` → IN_NAME (constrains to valid tool names)
+      - After ``"arguments":{"`` or ``,"`` at arguments depth → IN_ARG_KEY
+        (constrains to valid parameter names for the current tool)
+      - Closing ``"`` in constrained state → FREE
+
+    Depth tracking ensures nested objects/arrays in argument VALUES
+    do not trigger false IN_ARG_KEY transitions.
     """
 
     def __init__(self):
         self.state = JsonState.FREE
-        self.buffer = ""          
-        self.constrained_buf = "" 
-        self.current_function = "" 
+        self.buffer = ""
+        self.constrained_buf = ""
+        self.current_function = ""
         self.in_arguments = False
-        self.arguments_depth = 0  # nesting depth of the arguments {
+        self.arguments_depth = 0
         self.nesting_depth = 0
-        self.in_string_value = False
+        self.in_string = False
         self.prev_char_escape = False
 
     def feed(self, text: str):
@@ -137,7 +157,7 @@ class JsonStateMachine:
 
         self.buffer += ch
 
-        if self.in_string_value:
+        if self.in_string:
             if self.prev_char_escape:
                 self.prev_char_escape = False
                 return
@@ -145,7 +165,7 @@ class JsonStateMachine:
                 self.prev_char_escape = True
                 return
             if ch == '"':
-                self.in_string_value = False
+                self.in_string = False
             return
 
         if ch in '{[':
@@ -154,36 +174,36 @@ class JsonStateMachine:
             self.nesting_depth = max(0, self.nesting_depth - 1)
             if ch == '}' and self.in_arguments and self.nesting_depth < self.arguments_depth:
                 self.in_arguments = False
+            return
 
-        if self.buffer.endswith('"name":"'):
+        if self.buffer.endswith('"name":"') and not self.in_arguments:
             self.state = JsonState.IN_NAME
             self.constrained_buf = ""
             return
 
         if self.buffer.endswith('"arguments":{'):
             self.in_arguments = True
-            self.arguments_depth = self.nesting_depth  # depth of the arguments { itself
+            self.arguments_depth = self.nesting_depth
             return
 
-        if self.in_arguments and self._at_arg_key_start():
+        if (self.in_arguments
+                and self.nesting_depth == self.arguments_depth
+                and self._at_arg_key_start()):
             self.state = JsonState.IN_ARG_KEY
             self.constrained_buf = ""
             return
 
-        if ch == '"' and self._is_value_string_start():
-            self.in_string_value = True
+        if ch == '"' and self._is_value_quote():
+            self.in_string = True
 
     def _at_arg_key_start(self) -> bool:
-        """Check if buffer ends with ``{"`` or ``,"`` while in arguments."""
+        """True if buffer ends with ``{"`` or ``,"`` — an arg key is opening."""
         if len(self.buffer) < 2:
             return False
         return self.buffer[-2:] in ('{"', ',"')
 
-    def _is_value_string_start(self) -> bool:
-        """Check if the current ``"`` opens a JSON string value (preceded by ``:``).
-
-        Keys open after ``{`` or ``,``; values open after ``:``.
-        """
+    def _is_value_quote(self) -> bool:
+        """True if the current ``"`` opens a JSON string value (preceded by ``:``)."""
         for j in range(len(self.buffer) - 2, -1, -1):
             c = self.buffer[j]
             if c in ' \t\n\r':
@@ -193,10 +213,13 @@ class JsonStateMachine:
 
 
 def build_token_strings(tokenizer) -> list[str]:
-    """Map each vocab ID to its decoded text.
+    """Map each vocab ID to the exact characters it contributes to output.
 
-    Handles SentencePiece control tokens (IDs 0..N that decode to empty)
-    and byte-fallback pieces.
+    SentencePiece uses ``▁`` (U+2581) as a word-boundary marker that becomes
+    a space in decoded text.  We convert ``▁`` → ``' '`` so that both the
+    state machine and the trie matcher see consistent text.  This correctly
+    blocks ``▁``-prefixed tokens inside constrained spans (tool names and
+    argument keys never contain spaces in needle's compact JSON format).
     """
     vocab_size = tokenizer.vocab_size
     sp = tokenizer.sp
@@ -207,7 +230,6 @@ def build_token_strings(tokenizer) -> list[str]:
         elif sp.IsUnknown(i):
             strings.append("")
         elif sp.IsByte(i):
-            # Byte-fallback piece like <0x41>
             piece = sp.IdToPiece(i)
             try:
                 byte_val = int(piece[1:-1], 16) if piece.startswith("<0x") else ord(piece)
@@ -215,14 +237,13 @@ def build_token_strings(tokenizer) -> list[str]:
             except (ValueError, IndexError):
                 strings.append("")
         else:
-            # Normal BPE piece — decode via SentencePiece
-            text = sp.Decode([i])
-            strings.append(text)
+            piece = sp.IdToPiece(i)
+            strings.append(piece.replace("\u2581", " "))
     return strings
 
 
 class TokenIndex:
-    """Maps first character → list of token IDs for fast candidate filtering."""
+    """Maps first character -> list of token IDs for fast candidate filtering."""
 
     def __init__(self, token_strings: list[str]):
         self._index: dict[str, list[int]] = {}
@@ -251,6 +272,8 @@ def _check_token_valid(token_text: str, trie_node: TrieNode) -> bool:
 
     The token text may contain a closing ``"`` which signals end of the
     constrained span — at that point the trie node must be terminal.
+    Characters after the closing ``"`` are not checked (they are structural
+    JSON that the state machine handles separately).
     """
     node = trie_node
     for i, ch in enumerate(token_text):
@@ -259,7 +282,7 @@ def _check_token_valid(token_text: str, trie_node: TrieNode) -> bool:
         if ch not in node.children:
             return False
         node = node.children[ch]
-    return True  
+    return True
 
 
 def apply_constraints(
@@ -309,10 +332,17 @@ class ConstrainedDecoder:
     Holds per-example ``JsonStateMachine`` instances and shared token
     metadata. Call ``constrain_logits`` between logit computation and
     argmax, then ``update`` after selecting the token.
+
+    Both ``constrain_logits`` and ``update`` use the same ``token_strings``
+    table (with ``▁`` → space) so the state machine and trie matcher see
+    identical text.  This correctly blocks ``▁``-prefixed tokens inside
+    constrained spans, since spaces are never valid in tool names or
+    argument keys.
     """
 
     def __init__(self, tool_constraints_list: list[ToolConstraints],
-                 token_strings: list[str], token_index: TokenIndex):
+                 token_strings: list[str], token_index: TokenIndex,
+                 tokenizer=None):
         self.batch_size = len(tool_constraints_list)
         self.tool_constraints = tool_constraints_list
         self.machines = [JsonStateMachine() for _ in range(self.batch_size)]
@@ -324,15 +354,7 @@ class ConstrainedDecoder:
         return self.machines[batch_idx].state != JsonState.FREE
 
     def constrain_logits(self, logits: np.ndarray, batch_idx: int) -> np.ndarray:
-        """Apply grammar constraints to logits for a single batch element.
-
-        Args:
-            logits: shape (vocab_size,) numpy array
-            batch_idx: index into the batch
-
-        Returns:
-            Possibly-masked logits (same shape).
-        """
+        """Apply grammar constraints to logits for a single batch element."""
         machine = self.machines[batch_idx]
         tc = self.tool_constraints[batch_idx]
 
@@ -344,7 +366,7 @@ class ConstrainedDecoder:
         elif machine.state == JsonState.IN_ARG_KEY:
             trie = tc.get_param_trie(machine.current_function)
             if trie is None:
-                return logits 
+                return logits
         else:
             return logits
 

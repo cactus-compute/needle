@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Needle Playground | Cactus</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <div class="header-border">
+      <div class="header-inner">
+        <a class="header-logo" href="https://cactuscompute.com">
+          <img src="https://cactuscompute.com/assets/cactus_white.png" alt="Cactus" width="32" height="32">
+          <span>Cactus</span>
+        </a>
+        <nav class="header-nav">
+          <span class="nav-current">Needle Playground</span>
+        </nav>
+        <div class="header-spacer"></div>
+        <button class="tools-toggle" onclick="togglePanel()" aria-label="Toggle tools panel">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+          <span>Tools</span>
+        </button>
+      </div>
+    </div>
+  </header>
+  <main>
+    <aside id="sidebar">
+      <div class="panel-section panel-tools">
+        <div class="panel-header">
+          <label class="panel-label">Tools JSON</label>
+          <label class="file-btn">
+            Upload
+            <input type="file" id="toolsFile" accept=".json" onchange="loadToolsFile(this)">
+          </label>
+        </div>
+        <textarea id="tools" spellcheck="false" placeholder="Paste tool definitions here...">[
+  {"name": "set_timer", "description": "Set a timer for the specified duration or end time.", "parameters": {"time_human": {"type": "string", "description": "The duration or target end time in human readable format e.g. '1 hour and 30 minutes', '45 minutes', 'for 1:50pm', 'at 13:30'.", "required": true}}},
+  {"name": "send_email", "description": "Send an email to a recipient.", "parameters": {"to": {"type": "string", "description": "The recipient's email address.", "required": true}, "subject": {"type": "string", "description": "The email subject line.", "required": true}, "body": {"type": "string", "description": "The email body text.", "required": true}}},
+  {"name": "create_note", "description": "Create a new note with the given text.", "parameters": {"text": {"type": "string", "description": "The text of the note.", "required": true}, "title": {"type": "string", "description": "Optional title for the note.", "required": false}}}
+]</textarea>
+        <button class="btn-finetune" onclick="openFinetuneModal()">Finetune on these tools</button>
+      </div>
+    </aside>
+    <div class="resize-handle" id="resizeHandle"></div>
+    <section class="query-area">
+      <div class="query-section">
+        <div class="panel-header">
+          <label class="panel-label">Query</label>
+          <span class="model-name" id="modelName"></span>
+          <label class="file-btn">
+            Load model
+            <input type="file" id="modelFile" accept=".pkl" onchange="loadModelFile(this)">
+          </label>
+        </div>
+        <div class="input-row">
+          <input id="query" type="text" placeholder="e.g. Set a 25 minute timer" autofocus>
+          <button class="btn-primary" id="sendBtn" onclick="send()">Run</button>
+        </div>
+      </div>
+      <div class="result-section">
+        <label class="panel-label">Result</label>
+        <pre class="result-box" id="result"></pre>
+      </div>
+    </section>
+  </main>
+
+  <div class="modal-overlay" id="modalOverlay">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <span class="modal-title">Finetune</span>
+        <button class="modal-close" id="modalCloseBtn" onclick="closeModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-field">
+          <label class="modal-label">Gemini API Key</label>
+          <input type="password" id="ftApiKey" class="modal-input" placeholder="Paste your API key" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="modal-steps" id="ftSteps">
+          <div class="modal-step" data-step="generating data"><span class="step-dot"></span>Generating data</div>
+          <div class="modal-step" data-step="training"><span class="step-dot"></span>Training</div>
+        </div>
+        <div class="ft-eval" id="ftEvalResults"></div>
+      </div>
+      <div class="modal-footer" id="ftFooter">
+        <button class="btn-primary modal-start" id="ftStartBtn" onclick="startFinetune()">Start Finetune</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast">
+    <span class="toast-msg" id="toastMsg"></span>
+    <button class="toast-close" onclick="dismissToast()">&times;</button>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

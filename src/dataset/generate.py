@@ -1654,11 +1654,11 @@ def generate_all(num_samples, workers=8, batch_size=25, model=MODEL, client_pool
     rng = random.Random(42)
 
     target = int(num_samples * 1.3)
-    num_batches = (target + batch_size - 1) // batch_size
+    max_submissions = target // batch_size * 3  # hard cap to prevent infinite loop
     all_examples = []
     failed = 0
 
-    pbar = tqdm(total=num_batches, desc="Generating", unit="batch")
+    pbar = tqdm(total=num_samples, desc="Generating", unit="ex")
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = set()
@@ -1672,7 +1672,8 @@ def generate_all(num_samples, workers=8, batch_size=25, model=MODEL, client_pool
             pending.add(f)
             submitted += 1
 
-        for _ in range(min(workers, num_batches)):
+        initial = min(workers, (target + batch_size - 1) // batch_size)
+        for _ in range(initial):
             _submit_one()
 
         while pending:
@@ -1685,9 +1686,10 @@ def generate_all(num_samples, workers=8, batch_size=25, model=MODEL, client_pool
                     all_examples.extend(results)
                 except Exception as e:
                     failed += 1
-                pbar.update(1)
-                pbar.set_postfix(examples=len(all_examples), failed=failed)
-                if submitted < num_batches:
+                pbar.n = min(len(all_examples), num_samples)
+                pbar.set_postfix(failed=failed)
+                pbar.refresh()
+                if len(all_examples) < target and submitted < max_submissions:
                     _submit_one()
 
     pbar.close()
@@ -1739,7 +1741,7 @@ def _load_existing():
         print(f"Loaded existing dataset: {len(ds)} rows")
     else:
         print(f"Downloading existing dataset from {HF_DATASET_REPO}...")
-        from .data import download_hf_split
+        from .dataset import download_hf_split
         ds = download_hf_split("train", HF_DATASET_REPO)
         # Save locally so subsequent chunks don't re-download
         os.makedirs(local, exist_ok=True)

@@ -12,7 +12,7 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 import numpy as np
-from datasets import Audio, Dataset, load_from_disk
+from datasets import Dataset, load_from_disk
 from tqdm import tqdm
 import sentencepiece as spm
 
@@ -253,12 +253,7 @@ def _load_split_dataset(split="train"):
 
 
 def _set_audio_backend(ds):
-    """Disable automatic audio decoding to avoid torchcodec dependency.
-
-    Audio is decoded manually via soundfile in load_tool_call_audio().
-    """
-    if "audio" in ds.column_names:
-        ds = ds.cast_column("audio", Audio(sampling_rate=16000, decode=False))
+    """No-op kept for compatibility."""
     return ds
 
 
@@ -746,101 +741,6 @@ def pack_sequences(cache_path, enc_vl, dec_in_vl, dec_tgt_vl, loss_vl):
     print(f"  Packed {n} sequences into {n_bins} bins ({used / total_cap:.0%} utilization)")
     return n_bins
 
-
-
-def load_tool_call_audio(split="train", max_samples=None):
-    """Return dataset-local indices for the given split.
-
-    Audio is NOT loaded into memory.
-    """
-    ds = _load_split_dataset(split)
-    n = len(ds)
-    indices = list(range(n))
-    if max_samples:
-        indices = indices[:max_samples]
-    return indices
-
-
-def load_example_with_audio(idx, split="train"):
-    """Load a dataset example by index within a split.
-
-    Returns dict with {query, answers, tools, audio_array, sampling_rate}.
-    Audio fields are None for text-only datasets.
-    """
-    ds = _load_split_dataset(split)
-    if idx < 0 or idx >= len(ds):
-        raise IndexError(f"Index {idx} out of range (split has {len(ds)} rows)")
-    ex = ds[idx]
-
-    audio, sr = None, None
-    audio_val = ex.get("audio")
-    if audio_val is not None:
-        import io
-        import soundfile as sf
-
-        raw_bytes = None
-        if isinstance(audio_val, dict):
-            raw_bytes = audio_val.get("bytes")
-        elif isinstance(audio_val, bytes):
-            raw_bytes = audio_val
-        if raw_bytes is not None:
-            audio, sr = sf.read(io.BytesIO(raw_bytes), dtype="float32")
-            if audio.ndim > 1:
-                audio = audio.mean(axis=1)
-            audio = audio.astype(np.float32)
-
-    return {
-        "query": ex["query"],
-        "answers": ex["answers"],
-        "tools": ex["tools"],
-        "audio_array": audio,
-        "sampling_rate": sr,
-    }
-
-
-def compute_mel_spectrogram(audio, sr=16000, n_mels=80, n_fft=400, hop_length=160):
-    """Compute log-mel spectrogram using numpy/scipy. Returns (T_mel, n_mels) float32.
-
-    25ms window (n_fft=400 at 16kHz), 10ms hop (hop_length=160) -> ~100 frames/sec.
-    """
-    from scipy.signal import windows as scipy_windows
-    from scipy.fft import rfft
-
-    audio = np.append(audio[0], audio[1:] - 0.97 * audio[:-1])
-
-    window = scipy_windows.hann(n_fft, sym=False).astype(np.float32)
-    num_frames = 1 + (len(audio) - n_fft) // hop_length
-    if num_frames <= 0:
-        return np.zeros((1, n_mels), dtype=np.float32)
-
-    frames = np.lib.stride_tricks.as_strided(
-        audio,
-        shape=(num_frames, n_fft),
-        strides=(audio.strides[0] * hop_length, audio.strides[0]),
-    ).copy()
-    frames = frames * window
-    spectrum = np.abs(rfft(frames, n=n_fft, axis=-1)) ** 2
-
-    fmin, fmax = 0.0, sr / 2.0
-    mel_low = 2595.0 * np.log10(1.0 + fmin / 700.0)
-    mel_high = 2595.0 * np.log10(1.0 + fmax / 700.0)
-    mel_points = np.linspace(mel_low, mel_high, n_mels + 2)
-    hz_points = 700.0 * (10.0 ** (mel_points / 2595.0) - 1.0)
-    bin_points = np.floor((n_fft + 1) * hz_points / sr).astype(np.int32)
-
-    filterbank = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float32)
-    for m in range(n_mels):
-        f_left, f_center, f_right = bin_points[m], bin_points[m + 1], bin_points[m + 2]
-        for k in range(f_left, f_center):
-            if f_center > f_left:
-                filterbank[m, k] = (k - f_left) / (f_center - f_left)
-        for k in range(f_center, f_right):
-            if f_right > f_center:
-                filterbank[m, k] = (f_right - k) / (f_right - f_center)
-
-    mel_spec = spectrum @ filterbank.T
-    log_mel = np.log(np.maximum(mel_spec, 1e-10))
-    return log_mel.astype(np.float32)
 
 
 class VarLenArray:

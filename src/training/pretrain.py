@@ -22,15 +22,15 @@ import numpy as np
 import optax
 from tqdm import tqdm
 
-from .tokenizer import get_tokenizer, EOS_ID, TOOLS_ID, PAD_ID
-from .model import (
+from ..dataset.tokenizer import get_tokenizer, EOS_ID, TOOLS_ID, PAD_ID
+from ..model.architecture import (
     EncoderDecoderTransformer,
     TransformerConfig,
     make_padding_mask,
     make_causal_mask,
 )
 from .optim import create_train_state, _wsd_schedule
-from .distributed import _replicate, _unreplicate, shard_batch, _upload_checkpoint
+from ..utils.distributed import _replicate, _unreplicate, shard_batch, _upload_checkpoint
 
 _HF_PRETRAIN_REPO = "PleIAs/SYNTH"
 
@@ -235,7 +235,6 @@ def pretrain(args):
             activation=getattr(args, "activation", "swiglu"),
             no_feedforward=getattr(args, "no_feedforward", True),
             contrastive_dim=getattr(args, "contrastive_dim", 128),
-            enable_speech=False,
         )
 
     effective_batch_size = args.batch_size * num_devices

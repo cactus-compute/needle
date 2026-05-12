@@ -9,13 +9,13 @@ import numpy as np
 import optax
 from tqdm import tqdm
 
-from .data import (
+from ..dataset.dataset import (
     get_batches, get_tokenizer,
     load_prepared_data, load_tool_calls,
     PrefetchIterator, count_batches,
     get_contrastive_batches,
 )
-from .model import (
+from ..model.architecture import (
     EncoderDecoderTransformer,
     TransformerConfig,
     make_packing_mask,
@@ -23,16 +23,13 @@ from .model import (
     make_cross_packing_mask,
 )
 from .optim import create_train_state, _wsd_schedule
-from .distributed import (
+from ..utils.distributed import (
     _replicate, _unreplicate, shard_batch, _upload_checkpoint,
     load_pretrained_params, partial_load_params,
 )
-from .quantize import (
-    _quantize_params, _cubic_sparsity_schedule, _make_prune_mask,
-)
+from ..model.quantize import _quantize_params
 
 
-_GROUP_SIZE = 32
 _PRECISION = "int4"
 _MAT_FACTORS = ()
 _MAT_FF_WIDTHS = ()
@@ -58,7 +55,7 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, ffn_mask, rng, loss_mask,
                   enc_seg_ids, dec_seg_ids):
     q_params = jax.lax.cond(
         do_quantize,
-        lambda p: _quantize_params(p, group_size=_GROUP_SIZE, precision=_PRECISION),
+        lambda p: _quantize_params(p, precision=_PRECISION),
         lambda p: p,
         params,
     )
@@ -96,7 +93,7 @@ def _contrastive_loss_fn(state, params, query_tokens, tool_tokens, rng, do_quant
     """Compute CLIP contrastive loss on query/tool pairs."""
     q_params = jax.lax.cond(
         do_quantize,
-        lambda p: _quantize_params(p, group_size=_GROUP_SIZE, precision=_PRECISION),
+        lambda p: _quantize_params(p, precision=_PRECISION),
         lambda p: p,
         params,
     )
@@ -129,8 +126,8 @@ def _make_ffn_mask(batch_size, d_ff, mat_ff_widths):
     return jnp.concatenate(rows, axis=0)
 
 
-def _train_step(state, src, tgt_in, tgt_out, enc_seg_ids, dec_seg_ids, prune_mask, ffn_mask, rng, loss_mask, query_tokens, tool_tokens, cl_rng, do_quantize, do_contrastive, do_prune):
-    """Unified train step with boolean flags for contrastive loss and pruning."""
+def _train_step(state, src, tgt_in, tgt_out, enc_seg_ids, dec_seg_ids, ffn_mask, rng, loss_mask, query_tokens, tool_tokens, cl_rng, do_quantize, do_contrastive):
+    """Unified train step with boolean flag for contrastive loss."""
 
     def combined_loss(p):
         text_loss = _text_loss_fn(state, p, src, tgt_in, tgt_out, ffn_mask, rng, loss_mask, do_quantize,
@@ -147,12 +144,6 @@ def _train_step(state, src, tgt_in, tgt_out, enc_seg_ids, dec_seg_ids, prune_mas
     text_loss = jax.lax.pmean(text_loss, axis_name="batch")
     grad_norm = optax.global_norm(grads)
     state = state.apply_gradients(grads=grads)
-    new_params = jax.lax.cond(
-        do_prune,
-        lambda: jax.tree.map(lambda w, m: w * m, state.params, prune_mask),
-        lambda: state.params,
-    )
-    state = state.replace(params=new_params)
     return state, text_loss, grad_norm
 
 
@@ -213,15 +204,9 @@ def _estimate_mat_params(config, matryoshka_factor):
     emb = v * d
     attn = d * d + d * kv_dim * 2 + d * d
     ffn = d * d_ff * 3
-    speech_sub = 0
-    if getattr(config, "enable_speech", True):
-        C = 256
-        n_mels = getattr(config, "n_mels", 80)
-        freq_out = n_mels // 8
-        speech_sub = (1 * C * 9) + (C * 9 + C * C) + (C * 9 + C * C) + (C * freq_out * d)
     enc_block = attn + ffn
     dec_block = attn * 2 + ffn
-    total = emb + speech_sub + n_enc * enc_block + n_dec * dec_block
+    total = emb + n_enc * enc_block + n_dec * dec_block
     return int(total)
 
 
@@ -262,11 +247,13 @@ def train(args):
     val_dec_seg = val_data["packed_dec_seg"]
     print(f"      {len(enc_inputs):,} train / {len(val_enc):,} val packed bins (memory-mapped)")
 
-    try:
-        val_ds = load_tool_calls("val", max_samples=args.max_samples)
-    except (FileNotFoundError, Exception) as e:
-        print(f"      WARNING: could not load val dataset for eval samples: {e}")
-        val_ds = None
+    val_ds = getattr(args, "val_ds", None)
+    if val_ds is None:
+        try:
+            val_ds = load_tool_calls("val", max_samples=args.max_samples)
+        except (FileNotFoundError, Exception) as e:
+            print(f"      WARNING: could not load val dataset for eval samples: {e}")
+            val_ds = None
 
     cl_query_tokens = train_data.get("query_only")
     cl_tool_tokens = train_data.get("tool_individual")
@@ -314,12 +301,10 @@ def train(args):
             activation=getattr(args, "activation", "drelu"),
             num_memory_slots=getattr(args, "num_memory_slots", 64),
             contrastive_dim=getattr(args, "contrastive_dim", 128),
-            enable_speech=getattr(args, "enable_speech", False),
             no_feedforward=getattr(args, "no_feedforward", True),
         )
 
-    global _GROUP_SIZE, _PRECISION, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF, _CONTRASTIVE_WEIGHT, _LOSS_WEIGHT_MAP
-    _GROUP_SIZE = getattr(args, "group_size", 32)
+    global _PRECISION, _MAT_FACTORS, _MAT_FF_WIDTHS, _D_FF, _CONTRASTIVE_WEIGHT, _LOSS_WEIGHT_MAP
     _PRECISION = getattr(args, "precision", "int4")
     _CONTRASTIVE_WEIGHT = getattr(args, "contrastive_weight", 0.1)
     _LOSS_WEIGHT_MAP = jnp.array([
@@ -433,31 +418,11 @@ def train(args):
     eval_model = EncoderDecoderTransformer(config)
 
     last_val_ppl = None
-    sparsity_ratio = getattr(args, "sparsity_ratio", 0.0)
-    prune_mask = None
-    gradual_sparsify_done = False
-    # Dummy all-ones prune mask (replicated) — used when pruning is inactive
-    _unrep_params = _unreplicate(state).params
-    dummy_prune_mask = _replicate(jax.tree.map(jnp.ones_like, _unrep_params))
-    del _unrep_params
     # Dummy contrastive arrays — used when contrastive is inactive
     dummy_cl_tokens = jnp.zeros((num_devices, args.batch_size, 128), dtype=jnp.int32)
     dummy_cl_rng = jax.random.split(jax.random.PRNGKey(0), num_devices)
 
-    prune_interval = getattr(args, "prune_interval", 100)
-    prune_start_frac = getattr(args, "prune_start_frac", 0.33)
-    prune_end_frac = getattr(args, "prune_end_frac", 0.67)
-
-    weight_prune_epoch = 0 if sparsity_ratio > 0 else -1
-
     for epoch in range(args.epochs):
-        if epoch == weight_prune_epoch and not gradual_sparsify_done:
-            t_start = int(num_batches * prune_start_frac)
-            t_end = int(num_batches * prune_end_frac)
-            print(f"\nGradual magnitude sparsification: 0% -> {sparsity_ratio*100:.0f}% over epoch {epoch+1} "
-                  f"(steps {t_start}-{t_end}/{num_batches}, interval={prune_interval}, group_size={_GROUP_SIZE})")
-            epoch_step = 0
-
         text_losses = []
         text_batch_iter = PrefetchIterator(
             lambda: get_batches(enc_inputs, dec_inputs, dec_targets, global_batch_size,
@@ -524,29 +489,17 @@ def train(args):
                     do_contrastive = False
 
             do_cl = jnp.broadcast_to(jnp.array(do_contrastive), (num_devices,))
-            do_prune = jnp.broadcast_to(jnp.array(prune_mask is not None), (num_devices,))
-            cur_prune_mask = prune_mask if prune_mask is not None else dummy_prune_mask
 
             state, loss, grad_norm = p_train_step(
                 state, src_b, tgt_in_b, tgt_out_b, enc_seg_b, dec_seg_b,
-                cur_prune_mask, text_ffn_mask, text_rngs, lm_b,
-                cl_q_b, cl_t_b, cl_rngs, do_qat, do_cl, do_prune,
+                text_ffn_mask, text_rngs, lm_b,
+                cl_q_b, cl_t_b, cl_rngs, do_qat, do_cl,
             )
 
             text_loss_val = float(loss.addressable_shards[0].data[0])
             text_losses.append(text_loss_val)
             step_grad_norm = float(grad_norm.addressable_shards[0].data[0])
             global_step += 1
-
-            if epoch == weight_prune_epoch and not gradual_sparsify_done:
-                epoch_step += 1
-                current_sparsity = _cubic_sparsity_schedule(epoch_step, t_start, t_end, sparsity_ratio)
-                if epoch_step >= t_start and epoch_step % prune_interval == 0 and current_sparsity > 0:
-                    ema_unr = _unreplicate(state.params)
-                    mask = _make_prune_mask(ema_unr, current_sparsity, _GROUP_SIZE)
-                    del ema_unr
-                    prune_mask = _replicate(mask)
-                    del mask
 
             dt = time.perf_counter() - t0
             eval_every = getattr(args, "eval_every", 100)
@@ -575,11 +528,6 @@ def train(args):
                 "text_loss": f"{text_loss_val:.4f}",
                 "text_ppl": f"{last_val_ppl:.2f}" if last_val_ppl is not None else "?",
             }
-            if sparsity_ratio > 0:
-                if epoch == weight_prune_epoch and not gradual_sparsify_done:
-                    postfix["sparsification"] = f"{current_sparsity*100:.1f}%"
-                else:
-                    postfix["sparsification"] = "done"
             pbar.set_postfix(**postfix)
 
             if use_wandb and is_main:
@@ -591,8 +539,6 @@ def train(args):
                     "train/tokens_per_sec": tokens_per_batch / dt,
                     "train/step": global_step,
                 }
-                if epoch == weight_prune_epoch and not gradual_sparsify_done:
-                    log_dict["train/scheduled_sparsity"] = current_sparsity
                 if global_step % eval_every == 0 or global_step == total_steps:
                     log_dict["val/text_ppl"] = last_val_ppl
                 wandb.log(log_dict)
@@ -600,23 +546,6 @@ def train(args):
         text_batch_iter.close()
         if cl_batch_iter is not None:
             cl_batch_iter.close()
-
-        if epoch == weight_prune_epoch and not gradual_sparsify_done:
-            gradual_sparsify_done = True
-            if prune_mask is None:
-                ema_unr = _unreplicate(state.params)
-                mask = _make_prune_mask(ema_unr, sparsity_ratio, _GROUP_SIZE)
-                del ema_unr
-                prune_mask = _replicate(mask)
-                del mask
-            state = state.replace(
-                params=jax.tree.map(lambda w, m: w * m, state.params, prune_mask))
-            final_pruned = jax.tree.map(np.array, _unreplicate(state).params)
-            total_p = sum(x.size for x in jax.tree.leaves(final_pruned))
-            zero_p = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(final_pruned))
-            print(f"\n  Gradual sparsification complete — mask locked.")
-            print(f"  Final sparsity: {zero_p/total_p*100:.2f}% ({zero_p:,}/{total_p:,} near-zero)")
-            del final_pruned
 
         epoch_avg_loss = sum(text_losses) / len(text_losses) if text_losses else float("nan")
         final_loss = text_losses[-1] if text_losses else float("nan")
@@ -628,12 +557,11 @@ def train(args):
         # ── Host 0 only: val PPL + checkpoint save (fast) ──
         quant_val_ppl = 0.0
         mat_results = {}
-        sparsity = 0.0
-        total_params = near_zero = 0
+        total_params = 0
         ckpt_path = ""
 
         if is_main:
-            q_params = _quantize_params(eval_params, group_size=_GROUP_SIZE, precision=_PRECISION)
+            q_params = _quantize_params(eval_params, precision=_PRECISION)
             mat_vl_fns = {}
             if _MAT_FACTORS:
                 _apply_fn = _unreplicate(state).apply_fn
@@ -678,8 +606,6 @@ def train(args):
 
             params_np = jax.tree.map(lambda x: np.array(x).astype(np.float16), eval_params)
             total_params = sum(x.size for x in jax.tree.leaves(params_np))
-            near_zero = sum(int(np.sum(np.abs(x) < 1e-6)) for x in jax.tree.leaves(params_np))
-            sparsity = near_zero / total_params * 100
 
             ckpt_name = f"{experiment_name}_{args.num_layers}_{args.d_model}_{global_step}.pkl"
             ckpt_path = os.path.join(args.checkpoint_dir, ckpt_name)
@@ -688,7 +614,7 @@ def train(args):
             del params_np
 
         # ── All hosts: distributed generation eval ──
-        from .run import generate_batch
+        from ..model.run import generate_batch
         import json as _json_mod
 
         _pool_names = ["single", "multi"]
@@ -760,7 +686,7 @@ def train(args):
 
         # Prepare generation model (all hosts)
         if _MAT_FACTORS:
-            from .export import slice_params
+            from ..model.export import slice_params
             _max_factor = max(_MAT_FACTORS)
             _mat_params, _mat_config = slice_params(eval_params, config, _max_factor)
             _mat_params = jax.tree.map(jnp.array, _mat_params)
@@ -771,7 +697,7 @@ def train(args):
             _gen_model = eval_model
             _gen_label = "full"
 
-        _mat_params = _quantize_params(_mat_params, group_size=_GROUP_SIZE, precision=_PRECISION)
+        _mat_params = _quantize_params(_mat_params, precision=_PRECISION)
         _gen_label += f" {_PRECISION.upper()}"
 
         # Split eval examples across hosts — each host generates its slice
@@ -1025,7 +951,7 @@ def train(args):
             print(f"  ** New best single call_f1={best_call_f1:.1%} → {best_ckpt_path}")
             _upload_checkpoint(best_ckpt_path)
             if _MAT_FACTORS:
-                from .export import export_submodel
+                from ..model.export import export_submodel
                 for factor in _MAT_FACTORS:
                     d_ff_sub = config.d_ff // factor
                     mat_ckpt_path = os.path.join(
@@ -1037,7 +963,7 @@ def train(args):
 
         retrieval_metrics = None
         if has_contrastive and _CONTRASTIVE_WEIGHT > 0 and val_ds is not None:
-            from .eval import benchmark_retrieval
+            from ..training.eval import benchmark_retrieval
             retrieval_metrics = benchmark_retrieval(
                 eval_model, eval_params, tokenizer,
                 num_samples=min(500, getattr(args, "max_eval_samples", 500)),
@@ -1051,8 +977,7 @@ def train(args):
         print(f"  ─────────────────────────────────────")
         print(f"  Text loss      {final_loss:>12.4f}")
         print(f"  Text val ppl   {last_val_ppl:>12.2f}")
-        print(f"  Quant val ppl  {quant_val_ppl:>12.2f}  ({_PRECISION.upper()} g{_GROUP_SIZE})")
-        print(f"  Sparsity       {sparsity:>11.2f}%  ({near_zero:,}/{total_params:,})")
+        print(f"  Quant val ppl  {quant_val_ppl:>12.2f}  ({_PRECISION.upper()})")
         if mat_results:
             print(f"  ─────────────────────────────────────")
             print(f"  Matryoshka sub-models:")
@@ -1134,7 +1059,6 @@ def train(args):
                 "epoch/text_loss": final_loss,
                 "epoch/text_val_ppl": last_val_ppl,
                 "epoch/quant_val_ppl": quant_val_ppl,
-                "epoch/weight_sparsity": sparsity,
                 "epoch": epoch + 1,
             }
             for factor, (mat_ppl, mat_params, _) in mat_results.items():

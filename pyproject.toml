@@ -8,13 +8,14 @@ dependencies = [
     "flax",
     "optax",
     "datasets",
+    "huggingface_hub",
     "transformers",
     "wandb",
     "sentencepiece",
-    "soundfile",
     "scipy",
     "gcsfs",
     "tqdm",
+    "google-genai",
 ]
 
 [project.optional-dependencies]
