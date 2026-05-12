@@ -16,7 +16,7 @@ from ..dataset.dataset import (
     get_contrastive_batches,
 )
 from ..model.architecture import (
-    EncoderDecoderTransformer,
+    SimpleAttentionNetwork,
     TransformerConfig,
     make_packing_mask,
     make_causal_packing_mask,
@@ -325,7 +325,7 @@ def train(args):
     muon_schedule = _wsd_schedule(muon_lr, total_steps, warmup_steps)
     tokens_per_batch = global_batch_size * (args.max_enc_len + args.max_dec_len)
 
-    eval_model = EncoderDecoderTransformer(config)
+    eval_model = SimpleAttentionNetwork(config)
 
     last_val_ppl = None
     # Dummy contrastive arrays — used when contrastive is inactive

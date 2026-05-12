@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax.training import train_state
-from ..model.architecture import EncoderDecoderTransformer
+from ..model.architecture import SimpleAttentionNetwork
 
 
 def _newton_schulz(G, steps=5):
@@ -82,7 +82,7 @@ def _wsd_schedule(peak_value, total_steps, warmup_steps, decay_ratio=0.15):
 
 
 def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_steps, decay_ratio=0.15):
-    model = EncoderDecoderTransformer(config)
+    model = SimpleAttentionNetwork(config)
 
     rng, init_rng = jax.random.split(rng)
     dummy_src = jnp.ones((1, 128), dtype=jnp.int32)
