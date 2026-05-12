@@ -3,12 +3,10 @@ jaxlib
 flax
 optax
 datasets
+huggingface_hub
 gcsfs
 transformers
 wandb
 pyyaml
 sentencepiece
-google-cloud-texttospeech
 google-genai
-audiomentations
-gcsfs

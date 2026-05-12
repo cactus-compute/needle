@@ -263,7 +263,7 @@ _datagen_lock = threading.Lock()
 
 def _generate_custom_data(tools_json, api_key, num_samples, data_file):
     import json
-    from .. import generate_data as gd
+    from ..dataset import generate as gd
 
     tools = json.loads(tools_json)
 
@@ -431,7 +431,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def _run_generate(query, tools, seed, max_gen_len, constrained):
-    from ..run import generate
+    from ..model.run import generate
 
     with _lock:
         if _model is None or _params is None or _tokenizer is None:
@@ -456,9 +456,9 @@ def _run_generate(query, tools, seed, max_gen_len, constrained):
 
 def _load_checkpoint(path, display_name=None):
     global _model, _params, _tokenizer, _current_model, _current_model_path
-    from ..data import get_tokenizer
-    from ..model import EncoderDecoderTransformer
-    from ..run import load_checkpoint
+    from ..dataset.dataset import get_tokenizer
+    from ..model.architecture import EncoderDecoderTransformer
+    from ..model.run import load_checkpoint
 
     with _lock:
         _params, config = load_checkpoint(path)
@@ -518,7 +518,7 @@ def _validate_training_data(data_file_path):
 
 
 _SAMPLES_PER_TOOL = 120  # 100 train + 10 val + 10 test
-_EPOCHS = 3
+_EPOCHS = 1
 
 
 def _start_finetune(tools_json, api_key):
@@ -586,7 +586,7 @@ def _start_finetune(tools_json, api_key):
             proc = subprocess.Popen(
                 [
                     python, "-u",
-                    "-m", "src.finetune",
+                    "-m", "src.training.finetune",
                     str(data_file),
                     "--epochs", str(_EPOCHS),
                     "--batch-size", str(batch_size),
@@ -648,7 +648,7 @@ def _start_finetune(tools_json, api_key):
 
             # Assemble download bundle (same per-tool split as finetune)
             import zipfile
-            from ..finetune import _per_tool_split
+            from ..training.finetune import _per_tool_split
 
             with open(data_file) as _df:
                 all_examples = [_json.loads(ln) for ln in _df if ln.strip()]
@@ -733,18 +733,46 @@ def _start_finetune(tools_json, api_key):
     return True
 
 
+_HF_MODEL_REPO = "Cactus-Compute/needle"
+_HF_MODEL_FILE = "needle.pkl"
+
+
+def _resolve_checkpoint(checkpoint_arg):
+    """Resolve checkpoint path: download from HuggingFace if not provided or not local."""
+    if checkpoint_arg and os.path.exists(checkpoint_arg):
+        return checkpoint_arg
+    from huggingface_hub import hf_hub_download
+    local_dir = "checkpoints"
+    os.makedirs(local_dir, exist_ok=True)
+    filename = os.path.basename(checkpoint_arg) if checkpoint_arg else _HF_MODEL_FILE
+    repo = _HF_MODEL_REPO
+    local_path = os.path.join(local_dir, filename)
+    if os.path.exists(local_path):
+        return local_path
+    print(f"Downloading {filename} from {repo}...", file=sys.stderr)
+    path = hf_hub_download(
+        repo_id=repo,
+        filename=filename,
+        repo_type="model",
+        local_dir=local_dir,
+    )
+    print(f"Downloaded to {path}", file=sys.stderr)
+    return path
+
+
 def main(args):
     global _model, _params, _tokenizer, _current_model, _current_model_path
-    from ..data import get_tokenizer
-    from ..model import EncoderDecoderTransformer
-    from ..run import load_checkpoint
+    from ..dataset.dataset import get_tokenizer
+    from ..model.architecture import EncoderDecoderTransformer
+    from ..model.run import load_checkpoint
 
-    print(f"Loading checkpoint: {args.checkpoint}", file=sys.stderr)
-    _params, config = load_checkpoint(args.checkpoint)
+    checkpoint_path = _resolve_checkpoint(args.checkpoint)
+    print(f"Loading checkpoint: {checkpoint_path}", file=sys.stderr)
+    _params, config = load_checkpoint(checkpoint_path)
     _model = EncoderDecoderTransformer(config)
     _tokenizer = get_tokenizer()
-    _current_model = Path(args.checkpoint).name
-    _current_model_path = args.checkpoint
+    _current_model = Path(checkpoint_path).name
+    _current_model_path = checkpoint_path
 
     param_count = sum(x.size for x in __import__("jax").tree.leaves(_params))
     print(f"Model parameters: {param_count:,}", file=sys.stderr)

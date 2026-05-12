@@ -8,13 +8,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .data import get_tokenizer, compute_mel_spectrogram, to_snake_case, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_GEN_LEN
-from .model import (
+from ..dataset.dataset import get_tokenizer, to_snake_case, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_GEN_LEN
+from .architecture import (
     EncoderDecoderTransformer,
     TransformerConfig,
     make_causal_mask,
     make_padding_mask,
-    make_mel_padding_mask,
 )
 
 
@@ -180,86 +179,6 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
     return result
 
 
-def generate_with_confidence(model, params, tokenizer, query, tools="[]",
-                              max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN,
-                              seed=0, stream=True, normalize=True, constrained=True,
-                              confidence_threshold=None):
-    """Generate tool calls with confidence score.
-
-    Returns (result, confidence) where confidence is a float in [0, 1].
-    If confidence_threshold is set and confidence is below it, returns
-    (None, confidence) without running the decoder — saving compute for
-    queries that should be routed to cloud.
-    """
-    name_map = {}
-    if normalize:
-        tools, name_map = normalize_tools(tools)
-
-    enc_tokens = _build_encoder_input(tokenizer, query, tools, max_enc_len)
-    enc_input = jnp.array([enc_tokens])
-    pad_id = tokenizer.pad_token_id
-    src_mask = make_padding_mask(enc_input, pad_id)
-
-    # Get confidence + encoder output in one pass
-    confidence, encoder_out, enc_mask = model.apply(
-        {"params": params}, enc_input, src_mask=src_mask,
-        method="forward_confidence",
-    )
-    confidence_val = float(confidence[0])
-
-    # Early exit if below threshold — skip decoder entirely
-    if confidence_threshold is not None and confidence_val < confidence_threshold:
-        return None, confidence_val
-
-    # Proceed with normal decoding using already-computed encoder output
-    eos_id = tokenizer.eos_token_id
-    dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
-    dec_buffer = dec_buffer.at[0, 0].set(eos_id)
-
-    decode_fn = _get_decode_fn(model, max_gen_len)
-
-    constrained_decoder = None
-    if constrained:
-        from .constrained import build_constrained_decoder
-        constrained_decoder = build_constrained_decoder([tools], tokenizer)
-
-    if stream:
-        sys.stdout.write(f"\n")
-        sys.stdout.flush()
-
-    logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
-    generated_tokens = []
-
-    for i in range(0, max_gen_len - 1):
-        next_logits = logits[0, i]
-        if constrained_decoder and constrained_decoder.is_active(0):
-            logits_np = np.array(next_logits)
-            logits_np = constrained_decoder.constrain_logits(logits_np, 0)
-            next_token = int(np.argmax(logits_np))
-        else:
-            next_token = int(jnp.argmax(next_logits))
-        if constrained_decoder:
-            constrained_decoder.update(0, next_token)
-        if next_token == eos_id:
-            break
-        generated_tokens.append(next_token)
-        dec_buffer = dec_buffer.at[0, i + 1].set(next_token)
-        if stream:
-            sys.stdout.write(tokenizer.decode([next_token]))
-            sys.stdout.flush()
-        logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
-
-    if stream:
-        sys.stdout.write("\n")
-
-    result = tokenizer.decode(generated_tokens)
-    if result.startswith("<tool_call>"):
-        result = result[len("<tool_call>"):]
-    if normalize and name_map:
-        result = restore_tool_names(result, name_map)
-    return result, confidence_val
-
-
 def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, normalize=True, constrained=True):
     """Batch-generate tool-call outputs for multiple examples at once.
 
@@ -346,93 +265,6 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
     return results
 
 
-def load_audio(path, target_sr=16000):
-    """Load an audio file and resample to target_sr. Returns (audio_array, sr)."""
-    import soundfile as sf
-    audio, sr = sf.read(path, dtype="float32")
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    if sr != target_sr:
-        from scipy.signal import resample
-        num_samples = int(len(audio) * target_sr / sr)
-        audio = resample(audio, num_samples).astype(np.float32)
-        sr = target_sr
-    return audio, sr
-
-
-def generate_from_audio(model, params, tokenizer, audio_array, sr=16000, tools="[]", max_gen_len=DEFAULT_MAX_GEN_LEN, seed=0, stream=True, constrained=True):
-    """Generate tool-call output from audio using the speech encoder pathway.
-
-    mel -> encode_speech -> decoder [BOS, <tool_call>, tools_tokens...] -> greedy decode.
-    Same structure as generate() but uses speech encoder + mel padding mask.
-    """
-    n_mels = model.config.n_mels
-    mel = compute_mel_spectrogram(audio_array, sr=sr, n_mels=n_mels)
-    mel_input = jnp.array(mel)[None, :, :]  # (1, T_mel, n_mels)
-
-    pad_id = tokenizer.pad_token_id
-    eos_id = tokenizer.eos_token_id
-    tool_call_id = tokenizer.tool_call_token_id
-
-    src_mask = make_mel_padding_mask(mel_input)
-    encoder_out, enc_mask = model.apply(
-        {"params": params}, mel_input, src_mask=src_mask, deterministic=True, method="encode_speech"
-    )
-
-    tools_tokens = tokenizer.encode(tools)
-    prefix = [eos_id, tool_call_id] + tools_tokens
-    prefix_len = min(len(prefix), max_gen_len)
-
-    dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
-    for j, tok in enumerate(prefix[:max_gen_len]):
-        dec_buffer = dec_buffer.at[0, j].set(tok)
-
-    decode_fn = _get_decode_fn(model, max_gen_len)
-
-    generated_tokens = []
-
-    constrained_decoder = None
-    if constrained:
-        from .constrained import build_constrained_decoder
-        constrained_decoder = build_constrained_decoder([tools], tokenizer)
-
-    if stream:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-
-    logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
-
-    for i in range(prefix_len - 1, max_gen_len - 1):
-        next_logits = logits[0, i]
-
-        if constrained_decoder and constrained_decoder.is_active(0):
-            logits_np = np.array(next_logits)
-            logits_np = constrained_decoder.constrain_logits(logits_np, 0)
-            next_token = int(np.argmax(logits_np))
-        else:
-            next_token = int(jnp.argmax(next_logits))
-
-        if constrained_decoder:
-            constrained_decoder.update(0, next_token)
-
-        if next_token == eos_id:
-            break
-
-        generated_tokens.append(next_token)
-        dec_buffer = dec_buffer.at[0, i + 1].set(next_token)
-
-        if stream:
-            sys.stdout.write(tokenizer.decode([next_token]))
-            sys.stdout.flush()
-
-        logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
-
-    if stream:
-        sys.stdout.write("\n")
-
-    return tokenizer.decode(generated_tokens)
-
-
 def main(args):
     print(f"Loading checkpoint: {args.checkpoint}")
     params, config = load_checkpoint(args.checkpoint)
@@ -444,27 +276,6 @@ def main(args):
     print(f"Model parameters: {param_count:,}")
 
     use_constrained = not getattr(args, "no_constrained", False)
-
-    audio_files = getattr(args, "audio", None)
-    if audio_files:
-        tools = getattr(args, "tools", None) or "[]"
-        for i, audio_path in enumerate(audio_files):
-            print(f"\nVoice-to-tool-call: {audio_path}")
-            print(f"Tools: {tools[:80]}{'...' if len(tools) > 80 else ''}")
-            audio, sr = load_audio(audio_path)
-            generate_from_audio(
-                model,
-                params,
-                tokenizer,
-                audio,
-                sr=sr,
-                tools=tools,
-                max_gen_len=args.max_len,
-                seed=args.seed + i,
-                stream=True,
-                constrained=use_constrained,
-            )
-        return
 
     query = getattr(args, "query", None)
     tools = getattr(args, "tools", None) or "[]"
@@ -538,7 +349,6 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default="checkpoints/checkpoint_epoch3.pkl")
     parser.add_argument("--query", type=str, default=None, help="Query text for tool-call generation")
     parser.add_argument("--tools", type=str, default=None, help="Tools JSON for tool-call generation")
-    parser.add_argument("--audio", type=str, nargs="*", help="Audio file paths for voice-to-tool-call")
     parser.add_argument("--max-len", type=int, default=512)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()

@@ -7,8 +7,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from .data import get_tokenizer, load_tool_calls, load_prepared_data, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN
-from .model import (
+from ..dataset.dataset import get_tokenizer, load_tool_calls, load_prepared_data, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN
+from ..model.architecture import (
     EncoderDecoderTransformer,
     TransformerConfig,
     make_causal_mask,
@@ -17,7 +17,7 @@ from .model import (
     make_packing_mask,
     make_cross_packing_mask,
 )
-from .run import load_checkpoint, _get_decode_fn
+from ..model.run import load_checkpoint, _get_decode_fn
 
 
 def compute_perplexity_packed(model, params, packed_data, batch_size):
@@ -129,7 +129,7 @@ def compute_repetition_rate(texts):
 
 
 def benchmark_generation_quality(model, params, tokenizer, prompts, max_gen_len=128, temperature=0.8):
-    from .run import generate
+    from ..model.run import generate
 
     generations = []
     for i, prompt in enumerate(prompts):
@@ -181,8 +181,8 @@ def compute_wer(hypotheses, references):
 def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, constrained=True, ds=None):
     """Generate tool-call predictions and compute structured metrics."""
     import json
-    from .run import generate_batch, normalize_tools, restore_tool_names
-    from .data import load_tool_calls, to_snake_case
+    from ..model.run import generate_batch, normalize_tools, restore_tool_names
+    from ..dataset.dataset import load_tool_calls, to_snake_case
 
     if ds is None:
         ds = load_tool_calls("validation", max_samples=num_samples)
@@ -456,7 +456,7 @@ def benchmark_retrieval(model, params, tokenizer, num_samples=500, max_len=256, 
     and checks if the positive (called) tools appear in top-k.
     """
     import json
-    from .run import encode_for_retrieval
+    from ..model.run import encode_for_retrieval
 
     if ds is None:
         ds = load_tool_calls("validation", max_samples=num_samples)

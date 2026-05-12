@@ -12,7 +12,7 @@ Usage:
 import os
 import shutil
 
-from .data import (
+from .dataset import (
     CACHE_DIR,
     DEFAULT_MAX_DEC_LEN,
     DEFAULT_MAX_ENC_LEN,
@@ -70,7 +70,7 @@ def _clear_local_caches():
 
 def _download_synth_dataset():
     """Download synthesized tool-calling dataset (train + validation) from HuggingFace."""
-    from .data import download_hf_split
+    from .dataset import download_hf_split
 
     print("Downloading dataset from HuggingFace (Cactus-Compute/tool-calls)...")
     for split in ("train", "validation"):

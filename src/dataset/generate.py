@@ -1741,7 +1741,7 @@ def _load_existing():
         print(f"Loaded existing dataset: {len(ds)} rows")
     else:
         print(f"Downloading existing dataset from {HF_DATASET_REPO}...")
-        from .data import download_hf_split
+        from .dataset import download_hf_split
         ds = download_hf_split("train", HF_DATASET_REPO)
         # Save locally so subsequent chunks don't re-download
         os.makedirs(local, exist_ok=True)

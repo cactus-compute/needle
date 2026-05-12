@@ -45,11 +45,15 @@ class TransformerConfig:
     dtype: str = "bfloat16"
     activation: str = "drelu"
     num_memory_slots: int = 64
-    n_mels: int = 80
     dropout_rate: float = 0.1
     contrastive_dim: int = 128
-    enable_speech: bool = False
     no_feedforward: bool = True
+
+    def __init__(self, **kwargs):
+        valid = {f.name for f in self.__dataclass_fields__.values()}
+        for k, v in kwargs.items():
+            if k in valid:
+                setattr(self, k, v)
 
     @property
     def jax_dtype(self):
@@ -146,51 +150,6 @@ class FeedForward(nn.Module):
         if ffn_mask is not None:
             h = h * ffn_mask[:, None, :] 
         return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="down_proj")(h)
-
-
-class SpeechSubsampling(nn.Module):
-    """FastConformer-style 8x depthwise-separable convolutional subsampling.
-
-    Input: (B, T, n_mels) raw mel spectrogram.
-    Output: (B, T//8, d_model) subsampled features.
-
-    Architecture (3 stages of stride-2 = 8x total):
-      Conv2D(1 -> C, k=3, s=2) + ReLU
-      DW-Conv2D(C, k=3, s=2) + PW-Conv2D(C -> C, k=1) + ReLU
-      DW-Conv2D(C, k=3, s=2) + PW-Conv2D(C -> C, k=1) + ReLU
-      Reshape(C * F') + Linear -> d_model
-    """
-    d_model: int
-    conv_channels: int = 256
-    dtype: jnp.dtype = jnp.bfloat16
-
-    @nn.compact
-    def __call__(self, mel):
-        x = mel[..., None] 
-
-        x = nn.Conv(features=self.conv_channels, kernel_size=(3, 3), strides=(2, 2),
-                     padding='SAME', dtype=self.dtype, use_bias=False, name="conv1")(x)
-        x = nn.relu(x)
-
-        x = nn.Conv(features=self.conv_channels, kernel_size=(3, 3), strides=(2, 2),
-                     padding='SAME', feature_group_count=self.conv_channels,
-                     dtype=self.dtype, use_bias=False, name="dw_conv2")(x)
-        x = nn.Conv(features=self.conv_channels, kernel_size=(1, 1),
-                     dtype=self.dtype, use_bias=False, name="pw_conv2")(x)
-        x = nn.relu(x)
-
-        x = nn.Conv(features=self.conv_channels, kernel_size=(3, 3), strides=(2, 2),
-                     padding='SAME', feature_group_count=self.conv_channels,
-                     dtype=self.dtype, use_bias=False, name="dw_conv3")(x)
-        x = nn.Conv(features=self.conv_channels, kernel_size=(1, 1),
-                     dtype=self.dtype, use_bias=False, name="pw_conv3")(x)
-        x = nn.relu(x)
-
-        B, T, F, C = x.shape
-        x = x.reshape(B, T, F * C)
-        x = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False,
-                      kernel_init=default_init(), name="out_proj")(x)
-        return x
 
 
 class EncoderBlock(nn.Module):
@@ -364,41 +323,6 @@ class Decoder(nn.Module):
         return x
 
 
-class SpecAugment(nn.Module):
-    """SpecAugment: time and frequency masking for speech regularization."""
-    num_time_masks: int = 2
-    max_time_width: int = 100
-    num_freq_masks: int = 1
-    max_freq_width: int = 27
-
-    @nn.compact
-    def __call__(self, mel, deterministic=True):
-
-        if deterministic:
-            return mel
-            
-        B, T, F = mel.shape
-        rng = self.make_rng('specaugment')
-
-        x = mel
-        
-        for i in range(self.num_time_masks):
-            rng, k1, k2 = jax.random.split(rng, 3)
-            width = jax.random.randint(k1, (), 0, jnp.minimum(self.max_time_width, T))
-            start = jax.random.randint(k2, (), 0, jnp.maximum(T - width, 1))
-            time_mask = (jnp.arange(T) >= start) & (jnp.arange(T) < start + width)
-            x = x * (1.0 - time_mask[None, :, None].astype(x.dtype))
-
-        for i in range(self.num_freq_masks):
-            rng, k1, k2 = jax.random.split(rng, 3)
-            width = jax.random.randint(k1, (), 0, jnp.minimum(self.max_freq_width, F))
-            start = jax.random.randint(k2, (), 0, jnp.maximum(F - width, 1))
-            freq_mask = (jnp.arange(F) >= start) & (jnp.arange(F) < start + width)
-            x = x * (1.0 - freq_mask[None, None, :].astype(x.dtype))
-
-        return x
-
-
 class EncoderDecoderTransformer(nn.Module):
     """Encoder-decoder transformer with shared embeddings, tied output, RoPE, and bfloat16."""
     config: TransformerConfig
@@ -406,10 +330,6 @@ class EncoderDecoderTransformer(nn.Module):
     def setup(self):
         self.embedding = nn.Embed(self.config.vocab_size, self.config.d_model, embedding_init=jinit.normal(stddev=0.02))
         self.embed_scale = math.sqrt(self.config.d_model)
-        if self.config.enable_speech:
-            self.spec_augment = SpecAugment()
-            self.speech_subsample = SpeechSubsampling(
-                self.config.d_model, dtype=self.config.jax_dtype, name="speech_subsample")
         self.encoder = Encoder(self.config)
         self.decoder = Decoder(self.config)
         self.contrastive_hidden = nn.Dense(
@@ -421,15 +341,6 @@ class EncoderDecoderTransformer(nn.Module):
             use_bias=False, kernel_init=default_init(), name="contrastive_proj",
         )
         self.log_temp = self.param("log_temp", jinit.zeros, ())
-        
-        # self.confidence_hidden = nn.Dense(
-        #     self.config.d_model, dtype=self.config.jax_dtype,
-        #     kernel_init=default_init(), name="confidence_hidden",
-        # )
-        # self.confidence_out = nn.Dense(
-        #     1, dtype=jnp.float32,
-        #     kernel_init=jinit.zeros, name="confidence_out",
-        # )
 
     def _rope(self, seq_len):
         head_dim = self.config.d_model // self.config.num_heads
@@ -443,23 +354,6 @@ class EncoderDecoderTransformer(nn.Module):
     def encode(self, src, src_mask=None):
         """Backward-compatible alias for encode_text."""
         return self.encode_text(src, src_mask=src_mask)
-
-    def encode_speech(self, mel, src_mask=None, ffn_mask=None, deterministic=True):
-        assert self.config.enable_speech, "Speech is disabled in config"
-        mel = self.spec_augment(mel, deterministic=deterministic)
-        # FastConformer-style 8x subsampling: (B, T, 80) -> (B, T//8, d_model)
-        x = self.speech_subsample(mel) * self.embed_scale
-        if src_mask is not None:
-            T_new = x.shape[1]
-            # Downsample mask by 8x: group frames and keep valid if any in group
-            T_mask = src_mask.shape[-1]
-            pad_needed = (8 - T_mask % 8) % 8
-            if pad_needed > 0:
-                src_mask = jnp.pad(src_mask, ((0, 0), (0, 0), (0, 0), (0, pad_needed)))
-            src_mask = src_mask.reshape(src_mask.shape[0], 1, 1, -1, 8).any(axis=-1)
-            src_mask = src_mask[..., :T_new]
-        rope = self._rope(x.shape[1])
-        return self.encoder(x, mask=src_mask, rope=rope, ffn_mask=ffn_mask, deterministic=deterministic)
 
     def decode(self, tgt, encoder_out, self_mask=None, cross_mask=None, deterministic=True):
         """Decode from encoder output with cross_mask for variable-length encoder output."""
@@ -479,18 +373,6 @@ class EncoderDecoderTransformer(nn.Module):
         summed = jnp.sum(encoder_out * mask_3d, axis=1) 
         counts = jnp.maximum(jnp.sum(mask_2d, axis=1, keepdims=True), 1.0)
         return summed / counts
-
-    # def predict_confidence(self, encoder_out, enc_mask):
-    #     """Predict confidence score [0, 1] from encoder output."""
-    #     pooled = self._mean_pool(encoder_out, enc_mask)
-    #     h = nn.relu(self.confidence_hidden(pooled))
-    #     return nn.sigmoid(self.confidence_out(h)).squeeze(-1)
-
-    # def forward_confidence(self, src, src_mask=None):
-    #     """End-to-end confidence prediction from token input."""
-    #     encoder_out, enc_mask = self.encode_text(src, src_mask=src_mask)
-    #     confidence = self.predict_confidence(encoder_out, enc_mask)
-    #     return confidence, encoder_out, enc_mask
 
     def encode_contrastive(self, tokens, deterministic=True):
         """Encode tokens and project to L2-normalized contrastive space. Returns (B, contrastive_dim)."""
@@ -532,13 +414,6 @@ class EncoderDecoderTransformer(nn.Module):
         logits = x_f32 @ self.embedding.embedding.T
         return logits, 0.0
 
-    def forward_speech_masked(self, mel, tgt, src_mask=None, tgt_mask=None, ffn_mask=None, deterministic=True):
-        """Single speech forward with per-batch-item FFN masking. Returns (logits, slot_div)."""
-        encoder_out, enc_mask = self.encode_speech(mel, src_mask=src_mask, ffn_mask=ffn_mask, deterministic=deterministic)
-        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, cross_mask=enc_mask, ffn_mask=ffn_mask, deterministic=deterministic)
-        logits = x_f32 @ self.embedding.embedding.T
-        return logits, 0.0
-
     def _make_eval_ffn_mask(self, ff_width, B, dtype):
         """Default prefix FFN mask for eval: first ff_width neurons active."""
         mask = (jnp.arange(self.config.d_ff) < ff_width).astype(dtype)
@@ -567,35 +442,12 @@ class EncoderDecoderTransformer(nn.Module):
 
         return logits, 0.0, mat_logits
 
-    def forward_speech_with_aux(self, mel, tgt, src_mask=None, tgt_mask=None, mat_ff_widths=None, deterministic=True):
-        """Eval-only: separate per-width speech forwards for reporting per-width PPL."""
-        emb = self.embedding.embedding
-        B = mel.shape[0]
-
-        encoder_out, enc_mask = self.encode_speech(mel, src_mask=src_mask, deterministic=deterministic)
-        x_f32 = self._run_decoder(encoder_out, tgt, tgt_mask=tgt_mask, cross_mask=enc_mask)
-        logits = x_f32 @ emb.T
-
-        mat_logits = []
-        if mat_ff_widths is not None:
-            for ff_w in mat_ff_widths:
-                mask = self._make_eval_ffn_mask(ff_w, B, x_f32.dtype)
-                enc_m, enc_m_mask = self.encode_speech(mel, src_mask=src_mask, ffn_mask=mask, deterministic=deterministic)
-                x_m = self._run_decoder(enc_m, tgt, tgt_mask=tgt_mask, cross_mask=enc_m_mask, ffn_mask=mask)
-                mat_logits.append(x_m @ emb.T)
-
-        return logits, 0.0, mat_logits
-
-    def init_all(self, src, tgt, mel=None):
-        """Dummy forward through text (and optionally speech) pathways to initialize all params."""
+    def init_all(self, src, tgt):
+        """Dummy forward through text pathway to initialize all params."""
         src_mask = make_padding_mask(src, self.config.pad_token_id)
         tgt_mask = make_causal_mask(tgt.shape[1]) & make_padding_mask(tgt, self.config.pad_token_id)
         text_out, text_enc_mask = self.encode_text(src, src_mask=src_mask)
         _ = self._run_decoder(text_out, tgt, tgt_mask=tgt_mask, cross_mask=text_enc_mask)
-        if self.config.enable_speech and mel is not None:
-            mel_mask = make_mel_padding_mask(mel)
-            speech_out, speech_enc_mask = self.encode_speech(mel, src_mask=mel_mask, deterministic=True)
-            _ = self._run_decoder(speech_out, tgt, tgt_mask=tgt_mask, cross_mask=speech_enc_mask)
         _ = self.encode_contrastive(src)
         return jnp.zeros(())
 
@@ -607,12 +459,6 @@ def make_causal_mask(seq_len):
 
 def make_padding_mask(tokens, pad_token_id):
     mask = tokens != pad_token_id
-    return mask[:, None, None, :]
-
-
-def make_mel_padding_mask(mel):
-    """Create padding mask from mel spectrogram: non-zero frames are valid."""
-    mask = jnp.any(mel != 0, axis=-1)
     return mask[:, None, None, :]
 
 

@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax.training import train_state
-from .model import EncoderDecoderTransformer
+from ..model.architecture import EncoderDecoderTransformer
 
 
 def _newton_schulz(G, steps=5):
@@ -87,12 +87,9 @@ def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_
     rng, init_rng = jax.random.split(rng)
     dummy_src = jnp.ones((1, 128), dtype=jnp.int32)
     dummy_tgt = jnp.ones((1, 128), dtype=jnp.int32)
-    init_args = [dummy_src, dummy_tgt]
-    if config.enable_speech:
-        init_args.append(jnp.ones((1, 128, config.n_mels), dtype=jnp.float32))
     variables = model.init(
         {"params": init_rng},
-        *init_args,
+        dummy_src, dummy_tgt,
         method="init_all",
     )
 

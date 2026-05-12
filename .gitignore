@@ -91,3 +91,4 @@ wandb/
 tokenizer/
 data/
 voice_samples/
+needle-ui.*

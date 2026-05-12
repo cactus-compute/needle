@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .model import TransformerConfig
+from .architecture import TransformerConfig
 
 _FFN_KERNEL_NAMES = {"gate_proj", "up_proj", "down_proj"}
 

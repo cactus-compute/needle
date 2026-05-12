@@ -119,7 +119,7 @@ def train_tokenizer(vocab_size=8192, max_samples=None, force=False):
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
 
     from datasets import concatenate_datasets
-    from .data import _load_split_dataset
+    from .dataset import _load_split_dataset
 
     train_ds = _load_split_dataset("train")
     val_ds = _load_split_dataset("validation")

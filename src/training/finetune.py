@@ -7,8 +7,8 @@ import shutil
 import tempfile
 import time
 
-from . import data as data_mod
-from .data import _cache_key, _save_cache_metadata, get_tokenizer, pack_sequences, prepare_tool_call_pairs
+from ..dataset import dataset as data_mod
+from ..dataset.dataset import _cache_key, _save_cache_metadata, get_tokenizer, pack_sequences, prepare_tool_call_pairs
 
 
 def _write_split(split, examples, tokenizer, cache_dir, max_enc_len, max_dec_len):
@@ -60,7 +60,7 @@ def _call_key(c):
 
 def _quick_tool_eval(model, params, tokenizer, examples, max_gen_len=512, max_enc_len=1024):
     """Tool-call eval matching needle's F1 methodology (TP/FP/FN)."""
-    from .run import generate_batch
+    from ..model.run import generate_batch
 
     samples = [ex for ex in examples
                if ex.get("answers", "").strip() not in ("", "[]")]
@@ -222,7 +222,7 @@ def finetune_local(args):
     if len(examples) < 3:
         raise ValueError("finetune requires at least 3 examples for train/val/test splits")
 
-    from .tokenizer import DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN
+    from ..dataset.tokenizer import DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN
     max_enc_len = getattr(args, "max_enc_len", None) or DEFAULT_MAX_ENC_LEN
     max_dec_len = getattr(args, "max_dec_len", None) or DEFAULT_MAX_DEC_LEN
 
@@ -276,8 +276,8 @@ def finetune_local(args):
         val_ds = _Dataset.from_list(val_examples)
 
         # Base model eval on TEST set (never seen by model)
-        from .run import load_checkpoint
-        from .model import EncoderDecoderTransformer
+        from ..model.run import load_checkpoint
+        from ..model.architecture import EncoderDecoderTransformer
         print(f"Evaluating base model on {len(test_examples)} test examples...")
         base_params, base_config = load_checkpoint(args.checkpoint)
         base_model = EncoderDecoderTransformer(base_config)
@@ -310,20 +310,18 @@ def finetune_local(args):
             dtype=cfg.get("dtype", "bfloat16"),
             checkpoint_dir=args.checkpoint_dir, seed=42,
             eval_every=max(1, approx_steps), max_eval_samples=min(val_kept, 50),
-            sparsity_ratio=0.0, group_size=32, precision="int4",
-            prune_interval=100, prune_start_frac=0.33, prune_end_frac=0.67,
+            precision="int4",
             activation=cfg.get("activation", "drelu"),
             mat_factors=[2, 4], dropout=0.0,
             contrastive_weight=0.1,
             contrastive_dim=cfg.get("contrastive_dim", 128),
             num_memory_slots=cfg.get("num_memory_slots", 64),
-            enable_speech=cfg.get("enable_speech", False),
             w_name=2.0, w_value=4.0, w_key=1.5,
             no_feedforward=cfg.get("no_feedforward", True),
             val_ds=val_ds,
         )
 
-        from .train import train
+        from ..training.train import train
         train(train_args)
         best_path = _ensure_best_checkpoint(args.checkpoint_dir, run_id)
 
