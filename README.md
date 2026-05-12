@@ -116,7 +116,7 @@ needle tpu <action>                TPU management (see docs/tpu.md)
 ```
 @misc{ndubuaku2026needle,
   title={Needle},
-  author={Henry Ndubuaku and Jakub Mroz and Karen Mosoyan and Roman Shemet and Parkirat Sandhu and Satyajit Kumar and Noah Cylich and Justin H. Lee},
+  author={Henry Ndubuaku, Jakub Mroz,  Karen Mosoyan, Roman Shemet, Parkirat Sandhu, Satyajit Kumar, Noah Cylich, Justin H. Lee},
   year={2026},
   url={https://github.com/cactus-compute/needle}
 }
