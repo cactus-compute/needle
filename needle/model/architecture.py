@@ -11,6 +11,10 @@ def default_init():
     return jinit.normal(stddev=0.02)
 
 
+def lora_init(shape, dtype=jnp.float32):
+    return jinit.zeros(shape, dtype)
+
+
 def residual_init(num_layers):
     return jinit.normal(stddev=0.02 / math.sqrt(2 * num_layers))
 
@@ -48,6 +52,8 @@ class TransformerConfig:
     dropout_rate: float = 0.1
     contrastive_dim: int = 128
     no_feedforward: bool = True
+    lora_rank: int = 0
+    lora_alpha: int = 16
 
     def __init__(self, **kwargs):
         valid = {f.name for f in self.__dataclass_fields__.values()}
@@ -81,6 +87,29 @@ def apply_rope(x, cos, sin):
     return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
 
 
+class LoRADense(nn.Module):
+    features: int
+    dtype: jnp.dtype = jnp.bfloat16
+    use_bias: bool = False
+    kernel_init: callable = default_init
+    lora_rank: int = 0
+    lora_alpha: int = 16
+
+    @nn.compact
+    def __call__(self, inputs):
+        kernel = self.param("kernel", self.kernel_init, (inputs.shape[-1], self.features))
+        out = jnp.asarray(jnp.dot(inputs, kernel), dtype=self.dtype)
+        if self.lora_rank > 0:
+            lora_a = self.param("lora_A", lora_init, (inputs.shape[-1], self.lora_rank))
+            lora_b = self.param("lora_B", lora_init, (self.lora_rank, self.features))
+            scaling = self.lora_alpha / max(self.lora_rank, 1)
+            out = out + jnp.asarray(jnp.dot(jnp.dot(inputs, lora_a), lora_b) * scaling, dtype=self.dtype)
+        if self.use_bias:
+            bias = self.param("bias", jinit.zeros, (self.features,))
+            out = out + bias
+        return out
+
+
 class MultiHeadAttention(nn.Module):
     num_heads: int
     num_kv_heads: int
@@ -88,6 +117,8 @@ class MultiHeadAttention(nn.Module):
     num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
     rope_keys_only: bool = False
+    lora_rank: int = 0
+    lora_alpha: int = 16
 
     @nn.compact
     def __call__(self, q_input, kv_input, mask=None, rope=None):
@@ -95,9 +126,9 @@ class MultiHeadAttention(nn.Module):
         kv_dim = self.num_kv_heads * head_dim
         B = q_input.shape[0]
 
-        q = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="q_proj")(q_input)
-        k = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="k_proj")(kv_input)
-        v = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="v_proj")(kv_input)
+        q = LoRADense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=default_init(), lora_rank=self.lora_rank, lora_alpha=self.lora_alpha, name="q_proj")(q_input)
+        k = LoRADense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), lora_rank=self.lora_rank, lora_alpha=self.lora_alpha, name="k_proj")(kv_input)
+        v = LoRADense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), lora_rank=self.lora_rank, lora_alpha=self.lora_alpha, name="v_proj")(kv_input)
 
         q = q.reshape(B, -1, self.num_heads, head_dim).transpose(0, 2, 1, 3)
         k = k.reshape(B, -1, self.num_kv_heads, head_dim).transpose(0, 2, 1, 3)
@@ -127,7 +158,7 @@ class MultiHeadAttention(nn.Module):
 
         out = jnp.matmul(attn_weights, v)
         out = out.transpose(0, 2, 1, 3).reshape(B, -1, self.d_model)
-        return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="out_proj")(out)
+        return LoRADense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), lora_rank=self.lora_rank, lora_alpha=self.lora_alpha, name="out_proj")(out)
 
 
 class FeedForward(nn.Module):
@@ -136,11 +167,13 @@ class FeedForward(nn.Module):
     num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
     activation: str = "drelu"
+    lora_rank: int = 0
+    lora_alpha: int = 16
 
     @nn.compact
     def __call__(self, x, ffn_mask=None):
-        gate = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="gate_proj")(x)
-        up = nn.Dense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="up_proj")(x)
+        gate = LoRADense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), lora_rank=self.lora_rank, lora_alpha=self.lora_alpha, name="gate_proj")(x)
+        up = LoRADense(self.d_ff, dtype=self.dtype, use_bias=False, kernel_init=default_init(), lora_rank=self.lora_rank, lora_alpha=self.lora_alpha, name="up_proj")(x)
         if self.activation == "swiglu":
             h = nn.silu(gate) * up
         elif self.activation == "geglu":
@@ -149,7 +182,7 @@ class FeedForward(nn.Module):
             h = nn.relu(gate) * nn.relu(up)
         if ffn_mask is not None:
             h = h * ffn_mask[:, None, :] 
-        return nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), name="down_proj")(h)
+        return LoRADense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=residual_init(self.num_layers), lora_rank=self.lora_rank, lora_alpha=self.lora_alpha, name="down_proj")(h)
 
 
 class EncoderBlock(nn.Module):
@@ -163,22 +196,28 @@ class EncoderBlock(nn.Module):
     activation: str = "drelu"
     dropout_rate: float = 0.0
     no_feedforward: bool = True
+    lora_rank: int = 0
+    lora_alpha: int = 16
 
     @nn.compact
     def __call__(self, x, mask=None, rope=None, ffn_mask=None, deterministic=True):
         gate = nn.sigmoid(self.param("attn_gate", jinit.zeros, ())).astype(self.dtype)
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
-            x, x, mask=mask, rope=rope
-        )
+        x = MultiHeadAttention(
+            self.num_heads, self.num_kv_heads, self.d_model, self.num_layers,
+            self.dtype, name="self_attn", lora_rank=self.lora_rank, lora_alpha=self.lora_alpha,
+        )(x, x, mask=mask, rope=rope)
         x = residual + gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
 
         if not self.no_feedforward:
             ffn_gate = nn.sigmoid(self.param("ffn_gate", jinit.zeros, ())).astype(self.dtype)
             residual = x
             x = ZCRMSNorm(dtype=self.dtype)(x)
-            x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x, ffn_mask=ffn_mask)
+            x = FeedForward(
+                self.d_model, self.d_ff, self.num_layers, self.dtype,
+                self.activation, lora_rank=self.lora_rank, lora_alpha=self.lora_alpha,
+            )(x, ffn_mask=ffn_mask)
             x = residual + ffn_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
 
         return x
@@ -195,6 +234,8 @@ class _EncoderScanBody(nn.Module):
     activation: str = "drelu"
     dropout_rate: float = 0.0
     no_feedforward: bool = True
+    lora_rank: int = 0
+    lora_alpha: int = 16
     deterministic: bool = True
 
     @nn.compact
@@ -203,7 +244,7 @@ class _EncoderScanBody(nn.Module):
         x = EncoderBlock(
             self.num_heads, self.num_kv_heads, self.d_model, self.d_ff,
             self.num_layers, self.dtype, self.activation, self.dropout_rate,
-            self.no_feedforward,
+            self.no_feedforward, lora_rank=self.lora_rank, lora_alpha=self.lora_alpha,
         )(x, mask, rope, ffn_mask, self.deterministic)
         return (x, mask, rope, ffn_mask), None
 
@@ -227,7 +268,7 @@ class Encoder(nn.Module):
         (x, _, _, _), _ = ScanBlock(
             cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
             cfg.total_layers, dt, cfg.activation, cfg.dropout_rate,
-            cfg.no_feedforward, deterministic, name="layers",
+            cfg.no_feedforward, cfg.lora_rank, cfg.lora_alpha, deterministic, name="layers",
         )((x, mask, rope, ffn_mask), None)
 
         x = ZCRMSNorm(dtype=dt, name="final_norm")(x)
@@ -244,30 +285,37 @@ class DecoderBlock(nn.Module):
     activation: str = "drelu"
     dropout_rate: float = 0.0
     no_feedforward: bool = True
+    lora_rank: int = 0
+    lora_alpha: int = 16
 
     @nn.compact
     def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, ffn_mask=None, deterministic=True):
         self_gate = nn.sigmoid(self.param("self_attn_gate", jinit.zeros, ())).astype(self.dtype)
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
-            x, x, mask=self_mask, rope=rope
-        )
+        x = MultiHeadAttention(
+            self.num_heads, self.num_kv_heads, self.d_model, self.num_layers,
+            self.dtype, name="self_attn", lora_rank=self.lora_rank, lora_alpha=self.lora_alpha,
+        )(x, x, mask=self_mask, rope=rope)
         x = residual + self_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
 
         cross_gate = nn.sigmoid(self.param("cross_attn_gate", jinit.zeros, ())).astype(self.dtype)
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="cross_attn")(
-            x, encoder_out, mask=cross_mask
-        )
+        x = MultiHeadAttention(
+            self.num_heads, self.num_kv_heads, self.d_model, self.num_layers,
+            self.dtype, name="cross_attn", lora_rank=self.lora_rank, lora_alpha=self.lora_alpha,
+        )(x, encoder_out, mask=cross_mask)
         x = residual + cross_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
 
         if not self.no_feedforward:
             ffn_gate = nn.sigmoid(self.param("ffn_gate", jinit.zeros, ())).astype(self.dtype)
             residual = x
             x = ZCRMSNorm(dtype=self.dtype)(x)
-            x = FeedForward(self.d_model, self.d_ff, self.num_layers, self.dtype, self.activation)(x, ffn_mask=ffn_mask)
+            x = FeedForward(
+                self.d_model, self.d_ff, self.num_layers, self.dtype,
+                self.activation, lora_rank=self.lora_rank, lora_alpha=self.lora_alpha,
+            )(x, ffn_mask=ffn_mask)
             x = residual + ffn_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
 
         return x
@@ -285,6 +333,8 @@ class _DecoderScanBody(nn.Module):
     activation: str = "drelu"
     dropout_rate: float = 0.0
     no_feedforward: bool = True
+    lora_rank: int = 0
+    lora_alpha: int = 16
     deterministic: bool = True
 
     @nn.compact
@@ -293,7 +343,7 @@ class _DecoderScanBody(nn.Module):
         x = DecoderBlock(
             self.num_heads, self.num_kv_heads, self.d_model, self.d_ff,
             self.num_layers, self.dtype, self.activation, self.dropout_rate,
-            self.no_feedforward,
+            self.no_feedforward, lora_rank=self.lora_rank, lora_alpha=self.lora_alpha,
         )(x, encoder_out, self_mask, cross_mask, rope, ffn_mask, self.deterministic)
         return (x, encoder_out, self_mask, cross_mask, rope, ffn_mask), None
 
@@ -316,7 +366,7 @@ class Decoder(nn.Module):
         (x, _, _, _, _, _), _ = ScanBlock(
             cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
             cfg.total_layers, dt, cfg.activation, cfg.dropout_rate,
-            cfg.no_feedforward, deterministic, name="layers",
+            cfg.no_feedforward, cfg.lora_rank, cfg.lora_alpha, deterministic, name="layers",
         )((x, encoder_out, self_mask, cross_mask, rope, ffn_mask), None)
 
         x = ZCRMSNorm(dtype=dt)(x)
