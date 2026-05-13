@@ -77,6 +77,8 @@ async function send() {
   btn.disabled = true;
   result.className = "result-box";
   result.textContent = "Running...";
+  var confEl = document.getElementById("confidence");
+  if (confEl) confEl.textContent = "";
 
   try {
     var r = await fetch("/generate", {
@@ -101,6 +103,11 @@ async function send() {
     } else {
       result.className = "result-box has-result";
       result.textContent = data.result;
+      if (data.confidence !== null && data.confidence !== undefined) {
+        var pct = Math.round(data.confidence * 100);
+        var confEl = document.getElementById("confidence");
+        if (confEl) confEl.textContent = "Confidence: " + pct + "%";
+      }
     }
   } catch (e) {
     result.textContent = "";
