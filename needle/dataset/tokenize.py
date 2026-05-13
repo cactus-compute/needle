@@ -28,24 +28,25 @@ from .dataset import (
 )
 
 
-_HF_TOKENIZER_REPO = "Cactus-Compute/needle-tokenizer"
+_HF_MODEL_REPO = "Cactus-Compute/needle"
 _HF_TOKENIZED_REPO = "Cactus-Compute/tokenized-tool-calls"
 
 
 def _push_to_hf(cache_dir, tokenizer_dir):
-    """Upload tokenizer and tokenized data to their respective HuggingFace repos."""
+    """Upload tokenizer and tokenized data to HuggingFace."""
     from huggingface_hub import HfApi
 
     api = HfApi()
 
-    api.create_repo(_HF_TOKENIZER_REPO, repo_type="dataset", private=True, exist_ok=True)
-    print(f"Uploading tokenizer to {_HF_TOKENIZER_REPO} ...")
-    api.upload_folder(
-        folder_path=tokenizer_dir,
-        repo_id=_HF_TOKENIZER_REPO,
-        repo_type="dataset",
-        allow_patterns=["*.model", "*.vocab"],
-    )
+    print(f"Uploading tokenizer to {_HF_MODEL_REPO} ...")
+    for fname in os.listdir(tokenizer_dir):
+        if fname.endswith((".model", ".vocab")):
+            api.upload_file(
+                path_or_fileobj=os.path.join(tokenizer_dir, fname),
+                path_in_repo=f"tokenizer/{fname}",
+                repo_id=_HF_MODEL_REPO,
+                repo_type="model",
+            )
 
     api.create_repo(_HF_TOKENIZED_REPO, repo_type="dataset", private=True, exist_ok=True)
     print(f"Uploading tokenized data to {_HF_TOKENIZED_REPO} ...")
@@ -54,7 +55,7 @@ def _push_to_hf(cache_dir, tokenizer_dir):
         repo_id=_HF_TOKENIZED_REPO,
         repo_type="dataset",
         allow_patterns=["*.npy", "*.json"],
-        delete_patterns=["*.npy", "*.json"],  
+        delete_patterns=["*.npy", "*.json"],
     )
 
     print("HuggingFace upload complete.")

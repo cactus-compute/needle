@@ -21,7 +21,6 @@ from .tokenizer import (
     DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN,
     to_snake_case, NeedleTokenizer, train_tokenizer, get_tokenizer,
     _download_tokenizer_from_hf, TOKENIZER_DIR, TOKENIZER_PREFIX,
-    _HF_TOKENIZER_REPO,
 )
 
 import re as _re

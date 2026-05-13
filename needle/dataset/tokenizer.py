@@ -19,7 +19,7 @@ DEFAULT_MAX_ENC_LEN = 1024
 DEFAULT_MAX_DEC_LEN = 512
 DEFAULT_MAX_GEN_LEN = 512
 
-_HF_TOKENIZER_REPO = "Cactus-Compute/needle-tokenizer"
+_HF_MODEL_REPO = "Cactus-Compute/needle"
 
 
 def to_snake_case(name):
@@ -86,19 +86,22 @@ class NeedleTokenizer:
 
 def _download_tokenizer_from_hf():
     """Download tokenizer files from HuggingFace Hub into TOKENIZER_DIR."""
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import hf_hub_download
 
-    local = snapshot_download(
-        _HF_TOKENIZER_REPO,
-        repo_type="dataset",
-    )
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
-    for fname in os.listdir(local):
-        if fname.startswith("."):
-            continue
+    for fname in ["needle.model", "needle.vocab"]:
+        hf_hub_download(
+            repo_id=_HF_MODEL_REPO,
+            filename=f"tokenizer/{fname}",
+            repo_type="model",
+            local_dir=TOKENIZER_DIR,
+            force_download=True,
+        )
+        # hf_hub_download puts it in tokenizer/tokenizer/needle.model, move up
+        nested = os.path.join(TOKENIZER_DIR, "tokenizer", fname)
         dst = os.path.join(TOKENIZER_DIR, fname)
-        if not os.path.exists(dst):
-            os.symlink(os.path.join(local, fname), dst)
+        if os.path.exists(nested) and not os.path.exists(dst):
+            os.rename(nested, dst)
 
 
 def get_tokenizer(max_samples=None):
