@@ -1,0 +1,5 @@
+{
+  "library_name": "jax",
+  "model_type": "custom",
+  "architectures": ["SimpleAttentionNetwork"]
+}
