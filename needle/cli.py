@@ -238,6 +238,21 @@ def main():
     p.add_argument("--max-enc-len", type=int, default=None)
     p.add_argument("--max-dec-len", type=int, default=None)
 
+    p = sub.add_parser("export", add_help=False)
+    p.add_argument("--checkpoint", type=str, required=True,
+                   help="Path to trained checkpoint file")
+    p.add_argument("--format", type=str, required=True,
+                   choices=["onnx", "coreml", "tflite"],
+                   help="Export format: onnx, coreml, or tflite")
+    p.add_argument("--output", type=str, required=True,
+                   help="Output file path")
+    p.add_argument("--max-seq-len", type=int, default=128,
+                   help="Maximum sequence length for exported model (default: 128)")
+    p.add_argument("--batch-size", type=int, default=1,
+                   help="Batch size for exported model (default: 1)")
+    p.add_argument("--opset", type=int, default=17,
+                   help="ONNX opset version (default: 17)")
+
     p = sub.add_parser("playground", add_help=False)
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--port", type=int, default=7860)
@@ -333,6 +348,9 @@ def main():
     elif args.command == "finetune":
         from .training.finetune import finetune_local
         finetune_local(args)
+    elif args.command == "export":
+        from .model.export import export_model
+        export_model(args)
     elif args.command == "playground":
         from .ui.server import main as ui_main
         ui_main(args)
