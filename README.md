@@ -82,7 +82,7 @@ tokenizer = get_tokenizer()
 result = generate(
     model, params, tokenizer,
     query="What's the weather in San Francisco?",
-    tools='[{"name":"get_weather","parameters":{"location":"string"}}]',
+    tools='[{"name":"get_weather","description":"Get current weather for a city.","parameters":{"location":{"type":"string","description":"City name.","required":true}}}]',
     stream=False,
 )
 print(result)
@@ -97,6 +97,49 @@ needle playground
 
 # CLI (auto-downloads weights if not local)
 needle finetune data.jsonl
+```
+
+### Data format
+
+Each line in the JSONL file has three fields: `query`, `tools`, and `answers`.
+
+**Tool schema:**
+```json
+{
+  "name": "get_weather",
+  "description": "Get current weather for a city.",
+  "parameters": {
+    "location": { "type": "string", "description": "City name.", "required": true }
+  }
+}
+```
+
+**Answer schema:**
+```json
+{ "name": "get_weather", "arguments": { "location": "Paris" } }
+```
+
+**Full JSONL example** (each line is one training example, `tools` and `answers` are JSON-encoded strings):
+```jsonl
+{"query": "What's the weather in Paris?", "tools": "[{\"name\":\"get_weather\",\"description\":\"Get current weather for a city.\",\"parameters\":{\"location\":{\"type\":\"string\",\"description\":\"City name.\",\"required\":true}}}]", "answers": "[{\"name\":\"get_weather\",\"arguments\":{\"location\":\"Paris\"}}]"}
+{"query": "Turn off the lights", "tools": "[{\"name\":\"get_weather\",\"description\":\"Get current weather for a city.\",\"parameters\":{\"location\":{\"type\":\"string\",\"description\":\"City name.\",\"required\":true}}},{\"name\":\"toggle_lights\",\"description\":\"Toggle smart lights on or off.\",\"parameters\":{\"state\":{\"type\":\"string\",\"description\":\"on or off.\",\"required\":true}}}]", "answers": "[{\"name\":\"toggle_lights\",\"arguments\":{\"state\":\"off\"}}]"}
+```
+
+Provide at least **120 examples per tool** (100 train / 10 val / 10 test). Fewer examples will overfit — you'll see perfect training metrics but the model won't generalize. Vary query phrasing and include examples with multiple tools available.
+
+### Using a finetuned model
+
+Finetuning saves the best checkpoint as `checkpoints/needle_finetuned_<id>_best.pkl`:
+
+```bash
+needle run --checkpoint checkpoints/needle_finetuned_*_best.pkl \
+  --query "What's the weather?" --tools '[{"name":"get_weather","description":"Get current weather for a city.","parameters":{"location":{"type":"string","description":"City name.","required":true}}}]'
+```
+
+```python
+params, config = load_checkpoint("checkpoints/needle_finetuned_<id>_best.pkl")
+model = SimpleAttentionNetwork(config)
+result = generate(model, params, get_tokenizer(), query="...", tools='[...]', stream=False)
 ```
 
 ## CLI

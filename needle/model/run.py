@@ -284,9 +284,9 @@ def main(args):
         queries = [(query, tools)]
     else:
         queries = [
-            ('What is the weather in San Francisco?', '[{"name": "get_weather", "parameters": {"location": "string"}}]'),
-            ('Send an email to john@example.com saying hello', '[{"name": "send_email", "parameters": {"to": "string", "body": "string"}}]'),
-            ('Get the current stock price of AAPL', '[{"name": "get_stock_price", "parameters": {"symbol": "string"}}]'),
+            ('What is the weather in San Francisco?', '[{"name": "get_weather", "description": "Get current weather for a city.", "parameters": {"location": {"type": "string", "description": "City name.", "required": true}}}]'),
+            ('Send an email to john@example.com saying hello', '[{"name": "send_email", "description": "Send an email to a recipient.", "parameters": {"to": {"type": "string", "description": "The recipient email address.", "required": true}, "body": {"type": "string", "description": "The email body text.", "required": true}}}]'),
+            ('Get the current stock price of AAPL', '[{"name": "get_stock_price", "description": "Get the current stock price.", "parameters": {"symbol": {"type": "string", "description": "Ticker symbol.", "required": true}}}]'),
         ]
 
     for i, (q, t) in enumerate(queries):
