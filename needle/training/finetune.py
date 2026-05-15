@@ -6,6 +6,7 @@ import random
 import shutil
 import tempfile
 import time
+from collections import Counter
 
 from ..dataset import dataset as data_mod
 from ..dataset.dataset import _cache_key, _save_cache_metadata, get_tokenizer, pack_sequences, prepare_tool_call_pairs
@@ -236,6 +237,23 @@ def finetune_local(args):
     print(f"Loaded {len(examples)} examples from {args.jsonl_path}")
     if len(examples) < 3:
         raise ValueError("finetune requires at least 3 examples for train/val/test splits")
+    tool_counts = Counter()
+    for ex in examples:
+        for call in json.loads(ex.get("answers", "[]")):
+            if call.get("name"):
+                tool_counts[call["name"]] += 1
+    low_tools = {t: c for t, c in tool_counts.items() if c < 120}
+    if low_tools:
+        print(
+            f"\n⚠  WARNING: The following tools have fewer than 120 examples "
+            f"(need at least 120 per tool: 100 train / 10 val / 10 test):"
+        )
+        for tool, count in sorted(low_tools.items()):
+            print(f"   • {tool}: {count}")
+        print(
+            f"   Finetuning with too few examples will overfit (perfect training "
+            f"metrics but poor real-world performance). Add more diverse examples.\n"
+        )
 
     from ..dataset.tokenizer import DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN
     max_enc_len = getattr(args, "max_enc_len", None) or DEFAULT_MAX_ENC_LEN

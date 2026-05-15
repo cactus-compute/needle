@@ -98,7 +98,7 @@ tokenizer = get_tokenizer()
 result = generate(
     model, params, tokenizer,
     query="What's the weather in San Francisco?",
-    tools='[{"name":"get_weather","parameters":{"location":"string"}}]',
+    tools='[{"name":"get_weather","description":"Get current weather for a city.","parameters":{"location":{"type":"string","description":"City name.","required":true}}}]',
     stream=False,
 )
 print(result)
