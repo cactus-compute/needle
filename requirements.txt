@@ -10,3 +10,10 @@ wandb
 pyyaml
 sentencepiece
 google-genai
+# Export dependencies (optional)
+onnxruntime
+onnx
+tf2onnx
+jax2tf
+coremltools
+tensorflow
