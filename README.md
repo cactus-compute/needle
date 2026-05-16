@@ -148,6 +148,7 @@ result = generate(model, params, get_tokenizer(), query="...", tools='[...]', st
 needle playground                  Test and finetune via web UI
 needle finetune <data.jsonl>       Finetune on your own data
 needle run --query "..." --tools   Single inference
+needle mcp-server                  Run Needle as a local MCP tool router
 needle train                       Full training run
 needle pretrain                    Pretrain on PleIAs/SYNTH
 needle eval --checkpoint <path>    Evaluate a checkpoint
@@ -155,6 +156,61 @@ needle tokenize                    Tokenize dataset
 needle generate-data               Synthesize training data via Gemini
 needle tpu <action>                TPU management (see docs/tpu.md)
 ```
+
+## Local MCP Server
+
+Needle can be run as a local MCP tool router for agent workflows, with either stdio transport or a lightweight HTTP transport.
+
+### Start the local MCP server
+
+```bash
+needle mcp-server --checkpoint checkpoints/needle.pkl
+```
+
+### Run over HTTP
+
+```bash
+needle mcp-server --checkpoint checkpoints/needle.pkl --transport http --host 127.0.0.1 --port 8765
+```
+
+### Claude Desktop / MCP orchestrator configuration
+
+Use the local Needle process as a tool router for any MCP-compatible orchestrator.
+
+```json
+{
+  "mcpServers": {
+    "needle": {
+      "command": "needle",
+      "args": [
+        "mcp-server",
+        "--checkpoint",
+        "/path/to/needle/checkpoints/needle.pkl",
+        "--transport",
+        "http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8765"
+      ]
+    }
+  }
+}
+```
+
+With `--transport http`, the server listens on `http://127.0.0.1:8765` and accepts JSON-RPC 2.0 requests at the root path.
+
+### Health check
+
+```bash
+curl http://127.0.0.1:8765/health
+```
+
+### How the router works
+
+1. The orchestrator sends a natural language query and the available tool metadata.
+2. Needle returns a `tool_call`, `confidence`, and `match` flag.
+3. The orchestrator can execute the chosen tool locally if confidence is high, or escalate to a cloud LLM if not.
 
 ```
 @misc{ndubuaku2026needle,
