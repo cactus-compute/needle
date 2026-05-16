@@ -329,26 +329,47 @@ def finetune_local(args):
         print("Starting training...")
         approx_steps = max(1, (train_kept // args.batch_size) * args.epochs)
         cfg = ckpt_config
-        train_args = argparse.Namespace(
-            name=experiment_name, checkpoint=args.checkpoint, init_from=None,
-            epochs=args.epochs, batch_size=args.batch_size, lr=3e-5, muon_lr=0.02,
+        train_args_options = dict(
+            name=experiment_name,
+            checkpoint=args.checkpoint,
+            init_from=None,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=3e-5,
+            muon_lr=0.02,
             d_model=cfg["d_model"],
             num_heads=cfg["num_heads"],
             num_kv_heads=cfg.get("num_kv_heads", cfg["num_heads"]),
             num_layers=cfg["num_encoder_layers"],
             num_dec_layers=cfg["num_decoder_layers"],
             d_ff=cfg.get("d_ff", cfg["d_model"] * 4),
-            max_enc_len=max_enc_len, max_dec_len=max_dec_len, max_samples=None,
-            warmup_ratio=0.05, decay_ratio=0.05, wandb=False,
+            max_enc_len=max_enc_len,
+            max_dec_len=max_dec_len,
+            max_samples=None,
+            warmup_ratio=0.05,
+            decay_ratio=0.05,
+            wandb=False,
             dtype=cfg.get("dtype", "bfloat16"),
-            checkpoint_dir=args.checkpoint_dir, seed=42,
-            eval_every=max(1, approx_steps), max_eval_samples=min(val_kept, 50),
+            checkpoint_dir=args.checkpoint_dir,
+            seed=42,
+            eval_every=max(1, approx_steps),
+            max_eval_samples=min(val_kept, 50),
             contrastive_weight=0.1,
             contrastive_dim=cfg.get("contrastive_dim", 128),
             num_memory_slots=cfg.get("num_memory_slots", 64),
-            w_name=2.0, w_value=4.0, w_key=1.5,
+            w_name=2.0,
+            w_value=4.0,
+            w_key=1.5,
             val_ds=val_ds,
+            lora_rank=getattr(args, "lora_rank", 0),
+            lora_alpha=getattr(args, "lora_alpha", 16),
         )
+
+        if getattr(args, "lora_rank", 0) > 0:
+            train_args_options["init_from"] = args.checkpoint
+            train_args_options["checkpoint"] = None
+
+        train_args = argparse.Namespace(**train_args_options)
 
         from ..training.train import train
         train(train_args)
