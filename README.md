@@ -55,7 +55,7 @@ d=512, 8H/4KV, BPE=8192
 - Pretrained on 16 TPU v6e for 200B tokens (27hrs). 
 - Post-trained on 2B tokens of single-shot function call dataset (45mins). 
 
-Needle is an experimental run for Simple Attention Networks, geared at redefining tiny AI for consumer devies (phones, watches, glasses...).
+Needle is an experimental run for Simple Attention Networks, geared at redefining tiny AI for consumer devices (phones, watches, glasses...).
 So while it beats FunctionGemma-270m, Qwen-0.6B, Graninte-350m, LFM2.5-350m on single-shot function call for personal AI,
 Those model are have more scope/capacity and excel in conversational settings. Also, small models can be finicky. 
 Please use the UI in the next section to test on your own tools, and finetune accordingly, at the click of a button. 
