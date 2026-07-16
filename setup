@@ -71,7 +71,7 @@ pip install -e . -q
 ACCELERATOR="cpu"
 if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
     ACCELERATOR="gpu"
-elif ls /dev/accel* &>/dev/null 2>&1 || [ -n "$TPU_NAME" ] || [ -d /sys/class/accel ]; then
+elif ls /dev/accel* &>/dev/null 2>&1 || [ -n "$TPU_NAME" ] || [ -n "$(ls -A /sys/class/accel 2>/dev/null)" ]; then
     ACCELERATOR="tpu"
 fi
 
