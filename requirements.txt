@@ -1,6 +1,6 @@
-jax
-jaxlib
-flax
+jax>=0.4.30
+jaxlib>=0.4.30
+flax>=0.8.0
 optax
 datasets
 huggingface_hub
