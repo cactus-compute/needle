@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ..dataset.dataset import get_tokenizer, to_snake_case, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_GEN_LEN
+from ..dataset.tokenizer import get_tokenizer, to_snake_case, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_GEN_LEN
 from .architecture import (
     SimpleAttentionNetwork,
     TransformerConfig,

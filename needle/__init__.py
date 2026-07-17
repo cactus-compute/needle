@@ -11,7 +11,7 @@ from needle.model.run import (
     encode_for_retrieval,
     retrieve_tools,
 )
-from needle.dataset.dataset import get_tokenizer
+from needle.dataset.tokenizer import get_tokenizer
 
 __all__ = [
     "SimpleAttentionNetwork",
