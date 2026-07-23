@@ -78,7 +78,8 @@ def _text_loss_fn(state, params, src, tgt_in, tgt_out, rng, loss_mask, do_quanti
     ce_loss = jnp.sum(
         optax.softmax_cross_entropy_with_integer_labels(logits_f32, tgt_out) * mask
     ) / num_tokens
-    z_loss = 1e-4 * jnp.mean(jax.nn.logsumexp(logits_f32, axis=-1) ** 2)
+    # Mask z-loss to real tokens (like CE), else it scales with padding fraction.
+    z_loss = 1e-4 * jnp.sum((jax.nn.logsumexp(logits_f32, axis=-1) ** 2) * padding_mask) / num_tokens
     return ce_loss + z_loss
 
 

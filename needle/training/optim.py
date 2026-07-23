@@ -8,7 +8,11 @@ from ..model.architecture import SimpleAttentionNetwork
 
 
 def _newton_schulz(G, steps=5):
-    """Approximate polar decomposition via Newton-Schulz iteration."""
+    """Approximate polar decomposition via Newton-Schulz, with aspect-ratio scaling.
+
+    Flax kernels are (fan_in, fan_out); the max(1, fan_out/fan_in)**0.5 factor
+    keeps the update RMS consistent across non-square weights.
+    """
     a, b, c = 3.4445, -4.7750, 2.0315
     orig_dtype = G.dtype
     G = G.astype(jnp.float32)
@@ -22,7 +26,8 @@ def _newton_schulz(G, steps=5):
         X = a * X + B @ X
     if transposed:
         X = X.T
-    return X.astype(orig_dtype)
+    scale = jnp.sqrt(jnp.maximum(1.0, G.shape[1] / G.shape[0]))
+    return (X * scale).astype(orig_dtype)
 
 
 class MuonState(NamedTuple):
@@ -30,26 +35,28 @@ class MuonState(NamedTuple):
 
 
 def scale_by_muon(momentum=0.95, ns_steps=5):
-    """Muon gradient transform: orthogonalize 2D+ grads, then Nesterov momentum."""
+    """Muon gradient transform: Nesterov momentum on the raw grad, then orthogonalize.
+
+    Orthogonalizing before momentum accumulates a sum of orthogonal matrices,
+    which is not itself orthogonal — so the buffer holds raw grads and only the
+    Nesterov-blended update is passed through Newton-Schulz.
+    """
 
     def init_fn(params):
         return MuonState(mu=jax.tree.map(jnp.zeros_like, params))
 
+    def ortho(g):
+        if g.ndim == 3:
+            return jax.vmap(lambda m: _newton_schulz(m, steps=ns_steps), in_axes=(0,))(g)
+        if g.ndim == 2:
+            return _newton_schulz(g, steps=ns_steps)
+        return g
+
     def update_fn(updates, state, params=None):
         del params
-
-        def ortho(g):
-            if g.ndim == 3:
-                return jax.vmap(_newton_schulz, in_axes=(0,))(g)
-            if g.ndim == 2:
-                return _newton_schulz(g, steps=ns_steps)
-            return g
-
-        ortho_g = jax.tree.map(ortho, updates)
-        new_mu = jax.tree.map(lambda m, g: momentum * m + g, state.mu, ortho_g)
-        new_updates = jax.tree.map(
-            lambda g, m: g + momentum * m, ortho_g, new_mu
-        )
+        new_mu = jax.tree.map(lambda m, g: momentum * m + g, state.mu, updates)
+        blended = jax.tree.map(lambda g, m: g + momentum * m, updates, new_mu)
+        new_updates = jax.tree.map(ortho, blended)
         return new_updates, MuonState(mu=new_mu)
 
     return optax.GradientTransformation(init_fn, update_fn)

@@ -1,13 +1,15 @@
 import argparse
+import json
 import math
 import time
+from collections import Counter
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 
-from ..dataset.dataset import get_tokenizer, load_tool_calls, load_prepared_data, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN
+from ..dataset.dataset import get_tokenizer, load_tool_calls, load_prepared_data, to_snake_case, DEFAULT_MAX_ENC_LEN, DEFAULT_MAX_DEC_LEN, DEFAULT_MAX_GEN_LEN
 from ..model.architecture import (
     SimpleAttentionNetwork,
     TransformerConfig,
@@ -72,7 +74,7 @@ def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is th
     )
     dec_buffer = jnp.full((1, max_gen_len), pad_id, dtype=jnp.int32)
     dec_buffer = dec_buffer.at[0, 0].set(eos_id)
-    decode_fn(params, dec_buffer, encoder_out, enc_mask)
+    decode_fn(params, dec_buffer, encoder_out, enc_mask, jnp.array(0, dtype=jnp.int32))
 
     tokens_generated = []
     latencies = []
@@ -86,19 +88,19 @@ def measure_throughput(model, params, tokenizer, num_runs=10, prompt='What is th
         encoder_out, enc_mask = model.apply(
             {"params": params}, enc_input, src_mask=src_mask, method="encode"
         )
-        logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
+        logits = decode_fn(params, dec_buffer, encoder_out, enc_mask, jnp.array(0, dtype=jnp.int32))
 
         num_tokens = 0
         for i in range(max_gen_len - 1):
             rng, sample_rng = jax.random.split(rng)
-            next_token = jax.random.categorical(sample_rng, logits[0, i]).item()
+            next_token = jax.random.categorical(sample_rng, logits[0, 0]).item()
 
             if next_token == eos_id:
                 break
 
             num_tokens += 1
             dec_buffer = dec_buffer.at[0, i + 1].set(next_token)
-            logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
+            logits = decode_fn(params, dec_buffer, encoder_out, enc_mask, jnp.array(i + 1, dtype=jnp.int32))
 
         elapsed = time.perf_counter() - start
         tokens_generated.append(num_tokens)
@@ -178,74 +180,86 @@ def compute_wer(hypotheses, references):
     return total_edits / max(total_ref_words, 1)
 
 
-def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, constrained=True, ds=None):
-    """Generate tool-call predictions and compute structured metrics."""
-    import json
-    from ..model.run import generate_batch, normalize_tools, restore_tool_names
-    from ..dataset.dataset import load_tool_calls, to_snake_case
+def _normalize_value(v):
+    """Normalize a value for fuzzy comparison."""
+    if isinstance(v, str):
+        # Try parsing as number to handle "74.006" vs "74.0060"
+        try:
+            f = float(v)
+            v = str(f)
+        except ValueError:
+            pass
+        s = v.strip().lower()
+        if s.startswith("at "):
+            s = s[3:].strip()
+        if s.startswith("today at "):
+            s = s[len("today at "):].strip()
+        return s
+    if isinstance(v, float):
+        return str(v)
+    return v
 
-    if ds is None:
-        ds = load_tool_calls("validation", max_samples=num_samples)
 
-    queries = [ex["query"] for ex in ds]
-    tools_list = [ex["tools"] for ex in ds]
-    all_preds = generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=max_gen_len, max_enc_len=max_enc_len, normalize=True, constrained=constrained)
+def _normalize_args(args):
+    """Normalize all argument values for comparison."""
+    if not isinstance(args, dict):
+        return args
+    return {k: _normalize_value(v) for k, v in args.items()}
 
+
+def _call_key(c):
+    """Canonical (name, normalized-args) key for a single call, or None."""
+    if not isinstance(c, dict):
+        return None
+    norm_args = _normalize_args(c.get("arguments", {}))
+    return json.dumps({"name": c.get("name"), "arguments": norm_args}, sort_keys=True)
+
+
+def classify_bfcl(ref_calls, n_tools):
+    """Bucket an example into a BFCL-style category from its reference calls.
+
+    - irrelevance      : no call expected
+    - simple           : one call, one candidate tool
+    - multiple         : one call, several candidate tools (selection)
+    - parallel         : several calls, all to the same function
+    - parallel_multiple: several calls spanning >=2 distinct functions
+    """
+    calls = [c for c in ref_calls if isinstance(c, dict)]
+    n_calls = len(calls)
+    if n_calls == 0:
+        return "irrelevance"
+    n_unique = len({c.get("name") for c in calls})
+    if n_calls == 1:
+        return "simple" if n_tools <= 1 else "multiple"
+    return "parallel" if n_unique == 1 else "parallel_multiple"
+
+
+def score_tool_calls(ds, all_preds):
+    """Score decoded predictions against references. Pure function (no model).
+
+    ``ds`` is an iterable of {query, tools, answers}; ``all_preds`` is the
+    parallel list of decoded prediction strings. Returns the metrics dict.
+    Split out from generation so the scoring logic can be unit-tested on
+    hand-built parallel / irrelevance cases without loading a checkpoint.
+    """
     total = 0
     exact_match = 0
-    tp_names = 0
-    fp_names = 0
-    fn_names = 0
-    tp_calls = 0
-    fp_calls = 0
-    fn_calls = 0
+    tp_names = fp_names = fn_names = 0
+    tp_calls = fp_calls = fn_calls = 0
     json_parse_errors = 0
-    empty_ref = 0
-    empty_pred = 0
-    args_correct = 0
-    args_total = 0
-    halluc_params = 0
-    total_pred_params = 0
-    missing_params = 0
-    total_ref_params = 0
-    correct_values = 0
-    matched_params = 0
+    empty_ref = empty_pred = 0
+    args_correct = args_total = 0
+    halluc_params = total_pred_params = 0
+    missing_params = total_ref_params = 0
+    correct_values = matched_params = 0
     samples = []
-    failures = []  # (query, tools, ref, pred, reasons)
+    failures = []
 
-    def _normalize_value(v):
-        """Normalize a value for fuzzy comparison."""
-        if isinstance(v, str):
-            # Try parsing as number to handle "74.006" vs "74.0060"
-            try:
-                f = float(v)
-                # Preserve sign, normalize trailing zeros
-                v = str(f)
-            except ValueError:
-                pass
-            # Normalize time-like strings: strip leading "at ", lowercase
-            s = v.strip().lower()
-            if s.startswith("at "):
-                s = s[3:].strip()
-            # "today at 21:00" → "21:00", "tonight" is harder but normalize what we can
-            if s.startswith("today at "):
-                s = s[len("today at "):].strip()
-            return s
-        if isinstance(v, float):
-            return str(v)
-        return v
-
-    def _normalize_args(args):
-        """Normalize all argument values for comparison."""
-        if not isinstance(args, dict):
-            return args
-        return {k: _normalize_value(v) for k, v in args.items()}
-
-    def call_key(c):
-        if not isinstance(c, dict):
-            return None
-        norm_args = _normalize_args(c.get("arguments", {}))
-        return json.dumps({"name": c.get("name"), "arguments": norm_args}, sort_keys=True)
+    CATS = ("simple", "multiple", "parallel", "parallel_multiple")
+    cat_total = {c: 0 for c in CATS}
+    cat_correct = {c: 0 for c in CATS}
+    irrel_total = irrel_correct = 0   # ref empty; correct == abstained
+    rel_total = rel_correct = 0       # ref non-empty; correct == called something
 
     for i, (ex, pred_text) in enumerate(zip(ds, all_preds)):
         ref_text = ex["answers"]
@@ -255,14 +269,13 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
             ref_calls = json.loads(ref_text)
         except (json.JSONDecodeError, TypeError):
             ref_calls = []
-
-        # Normalize ref tool names to snake_case for consistent comparison
+        if not isinstance(ref_calls, list):
+            ref_calls = []
         for rc in ref_calls:
             if isinstance(rc, dict) and "name" in rc:
                 rc["name"] = to_snake_case(rc["name"])
 
-        # Normalize pred tool names to snake_case too (restore_tool_names in
-        # generate_batch maps back to originals, but we want snake_case comparison)
+        # Normalize pred tool names to snake_case for comparison.
         try:
             pred_calls_raw = json.loads(pred_text)
             if isinstance(pred_calls_raw, list):
@@ -275,15 +288,18 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
         except (json.JSONDecodeError, TypeError):
             pass
 
-        # Also normalize tool definitions for param validation
         try:
             tool_defs_raw = json.loads(ex["tools"])
+            if not isinstance(tool_defs_raw, list):
+                tool_defs_raw = []
             for td in tool_defs_raw:
                 if isinstance(td, dict) and "name" in td:
                     td["name"] = to_snake_case(td["name"])
             tools_normalized = json.dumps(tool_defs_raw)
         except (json.JSONDecodeError, TypeError):
+            tool_defs_raw = []
             tools_normalized = ex["tools"]
+        n_tools = len(tool_defs_raw)
 
         try:
             pred_calls = json.loads(pred_text)
@@ -304,31 +320,56 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
         if pred_is_empty:
             empty_pred += 1
 
+        # Exact (order-independent, multiset-correct) match.
         if ref_is_empty and pred_is_empty:
-            exact_match += 1
+            is_exact = True
         elif not ref_is_empty and not pred_is_empty:
-            # Order-independent comparison: sort calls by their canonical key
-            ref_sorted = sorted([call_key(c) for c in ref_calls if call_key(c)])
-            pred_sorted = sorted([call_key(c) for c in pred_calls if call_key(c)])
-            if ref_sorted == pred_sorted and len(ref_sorted) == len(ref_calls) and len(pred_sorted) == len(pred_calls):
-                exact_match += 1
+            ref_sorted = sorted(k for k in (_call_key(c) for c in ref_calls) if k)
+            pred_sorted = sorted(k for k in (_call_key(c) for c in pred_calls) if k)
+            is_exact = (ref_sorted == pred_sorted
+                        and len(ref_sorted) == len(ref_calls)
+                        and len(pred_sorted) == len(pred_calls))
+        else:
+            is_exact = False
+        if is_exact:
+            exact_match += 1
 
+        # Relevance / irrelevance + per-category AST accuracy.
+        if ref_is_empty:
+            irrel_total += 1
+            if pred_is_empty:
+                irrel_correct += 1
+        else:
+            rel_total += 1
+            if not pred_is_empty:
+                rel_correct += 1
+            cat = classify_bfcl(ref_calls, n_tools)
+            if cat in cat_total:
+                cat_total[cat] += 1
+                if is_exact:
+                    cat_correct[cat] += 1
+
+        # Name-level P/R (set semantics fine for names).
         ref_name_set = {c["name"] for c in ref_calls if isinstance(c, dict) and "name" in c}
         pred_name_set = {c["name"] for c in pred_calls if isinstance(c, dict) and "name" in c}
         tp_names += len(pred_name_set & ref_name_set)
         fp_names += len(pred_name_set - ref_name_set)
         fn_names += len(ref_name_set - pred_name_set)
 
-        ref_keys = {call_key(c) for c in ref_calls} - {None}
-        pred_keys = {call_key(c) for c in pred_calls} - {None}
-        tp_calls += len(pred_keys & ref_keys)
-        fp_calls += len(pred_keys - ref_keys)
-        fn_calls += len(ref_keys - pred_keys)
+        # Call-level P/R as MULTISETS — identical parallel calls must not collapse.
+        ref_counter = Counter(k for k in (_call_key(c) for c in ref_calls) if k)
+        pred_counter = Counter(k for k in (_call_key(c) for c in pred_calls) if k)
+        tp_calls += sum((ref_counter & pred_counter).values())
+        fp_calls += sum((pred_counter - ref_counter).values())
+        fn_calls += sum((ref_counter - pred_counter).values())
 
+        # Consumable ref-arg instances per name.
         ref_by_name = {}
         for c in ref_calls:
             if isinstance(c, dict) and "name" in c:
-                ref_by_name.setdefault(c["name"], []).append(c.get("arguments", {}))
+                ref_by_name.setdefault(c["name"], []).append(c.get("arguments", {}) or {})
+
+        # args_acc: each pred vs ANY ref instance of the same name.
         for c in pred_calls:
             if isinstance(c, dict) and "name" in c and c["name"] in ref_by_name:
                 args_total += 1
@@ -336,83 +377,77 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
                 if any(pa == json.dumps(_normalize_args(ra), sort_keys=True) for ra in ref_by_name[c["name"]]):
                     args_correct += 1
 
+        # Param-level metrics via greedy bipartite matching to DISTINCT ref instances.
         try:
             tool_defs = json.loads(tools_normalized)
-            tool_param_map = {t["name"]: set((t.get("parameters") or {}).keys()) for t in tool_defs if isinstance(t, dict) and "name" in t}
+            tool_param_map = {t["name"]: set((t.get("parameters") or {}).keys())
+                              for t in tool_defs if isinstance(t, dict) and "name" in t}
         except (json.JSONDecodeError, TypeError):
             tool_param_map = {}
+
+        used = {name: [False] * len(lst) for name, lst in ref_by_name.items()}
+        matched_pairs = []  # (pred_call, matched_ref_args) — for failure diagnosis
         for c in pred_calls:
             if not isinstance(c, dict) or "name" not in c:
                 continue
             cname = c["name"]
-            if cname not in tool_param_map:
-                continue
-            schema_keys = tool_param_map[cname]
-            p_keys = set((c.get("arguments") or {}).keys())
-            total_pred_params += len(p_keys)
-            halluc_params += len(p_keys - schema_keys)
+            p_args = c.get("arguments", {}) or {}
+            p_keys = set(p_args.keys())
+            if cname in tool_param_map:
+                total_pred_params += len(p_keys)
+                halluc_params += len(p_keys - tool_param_map[cname])
             if cname in ref_by_name:
-                ref_args = ref_by_name[cname][0]
-                r_keys = set((ref_args if isinstance(ref_args, dict) else {}).keys())
+                cand = [j for j in range(len(ref_by_name[cname])) if not used[cname][j]]
+                if not cand:
+                    continue
+                pnorm = json.dumps(_normalize_args(p_args), sort_keys=True)
+
+                def _match_score(j, _cname=cname, _pnorm=pnorm, _pk=p_keys):
+                    ra = ref_by_name[_cname][j]
+                    exact = json.dumps(_normalize_args(ra), sort_keys=True) == _pnorm
+                    return (exact, len(_pk & set(ra.keys())))
+
+                j = max(cand, key=_match_score)
+                used[cname][j] = True
+                ref_args = ref_by_name[cname][j]
+                matched_pairs.append((c, ref_args))
+                r_keys = set(ref_args.keys())
                 total_ref_params += len(r_keys)
                 missing_params += len(r_keys - p_keys)
                 m_keys = p_keys & r_keys
                 matched_params += len(m_keys)
                 for k in m_keys:
-                    pv_norm = _normalize_value(c.get("arguments", {})[k])
-                    rv_norm = _normalize_value(ref_args[k])
-                    if json.dumps(pv_norm, sort_keys=True) == json.dumps(rv_norm, sort_keys=True):
+                    if (json.dumps(_normalize_value(p_args[k]), sort_keys=True)
+                            == json.dumps(_normalize_value(ref_args[k]), sort_keys=True)):
                         correct_values += 1
 
-        # Diagnose failures for this example
-        is_exact = (ref_is_empty and pred_is_empty) or (
-            not ref_is_empty and not pred_is_empty
-            and sorted([call_key(c) for c in ref_calls if call_key(c)])
-            == sorted([call_key(c) for c in pred_calls if call_key(c)])
-            and len(ref_calls) == len(pred_calls)
-        )
+        # Failure diagnosis.
         if not is_exact and len(failures) < 50:
             reasons = []
-            if json_parse_errors > 0 and i == total - 1:
-                # Check if this specific example had a parse error
-                try:
-                    json.loads(pred_text)
-                except (json.JSONDecodeError, TypeError):
-                    reasons.append("json_parse_error")
-
+            if not pred_calls and pred_text.strip() not in ("", "[]"):
+                reasons.append("json_parse_error")
             ex_fp_names = pred_name_set - ref_name_set
             ex_fn_names = ref_name_set - pred_name_set
             if ex_fp_names:
                 reasons.append(f"wrong_tools:{','.join(sorted(ex_fp_names))}")
             if ex_fn_names:
                 reasons.append(f"missing_tools:{','.join(sorted(ex_fn_names))}")
-
             if not ex_fp_names and not ex_fn_names and pred_name_set:
-                # Right tools but wrong args — find which values differ
-                for c in pred_calls:
-                    if not isinstance(c, dict) or "name" not in c:
-                        continue
+                for c, ref_args in matched_pairs:
                     cname = c["name"]
-                    if cname not in ref_by_name:
-                        continue
-                    pred_args = c.get("arguments", {})
-                    ref_args = ref_by_name[cname][0]
+                    pred_args = c.get("arguments", {}) or {}
                     for k in set(pred_args.keys()) | set(ref_args.keys()):
                         pv = pred_args.get(k, "<MISSING>")
                         rv = ref_args.get(k, "<MISSING>")
-                        pv_n = _normalize_value(pv)
-                        rv_n = _normalize_value(rv)
-                        if json.dumps(pv_n, sort_keys=True) != json.dumps(rv_n, sort_keys=True):
+                        if (json.dumps(_normalize_value(pv), sort_keys=True)
+                                != json.dumps(_normalize_value(rv), sort_keys=True)):
                             reasons.append(f"value_mismatch:{cname}.{k}={json.dumps(pv)[:60]}!={json.dumps(rv)[:60]}")
-
             if ref_is_empty and not pred_is_empty:
                 reasons.append("false_positive:should_be_empty")
             if not ref_is_empty and pred_is_empty:
                 reasons.append("false_negative:predicted_empty")
-
             if not reasons:
                 reasons.append("unknown")
-
             failures.append({
                 "query": ex["query"][:200],
                 "ref": ref_text[:300],
@@ -444,9 +479,30 @@ def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=
         "call_f1": call_f1,
         "empty_ref_pct": empty_ref / max(total, 1),
         "empty_pred_pct": empty_pred / max(total, 1),
+        # BFCL-style AST accuracy per category (exact match within each bucket).
+        "category_counts": dict(cat_total),
+        "category_accuracy": {c: (cat_correct[c] / cat_total[c]) if cat_total[c] else None for c in CATS},
+        "irrelevance_accuracy": (irrel_correct / irrel_total) if irrel_total else None,
+        "false_trigger_rate": ((irrel_total - irrel_correct) / irrel_total) if irrel_total else None,
+        "relevance_accuracy": (rel_correct / rel_total) if rel_total else None,
+        "irrelevance_n": irrel_total,
+        "relevance_n": rel_total,
         "samples": samples,
         "failures": failures,
     }
+
+
+def benchmark_tool_calls(model, params, tokenizer, num_samples=200, max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, constrained=True, ds=None):
+    """Generate tool-call predictions and compute structured metrics."""
+    from ..model.run import generate_batch
+
+    if ds is None:
+        ds = load_tool_calls("validation", max_samples=num_samples)
+
+    queries = [ex["query"] for ex in ds]
+    tools_list = [ex["tools"] for ex in ds]
+    all_preds = generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=max_gen_len, max_enc_len=max_enc_len, normalize=True, constrained=constrained)
+    return score_tool_calls(ds, all_preds)
 
 
 def benchmark_retrieval(model, params, tokenizer, num_samples=500, max_len=256, ks=(1, 2, 3, 4, 5), ds=None):
@@ -620,6 +676,17 @@ def main(args):
             print(f"  Args acc         {tc['args_acc']:>10.1%}")
             print(f"  Call F1          {tc['call_f1']:>10.1%}")
             print(f"  Exact match      {tc['exact_match']:>10.1%}")
+            # BFCL-style per-category AST accuracy + abstention/relevance.
+            cat_acc = tc.get("category_accuracy", {})
+            cat_n = tc.get("category_counts", {})
+            for c in ("simple", "multiple", "parallel", "parallel_multiple"):
+                if cat_acc.get(c) is not None:
+                    print(f"  {('AST ' + c):<16} {cat_acc[c]:>10.1%}  (n={cat_n.get(c, 0)})")
+            if tc.get("relevance_accuracy") is not None:
+                print(f"  Relevance acc    {tc['relevance_accuracy']:>10.1%}  (n={tc.get('relevance_n', 0)})")
+            if tc.get("irrelevance_accuracy") is not None:
+                print(f"  Irrelevance acc  {tc['irrelevance_accuracy']:>10.1%}  (n={tc.get('irrelevance_n', 0)})")
+                print(f"  False trigger    {tc['false_trigger_rate']:>10.1%}")
             if tc["samples"]:
                 print(f"  samples:")
                 for query, ref, pred in tc["samples"][:3]:
