@@ -62,9 +62,35 @@ Please use the UI in the next section to test on your own tools, and finetune ac
 
 ## Quickstart
 
+### macOS / Linux
+
 ```bash
 git clone https://github.com/cactus-compute/needle.git
 cd needle && source ./setup
+needle playground
+```
+
+### Windows
+
+```bat
+git clone https://github.com/cactus-compute/needle.git
+cd needle
+.\setup.bat
+```
+
+> **Note:** `setup.bat` creates a `.venv`, installs all dependencies (including JAX in CPU mode), and prompts for an optional W&B API key.
+
+After setup completes, activate the virtual environment in every new terminal session before running needle commands:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+> **Tip:** If PowerShell blocks the script, run `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser` once and retry.
+
+Then launch the playground:
+
+```powershell
 needle playground
 ```
 
