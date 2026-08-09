@@ -88,34 +88,84 @@ class MultiHeadAttention(nn.Module):
     num_layers: int
     dtype: jnp.dtype = jnp.bfloat16
     rope_keys_only: bool = False
+    decode: bool = False
+    cache_len: int = 0
+    cross_cache: bool = False
 
     @nn.compact
-    def __call__(self, q_input, kv_input, mask=None, rope=None):
+    def __call__(self, q_input, kv_input, mask=None, rope=None, cache_pos=None, cross_prefill=True):
         head_dim = self.d_model // self.num_heads
         kv_dim = self.num_kv_heads * head_dim
         B = q_input.shape[0]
 
+        # Query always depends on the (changing) decoder hidden state, so it is
+        # projected on every step.
         q = nn.Dense(self.d_model, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="q_proj")(q_input)
-        k = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="k_proj")(kv_input)
-        v = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="v_proj")(kv_input)
-
         q = q.reshape(B, -1, self.num_heads, head_dim).transpose(0, 2, 1, 3)
-        k = k.reshape(B, -1, self.num_kv_heads, head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(B, -1, self.num_kv_heads, head_dim).transpose(0, 2, 1, 3)
-
         q = ZCRMSNorm(dtype=self.dtype, name="q_norm")(q)
-        k = ZCRMSNorm(dtype=self.dtype, name="k_norm")(k)
+        if rope is not None and not self.rope_keys_only:
+            cos, sin = rope
+            q = apply_rope(q, cos, sin)
+
+        if self.cross_cache:
+            # Static cross-attention K/V cache: kv_input (encoder output) is
+            # constant across decode steps, so project K/V once when
+            # cross_prefill=True and reuse them on every subsequent step.
+            cached_key = self.variable(
+                "cache", "cross_k",
+                lambda: jnp.zeros((B, self.num_kv_heads, kv_input.shape[1], head_dim), self.dtype),
+            )
+            cached_value = self.variable(
+                "cache", "cross_v",
+                lambda: jnp.zeros((B, self.num_kv_heads, kv_input.shape[1], head_dim), self.dtype),
+            )
+            if cross_prefill:
+                k = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="k_proj")(kv_input)
+                v = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="v_proj")(kv_input)
+                k = k.reshape(B, -1, self.num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+                v = v.reshape(B, -1, self.num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+                k = ZCRMSNorm(dtype=self.dtype, name="k_norm")(k)
+                cached_key.value = k
+                cached_value.value = v
+            k = cached_key.value
+            v = cached_value.value
+        else:
+            k = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="k_proj")(kv_input)
+            v = nn.Dense(kv_dim, dtype=self.dtype, use_bias=False, kernel_init=default_init(), name="v_proj")(kv_input)
+            k = k.reshape(B, -1, self.num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+            v = v.reshape(B, -1, self.num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+            k = ZCRMSNorm(dtype=self.dtype, name="k_norm")(k)
+
+            if rope is not None:
+                cos, sin = rope
+                k = apply_rope(k, cos, sin)
+
+            if self.decode:
+                # Incremental single-token step: append this token's (rope'd) K/V to a
+                # fixed-size cache and attend against the whole prefix. Cache is stored
+                # in float32 to match the non-cached path's precision exactly.
+                cached_key = self.variable(
+                    "cache", "cached_key",
+                    lambda: jnp.zeros((B, self.num_kv_heads, self.cache_len, head_dim), jnp.float32),
+                )
+                cached_value = self.variable(
+                    "cache", "cached_value",
+                    lambda: jnp.zeros((B, self.num_kv_heads, self.cache_len, head_dim), jnp.float32),
+                )
+                zero = jnp.array(0, jnp.int32)
+                cp = jnp.asarray(cache_pos, jnp.int32)
+                idx = (zero, zero, cp, zero)
+                new_k = jax.lax.dynamic_update_slice(cached_key.value, k.astype(jnp.float32), idx)
+                new_v = jax.lax.dynamic_update_slice(cached_value.value, v.astype(jnp.float32), idx)
+                cached_key.value = new_k
+                cached_value.value = new_v
+                k = new_k
+                v = new_v
 
         repeats = self.num_heads // self.num_kv_heads
         if repeats > 1:
             k = jnp.repeat(k, repeats, axis=1)
             v = jnp.repeat(v, repeats, axis=1)
-
-        if rope is not None:
-            cos, sin = rope
-            if not self.rope_keys_only:
-                q = apply_rope(q, cos, sin)
-            k = apply_rope(k, cos, sin)
 
         scale = jnp.sqrt(jnp.float32(head_dim))
         attn_weights = jnp.matmul(q, k.transpose(0, 1, 3, 2)) / scale
@@ -244,22 +294,31 @@ class DecoderBlock(nn.Module):
     activation: str = "drelu"
     dropout_rate: float = 0.0
     no_feedforward: bool = True
+    decode: bool = False
+    cache_len: int = 0
+    use_cross_cache: bool = True
 
     @nn.compact
-    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, ffn_mask=None, deterministic=True):
+    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, ffn_mask=None, deterministic=True, cache_pos=None, cross_prefill=True):
         self_gate = nn.sigmoid(self.param("self_attn_gate", jinit.zeros, ())).astype(self.dtype)
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="self_attn")(
-            x, x, mask=self_mask, rope=rope
+        x = MultiHeadAttention(
+            self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype,
+            decode=self.decode, cache_len=self.cache_len, name="self_attn",
+        )(
+            x, x, mask=self_mask, rope=rope, cache_pos=cache_pos
         )
         x = residual + self_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
 
         cross_gate = nn.sigmoid(self.param("cross_attn_gate", jinit.zeros, ())).astype(self.dtype)
         residual = x
         x = ZCRMSNorm(dtype=self.dtype)(x)
-        x = MultiHeadAttention(self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype, name="cross_attn")(
-            x, encoder_out, mask=cross_mask
+        x = MultiHeadAttention(
+            self.num_heads, self.num_kv_heads, self.d_model, self.num_layers, self.dtype,
+            cross_cache=(self.decode and self.use_cross_cache), name="cross_attn",
+        )(
+            x, encoder_out, mask=cross_mask, cross_prefill=cross_prefill
         )
         x = residual + cross_gate * nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
 
@@ -275,7 +334,7 @@ class DecoderBlock(nn.Module):
 
 
 class _DecoderScanBody(nn.Module):
-    """Wraps DecoderBlock for nn.scan: carry = (x, encoder_out, self_mask, cross_mask, rope, ffn_mask)."""
+    """Wraps DecoderBlock for nn.scan: carry = (x, encoder_out, self_mask, cross_mask, rope, ffn_mask, cache_pos)."""
     num_heads: int
     num_kv_heads: int
     d_model: int
@@ -286,38 +345,47 @@ class _DecoderScanBody(nn.Module):
     dropout_rate: float = 0.0
     no_feedforward: bool = True
     deterministic: bool = True
+    decode: bool = False
+    cache_len: int = 0
+    cross_prefill: bool = True
+    use_cross_cache: bool = True
 
     @nn.compact
     def __call__(self, carry, _):
-        x, encoder_out, self_mask, cross_mask, rope, ffn_mask = carry
+        x, encoder_out, self_mask, cross_mask, rope, ffn_mask, cache_pos = carry
         x = DecoderBlock(
             self.num_heads, self.num_kv_heads, self.d_model, self.d_ff,
             self.num_layers, self.dtype, self.activation, self.dropout_rate,
-            self.no_feedforward,
-        )(x, encoder_out, self_mask, cross_mask, rope, ffn_mask, self.deterministic)
-        return (x, encoder_out, self_mask, cross_mask, rope, ffn_mask), None
+            self.no_feedforward, self.decode, self.cache_len, self.use_cross_cache,
+        )(x, encoder_out, self_mask, cross_mask, rope, ffn_mask, self.deterministic, cache_pos, self.cross_prefill)
+        return (x, encoder_out, self_mask, cross_mask, rope, ffn_mask, cache_pos), None
 
 
 class Decoder(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, ffn_mask=None, deterministic=True):
+    def __call__(self, x, encoder_out, self_mask=None, cross_mask=None, rope=None, ffn_mask=None, deterministic=True, decode=False, cache_pos=None, cache_len=0, cross_prefill=True, use_cross_cache=True):
         cfg = self.config
         dt = cfg.jax_dtype
         x = x.astype(dt)
 
+        # In decode mode the KV cache ('cache' collection) is scanned per layer.
+        variable_axes = {"params": 0, "cache": 0} if decode else {"params": 0}
+        if cache_pos is None:
+            cache_pos = jnp.array(0, jnp.int32)
+
         ScanBlock = nn.scan(
             nn.remat(_DecoderScanBody),
-            variable_axes={"params": 0},
+            variable_axes=variable_axes,
             split_rngs={"params": True, "dropout": True},
             length=cfg.num_decoder_layers,
         )
-        (x, _, _, _, _, _), _ = ScanBlock(
+        (x, _, _, _, _, _, _), _ = ScanBlock(
             cfg.num_heads, cfg.num_kv_heads, cfg.d_model, cfg.d_ff,
             cfg.total_layers, dt, cfg.activation, cfg.dropout_rate,
-            cfg.no_feedforward, deterministic, name="layers",
-        )((x, encoder_out, self_mask, cross_mask, rope, ffn_mask), None)
+            cfg.no_feedforward, deterministic, decode, cache_len, cross_prefill, use_cross_cache, name="layers",
+        )((x, encoder_out, self_mask, cross_mask, rope, ffn_mask, cache_pos), None)
 
         x = ZCRMSNorm(dtype=dt)(x)
         return x
@@ -362,6 +430,31 @@ class SimpleAttentionNetwork(nn.Module):
         x = self.decoder(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, deterministic=deterministic)
         logits = x.astype(jnp.float32) @ self.embedding.embedding.T
         return logits
+
+    def decode_step(self, tgt_token, encoder_out, self_mask, cross_mask, rope, cache_pos, cache_len, cross_prefill=True, use_cross_cache=True):
+        """Single-token incremental decode with KV cache. Returns logits (B, vocab).
+
+        tgt_token: (B, 1) int tokens for the current step.
+        self_mask: (B|1, 1, 1, cache_len) bool mask over cached key positions.
+        cross_mask: (B, 1, 1, T_enc) encoder padding mask.
+        rope: (cos, sin) for the single current position.
+        cache_pos: int32 scalar absolute position of this token.
+        cache_len: static int cache length.
+        cross_prefill: if True, project and store the (constant) cross-attention
+            K/V into the cache; if False, reuse the cached cross K/V. Set True on
+            the first (prefill) step and False on every subsequent step. Only
+            meaningful when use_cross_cache is True.
+        use_cross_cache: if True, cache the static cross-attention K/V; if False,
+            re-project them every step (original behavior).
+        """
+        x = self.embedding(tgt_token) * self.embed_scale
+        x = self.decoder(
+            x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope,
+            deterministic=True, decode=True, cache_pos=cache_pos, cache_len=cache_len,
+            cross_prefill=cross_prefill, use_cross_cache=use_cross_cache,
+        )
+        logits = x.astype(jnp.float32) @ self.embedding.embedding.T
+        return logits[:, 0, :]
 
     def _mean_pool(self, encoder_out, enc_mask):
         """Mean-pool encoder output over non-padded positions. Returns (B, d_model)."""
