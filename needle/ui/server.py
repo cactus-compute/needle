@@ -377,11 +377,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._json_response(400, {"error": str(exc)})
             return
 
-        result, error = _run_generate(query, tools, seed, max_gen_len, constrained)
+        result, confidence, error = _run_generate(query, tools, seed, max_gen_len, constrained)
         if error:
             self._json_response(500, {"error": error})
         else:
-            self._json_response(200, {"result": result})
+            self._json_response(200, {"result": result, "confidence": confidence})
 
     def _handle_finetune(self):
         if not _is_local_request(self.client_address[0]):
@@ -437,7 +437,7 @@ def _run_generate(query, tools, seed, max_gen_len, constrained):
         if _model is None or _params is None or _tokenizer is None:
             return None, "model is not loaded"
         try:
-            result = generate(
+            result, confidence = generate(
                 _model,
                 _params,
                 _tokenizer,
@@ -447,11 +447,12 @@ def _run_generate(query, tools, seed, max_gen_len, constrained):
                 seed=seed,
                 stream=False,
                 constrained=constrained,
+                return_confidence=True,
             )
-            return result, None
+            return result, confidence, None
         except Exception as exc:
             print(f"[generate] {exc}", file=sys.stderr)
-            return None, "Generation failed"
+            return None, None, "Generation failed"
 
 
 def _load_checkpoint(path, display_name=None):

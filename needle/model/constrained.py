@@ -96,8 +96,9 @@ class ToolConstraints:
             params = tool.get("parameters", {})
             if isinstance(params, dict):
                 param_trie = Trie()
-                for key, val in params.items():
-                    if isinstance(val, dict):
+                properties = params.get("properties", params)
+                for key in properties:
+                    if isinstance(key, str) and key:
                         param_trie.insert(key)
                 self.param_tries[name] = param_trie
 
@@ -347,10 +348,20 @@ class ConstrainedDecoder:
         self.machines = [JsonStateMachine() for _ in range(self.batch_size)]
         self.token_strings = token_strings
         self.token_index = token_index
+        self._confidence: list[float] = [0.0] * self.batch_size
 
     def is_active(self, batch_idx: int) -> bool:
         """Return True if this batch element is currently in a constrained state."""
         return self.machines[batch_idx].state != JsonState.FREE
+
+    def get_confidence(self, batch_idx: int = 0) -> float:
+        """Return confidence [0, 1] from the last tool name selection.
+
+        Computed as the max softmax probability over valid name-starting tokens
+        at the first constrained step. Returns 0.0 if no constrained name
+        generation has occurred yet.
+        """
+        return self._confidence[batch_idx]
 
     def constrain_logits(self, logits: np.ndarray, batch_idx: int) -> np.ndarray:
         """Apply grammar constraints to logits for a single batch element."""
@@ -374,7 +385,16 @@ class ConstrainedDecoder:
             logger.warning("Constrained decoding: off-trie at %r, falling back", machine.constrained_buf)
             return logits
 
-        return apply_constraints(logits, machine.state, node, self.token_strings, self.token_index)
+        masked = apply_constraints(logits, machine.state, node, self.token_strings, self.token_index)
+
+        if machine.state == JsonState.IN_NAME and machine.constrained_buf == "":
+            valid = masked > -np.inf
+            if valid.any():
+                subset = masked[valid]
+                exp_l = np.exp(subset - subset.max())
+                self._confidence[batch_idx] = float(exp_l.max() / exp_l.sum())
+
+        return masked
 
     def update(self, batch_idx: int, token_id: int):
         """Advance the state machine for *batch_idx* with the selected token."""

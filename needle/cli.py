@@ -243,6 +243,18 @@ def main():
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--host", type=str, default="127.0.0.1")
 
+    p = sub.add_parser("mcp-server", add_help=False)
+    p.add_argument("--checkpoint", type=str, default="checkpoints/needle.pkl")
+    p.add_argument(
+        "--transport",
+        type=str,
+        choices=["stdio", "http"],
+        default="stdio",
+        help="MCP transport to run: stdio for JSON-RPC over stdin/stdout, http for local HTTP server",
+    )
+    p.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind for HTTP transport")
+    p.add_argument("--port", type=int, default=8765, help="Port to bind for HTTP transport")
+
     p = sub.add_parser("tpu", add_help=False)
     tpu_sub = p.add_subparsers(dest="tpu_action")
 
@@ -336,6 +348,9 @@ def main():
     elif args.command == "playground":
         from .ui.server import main as ui_main
         ui_main(args)
+    elif args.command == "mcp-server":
+        from .mcp_server import main as mcp_main
+        mcp_main()
     elif args.command == "tpu":
         from .utils.tpu import tpu_dispatch
         tpu_dispatch(args)

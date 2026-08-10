@@ -103,11 +103,27 @@ def _build_encoder_input(tokenizer, query, tools, max_enc_len=DEFAULT_MAX_ENC_LE
     return q_toks + [tools_sep_id] + t_toks
 
 
-def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, seed=0, stream=True, task_token_id=None, normalize=True, constrained=True):
+def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MAX_GEN_LEN, max_enc_len=DEFAULT_MAX_ENC_LEN, seed=0, stream=True, task_token_id=None, normalize=True, constrained=True, threshold: float = 0.0, return_confidence: bool = False):
     """Generate tool-call output.
 
     Encoder: [query_tokens..., <tools>, tools_tokens...] truncated to max_enc_len.
     Decoder: prefilled with [EOS], model predicts <tool_call> first, then answer tokens.
+
+    Tool descriptions are supported — include a ``"description"`` field in each
+    tool object and the encoder will incorporate the text for better semantic
+    matching::
+
+        [{"name": "get_weather",
+          "description": "Get current weather for a location",
+          "parameters": {"location": "string"}}]
+
+    Args:
+        threshold: confidence threshold in [0, 1]. When > 0 and the model's
+            confidence is below this value, returns a no-match sentinel instead
+            of a tool call: ``{"match":false,"confidence":0.31}``.
+            Set to 0.0 (default) to disable and always return the best guess.
+        return_confidence: if True, returns a ``(result, confidence)`` tuple
+            instead of just the result string.
     """
     name_map = {}
     if normalize:
@@ -176,6 +192,14 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
         result = result[len("<tool_call>"):]
     if normalize and name_map:
         result = restore_tool_names(result, name_map)
+
+    confidence = constrained_decoder.get_confidence(0) if constrained_decoder else 1.0
+
+    if threshold > 0.0 and confidence < threshold:
+        result = _json.dumps({"match": False, "confidence": round(confidence, 4)}, separators=(",", ":"))
+
+    if return_confidence:
+        return result, confidence
     return result
 
 
