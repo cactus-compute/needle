@@ -56,12 +56,26 @@ def scale_by_muon(momentum=0.95, ns_steps=5):
 
 
 def _param_labels(params):
-    """Label each param: 'muon' for Dense kernels, 'adam' for the rest."""
+    """Label each param: 'muon' for Dense kernels, 'adam' for the rest.
+
+    If LoRA weights are present, freeze base LoRADense kernels and only train
+    the adapter parameters.
+    """
+
+    def _has_lora_siblings(path):
+        subtree = params
+        for node in path[:-1]:
+            key = node.key if hasattr(node, "key") else str(node)
+            subtree = subtree[key]
+        return hasattr(subtree, "__getitem__") and ("lora_A" in subtree or "lora_B" in subtree)
 
     def _label(path, leaf):
         name = path[-1].key if hasattr(path[-1], "key") else str(path[-1])
-        if name == "kernel" and leaf.ndim in (2, 3):
-            return "muon"
+        if name == "kernel":
+            if _has_lora_siblings(path):
+                return "frozen"
+            if leaf.ndim in (2, 3):
+                return "muon"
         return "adam"
 
     return jax.tree_util.tree_map_with_path(_label, params)
@@ -106,10 +120,11 @@ def create_train_state(rng, config, learning_rate, muon_lr, total_steps, warmup_
         optax.adamw(adam_schedule, b2=0.95, weight_decay=0.0),
     )
 
+    frozen_opt = optax.set_to_zero()
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.multi_transform(
-            {"muon": muon_opt, "adam": adam_opt},
+            {"muon": muon_opt, "adam": adam_opt, "frozen": frozen_opt},
             _param_labels,
         ),
     )

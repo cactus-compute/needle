@@ -122,6 +122,10 @@ def main():
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument("--muon-lr", type=float, default=0.02)
+    p.add_argument("--lora-rank", type=int, default=0,
+                   help="Enable LoRA adaptation with this rank (default: 0 = disabled)")
+    p.add_argument("--lora-alpha", type=int, default=16,
+                   help="LoRA scaling alpha (default: 16)")
     p.add_argument("--d-model", type=int, default=512)
     p.add_argument("--num-heads", type=int, default=8)
     p.add_argument("--num-kv-heads", type=int, default=4)
@@ -237,6 +241,10 @@ def main():
     p.add_argument("--cache-dir", type=str, default=None)
     p.add_argument("--max-enc-len", type=int, default=None)
     p.add_argument("--max-dec-len", type=int, default=None)
+    p.add_argument("--lora-rank", type=int, default=0,
+                   help="Enable LoRA adaptation with this rank (default: 0 = disabled)")
+    p.add_argument("--lora-alpha", type=int, default=16,
+                   help="LoRA scaling alpha (default: 16)")
 
     p = sub.add_parser("playground", add_help=False)
     p.add_argument("--checkpoint", type=str, default=None)

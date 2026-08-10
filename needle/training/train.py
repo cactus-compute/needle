@@ -217,6 +217,13 @@ def train(args):
         with open(resume_checkpoint, "rb") as f:
             ckpt_data = pickle.load(f)
         config = TransformerConfig(**ckpt_data["config"])
+        if getattr(args, "lora_rank", 0) > 0:
+            config.lora_rank = args.lora_rank
+            config.lora_alpha = args.lora_alpha
+            if getattr(args, "init_from", None) is None and config.lora_rank > 0 and ckpt_data["config"].get("lora_rank", 0) == 0:
+                print(f"  Switching from resume checkpoint to init_from for LoRA training (rank={config.lora_rank})")
+                args.init_from = resume_checkpoint
+                resume_checkpoint = None
         ckpt_params = jax.tree.map(jnp.array, ckpt_data["params"])
         print(f"  Config: d={config.d_model}, heads={config.num_heads}, layers={config.num_encoder_layers}/{config.num_decoder_layers}")
     else:
@@ -231,6 +238,8 @@ def train(args):
             dtype=args.dtype,
             num_memory_slots=getattr(args, "num_memory_slots", 64),
             contrastive_dim=getattr(args, "contrastive_dim", 128),
+            lora_rank=getattr(args, "lora_rank", 0),
+            lora_alpha=getattr(args, "lora_alpha", 16),
         )
 
     global _PRECISION, _CONTRASTIVE_WEIGHT, _LOSS_WEIGHT_MAP
