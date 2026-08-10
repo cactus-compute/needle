@@ -1733,7 +1733,7 @@ UPLOAD_EVERY = 100000
 
 def _load_existing():
     """Load existing dataset from disk or HuggingFace."""
-    from datasets import load_dataset, load_from_disk
+    from datasets import load_from_disk
 
     local = os.path.abspath(LOCAL_UNIFIED_DIR)
     if os.path.exists(local) and any(f.endswith(".arrow") for f in os.listdir(local)):
@@ -1742,7 +1742,14 @@ def _load_existing():
     else:
         print(f"Downloading existing dataset from {HF_DATASET_REPO}...")
         from .dataset import download_hf_split
-        ds = download_hf_split("train", HF_DATASET_REPO)
+        try:
+            ds = download_hf_split("train", HF_DATASET_REPO)
+        except Exception as exc:
+            print(
+                f"Warning: could not load existing dataset {HF_DATASET_REPO}: {exc}\n"
+                "Generation will continue from an empty corpus and save results locally."
+            )
+            return None
         # Save locally so subsequent chunks don't re-download
         os.makedirs(local, exist_ok=True)
         ds.save_to_disk(local)
@@ -1770,17 +1777,20 @@ def _merge_and_upload(existing, new_examples):
         "model": [ex["model"] for ex in new_examples],
         "language": [ex.get("language", "English") for ex in new_examples],
     })
-    # Keep only columns that exist in the existing dataset (language may be new)
-    overlap_cols = [c for c in new_ds.column_names if c in existing.column_names]
-    extra_cols = [c for c in new_ds.column_names if c not in existing.column_names]
-    if extra_cols:
-        # Add missing columns to existing dataset with defaults
-        for col in extra_cols:
-            existing = existing.add_column(col, ["English"] * len(existing) if col == "language" else [""] * len(existing))
-    new_ds = new_ds.select_columns(existing.column_names)
+    if existing is None:
+        merged = new_ds
+        print(f"\nCreated dataset: {len(merged)} rows")
+    else:
+        # Keep only columns that exist in the existing dataset (language may be new)
+        extra_cols = [c for c in new_ds.column_names if c not in existing.column_names]
+        if extra_cols:
+            # Add missing columns to existing dataset with defaults
+            for col in extra_cols:
+                existing = existing.add_column(col, ["English"] * len(existing) if col == "language" else [""] * len(existing))
+        new_ds = new_ds.select_columns(existing.column_names)
 
-    merged = concatenate_datasets([existing, new_ds])
-    print(f"\nMerged: {len(merged)} rows (+{len(new_ds)} new)")
+        merged = concatenate_datasets([existing, new_ds])
+        print(f"\nMerged: {len(merged)} rows (+{len(new_ds)} new)")
 
     for src, cnt in Counter(merged["source"]).most_common():
         print(f"  {src}: {cnt}")
@@ -1794,6 +1804,10 @@ def _merge_and_upload(existing, new_examples):
         shutil.rmtree(local)
     os.rename(tmp_dir, local)
     print("Saved locally.")
+
+    if existing is None:
+        print(f"Skipping upload to {HF_DATASET_REPO}; no existing remote dataset was available.")
+        return merged
 
     import tempfile
     from huggingface_hub import HfApi, CommitOperationDelete
