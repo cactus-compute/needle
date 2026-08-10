@@ -71,7 +71,12 @@ _split_dataset_cache = {}
 
 
 def _mark_json_value(s, char_w, key, value_str, weight):
-    """Find '"key": "value_str"' or '"key": value_str' in s, mark value chars."""
+    """Mark value chars for every '"key": "value_str"' / '"key": value_str' in s.
+
+    Marks all occurrences, not just the first, so repeated names/values across
+    parallel calls are weighted rather than left at base weight.
+    """
+    found = False
     pattern_str = f'"{_re.escape(key)}"\\s*:\\s*"{_re.escape(value_str)}"'
     for m in _re.finditer(pattern_str, s):
         tail = s[m.start() + len(f'"{key}"'):m.end()]
@@ -79,8 +84,10 @@ def _mark_json_value(s, char_w, key, value_str, weight):
         val_start = m.start() + len(f'"{key}"') + val_offset
         val_end = val_start + len(value_str)
         char_w[val_start:val_end] = np.maximum(char_w[val_start:val_end], weight)
+        found = True
+    if found:
         return
-        
+
     pattern_ns = f'"{_re.escape(key)}"\\s*:\\s*{_re.escape(value_str)}'
     for m in _re.finditer(pattern_ns, s):
         colon_offset = s[m.start():m.end()].index(':')
@@ -89,7 +96,6 @@ def _mark_json_value(s, char_w, key, value_str, weight):
             val_start += 1
         val_end = m.end()
         char_w[val_start:val_end] = np.maximum(char_w[val_start:val_end], weight)
-        return
 
 
 def _mark_json_key_in_args(s, char_w, key, weight):

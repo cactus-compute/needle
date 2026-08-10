@@ -355,11 +355,19 @@ class SimpleAttentionNetwork(nn.Module):
         """Backward-compatible alias for encode_text."""
         return self.encode_text(src, src_mask=src_mask)
 
-    def decode(self, tgt, encoder_out, self_mask=None, cross_mask=None, deterministic=True):
-        """Decode from encoder output with cross_mask for variable-length encoder output."""
+    def decode(self, tgt, encoder_out, self_mask=None, cross_mask=None, deterministic=True, cur_pos=None):
+        """Decode from encoder output with cross_mask for variable-length encoder output.
+
+        When cur_pos (a possibly-traced scalar) is given, only that position is
+        projected to the vocabulary — returns (B, 1, V) and skips the full-buffer
+        (B, T, d) @ (d, V) matmul that dominates each decode step. cur_pos=None
+        keeps the training path unchanged.
+        """
         x = self.embedding(tgt) * self.embed_scale
         rope = self._rope(tgt.shape[1])
         x = self.decoder(x, encoder_out, self_mask=self_mask, cross_mask=cross_mask, rope=rope, deterministic=deterministic)
+        if cur_pos is not None:
+            x = jax.lax.dynamic_slice_in_dim(x, cur_pos, 1, axis=1)
         logits = x.astype(jnp.float32) @ self.embedding.embedding.T
         return logits
 

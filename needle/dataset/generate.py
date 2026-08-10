@@ -1247,6 +1247,27 @@ def _grounding_check(pname, pval, pdesc, query, query_lower):
     return True
 
 
+def _boolean_enable_conflict(query_lower, pval):
+    """True if a boolean 'enabled' value clearly contradicts the query intent.
+
+    Matches whole words/phrases, not substrings: "on" in "location"/"song"
+    otherwise makes the on-intent always fire and disables the filter.
+    """
+    words = set(re.findall(r"[a-z']+", query_lower))
+    off_words = {"off", "disable", "disabled", "stop", "deactivate", "without"}
+    on_words = {"on", "enable", "enabled", "start", "activate"}
+    off_phrases = ("turn off", "switch off", "shut off", "turn it off", "don't")
+    on_phrases = ("turn on", "switch on", "turn it on")
+    wants_off = bool(words & off_words) or any(p in query_lower for p in off_phrases)
+    wants_on = bool(words & on_words) or any(p in query_lower for p in on_phrases)
+    # Only flag clear contradictions — if ambiguous, allow.
+    if wants_off and not wants_on and pval is True:
+        return True
+    if wants_on and not wants_off and pval is False:
+        return True
+    return False
+
+
 def _semantic_check(tool_name, args, schema, query, call_type="single"):
     """Lightweight rule-based semantic validation of argument values.
 
@@ -1297,14 +1318,7 @@ def _semantic_check(tool_name, args, schema, query, call_type="single"):
         # check alignment with query intent
         if expected_type == "boolean" and isinstance(pval, bool):
             if pname == "enabled":
-                disable_words = ("off", "disable", "stop", "don't", "no ", "without")
-                enable_words = ("on", "enable", "start", "turn on", "activate")
-                query_wants_off = any(w in query_lower for w in disable_words)
-                query_wants_on = any(w in query_lower for w in enable_words)
-                # Only reject clear contradictions — if ambiguous, allow
-                if query_wants_off and not query_wants_on and pval is True:
-                    return False
-                if query_wants_on and not query_wants_off and pval is False:
+                if _boolean_enable_conflict(query_lower, pval):
                     return False
 
         # Grounding check: argument values must be traceable to the query.

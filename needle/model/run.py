@@ -71,10 +71,10 @@ def _get_decode_fn(model, max_gen_len):
         tgt_mask = make_causal_mask(max_gen_len)
 
         @jax.jit
-        def decode_step(params, dec_buffer, encoder_out, cross_mask):
+        def decode_step(params, dec_buffer, encoder_out, cross_mask, cur_pos):
             return model.apply(
                 {"params": params}, dec_buffer, encoder_out,
-                self_mask=tgt_mask, cross_mask=cross_mask, method="decode",
+                self_mask=tgt_mask, cross_mask=cross_mask, cur_pos=cur_pos, method="decode",
             )
 
         _decode_fn_cache[key] = decode_step
@@ -140,10 +140,11 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
         sys.stdout.write(f"\n")
         sys.stdout.flush()
 
-    logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
+    streamed = ""
+    logits = decode_fn(params, dec_buffer, encoder_out, enc_mask, jnp.array(0, dtype=jnp.int32))
 
     for i in range(0, max_gen_len - 1):
-        next_logits = logits[0, i]
+        next_logits = logits[0, 0]
 
         if constrained_decoder and constrained_decoder.is_active(0):
             logits_np = np.array(next_logits)
@@ -162,10 +163,18 @@ def generate(model, params, tokenizer, query, tools="[]", max_gen_len=DEFAULT_MA
         dec_buffer = dec_buffer.at[0, i + 1].set(next_token)
 
         if stream:
-            sys.stdout.write(tokenizer.decode([next_token]))
-            sys.stdout.flush()
+            # Emit the decode delta of the whole sequence, not the token alone:
+            # per-token decode drops SentencePiece spaces and splits multibyte
+            # pieces. Hold until the trailing char completes (no U+FFFD).
+            full = tokenizer.decode(generated_tokens)
+            if not full.endswith("�"):
+                delta = full[len(streamed):]
+                if delta:
+                    sys.stdout.write(delta)
+                    sys.stdout.flush()
+                    streamed = full
 
-        logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
+        logits = decode_fn(params, dec_buffer, encoder_out, enc_mask, jnp.array(i + 1, dtype=jnp.int32))
 
     if stream:
         sys.stdout.write("\n")
@@ -229,18 +238,18 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
         from .constrained import build_constrained_decoder
         constrained_decoder = build_constrained_decoder(tools_list, tokenizer)
 
-    logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
+    logits = decode_fn(params, dec_buffer, encoder_out, enc_mask, jnp.array(0, dtype=jnp.int32))
 
     for pos in range(0, max_gen_len - 1):
         for i in range(B):
             if finished[i]:
                 continue
             if constrained_decoder and constrained_decoder.is_active(i):
-                logits_np = np.array(logits[i, pos])
+                logits_np = np.array(logits[i, 0])
                 logits_np = constrained_decoder.constrain_logits(logits_np, i)
                 next_token = int(np.argmax(logits_np))
             else:
-                next_token = int(jnp.argmax(logits[i, pos]))
+                next_token = int(jnp.argmax(logits[i, 0]))
             if constrained_decoder:
                 constrained_decoder.update(i, next_token)
             if next_token == eos_id:
@@ -252,7 +261,7 @@ def generate_batch(model, params, tokenizer, queries, tools_list, max_gen_len=DE
         if all(finished):
             break
 
-        logits = decode_fn(params, dec_buffer, encoder_out, enc_mask)
+        logits = decode_fn(params, dec_buffer, encoder_out, enc_mask, jnp.array(pos + 1, dtype=jnp.int32))
 
     results = []
     for i in range(B):
