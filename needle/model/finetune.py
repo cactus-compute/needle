@@ -16,7 +16,9 @@ from .tokenizer import (
 LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "gate_proj", "out_proj")
 DEFAULT_BASE = "checkpoints/needle2.pkl"
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_URL = os.environ.get(
+    "OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions"
+)
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 
 _GEN_SYSTEM = (

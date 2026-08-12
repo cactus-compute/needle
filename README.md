@@ -225,6 +225,8 @@ needle generate-data --tools my_tools.json --num-samples 500 --output data.jsonl
 needle generate-data --augment data.jsonl --num-samples 500      # expand an existing JSONL
 ```
 
+Set `OPENROUTER_URL` to use an OpenAI-compatible gateway instead of the default OpenRouter endpoint.
+
 **2. LoRA fine-tune.** The base checkpoint auto-downloads from Hugging Face if you do not pass `--checkpoint`. `--generate N` first synthesizes N more examples from the tools in your data (also needs `OPENROUTER_API_KEY`).
 
 ```sh

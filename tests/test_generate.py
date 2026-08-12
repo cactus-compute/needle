@@ -1,4 +1,5 @@
 import json
+import importlib
 
 import pytest
 
@@ -41,6 +42,18 @@ def test_generate_examples_requires_api_key(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     with pytest.raises(RuntimeError):
         finetune.generate_examples([{"name": "f"}], n=1)
+
+
+def test_openrouter_url_can_be_overridden_from_environment(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_URL", "https://gateway.example.test/v1/chat")
+    from needle.model import finetune
+    importlib.reload(finetune)
+
+    try:
+        assert finetune.OPENROUTER_URL == "https://gateway.example.test/v1/chat"
+    finally:
+        monkeypatch.delenv("OPENROUTER_URL", raising=False)
+        importlib.reload(finetune)
 
 
 def _unique_generator():
