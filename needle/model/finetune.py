@@ -225,9 +225,18 @@ def load_jsonl(path, tokenizer, max_len):
 
 
 def lora_target_paths(params):
+    import jax.numpy as jnp
     from flax.traverse_util import flatten_dict
-    return [path for path in flatten_dict(params)
-            if path[-1] == "kernel" and any(t in path for t in LORA_TARGETS)]
+    flat = flatten_dict(params)
+    # Target the actual stack layers (not mtp_block which has zeroed weights)
+    paths = [path for path in flat
+             if path[-1] == "kernel"
+             and "stack" in path
+             and "layers" in path
+             and any(t in path for t in LORA_TARGETS)]
+    # Filter to only weights with non-zero magnitude (skip dead weights)
+    paths = [p for p in paths if jnp.max(jnp.abs(flat[p])) > 1e-6]
+    return paths
 
 
 def init_lora(params, paths, rank, key):
@@ -242,8 +251,8 @@ def init_lora(params, paths, rank, key):
         lead = weight.shape[:-2]
         key, sub = jax.random.split(key)
         lora[path] = {
-            "A": (jax.random.normal(sub, lead + (in_dim, rank), jnp.float32) / rank).astype(weight.dtype),
-            "B": jnp.zeros(lead + (rank, out_dim), weight.dtype),
+            "A": jax.random.normal(sub, lead + (in_dim, rank), jnp.float32) / rank,
+            "B": jnp.zeros(lead + (rank, out_dim), jnp.float32),
         }
     return lora
 
@@ -253,7 +262,7 @@ def merge_lora(params, lora, scale):
     from flax.traverse_util import flatten_dict, unflatten_dict
     flat = dict(flatten_dict(params))
     for path, adapter in lora.items():
-        flat[path] = flat[path] + scale * jnp.matmul(adapter["A"], adapter["B"]).astype(flat[path].dtype)
+        flat[path] = flat[path] + (scale * jnp.matmul(adapter["A"], adapter["B"])).astype(flat[path].dtype)
     return unflatten_dict(flat)
 
 
