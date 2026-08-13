@@ -228,13 +228,11 @@ def lora_target_paths(params):
     import jax.numpy as jnp
     from flax.traverse_util import flatten_dict
     flat = flatten_dict(params)
-    # Target the actual stack layers (not mtp_block which has zeroed weights)
     paths = [path for path in flat
              if path[-1] == "kernel"
              and "stack" in path
              and "layers" in path
              and any(t in path for t in LORA_TARGETS)]
-    # Filter to only weights with non-zero magnitude (skip dead weights)
     paths = [p for p in paths if jnp.max(jnp.abs(flat[p])) > 1e-6]
     return paths
 
