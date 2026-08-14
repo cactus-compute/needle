@@ -4,7 +4,7 @@ version = "2.0.0"
 description = "A 14MB foundation tool-calling model for tiny devices: inference, LoRA finetuning, and build."
 requires-python = ">=3.9"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = { text = "MIT" }
 dependencies = [
     "huggingface_hub",
     "numpy",
