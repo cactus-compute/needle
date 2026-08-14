@@ -63,6 +63,37 @@ print(invoice.vendor, invoice.total)   # -> Acme Corp 1200.0
 
 Per argument descriptions and choices, value constraints compiled into the decode grammar, raw JSON schemas, driving the loop with `complete()`, the response contract, system facts, tool retrieval, and confidence gating are all covered in [doc/apis.md](doc/apis.md).
 
+## Offline and air-gapped setup
+
+Needle's inference engine is a native library (`libneedle.so` / `libneedle.dylib` / `libneedle.dll`) that is downloaded once from Hugging Face the first time you create a `Needle` agent, then cached on disk. Inference itself never touches the network, so once the engine is in place the package runs fully offline.
+
+**Where the engine lives.** The engine is cached at:
+
+```
+~/.cache/cactus-needle/<engine-version>/libneedle.so
+```
+
+(e.g. `~/.cache/cactus-needle/2.0.1/libneedle.so` on Linux). At load time the package looks for the library in this order:
+
+1. Next to the installed package itself (`<site-packages>/needle/libneedle.so`) — an override that always wins;
+2. The `~/.cache/cactus-needle/<engine-version>/` cache directory;
+3. Downloads it from Hugging Face (`Cactus-Compute/needle2`) and caches it in the directory above.
+
+There is no dedicated environment variable for the cache path itself; to deploy to an offline device, either approach works:
+
+**Pre-cache the directory.** On a machine with network access, run any script that creates a `Needle` agent once (this downloads and caches the engine), then copy the whole `~/.cache/cactus-needle/` directory to the target device at the same location relative to `$HOME`. The package will find the cached engine and never attempt a download.
+
+**Ship the library next to the package.** Copy `libneedle.so` (or the matching platform name) into the installed package directory:
+
+```sh
+python -c "import needle, os; print(os.path.dirname(needle.__file__))"
+# copy libneedle.so into that directory
+```
+
+Because the package-local copy is checked first, this works regardless of `$HOME` or cache state — useful for CI images and containerized deployments.
+
+**HF download controls.** The initial download uses `huggingface_hub`, so the standard environment variables apply to that step: `HF_HOME` / `HF_HUB_CACHE` redirect where the downloaded wheel is stored, and `HF_HUB_OFFLINE=1` makes the hub fail fast instead of attempting a network call. Set `HF_HUB_OFFLINE=1` in CI or on air-gapped devices so a missing engine produces a clear error instead of a hanging download.
+
 ## Playground
 
 Try any model in the browser: pick a preset, edit the tools or prompt, and Run. Follow-up queries continue the same conversation.
