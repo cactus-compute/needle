@@ -50,6 +50,7 @@ class Needle:
     def __init__(self, tools=None, system=None, weights=None, tool_index_path=None, buffer_size=65536):
         self._functions = {}
         self._weights = weights
+        self._weight_blob = None
         if weights:
             warnings.warn("finetuning does not update the confidence head, so scores are "
                           "uncalibrated for tuned weights; this agent reports confidence as None",
@@ -66,9 +67,12 @@ class Needle:
         if _active is self:
             return
         if self._weights and _active_weights != self._weights:
-            with open(self._weights, "rb") as handle:
-                blob = handle.read()
-            if _lib().needle_load(blob, len(blob)) != 0:
+            if self._weight_blob is None:
+                with open(self._weights, "rb") as handle:
+                    # needle_load does not copy the input buffer and retains/dereferences
+                    # it during inference, so the bytes object must be kept alive on self.
+                    self._weight_blob = handle.read()
+            if _lib().needle_load(self._weight_blob, len(self._weight_blob)) != 0:
                 raise RuntimeError(
                     f"failed to load weights from {self._weights} - the .cact "
                     f"format is tied to the engine version, so an archive "
