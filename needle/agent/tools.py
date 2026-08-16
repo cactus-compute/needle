@@ -3,6 +3,7 @@ import inspect
 import re
 import types
 import typing
+from typing import Callable
 
 _JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean",
                list: "array", dict: "object"}
@@ -107,7 +108,7 @@ def _parse_doc(doc):
     return " ".join(w for w in desc if w).strip(), args
 
 
-def build_schema(fn):
+def build_schema(fn: Callable) -> dict:
     signature = inspect.signature(fn)
     try:
         hints = typing.get_type_hints(fn, include_extras=True)
@@ -146,7 +147,7 @@ def _is_pydantic_model(obj):
         for base in obj.__mro__)
 
 
-def pydantic_schema(model):
+def pydantic_schema(model: type) -> dict:
     raw = model.model_json_schema() if hasattr(model, "model_json_schema") else model.schema()
     parameters = {"type": "object", "properties": raw.get("properties", {})}
     for key in ("required", "$defs", "definitions"):
@@ -159,6 +160,6 @@ def pydantic_schema(model):
     return out
 
 
-def tool(fn):
+def tool(fn: Callable) -> Callable:
     fn._needle_tool = build_schema(fn)
     return fn

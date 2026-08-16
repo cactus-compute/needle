@@ -100,7 +100,7 @@ class Needle:
                 schemas.append(entry)
         return schemas
 
-    def complete(self, text, max_new_tokens=256):
+    def complete(self, text: str, max_new_tokens: int = 256) -> dict:
         self._bind()
         rc = _lib().needle_complete(text.encode("utf-8"), int(max_new_tokens),
                                     self._buffer, len(self._buffer))
@@ -116,7 +116,7 @@ class Needle:
             response["confidence"] = None
         return response
 
-    def run(self, query, max_steps=8, max_new_tokens=256):
+    def run(self, query: str, max_steps: int = 8, max_new_tokens: int = 256) -> dict:
         response = self.complete(query, max_new_tokens)
         executed = []
         for _ in range(max_steps):
@@ -138,7 +138,7 @@ class Needle:
         response["results"] = executed
         return response
 
-    def extract(self, text, schema, max_new_tokens=256):
+    def extract(self, text: str, schema: type | dict, max_new_tokens: int = 256) -> object:
         return extract(text, schema, max_new_tokens=max_new_tokens)
 
     def reset(self):
@@ -154,7 +154,7 @@ def _jsonable(value):
     return str(value)
 
 
-def extract(text, schema, system=None, max_new_tokens=256):
+def extract(text: str, schema: type | dict, system: str | None = None, max_new_tokens: int = 256) -> object:
     """One-shot structured extraction: declare `schema` as the only tool and return
     the parsed object (a Pydantic instance if `schema` is a model, else a dict).
     Re-initializes the shared engine with this single schema."""
