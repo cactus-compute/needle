@@ -12,6 +12,12 @@ from .architecture import SimpleAttentionNetwork, TransformerConfig
 
 CHECKPOINT_FORMAT_VERSION = 2
 
+# Round decode buffers up to a multiple of this many tokens so JIT-compiled
+# decode functions get reused across calls with similar prompt lengths
+# instead of retracing for every distinct length (mirrors the bucketing in
+# finetune.fit_max_len).
+BUF_BUCKET = 128
+
 _decode_fn_cache = {}
 
 
@@ -216,11 +222,11 @@ def main(args):
     model = SimpleAttentionNetwork(config)
     tokenizer = get_tokenizer(config.vocab_size)
 
-    prompt = args.prompt or "The most surprising thing about"
+    prompt = args.query or "The most surprising thing about"
     print(f"prompt: {prompt!r}")
     generate(
         model, params, tokenizer, prompt,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
+        max_new_tokens=args.max_len,
+        temperature=getattr(args, "temperature", 0.0),
         seed=args.seed,
     )
