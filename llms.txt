@@ -24,7 +24,7 @@ pip install cactus-needle
 - `agent.reset()` - rewind the conversation, keep the tools loaded.
 - `needle.tool` - decorator that turns a function into a tool schema (attached as `fn._needle_tool`).
 - `needle.Field(default=..., *, description, enum, const, ge, le, gt, lt, multiple_of, min_length, max_length, pattern, format, min_items, max_items, unique_items)` - per-argument constraints; attach inline with `typing.Annotated`.
-- `needle.extract(text, schema, system=None, max_new_tokens=256)` - one-shot extraction; returns a Pydantic instance if `schema` is a model, else a dict (or `None` if nothing matched).
+- `needle.extract(text, schema, system=None, max_new_tokens=256, weights=None)` - one-shot extraction; returns a Pydantic instance if `schema` is a model, else a dict (or `None` if nothing matched). `weights` selects a tuned `.cact` and defaults to whatever the engine already has loaded, so extraction inherits the active tuned model unless you pass another path.
 
 ## Defining tools (three equivalent ways)
 

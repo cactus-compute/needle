@@ -8,7 +8,7 @@
 | `agent.reset()` | Rewind the conversation, keep the tools loaded. |
 | `needle.tool` | Decorator that turns a function into a tool schema (attached as `fn._needle_tool`). |
 | `needle.Field(...)` | Per argument constraints, attached inline with `typing.Annotated` or passed as a default. |
-| `needle.extract(text, schema, system=None, max_new_tokens=256)` | One shot extraction. Returns a Pydantic instance if `schema` is a model, else a dict, or `None` if nothing matched. |
+| `needle.extract(text, schema, system=None, max_new_tokens=256, weights=None)` | One shot extraction. Returns a Pydantic instance if `schema` is a model, else a dict, or `None` if nothing matched. `weights` selects a tuned `.cact` and defaults to whatever the engine already has loaded. |
 
 ## Declaring tools
 
