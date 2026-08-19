@@ -156,7 +156,7 @@ Calibration holds for the base model only. Fine-tuning does not update the head,
 
 The engine is fetched once and cached at `~/.cache/cactus-needle/<engine version>/`. Inference itself never touches the network, so an air gapped device only needs that one file in place. Three ways to get it there:
 
-1. `needle fetch` downloads the engine for the current machine into the cache and prints the path. `--out <dir>` places it elsewhere. `--platform-tag manylinux2014_aarch64` fetches the build for a different device; tags follow the wheel names on the Hugging Face repo (`macosx_11_0_arm64`, `manylinux2014_x86_64`, `musllinux_1_2_aarch64`, `win_amd64`, `win_arm64`).
+1. `needle fetch` downloads the engine for the current machine into the cache and prints the path. `--out <dir>` places it elsewhere. `--platform-tag manylinux2014_aarch64` fetches the build for a different device; tags follow the wheel names on the Hugging Face repo (`macosx_11_0_arm64`, `manylinux2014_x86_64`, `musllinux_1_2_aarch64`, `win_amd64`, `win_arm64`). For the standalone engine runner, `needle download <platform> [--out <dir>]` (platform folder names like `macos-arm64`, `linux-x86_64`; the CLI prints the full list on an invalid name) copies that platform's engine files into `<out>/<platform>/` and marks the `needle` runner executable.
 2. Copy the file to the same cache path on the device, or drop it inside the installed `needle/` package directory, which wins over the cache.
 3. Set `NEEDLE_LIB_PATH=/path/to/libneedle.so` to load exactly that file and skip every lookup.
 

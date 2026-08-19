@@ -121,7 +121,7 @@ pip install "cactus-needle[metal]"
 needle build checkpoints/needle2.pkl --lora checkpoints/needle_lora.pkl --out my_needle.cact
 ```
 
-Add `--bits 2` for a smaller model (by default the export follows the checkpoint's declared per-layer bit map, falling back to 4 when the checkpoint declares none), or set `NEEDLE_HF_REPO=<you>/<model>` and pass `--upload` to publish the `.cact`. The counterpart `needle download <you>/<model>/my_needle.cact` pulls a published archive on any machine.
+Add `--bits 2` for a smaller model (by default the export follows the checkpoint's declared per-layer bit map, falling back to 4 when the checkpoint declares none), or set `NEEDLE_HF_REPO=<you>/<model>` and pass `--upload` to publish the `.cact`. The counterpart `needle download <you>/<model>/my_needle.cact` pulls a published archive on any machine, and `needle download <platform>` (e.g. `macos-arm64`) fetches that platform's engine runner.
 
 **4. Run it.** The engine is weights-agnostic, so a tuned `.cact` runs on it directly - no recompilation:
 

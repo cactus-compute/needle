@@ -190,7 +190,7 @@ Preset demos, editable tools/prompt, multi-turn follow-ups, and a "Finetune on t
 - `needle generate-data` / `needle finetune` / `needle build` - the fine-tuning pipeline.
 - `needle playground` - browser UI.
 - `needle fetch [--platform-tag <tag>] [--out <dir>]` - pre-download the inference engine for this machine (or another platform) into the cache; prints the path. For air-gapped devices, also see `NEEDLE_LIB_PATH` and `HF_HUB_OFFLINE` in doc/apis.md.
-- `needle download <org>/<repo>[/<file>.cact] [--out <dir>]` - pull a published `.cact` (single-archive repos need only `<org>/<repo>`).
+- `needle download <org>/<repo>[/<file>.cact] | <platform> [--out <dir>]` - pull a published `.cact` (single-archive repos need only `<org>/<repo>`), or pass a platform folder name (`macos-arm64`, `linux-x86_64`, ...) to fetch that platform's engine files (including the `needle` runner, marked executable) into `<out>/<platform>/`.
 
 ## Common mistakes to avoid
 
