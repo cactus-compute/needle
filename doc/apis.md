@@ -105,6 +105,7 @@ Needle solves every problem as a function call. The context declares what may be
 - `reasoning` is the model's short derivation of each argument from its source span (`'ten minutes' -> minutes 10`). It is generated unconstrained; only the call itself is grammar-constrained, so the JSON cannot be malformed while the derivation stays legible.
 - After you execute a call, pass the result back as the next `complete()`. The model continues from it, and later arguments may depend on earlier results: `search_for_contact` first, then `send_instant_message` with the returned `contact_id`. A final `"type": "respond"` with empty `function_calls` signals the loop is done; the answer is the tool results themselves, which `run()` collects on the final response as `results`. No free text is generated.
 - A session shares one toolset. Later turns are bare queries against the same tools; `reset()` rewinds the conversation and keeps the tools loaded.
+- Weights stay loaded for the process. Once a tuned `.cact` is bound, constructing or calling a base-model agent raises instead of silently answering with those weights; construct base-model agents before tuned ones, or run tuned and base workloads in separate processes. Rebinding agents on the same weights is fine.
 
 ## Extraction
 

@@ -199,4 +199,5 @@ Preset demos, editable tools/prompt, multi-turn follow-ups, and a "Finetune on t
 - Do not create one `Needle` per turn for a conversation; reuse the instance so context carries. New tools = new instance.
 - `import needle` does not import JAX; only `needle finetune`/`build` do.
 - `weights=` expects a `.cact` (from `needle build`), not a `.pkl` checkpoint.
+- The engine cannot unload weights: once a tuned `.cact` is bound, constructing or calling a base-model agent raises instead of silently answering with those weights. Construct agents that want the base model before any tuned one, or run them in separate processes.
 ```
