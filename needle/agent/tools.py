@@ -135,9 +135,10 @@ def build_schema(fn: Callable) -> dict:
     parameters = {"type": "object", "properties": properties}
     if required:
         parameters["required"] = required
-    out = {"name": fn.__name__, "parameters": parameters}
+    out = {"name": fn.__name__}
     if description:
         out["description"] = description
+    out["parameters"] = parameters
     return out
 
 
