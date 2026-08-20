@@ -11,13 +11,7 @@ from .tokenizer import get_tokenizer, BOS_ID, EOS_ID, PAD_ID
 from .architecture import SimpleAttentionNetwork, TransformerConfig
 
 CHECKPOINT_FORMAT_VERSION = 2
-
-# Round decode buffers up to a multiple of this many tokens so JIT-compiled
-# decode functions get reused across calls with similar prompt lengths
-# instead of retracing for every distinct length (mirrors the bucketing in
-# finetune.fit_max_len).
 BUF_BUCKET = 128
-
 _decode_fn_cache = {}
 
 
