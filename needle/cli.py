@@ -125,8 +125,8 @@ def main():
     p.add_argument("--tools", type=str, default=None, help="Tools JSON for tool-call generation")
     p.add_argument("--max-len", type=int, default=512)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--no-constrained", action="store_true",
-                   help="Disable grammar-constrained decoding for tool names/arg keys")
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="Sampling temperature (0 = greedy)")
 
     p = sub.add_parser("finetune")
     p.add_argument("jsonl_path", type=str, help="Path to JSONL training data")

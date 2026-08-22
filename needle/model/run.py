@@ -1,4 +1,5 @@
 import os
+import json
 import pickle
 import re
 import sys
@@ -211,16 +212,27 @@ def generate(model, params, tokenizer, prompt, max_new_tokens=256, temperature=0
     return text
 
 
+def build_prompt(query, tools=None):
+    if not tools:
+        return query
+    from .finetune import render_example
+    prompt, _ = render_example({"query": query, "tools": tools})
+    return prompt
+
+
 def main(args):
     params, config = load_checkpoint(args.checkpoint)
     model = SimpleAttentionNetwork(config)
     tokenizer = get_tokenizer(config.vocab_size)
 
     prompt = args.query or "The most surprising thing about"
+    if getattr(args, "tools", None):
+        with open(args.tools) as handle:
+            prompt = build_prompt(prompt, json.load(handle))
     print(f"prompt: {prompt!r}")
     generate(
         model, params, tokenizer, prompt,
         max_new_tokens=args.max_len,
-        temperature=getattr(args, "temperature", 0.0),
+        temperature=args.temperature,
         seed=args.seed,
     )
