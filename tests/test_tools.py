@@ -1,3 +1,4 @@
+import enum
 import sys
 import typing
 
@@ -138,3 +139,22 @@ def test_tool_decorator_preserves_callable():
 
     assert greet("bob") == "hi bob"
     assert greet._needle_tool["name"] == "greet"
+
+
+def test_numeric_literal_and_int_enum_schema():
+    class Level(enum.IntEnum):
+        LOW = 1
+        MEDIUM = 2
+        HIGH = 3
+
+    def f(
+        port: typing.Literal[80, 443, 8080],
+        level: Level,
+        mode: typing.Literal["fast", "slow"] = "fast"
+    ):
+        pass
+
+    props = build_schema(f)["parameters"]["properties"]
+    assert props["port"] == {"type": "integer", "enum": [80, 443, 8080]}
+    assert props["level"] == {"type": "integer", "enum": [1, 2, 3]}
+    assert props["mode"] == {"type": "string", "enum": ["fast", "slow"]}

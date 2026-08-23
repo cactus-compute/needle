@@ -64,12 +64,16 @@ def _json_type(annotation):
         if annotation in _JSON_TYPES:
             return {"type": _JSON_TYPES[annotation]}
         if isinstance(annotation, type) and issubclass(annotation, enum.Enum):
-            return {"type": "string", "enum": [e.value for e in annotation]}
+            values = [e.value for e in annotation]
+            val_type = _JSON_TYPES.get(type(values[0]), "string") if values else "string"
+            return {"type": val_type, "enum": values}
         if _is_pydantic_model(annotation):
             return pydantic_schema(annotation)["parameters"]
         return {"type": "string"}
     if origin is typing.Literal:
-        return {"type": "string", "enum": list(typing.get_args(annotation))}
+        args = list(typing.get_args(annotation))
+        val_type = _JSON_TYPES.get(type(args[0]), "string") if args else "string"
+        return {"type": val_type, "enum": args}
     if origin in (list, typing.List):
         args = typing.get_args(annotation)
         return {"type": "array", "items": _json_type(args[0]) if args else {"type": "string"}}
