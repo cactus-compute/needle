@@ -144,6 +144,10 @@ agent = needle.Needle(weights="my_needle.cact", tools=[...])
 agent.run("...")
 ```
 
+## Telemetry
+
+Cactus Compute collects strictly anonymous usage telemetry (function name, package version, OS — never your prompts, outputs, or data); opt out with `NEEDLE_TELEMETRY=0` or `DO_NOT_TRACK=1`.
+
 ## Citation
 
 Needle 2 is built by the Cactus Compute team. If you use it in your work, please cite:
