@@ -30,6 +30,13 @@ Each block carries its update rule. Here x̂ is the RMS-normalised flattening of
 pip install cactus-needle
 ```
 
+The runtime package does not install the training stack. Add the `train` extra
+when using fine-tuning or checkpoint export:
+
+```sh
+pip install "cactus-needle[train]"
+```
+
 Needle reads your tool descriptions to decide what to call and how to fill arguments, so describing them well is the whole game.
 
 **Simple**: decorate a function. The signature gives the argument types, the docstring is the tool description, and `run()` completes the loop: model picks the call, Needle executes your function, feeds the result back, and returns the final response with the executed tool results attached as `results`.
@@ -119,13 +126,13 @@ Key options: `--epochs` (default 3), `--lora-rank` (16), `--lora-alpha` (32), `-
 Training is plain JAX and runs on any accelerator jax supports. On an NVIDIA machine install the CUDA build and the same command trains on the GPU:
 
 ```sh
-pip install "cactus-needle[gpu]"
+pip install "cactus-needle[train,gpu]"
 ```
 
 On Apple Silicon the `metal` extra trains on the GPU:
 
 ```sh
-pip install "cactus-needle[metal]"
+pip install "cactus-needle[train,metal]"
 ```
 
 **3. Build a tuned `.cact`.** Merge the adapter into the base and quantize. The base auto-downloads if absent.

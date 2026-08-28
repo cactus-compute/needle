@@ -7,17 +7,23 @@ readme = "README.md"
 license = { text = "Apache-2.0" }
 dependencies = [
     "huggingface_hub",
-    "numpy",
-    "jax",
-    "jaxlib",
-    "flax>=0.10.2",
-    "optax",
-    "sentencepiece",
 ]
 
 [project.optional-dependencies]
+train = [
+  "numpy",
+  "jax",
+  "jaxlib",
+  "flax>=0.10.2",
+  "optax",
+  "sentencepiece"
+]
 gpu = ["jax[cuda12]"]
-metal = ["jax==0.4.38", "jaxlib==0.4.38", "jax-metal", "flax==0.10.2", "optax==0.2.4"]
+metal = [
+    "jax==0.4.38",
+    "jaxlib==0.4.38",
+    "jax-metal"
+]
 test = ["pytest", "pydantic"]
 
 [project.scripts]

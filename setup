@@ -20,11 +20,11 @@ fi
 source "$VENV_DIR/bin/activate"
 
 pip install --upgrade pip -q
-pip install -e . -q
+pip install -e ".[train]" -q
 
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-    echo "NVIDIA GPU detected; installing jax[cuda12]..."
-    pip install -U "jax[cuda12]" -q
+    echo "NVIDIA GPU detected; installing gpu extras..."
+    pip install -e ".[gpu]" -q
 fi
 
 needle --help

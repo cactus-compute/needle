@@ -4,6 +4,12 @@ Needle finetunes with LoRA adapters on the frozen base model: rank 16 on the fiv
 
 ## Data format
 
+Install the training dependencies before running the commands in this guide:
+
+```sh
+pip install "cactus-needle[train]"
+```
+
 One JSON object per line. `query` and `tools` describe the turn, `answers` lists the exact calls the model should emit, `reasoning` is one short line deriving each argument from its source span in the query. `reasoning` is optional but include it: the model produces the derivation before the call, and examples that show where each value comes from teach grounding, not just tool selection.
 
 ```json
@@ -46,13 +52,13 @@ The playground button labelled Finetune on these tools runs the same pipeline fr
 Training is plain JAX, so it runs on any accelerator jax supports. On an NVIDIA machine install the CUDA build and the same command trains on the GPU, nothing else changes:
 
 ```sh
-pip install "cactus-needle[gpu]"
+pip install "cactus-needle[train,gpu]"
 ```
 
 Apple GPUs train through the jax metal plugin, which does not work past jax 0.4.38, so the `metal` extra pins an older stack:
 
 ```sh
-pip install "cactus-needle[metal]"
+pip install "cactus-needle[train,metal]"
 ```
 
 Needle detects the Metal backend and adapts automatically: manual attention, no rematerialisation, unrolled layer stack, and the `ENABLE_PJRT_COMPATIBILITY` variable the plugin requires is set for you. Measured on an M5 Max: 0.71 seconds per step against 2.90 on CPU at the same shape, about 4 times faster, with a one time compile of about 23 seconds. Training runs in float32 on every backend.
