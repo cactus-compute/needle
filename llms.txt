@@ -197,7 +197,7 @@ Adapt by swapping the Literal values for your own and keeping the shapes: closed
 
 ## CLI summary
 
-- `needle run --checkpoint <base.pkl> --query "..." --tools tools.json` - JAX reference inference from a checkpoint (dev path; normal inference is the Python `Needle` API above).
+- `needle run --checkpoint <base.pkl> --query "..." --tools tools.json [--temperature <t>]` - JAX reference inference from a checkpoint (dev path; normal inference is the Python `Needle` API above); `--temperature` defaults to 0 (greedy).
 - `needle generate-data` / `needle finetune` / `needle build` - the fine-tuning pipeline.
 - `needle playground` - browser UI.
 - `needle fetch [--platform-tag <tag>] [--out <dir>]` - pre-download the inference engine for this machine (or another platform) into the cache; prints the path. For air-gapped devices, also see `NEEDLE_LIB_PATH` and `HF_HUB_OFFLINE` in doc/apis.md.

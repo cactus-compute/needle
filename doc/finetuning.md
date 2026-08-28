@@ -41,6 +41,8 @@ To grow a small hand written set, seed the generator with it (needs `OPENROUTER_
 needle generate-data --augment data.jsonl --num-samples 1000
 ```
 
+`finetune` runs the same generator inline: `--generate 300` synthesizes that many extra examples before training starts (`0` disables it, the default), `--model` picks the OpenRouter model (default `deepseek/deepseek-v4-flash`), and `--workers` bounds concurrent requests (default 8).
+
 The playground button labelled Finetune on these tools runs the same pipeline from the browser.
 
 Training is plain JAX, so it runs on any accelerator jax supports. On an NVIDIA machine install the CUDA build and the same command trains on the GPU, nothing else changes:
