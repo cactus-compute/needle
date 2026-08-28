@@ -16,7 +16,7 @@ from pathlib import Path
 
 ENDPOINT = os.environ.get(
     "NEEDLE_TELEMETRY_URL",
-    "https://mamakztargnvtkhqjynx.supabase.co/functions/v1/telemetry",
+    "https://vlqqczxwyaodtcdmdmlw.supabase.co/functions/v1/telemetry",
 )
 
 _NOTICE = ("cactus-needle collects anonymous usage counts (function name, "
