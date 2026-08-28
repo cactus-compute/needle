@@ -16,15 +16,26 @@ if [ -z "$PYTHON" ]; then
     exit 1
 fi
 
-[ -d "$VENV_DIR" ] || "$PYTHON" -m venv "$VENV_DIR"
+# Use uv when available (10-100x faster), fall back to pip.
+UV_INSTALL="pip install"
+UV_VENV="$PYTHON -m venv"
+if command -v uv >/dev/null 2>&1; then
+    echo "  uv detected — using uv for package management"
+    UV_INSTALL="uv pip install"
+    UV_VENV="uv venv"
+fi
+
+[ -d "$VENV_DIR" ] || $UV_VENV "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 
-pip install --upgrade pip -q
-pip install -e . -q
+if [ "$UV_INSTALL" = "pip install" ]; then
+    pip install --upgrade pip -q
+fi
+$UV_INSTALL -e . -q
 
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
     echo "NVIDIA GPU detected; installing jax[cuda12]..."
-    pip install -U "jax[cuda12]" -q
+    $UV_INSTALL -U "jax[cuda12]" -q
 fi
 
 needle --help
