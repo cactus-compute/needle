@@ -40,7 +40,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e ".[test]"
+      - run: pip install -e ".[test,train]"
       - run: pytest -q -m "not slow"
 
   release:
@@ -49,11 +49,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write        # pushes the vX.Y.Z release tag
-      id-token: write        
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

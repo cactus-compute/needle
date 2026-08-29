@@ -31,11 +31,11 @@ source "$VENV_DIR/bin/activate"
 if [ "$UV_INSTALL" = "pip install" ]; then
     pip install --upgrade pip -q
 fi
-$UV_INSTALL -e . -q
+$UV_INSTALL -e ".[train]" -q
 
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-    echo "NVIDIA GPU detected; installing jax[cuda12]..."
-    $UV_INSTALL -U "jax[cuda12]" -q
+    echo "NVIDIA GPU detected; installing gpu extras..."
+    $UV_INSTALL -e ".[gpu]" -q
 fi
 
 needle --help

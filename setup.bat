@@ -19,6 +19,6 @@ if not exist "%VENV_DIR%\Scripts\python.exe" %PYTHON_CMD% -m venv "%VENV_DIR%"
 call "%VENV_DIR%\Scripts\activate.bat"
 
 python -m pip install --upgrade pip -q
-python -m pip install -e . -q
+python -m pip install -e ".[train]" -q
 
 needle --help

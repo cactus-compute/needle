@@ -7,6 +7,7 @@ import sys
 import warnings
 
 from .agent.tools import Field, build_schema, pydantic_schema, tool, _is_pydantic_model
+from ._telemetry import track as _track
 
 __version__ = "2.0.8"
 __all__ = ["Needle", "tool", "Field", "extract", "__version__"]
@@ -63,6 +64,10 @@ class Needle:
         self._system = (system or "").encode("utf-8")
         tools_json = tools if isinstance(tools, str) else json.dumps(self._resolve(tools))
         self._tools_json = tools_json.encode("utf-8")
+        try:
+            self._n_tools = len(json.loads(tools_json))
+        except (json.JSONDecodeError, TypeError):
+            self._n_tools = None
         self._tool_index_path = tool_index_path.encode("utf-8") if tool_index_path else None
         self._buffer = ctypes.create_string_buffer(buffer_size)
         self._bind()
@@ -108,7 +113,14 @@ class Needle:
                 schemas.append(entry)
         return schemas
 
+    def _track_props(self):
+        return {"n_tools": self._n_tools, "tuned": bool(self._weights)}
+
     def complete(self, text: str, max_new_tokens: int = 256) -> dict:
+        _track("complete", self._track_props())
+        return self._complete(text, max_new_tokens)
+
+    def _complete(self, text: str, max_new_tokens: int = 256) -> dict:
         self._bind()
         rc = _lib().needle_complete(text.encode("utf-8"), int(max_new_tokens),
                                     self._buffer, len(self._buffer))
@@ -125,7 +137,8 @@ class Needle:
         return response
 
     def run(self, query: str, max_steps: int = 8, max_new_tokens: int = 256) -> dict:
-        response = self.complete(query, max_new_tokens)
+        _track("run", self._track_props())
+        response = self._complete(query, max_new_tokens)
         executed = []
         for _ in range(max_steps):
             calls = response.get("function_calls") or []
@@ -142,7 +155,7 @@ class Needle:
                 except Exception as exc:
                     results.append({"error": str(exc)})
             executed.extend(results)
-            response = self.complete(json.dumps(results, default=_jsonable), max_new_tokens)
+            response = self._complete(json.dumps(results, default=_jsonable), max_new_tokens)
         response["results"] = executed
         return response
 
@@ -169,8 +182,9 @@ def extract(text: str, schema: type | dict, system: str | None = None,
     the parsed object (a Pydantic instance if `schema` is a model, else a dict).
     Re-initializes the shared engine with this single schema. Defaults to whatever
     weights are already loaded, since the engine cannot unload them."""
+    _track("extract", {"n_tools": 1, "tuned": bool(weights or _active_weights)})
     agent = Needle(tools=[schema], system=system, weights=weights or _active_weights)
-    response = agent.complete(text, max_new_tokens)
+    response = agent._complete(text, max_new_tokens)
     calls = response.get("function_calls") or []
     if not calls:
         return None

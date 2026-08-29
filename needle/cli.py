@@ -190,6 +190,9 @@ def main():
         print(HELP)
         sys.exit(0)
 
+    from ._telemetry import track
+    track("cli:" + args.command)
+
     if args.command == "run":
         from .model.run import main as run_main
         run_main(args)

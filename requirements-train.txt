@@ -1,0 +1,9 @@
+-r requirements.txt
+
+# Training and checkpoint export dependencies
+numpy
+jax
+jaxlib
+flax>=0.10.2
+optax
+sentencepiece
