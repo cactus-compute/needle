@@ -89,10 +89,15 @@ def _json_type(annotation):
 def _field_of(annotation, default):
     if isinstance(default, Field):
         return default
-    if typing.get_origin(annotation) is typing.Annotated:
+    origin = typing.get_origin(annotation)
+    if origin is typing.Annotated:
         for meta in typing.get_args(annotation)[1:]:
             if isinstance(meta, Field):
                 return meta
+    if origin in _UNION_ORIGINS:
+        rest = [a for a in typing.get_args(annotation) if a is not type(None)]
+        if len(rest) == 1:
+            return _field_of(rest[0], _MISSING)
     return None
 
 

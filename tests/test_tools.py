@@ -59,6 +59,26 @@ def test_optional_annotation_not_required():
     assert schema["parameters"]["required"] == ["a"]
 
 
+def test_optional_annotated_field_constraints():
+    def f(
+        value: typing.Optional[typing.Annotated[
+            str, Field(pattern="^[a-z]+$", min_length=2, format="email")]] = None,
+        count: typing.Annotated[typing.Optional[int], Field(ge=0)] = None,
+    ):
+        pass
+
+    schema = build_schema(f)
+    properties = schema["parameters"]["properties"]
+    assert properties["value"] == {
+        "type": "string",
+        "pattern": "^[a-z]+$",
+        "minLength": 2,
+        "format": "email",
+    }
+    assert properties["count"] == {"type": "integer", "minimum": 0}
+    assert not {"value", "count"} & set(schema["parameters"].get("required", []))
+
+
 @pep604
 def test_pep604_none_union_not_required():
     def f(a: str, b: str | None = None, c: int | None = None, d: str | int | None = None):
