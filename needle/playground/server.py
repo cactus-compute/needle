@@ -11,7 +11,7 @@ _STATIC = {"/": "index.html", "/index.html": "index.html",
 _CTYPE = {".html": "text/html; charset=utf-8",
           ".js": "application/javascript; charset=utf-8",
           ".css": "text/css; charset=utf-8"}
-_DOWNLOADS = Path(tempfile.gettempdir())
+_DOWNLOADS = Path(tempfile.mkdtemp(prefix="needle-playground-"))
 
 
 class Engine:
