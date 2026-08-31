@@ -9,7 +9,7 @@ ships a usable documentation slice with executable examples and explicit limits.
 
 ## Phases
 
-- [ ] **Phase 1: Install and First Inference** - Make a clean environment and first response repeatable.
+- [x] **Phase 1: Install and First Inference** - Make a clean environment and first response repeatable. (completed 2026-08-31)
 - [ ] **Phase 2: Model and Runtime Concepts** - Explain architecture, artifacts, troubleshooting, and safety boundaries.
 - [ ] **Phase 3: LoRA Fine-Tuning** - Document data preparation and a reproducible local adaptation run.
 - [ ] **Phase 4: Export and Deployment Verification** - Teach merge, quantize, `.cact` loading, and end-to-end checks.
@@ -34,9 +34,9 @@ ships a usable documentation slice with executable examples and explicit limits.
 Plans:
 
 - [x] 01-01-PLAN.md
-- [ ] 01-02-PLAN.md
+- [x] 01-02-PLAN.md
 - [x] 01-01: Write installation, asset/cache, and backend matrix guide.
-- [ ] 01-02: Write and verify CLI/API inference quickstart with expected output.
+- [x] 01-02: Write and verify CLI/API inference quickstart with expected output.
 
 ### Phase 2: Model and Runtime Concepts
 
@@ -105,7 +105,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Install and First Inference | 1/2 | In Progress|  |
+| 1. Install and First Inference | 2/2 | Complete    | 2026-08-31 |
 | 2. Model and Runtime Concepts | 0/2 | Not started | - |
 | 3. LoRA Fine-Tuning | 0/2 | Not started | - |
 | 4. Export and Deployment Verification | 0/2 | Not started | - |

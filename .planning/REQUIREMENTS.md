@@ -7,15 +7,15 @@
 
 ### Installation and Environment
 
-- [ ] **INST-01**: A beginner can create an isolated Python 3.9+ environment and install the correct base, training, test, GPU, or Metal extras for their platform.
-- [ ] **INST-02**: The guide explains native engine, checkpoint, tokenizer, Hugging Face cache locations, offline mode, and required environment variables.
-- [ ] **INST-03**: The guide states a supported CPU/GPU/Metal matrix and gives a CPU fallback when acceleration is unavailable.
+- [x] **INST-01**: A beginner can create an isolated Python 3.9+ environment and install the correct base, training, test, GPU, or Metal extras for their platform.
+- [x] **INST-02**: The guide explains native engine, checkpoint, tokenizer, Hugging Face cache locations, offline mode, and required environment variables.
+- [x] **INST-03**: The guide states a supported CPU/GPU/Metal matrix and gives a CPU fallback when acceleration is unavailable.
 
 ### Inference Quickstart
 
-- [ ] **INFR-01**: A beginner can run a copy-paste pre-trained inference example and identify the expected successful output.
-- [ ] **INFR-02**: The guide demonstrates equivalent CLI and `Needle` Python API flows, including a minimal typed tool call or extraction example.
-- [ ] **INFR-03**: Each quickstart includes a verification command and links common errors to troubleshooting guidance.
+- [x] **INFR-01**: A beginner can run a copy-paste pre-trained inference example and identify the expected successful output.
+- [x] **INFR-02**: The guide demonstrates equivalent CLI and `Needle` Python API flows, including a minimal typed tool call or extraction example.
+- [x] **INFR-03**: Each quickstart includes a verification command and links common errors to troubleshooting guidance.
 
 ### Model and Runtime Concepts
 
@@ -43,8 +43,8 @@
 
 ### Documentation Quality
 
-- [ ] **DOCS-01**: The primary onboarding path is Chinese-first, preserves exact commands/API identifiers, and links every conceptual claim to a source path or official reference.
-- [ ] **DOCS-02**: Every tutorial states prerequisites, expected output, cleanup/cache behavior, and a practical verification step for CPU and supported accelerator branches.
+- [x] **DOCS-01**: The primary onboarding path is Chinese-first, preserves exact commands/API identifiers, and links every conceptual claim to a source path or official reference.
+- [x] **DOCS-02**: Every tutorial states prerequisites, expected output, cleanup/cache behavior, and a practical verification step for CPU and supported accelerator branches.
 - [ ] **DOCS-03**: Examples are organized by user goal and can be checked in automated tests or a documented manual verification pass.
 
 ## v2 Requirements
@@ -73,12 +73,12 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| INST-01 | Phase 1 | Pending |
-| INST-02 | Phase 1 | Pending |
-| INST-03 | Phase 1 | Pending |
-| INFR-01 | Phase 1 | Pending |
-| INFR-02 | Phase 1 | Pending |
-| INFR-03 | Phase 1 | Pending |
+| INST-01 | Phase 1 | Complete |
+| INST-02 | Phase 1 | Complete |
+| INST-03 | Phase 1 | Complete |
+| INFR-01 | Phase 1 | Complete |
+| INFR-02 | Phase 1 | Complete |
+| INFR-03 | Phase 1 | Complete |
 | MODL-01 | Phase 2 | Pending |
 | MODL-02 | Phase 2 | Pending |
 | MODL-03 | Phase 2 | Pending |
@@ -91,11 +91,12 @@
 | SAFE-01 | Phase 2 | Pending |
 | SAFE-02 | Phase 2 | Pending |
 | SAFE-03 | Phase 2 | Pending |
-| DOCS-01 | Phase 1 | Pending |
-| DOCS-02 | Phase 1 | Pending |
+| DOCS-01 | Phase 1 | Complete |
+| DOCS-02 | Phase 1 | Complete |
 | DOCS-03 | Phase 4 | Pending |
 
 **Coverage:**
+
 - v1 requirements: 21 total
 - Mapped to phases: 21
 - Unmapped: 0
