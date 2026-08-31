@@ -71,3 +71,88 @@ export DO_NOT_TRACK=1
 ```
 
 Windows PowerShell 对应 `\$env:NEEDLE_TELEMETRY = "0"`。
+
+## 认识模型资产
+
+安装 Python 包不会把所有训练文件放进仓库。先区分这些文件的职责：
+
+| 资产 | 用途 | Phase 1 是否需要 |
+| --- | --- | --- |
+| 原生引擎 `libneedle.so`（macOS 为 `.dylib`，Windows 为 `.dll`） | 针对当前 CPU/平台的推理运行时；包含发布版 Needle 2 的内置权重 | 是，运行 `needle fetch` 获取 |
+| 基础 checkpoint `checkpoints/*.pkl` | JAX/Flax 参考模型的参数，用于训练、评估或导出；不是原生运行时直接读取的文件 | 否，微调时再下载/准备 |
+| SentencePiece tokenizer `tokenizer.model` / `tokenizer.vocab` | 把文本转换为训练和参考解码使用的 token；导出时会嵌入 `.cact` | 否，训练/参考解码时按需获取 |
+| `.cact` | 将 checkpoint（可含 LoRA 合并结果）量化并打包为原生引擎可加载的调优权重 | 否；使用调优模型时才需要 |
+
+因此，CPU 首次推理只需原生引擎。`needle fetch` 只负责当前机器的引擎，
+不会偷偷替你下载训练 checkpoint；缺少训练资产时，请按相应教程显式准备。
+
+## 显式获取原生引擎
+
+激活 `.venv` 后，在联网机器上执行：
+
+```sh
+needle fetch
+```
+
+命令会根据操作系统和 CPU 架构自动选择构建，写入默认缓存
+`~/.cache/cactus-needle/2.0.3/`，并打印类似以下信息（路径和扩展名随平台变化）：
+
+```text
+  engine    /home/alice/.cache/cactus-needle/2.0.3/libneedle.so
+  deploy    copy to ~/.cache/cactus-needle/2.0.3/ on the device, or point NEEDLE_LIB_PATH at the file
+```
+
+检查文件确实存在且大小合理：
+
+```sh
+CACHE_DIR="$HOME/.cache/cactus-needle/2.0.3"
+find "$CACHE_DIR" -maxdepth 1 -type f -printf '%f %s bytes\\n' 2>/dev/null || \
+  find "$CACHE_DIR" -maxdepth 1 -type f -print
+```
+
+需要为另一台设备预取时，可显式指定 wheel tag，例如：
+
+```sh
+needle fetch --platform-tag manylinux2014_aarch64 --out ./engine-cache
+```
+
+这是跨设备部署的高级用法。若要获取独立的 engine runner（而不是 Python
+包使用的共享库），使用 `needle download <platform>`，例如
+`needle download linux-x86_64 --out ./runner`；可用的平台列表以
+`needle --help` 和命令报错提示为准。
+
+若要清除某个版本的引擎缓存，请先确认目录只包含 Needle 文件，再删除这个
+明确的版本目录，之后重新执行 `needle fetch`：
+
+```sh
+rm -rf "$HOME/.cache/cactus-needle/2.0.3"
+```
+
+不要删除整个 `~/.cache`，也不要把 checkpoint 或 `.cact` 混放进引擎缓存目录。
+
+## 在线后离线检查
+
+先在线完成 `needle fetch`，再在同一环境中打开 Hugging Face 离线开关。这样
+可以确认运行时只使用缓存，不会在资产缺失时隐式发起网络请求：
+
+```sh
+needle fetch
+HF_HUB_OFFLINE=1 python -c "import needle; print('import ok:', needle.__version__)"
+HF_HUB_OFFLINE=1 python - <<'PY'
+import needle
+
+agent = needle.Needle(tools=[])
+result = agent.complete("hello", max_new_tokens=16)
+assert isinstance(result, dict)
+print("offline inference envelope:", result.get("type"), result.get("function_calls"))
+PY
+```
+
+成功标准是命令退出码为 0，最后一行打印一个响应 envelope（即使没有工具，
+`function_calls` 也应是空列表）。不要比较精确文本，因为模型版本、平台和
+采样设置可能影响输出。若缓存缺失，关闭离线变量后重新执行 `needle fetch`；
+不要依赖 `Needle` 初始化时的隐式下载来修复环境。设置了 `HF_HUB_OFFLINE=1`
+时，缺失引擎应快速报错并指出 Hugging Face 离线限制。
+
+`NEEDLE_LIB_PATH=/path/to/libneedle.so` 可以覆盖默认查找路径，适合把缓存文件
+部署到自定义目录；使用它时仍建议先用上面的 `find` 检查文件存在。
