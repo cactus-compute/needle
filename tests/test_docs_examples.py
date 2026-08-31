@@ -24,6 +24,8 @@ def test_inference_guide_has_cli_first_and_python_api_examples():
     assert "needle run" in text
     assert "--max-len 16" in text
     assert "Needle" in text and "max_new_tokens=16" in text
+    assert "@needle.tool" in text
+    assert "function_calls" in text
     assert "needle fetch" in text
     assert "退出码" in text
 

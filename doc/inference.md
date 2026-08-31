@@ -67,6 +67,26 @@ PY
 
 完整的工具调用、`run()` 循环和结构化提取 API 见 [API 文档](apis.md)。
 
+## 可选：最小 typed tool
+
+如果你的请求需要调用工具，可以直接用 Python 类型标注生成 schema：
+
+```python
+import needle
+
+@needle.tool
+def set_volume(level: int):
+    "Set the speaker volume from 0 to 100."
+    return {"level": level}
+
+agent = needle.Needle(tools=[set_volume])
+response = agent.complete("把音量调到 30", max_new_tokens=16)
+print(response.get("function_calls") or [])
+```
+
+成功时 `function_calls` 是列表（通常包含 `set_volume` 和 `level: 30`）；模型
+可能因版本或置信度设置返回空列表，所以验收仍以字典 envelope 和退出码为准。
+
 ## 离线验收
 
 在线执行过 `needle fetch` 后，可以用下面的命令确认不需要网络：
