@@ -32,18 +32,21 @@ coverage:
       - kind: e2e
         ref: ".venv/bin/needle run --checkpoint checkpoints/needle2.pkl --query 'hello' --max-len 4 --temperature 0"
         status: pass
+    human_judgment: false
   - id: I2
     description: "Native API CPU response after explicit fetch and offline mode"
     verification:
       - kind: e2e
         ref: "HF_HUB_OFFLINE=1 Needle().complete(..., max_new_tokens=16)"
         status: pass
+    human_judgment: false
   - id: I3
     description: "Documentation drift smoke checks"
     verification:
       - kind: unit
         ref: ".venv/bin/pytest -q tests/test_docs_examples.py"
         status: pass
+    human_judgment: false
 ---
 
 # Phase 1 Plan 2: CLI and Python Inference Quickstart Summary
