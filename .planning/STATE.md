@@ -7,7 +7,7 @@ stopped_at: Phase 01 complete, ready to plan Phase 2
 last_updated: "2026-08-31T14:26:10.336Z"
 last_activity: 2026-08-31
 last_activity_desc: Phase 01 complete, transitioned to Phase 2
-state_head: a51cd186c16be4edd208625417bc343f7c455de6
+state_head: 7c5922f22eb091a4a7548dc97d217e766f3f189c
 progress:
   total_phases: 4
   completed_phases: 1
@@ -23,7 +23,7 @@ progress:
 See: `.planning/PROJECT.md` (updated 2026-08-31)
 
 **Core value:** A beginner can install Needle and reliably go from a first inference request to a fine-tuned, exported model without guessing which assets, commands, or runtime constraints apply.
-**Current focus:** Phase 01 — Install and First Inference
+**Current focus:** Phase 02 — Model and Runtime Concepts
 
 ## Current Position
 
@@ -71,8 +71,7 @@ None yet.
 
 ### Blockers/Concerns
 
-- Git index is read-only in the current environment; planning files are present but commits need a writable Git environment.
-- Exact CUDA/Metal matrix and clean-environment tutorial runs need validation during Phase 1.
+- CUDA and Metal installation/runtime verification remain intentionally deferred to a later phase.
 
 ## Deferred Items
 
