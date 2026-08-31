@@ -2,6 +2,7 @@
 phase: 01-install-and-first-inference
 status: passed
 verified: 2026-08-31
+reverified_after: 2026-08-31T14:50:00Z
 verifier: inline goal-backward verification
 ---
 
@@ -47,3 +48,11 @@ None required. The documented CPU commands were executed successfully; generated
 
 CUDA and Apple Metal installation/verification remain deferred to a later phase, as
 decided in the phase context. No claim is made that those branches were tested here.
+
+## Reverification
+
+Re-ran after the UAT coverage metadata correction in `01-02-SUMMARY.md`:
+
+- `.venv/bin/pytest -q tests/test_docs_examples.py` -> 4 passed
+- `.venv/bin/pytest -q -m "not slow"` -> 78 passed, 5 deselected
+- `needle fetch`, offline native API, and bounded CLI inference remained successful.
