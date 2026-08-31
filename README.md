@@ -41,7 +41,8 @@ needle fetch
 ```
 
 Phase 1 只验证 CPU；CUDA 和 Metal 的安装与验证会在后续阶段补充。完成安装
-后可继续阅读首次推理指南，先用 CLI，再使用等价的 `Needle` Python API。
+后可继续阅读[首次推理指南](doc/inference.md)，先用 CLI，再使用等价的
+`Needle` Python API。
 
 ## Quickstart
 
