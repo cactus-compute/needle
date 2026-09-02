@@ -61,7 +61,16 @@ jobs:
       - id: version
         run: |
           last=$(git tag --list 'v*' --sort=-v:refname | head -1)
-          if [ -n "$last" ] && [ "$(git rev-parse "$last^{commit}")" = "$(git rev-parse HEAD)" ]; then
+          # New release tags include a metadata-only child commit. Its parent
+          # is the main commit that was tested and published.
+          source=""
+          if [ -n "$last" ]; then
+            source=$(git rev-parse "$last^{commit}")
+            if [ "$source" != "$(git rev-parse HEAD)" ] && [ "$(git log -1 --format=%s "$last")" = "chore: release ${last#v}" ]; then
+              source=$(git rev-parse "$last^")
+            fi
+          fi
+          if [ "$source" = "$(git rev-parse HEAD)" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -84,5 +93,11 @@ jobs:
           skip-existing: true
       - if: steps.version.outputs.skip != 'true'
         run: |
+          # Preserve the exact versioned source used for the distribution.
+          # Keep the release-only commit on the tag, without writing to main.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml needle/__init__.py
+          git commit -m "chore: release ${{ steps.version.outputs.next }}"
           git tag "v${{ steps.version.outputs.next }}"
           git push origin "v${{ steps.version.outputs.next }}"
