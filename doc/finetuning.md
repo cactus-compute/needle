@@ -44,7 +44,7 @@ adapter; `needle build` rejects a conflicting bit-width override. Use
 
 To share a tuned model, set `NEEDLE_HF_REPO=<you>/<model>` and pass `--upload` to `needle build`; on any other machine `needle download <you>/<model>/tuned.cact` pulls it back down (or pass just `<you>/<model>` when the repo holds a single archive).
 
-Defaults: batch size 16, learning rate 0.0001 with warmup and cosine decay, gradient clipping at norm 1, rank 16, alpha 32, max length 1024, validation split 0.1. The base checkpoint downloads from Hugging Face on first run.
+Defaults: batch size 16, learning rate 0.0001 with warmup and cosine decay, gradient clipping at norm 1, rank 16, alpha 32, max length 1024, validation split 0.1, random seed 0. Use `--seed` to reproduce or intentionally vary LoRA initialization, validation selection, and epoch shuffling. The base checkpoint downloads from Hugging Face on first run.
 
 To grow a small hand written set, seed the generator with it (needs `OPENROUTER_API_KEY`; set `OPENROUTER_URL` to use another OpenAI compatible gateway):
 

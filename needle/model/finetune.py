@@ -21,6 +21,12 @@ from .tokenizer import (
 )
 
 LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "gate_proj", "out_proj")
+
+
+def _training_rng(seed):
+    return np.random.default_rng(int(seed))
+
+
 DEFAULT_BASE = "checkpoints/needle2.pkl"
 
 OPENROUTER_URL = os.environ.get(
@@ -354,12 +360,14 @@ def finetune_local(args, progress=None):
         emit(f"  {'numerics':<9} full precision")
     paths = lora_target_paths(params)
     scale = args.lora_alpha / args.lora_rank
-    lora = init_lora(params, paths, args.lora_rank, jax.random.PRNGKey(0))
+    seed = int(getattr(args, "seed", 0))
+    rng = _training_rng(seed)
+    lora = init_lora(params, paths, args.lora_rank, jax.random.PRNGKey(seed))
     emit(f"  {'lora':<9} rank {args.lora_rank}  alpha {args.lora_alpha:g}  {len(paths)} weight groups")
 
     n_val = min(int(len(seqs) * getattr(args, "val_split", 0.1)), len(seqs) - 1)
     if n_val > 0:
-        order = np.random.default_rng(0).permutation(len(seqs))
+        order = rng.permutation(len(seqs))
         seqs, masks = seqs[order], masks[order]
         val_seqs, val_masks = seqs[:n_val], masks[:n_val]
         seqs, masks = seqs[n_val:], masks[n_val:]
@@ -399,7 +407,7 @@ def finetune_local(args, progress=None):
     every = max(1, total_steps // 50)
     step_i = 0
     for epoch in range(args.epochs):
-        order = np.random.permutation(count)
+        order = rng.permutation(count)
         last = 0.0
         for start in range(0, count, batch):
             idx = order[start:start + batch]
@@ -428,6 +436,7 @@ def finetune_local(args, progress=None):
             "rank": args.lora_rank,
             "qat_bits": qat_bits,
             "qat_bits_map": qat_bits_map,
+            "seed": seed,
         }, handle)
     print(f"  {'adapter':<9} {out}")
     print(f"  {'next':<9} needle build {base_path} --lora {out}")
