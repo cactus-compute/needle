@@ -25,7 +25,7 @@ pip install "cactus-needle[train]"       # adds JAX + training deps for finetune
 - `agent.reset()` - rewind the conversation, keep the tools loaded.
 - `needle.tool` - decorator that turns a function into a tool schema (attached as `fn._needle_tool`).
 - `needle.Field(default=..., *, description, enum, const, ge, le, gt, lt, multiple_of, min_length, max_length, pattern, format, min_items, max_items, unique_items)` - per-argument constraints; attach inline with `typing.Annotated`.
-- `needle.extract(text, schema, system=None, max_new_tokens=256, weights=None)` - one-shot extraction; returns a Pydantic instance if `schema` is a model, else a dict (or `None` if nothing matched). `weights` selects a tuned `.cact` and defaults to whatever the engine already has loaded, so extraction inherits the active tuned model unless you pass another path.
+- `needle.extract(text, schema, system=None, max_new_tokens=256, weights=None, strict=True)` - one-shot extraction; returns a Pydantic instance if `schema` is a model, else a dict (or `None` if nothing matched). `weights` selects a tuned `.cact` and defaults to whatever the engine already has loaded, so extraction inherits the active tuned model unless you pass another path. With `strict=True` (the default), temporal values that contradict a literal year in the input, plus engine-reported fabricated or negated values, raise `ExtractionValidationError` instead of being returned silently.
 
 ## Defining tools (three equivalent ways)
 
@@ -202,8 +202,8 @@ Adapt by swapping the Literal values for your own and keeping the shapes: closed
 - `needle run --checkpoint <base.pkl> --query "..." --tools tools.json` - JAX reference inference from a checkpoint (dev path; normal inference is the Python `Needle` API above).
 - `needle generate-data` / `needle finetune` / `needle build` - the fine-tuning pipeline.
 - `needle playground` - browser UI.
-- `needle fetch [--platform-tag <tag>] [--out <dir>]` - pre-download the inference engine for this machine (or another platform) into the cache; prints the path. For air-gapped devices, also see `NEEDLE_LIB_PATH` and `HF_HUB_OFFLINE` in doc/apis.md.
-- `needle download <org>/<repo>[/<file>.cact] | <platform> [--out <dir>]` - pull a published `.cact` (single-archive repos need only `<org>/<repo>`), or pass a platform folder name (`macos-arm64`, `linux-x86_64`, `wasm`, `wasm-component`, ...) to fetch that platform's engine files into `<out>/<platform>/`. Native runners are marked executable; `wasm-component` contains the WASI Preview 2 component and WIT contract.
+- `needle fetch [--generation 2|3] [--platform-tag <tag>] [--out <dir>]` - pre-download that generation's inference engine (default: 2) for this machine (or another platform) into the cache; prints the path. For air-gapped devices, also see `NEEDLE2_LIB_PATH`/`NEEDLE3_LIB_PATH` (the legacy `NEEDLE_LIB_PATH` is a Needle 2 alias, deliberately ignored for Needle 3) and `HF_HUB_OFFLINE` in doc/apis.md.
+- `needle download <org>/<repo>[/<file>.cact] | <platform> [--generation 2|3] [--out <dir>]` - pull a published `.cact` (single-archive repos need only `<org>/<repo>`), or pass a platform folder name (`macos-arm64`, `linux-x86_64`, `wasm`, `wasm-component`, ...) with `--generation` (default: 2) to fetch that platform's engine files into `<out>/<platform>/`. Native runners are marked executable; `wasm-component` contains the WASI Preview 2 component and WIT contract.
 
 ## Common mistakes to avoid
 
