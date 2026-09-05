@@ -114,3 +114,42 @@ def test_auto_qat_preserves_checkpoint_mixed_bit_map(tiny_checkpoint, tmp_path):
                                          lora=str(adapter_path),
                                          out=str(tmp_path / "wrong.cact"),
                                          upload=False, bits="4"))
+
+
+def test_finetune_rng_is_controlled_by_seed():
+    from needle.model.finetune import _training_rng
+
+    a = _training_rng(17)
+    b = _training_rng(17)
+    c = _training_rng(18)
+    a_orders = [a.permutation(12).tolist() for _ in range(3)]
+    b_orders = [b.permutation(12).tolist() for _ in range(3)]
+    c_orders = [c.permutation(12).tolist() for _ in range(3)]
+    assert a_orders == b_orders
+    assert a_orders != c_orders
+
+
+def test_finetune_adapter_records_realized_seed(tiny_checkpoint, tmp_path):
+    from needle.model.finetune import finetune_local
+
+    data = tmp_path / "data.jsonl"
+    rows = []
+    for i in range(4):
+        rows.append({
+            "tools": TOOLS,
+            "query": f"email user{i}@example.com about item {i}",
+            "answers": [{"name": "send_email", "arguments": {"to": f"user{i}@example.com", "subject": f"item {i}"}}],
+        })
+    with data.open("w") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+
+    out = tmp_path / "seeded-adapter.pkl"
+    args = _finetune_args(data, tiny_checkpoint, out, tmp_path / "ck", qat_bits="none")
+    args.seed = 17
+    args.val_split = 0.0
+    finetune_local(args)
+
+    with out.open("rb") as handle:
+        adapter = pickle.load(handle)
+    assert adapter["seed"] == 17

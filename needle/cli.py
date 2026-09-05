@@ -140,6 +140,8 @@ def main():
     p.add_argument("--max-len", type=int, default=1024, help="Max training sequence length")
     p.add_argument("--val-split", type=float, default=0.1,
                    help="Fraction of examples held out for validation (0 disables)")
+    p.add_argument("--seed", type=int, default=0,
+                   help="Random seed for LoRA init, validation split, and epoch shuffling")
     p.add_argument("--generate", type=int, default=0,
                    help="Generate N extra examples via OpenRouter before training (0 = off)")
     p.add_argument("--model", type=str, default="deepseek/deepseek-v4-flash",
