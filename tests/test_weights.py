@@ -202,3 +202,49 @@ def test_extraction_rejects_fabricated_temporal_year():
     assert needle._source_years("due September 5") == set()
     assert needle._source_years("due 5th September 42") == {42}
     assert needle._source_years("Invoice 42 is due tomorrow at 5") == set()
+
+
+def test_agent_extract_carries_its_own_system_facts(engine, monkeypatch):
+    import needle
+
+    seen = {}
+
+    def spy(text, schema, system=None, max_new_tokens=256, weights=None, strict=True):
+        seen.update(text=text, system=system, weights=weights, strict=strict)
+        return None
+
+    monkeypatch.setattr(needle, "extract", spy)
+    facts = "date: 2026-07-21 Tue 14:30; locale: en-US"
+    agent = needle.Needle(tools="[]", system=facts)
+
+    assert agent.extract("dinner tomorrow at 7", {"type": "object"}) is None
+    assert seen["system"] == facts
+    assert seen["text"] == "dinner tomorrow at 7"
+
+
+def test_agent_extract_without_system_facts_sends_none(engine, monkeypatch):
+    import needle
+
+    seen = {}
+    monkeypatch.setattr(
+        needle, "extract",
+        lambda text, schema, system=None, **kwargs: seen.update(system=system))
+    needle.Needle(tools="[]").extract("anything", {"type": "object"})
+
+    assert seen["system"] is None
+
+
+def test_agent_extract_still_carries_weights_and_strict(engine, tuned, monkeypatch):
+    import needle
+
+    seen = {}
+    monkeypatch.setattr(
+        needle, "extract",
+        lambda text, schema, system=None, max_new_tokens=256, weights=None, strict=True:
+            seen.update(system=system, weights=weights, strict=strict))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        agent = needle.Needle(tools="[]", weights=tuned, system="device: phone")
+    agent.extract("anything", {"type": "object"}, strict=False)
+
+    assert seen == {"system": "device: phone", "weights": tuned, "strict": False}
