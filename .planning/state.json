@@ -1,0 +1,33 @@
+{
+  "contract": "1.0.0",
+  "flavor": "core",
+  "milestone": null,
+  "phases": [
+    {
+      "number": "1",
+      "name": "Install and First Inference",
+      "status": "complete"
+    },
+    {
+      "number": "2",
+      "name": "Model and Runtime Concepts",
+      "status": "pending"
+    },
+    {
+      "number": "3",
+      "name": "LoRA Fine-Tuning",
+      "status": "pending"
+    },
+    {
+      "number": "4",
+      "name": "Export and Deployment Verification",
+      "status": "pending"
+    }
+  ],
+  "next": {
+    "command": "/gsd:progress --next",
+    "label": "Advance to the next step (plan phase 2)",
+    "reason": "Phase 2 of 4 — needs a plan"
+  },
+  "updated_at": "2026-08-31T14:26:10.352Z"
+}
