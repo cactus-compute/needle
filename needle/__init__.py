@@ -110,7 +110,8 @@ class Needle:
             self._n_tools = len(json.loads(tools_json))
         except (json.JSONDecodeError, TypeError):
             self._n_tools = None
-        self._tool_index_path = tool_index_path.encode("utf-8") if tool_index_path else None
+        self._tool_index_path = (os.fspath(tool_index_path).encode("utf-8")
+                                 if tool_index_path else None)
         self._buffer = ctypes.create_string_buffer(buffer_size)
         if self._weights:
             self._worker = FineTuneWorker(
