@@ -1,4 +1,5 @@
 import json
+import os
 import warnings
 
 import pytest
@@ -202,3 +203,27 @@ def test_extraction_rejects_fabricated_temporal_year():
     assert needle._source_years("due September 5") == set()
     assert needle._source_years("due 5th September 42") == {42}
     assert needle._source_years("Invoice 42 is due tomorrow at 5") == set()
+
+
+def test_tool_index_path_takes_a_path_object(engine, tmp_path):
+    import needle
+
+    index = tmp_path / "tools.idx"
+    agent = needle.Needle(tools="[]", tool_index_path=index)
+
+    assert agent._tool_index_path == os.fspath(index).encode("utf-8")
+
+
+def test_tool_index_path_agrees_between_the_base_and_tuned_paths(engine, tuned, tmp_path):
+    import needle
+
+    index = tmp_path / "tools.idx"
+    base = needle.Needle(tools="[]", tool_index_path=index)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        needle.Needle(tools="[]", weights=tuned, tool_index_path=index)
+
+    started = [call for call in engine
+               if isinstance(call, tuple) and call[0] == "worker_start"]
+    assert started
+    assert base._tool_index_path.decode("utf-8") == os.fspath(index)
