@@ -205,8 +205,9 @@ class Needle:
 
     def extract(self, text: str, schema: type | dict, max_new_tokens: int = 256,
                 strict: bool = True) -> object:
-        return extract(text, schema, max_new_tokens=max_new_tokens,
-                       weights=self._weights, strict=strict)
+        return extract(text, schema, system=self._system.decode("utf-8") or None,
+                       max_new_tokens=max_new_tokens, weights=self._weights,
+                       strict=strict)
 
     def reset(self):
         self._bind()
