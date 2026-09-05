@@ -62,3 +62,45 @@ def test_fetch_library_creates_destination(tmp_path, monkeypatch):
 
     assert (tmp_path / "new" / "libneedle.so").read_bytes() == b"engine"
     assert out == str(tmp_path / "new" / "libneedle.so")
+
+
+def test_engine_gate_finds_the_cache_the_runtime_loads_from(tmp_path, monkeypatch):
+    import needle
+    from needle.agent import fetch
+    from conftest import _engine_available
+
+    package = tmp_path / "pkg"
+    package.mkdir()
+    monkeypatch.setattr(needle, "__file__", str(package / "__init__.py"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("NEEDLE_LIB_PATH", raising=False)
+    monkeypatch.delenv("NEEDLE2_LIB_PATH", raising=False)
+
+    assert not _engine_available()
+
+    cache = tmp_path / ".cache" / "cactus-needle" / "v2" / fetch.engine_version(2)
+    cache.mkdir(parents=True)
+    (cache / fetch._lib_name()).write_bytes(b"")
+
+    assert _engine_available()
+
+
+def test_engine_gate_honours_the_library_override(tmp_path, monkeypatch):
+    import needle
+    from needle.agent import fetch
+    from conftest import _engine_available
+
+    package = tmp_path / "pkg"
+    package.mkdir()
+    monkeypatch.setattr(needle, "__file__", str(package / "__init__.py"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    engine = tmp_path / fetch._lib_name()
+    engine.write_bytes(b"")
+    monkeypatch.setenv("NEEDLE_LIB_PATH", str(engine))
+    assert _engine_available()
+
+    monkeypatch.setenv("NEEDLE_LIB_PATH", str(tmp_path / "gone"))
+    assert not _engine_available()
