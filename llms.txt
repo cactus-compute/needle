@@ -20,12 +20,20 @@ pip install "cactus-needle[train]"       # adds JAX + training deps for finetune
   - `system`: optional environment-facts string (see System facts).
   - `weights`: path to a tuned `.cact` to load instead of the baked base model.
   - `tool_index_path`: path to persist tool embeddings when you declare many tools.
-- `agent.run(query, max_steps=8, max_new_tokens=256) -> dict` - full agentic loop: model picks calls, Needle executes your Python functions, feeds results back, returns the final response with the executed tool results attached as `results`.
-- `agent.complete(text, max_new_tokens=256) -> dict` - one turn; you execute the call and feed the result back yourself via the next `complete(...)`.
+- `agent.run(query="", max_steps=8, max_new_tokens=256, audio=None, audio_format="wav", sample_rate=0, channels=1) -> dict` - full agentic loop: model picks calls, Needle executes your Python functions, feeds results back, returns the final response with the executed tool results attached as `results`. Accepts text, speech, or mixed input via the audio arguments (Needle 3 only).
+- `agent.complete(text="", max_new_tokens=256, audio=None, audio_format="wav", sample_rate=0, channels=1) -> dict` - one turn; you execute the call and feed the result back yourself via the next `complete(...)`. Accepts text, speech, or mixed input via the audio arguments (Needle 3 only).
+- `agent.embed(text="", audio=None, audio_format="wav", sample_rate=0, channels=1) -> list[float]` - embed text, serialized tool schemas, audio, or a mixed input with the Needle 3 retrieval head; raises `ValueError` on a Needle 2 model.
 - `agent.reset()` - rewind the conversation, keep the tools loaded.
 - `needle.tool` - decorator that turns a function into a tool schema (attached as `fn._needle_tool`).
 - `needle.Field(default=..., *, description, enum, const, ge, le, gt, lt, multiple_of, min_length, max_length, pattern, format, min_items, max_items, unique_items)` - per-argument constraints; attach inline with `typing.Annotated`.
 - `needle.extract(text, schema, system=None, max_new_tokens=256, weights=None)` - one-shot extraction; returns a Pydantic instance if `schema` is a model, else a dict (or `None` if nothing matched). `weights` selects a tuned `.cact` and defaults to whatever the engine already has loaded, so extraction inherits the active tuned model unless you pass another path.
+
+Audio input (Needle 3 models only; a Needle 2 engine raises `ValueError`): `audio` accepts a WAV path or WAV bytes; raw PCM16/float32 buffers pass `audio_format="pcm16"` or `"float32"` together with positive `sample_rate` and `channels`. Tokenization is internal - pass the buffer directly:
+
+```python
+agent.complete(audio="command.wav")
+agent.embed(audio=pcm16_bytes, audio_format="pcm16", sample_rate=48_000, channels=2)
+```
 
 ## Defining tools (three equivalent ways)
 
