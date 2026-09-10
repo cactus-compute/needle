@@ -108,6 +108,6 @@ def get_tokenizer(vocab_size=None):
         except Exception as e:
             raise RuntimeError(
                 f"No pretraining tokenizer at {model_path} and HF download failed ({e}). "
-                f"Run `needle tokenizer-train` (add --upload to share it via HF hub)."
+                f"It ships in the {HF_REPO} Hugging Face repo; retry once it is reachable."
             ) from e
     return SANTokenizer(model_path)
