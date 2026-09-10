@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import tomllib
+import pytest
+
+tomllib = pytest.importorskip("tomllib")
 
 
 def test_training_dependencies_are_not_required_for_runtime() -> None:
