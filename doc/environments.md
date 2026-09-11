@@ -113,6 +113,10 @@ Each suite has 32 cases across six categories:
 
 Cases marked `critical: True` (all `missing`, `negation`, and `invalid` cases) fail the suite regardless of the overall rate. `run_tests()` scores raw model output; `run_tests(min_confidence=0.4)` applies the production contract, acting on a call only at or above the threshold and treating anything below as a refusal.
 
+A suite scores the model's output, not the harness: each case is decided by what the model emitted for that query, so a red suite reports the model's fit to the tool surface rather than a defect in the code that scores it. The rule above is pinned by a test in `tests/test_environments.py` that runs without the engine, so it cannot change silently.
+
+The shipped base model does not pass all six suites, measured on engine 2.0.4: five fall short, and the failures concentrate in the `missing`, `negation`, and `invalid` categories, where the model supplies a value the query never stated, drops a stated bound, or substitutes a value that is not in the enum. Whether a green suite is the intended target for the shipped base model is a question about the model rather than about this package; this page records the measurement instead of settling it.
+
 ## Adapting one
 
 Swap the `Literal` values (rooms, contacts, categories) for your own and keep the shapes: closed sets as enums, bounded numbers, verbatim copy for free text, five tools or fewer. One learned rule from smart_home: avoid enum values that hide inside likely query words (a room named office poisons an off action, so that home has a study).
