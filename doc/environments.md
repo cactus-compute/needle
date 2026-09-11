@@ -23,7 +23,7 @@ Every environment module exposes the same surface:
 | `SYSTEM` | The system prompt the agent is built with. |
 | `agent` | A `needle.Needle(tools=TOOLS, system=SYSTEM)`, constructed lazily on first access so importing never fetches the engine. Construction sets `NEEDLE_STRICT_VALIDATE=1` (if unset) so out-of-bounds calls are suppressed to refusals. |
 | `TEST_CASES` | The frozen suite: dicts of `query`, expected `calls`, `category`, and optional `critical`. |
-| `run_tests(min_confidence=0.0, verbose=True)` | Runs the suite against the shipped engine; returns `True` at >=90% pass with zero critical failures. |
+| `run_tests(min_confidence=0.0, verbose=True)` | Runs the suite against the shipped engine; returns `True` when at least `round(0.9 * len(TEST_CASES))` cases pass — 29 of the shipped 32 — and no `critical` case fails. |
 
 `needle.environments.ENVIRONMENTS` maps name to module; `needle.environments.run_tests()` runs all six.
 
@@ -113,9 +113,9 @@ Each suite has 32 cases across six categories:
 
 Cases marked `critical: True` (all `missing`, `negation`, and `invalid` cases) fail the suite regardless of the overall rate. `run_tests()` scores raw model output; `run_tests(min_confidence=0.4)` applies the production contract, acting on a call only at or above the threshold and treating anything below as a refusal.
 
-A suite scores the model's output, not the harness: each case is decided by what the model emitted for that query, so a red suite reports the model's fit to the tool surface rather than a defect in the code that scores it. The rule above is pinned by a test in `tests/test_environments.py` that runs without the engine, so it cannot change silently.
+A suite scores the model's output, not the harness: each case is decided by what the model emitted for that query, so a red suite usually reports the model's fit to the tool surface rather than a defect in the code that scores it. It can also mean the reply the engine produced is not the shape the harness expects, so rule that out before blaming the model. The threshold and the effect of a `critical` flag are pinned by tests in `tests/test_environments.py` that run without the engine.
 
-The shipped base model does not pass all six suites, measured on engine 2.0.4: five fall short, and the failures concentrate in the `missing`, `negation`, and `invalid` categories, where the model supplies a value the query never stated, drops a stated bound, or substitutes a value that is not in the enum. Whether a green suite is the intended target for the shipped base model is a question about the model rather than about this package; this page records the measurement instead of settling it.
+The shipped base model does not pass all six suites, measured on engine 2.0.4 at the default confidence gate: five fall short. The failures are not confined to one category — the model both misses calls the query did state and invents values it did not, and among the refusal categories it fails `missing` most often. Whether a green suite is the intended target for the shipped base model is a question about the model rather than about this package; this page records the measurement instead of settling it.
 
 ## Adapting one
 

@@ -77,6 +77,9 @@ def test_smart_home_smoke():
 
 _MATCHING = {"name": "set_level", "arguments": {"level": 5}}
 _OTHER = {"name": "set_level", "arguments": {"level": 9}}
+_PASS = "pass"
+_LOW = "low"
+_FAIL = "fail"
 
 
 @tool
@@ -100,16 +103,17 @@ class _Stub:
         return 0
 
     def needle_complete(self, text, *args):
+        # The output buffer is the second-to-last argument in every
+        # needle_complete signature, for both engine generations.
         buffer = args[-2]
         prompt = text.decode("utf-8").strip()
-        if prompt.startswith("low"):
-            confidence = 0.2
-        else:
-            confidence = 0.9
-        calls = [_MATCHING if prompt.startswith(("low", "pass")) else _OTHER]
-        buffer.value = json.dumps(
-            {"type": "call", "confidence": confidence, "function_calls": calls}
-        ).encode("utf-8")
+        matched = not prompt.startswith(_FAIL)
+        confidence = 0.2 if prompt.startswith(_LOW) else 0.9
+        buffer.value = json.dumps({
+            "type": "call",
+            "confidence": confidence,
+            "function_calls": [_MATCHING if matched else _OTHER],
+        }).encode("utf-8")
         return 0
 
     def needle_reset(self):
@@ -121,20 +125,22 @@ def stub(monkeypatch):
     import needle
 
     engine = _Stub()
+    monkeypatch.setenv("NEEDLE_TELEMETRY", "0")
+    # agent_for sets this with setdefault, so claiming it here keeps the change
+    # from leaking into the rest of the process.
+    monkeypatch.setenv("NEEDLE_STRICT_VALIDATE", "1")
     monkeypatch.setattr(needle, "_lib", lambda generation=2: engine)
-    monkeypatch.setattr(needle, "_library_path", lambda generation=2: "/tmp/libneedle2")
     monkeypatch.setattr(needle, "_active", {})
     monkeypatch.setattr(_harness, "_agents", {})
-    return engine
 
 
 def _synthetic(name, passes, failures, critical=0):
-    """A suite whose queries drive the stub: a "pass ..." query is answered with
-    the call the case expects, any other with a different one."""
-    cases = [{"query": f"pass {i}", "calls": [_MATCHING], "category": "positive"}
+    """A suite whose queries drive the stub: a _PASS query is answered with the
+    call its case expects, a _FAIL query with a different one."""
+    cases = [{"query": f"{_PASS} {i}", "calls": [_MATCHING], "category": "positive"}
              for i in range(passes)]
     for i in range(failures):
-        case = {"query": f"fail {i}", "calls": [_MATCHING], "category": "negative"}
+        case = {"query": f"{_FAIL} {i}", "calls": [_MATCHING], "category": "synthetic"}
         if i < critical:
             case["critical"] = True
         cases.append(case)
@@ -157,10 +163,20 @@ def test_one_critical_failure_fails_a_suite_that_clears_the_rate(stub):
 def test_min_confidence_treats_a_low_confidence_call_as_a_refusal(stub):
     module = types.SimpleNamespace(
         __name__="d", TOOLS=[set_level], SYSTEM="",
-        TEST_CASES=[{"query": "low", "calls": [], "category": "missing"}])
+        TEST_CASES=[{"query": _LOW, "calls": [], "category": "missing"}])
 
     assert _harness.run_tests(module, 0.0, verbose=False) is False
     assert _harness.run_tests(module, 0.4, verbose=False) is True
+
+
+def test_min_confidence_keeps_a_call_at_the_threshold(stub):
+    module = types.SimpleNamespace(
+        __name__="e", TOOLS=[set_level], SYSTEM="",
+        TEST_CASES=[{"query": _PASS, "calls": [_MATCHING], "category": "positive"}])
+
+    # "at or above the threshold" is a strict comparison, so a call whose
+    # confidence equals the gate is acted on rather than treated as a refusal.
+    assert _harness.run_tests(module, 0.9, verbose=False) is True
 
 
 def test_aggregate_reports_failure_when_any_environment_fails(monkeypatch):
@@ -171,7 +187,8 @@ def test_aggregate_reports_failure_when_any_environment_fails(monkeypatch):
         def run_tests(self, min_confidence=0.0, verbose=True):
             return self._ok
 
-    monkeypatch.setattr(environments, "_load", lambda name: _Module(name != "wearable"))
+    failing = environments._NAMES[-1]
+    monkeypatch.setattr(environments, "_load", lambda name: _Module(name != failing))
     assert environments.run_tests(verbose=False) is False
 
     monkeypatch.setattr(environments, "_load", lambda name: _Module(True))
