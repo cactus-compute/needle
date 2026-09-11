@@ -6,4 +6,5 @@ jax
 jaxlib
 flax>=0.10.2
 optax
+safetensors
 sentencepiece

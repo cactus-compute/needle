@@ -79,7 +79,7 @@ def _finetune_worker(tools_json, api_key, samples, engine):
                 handle.write(json.dumps(row) + "\n")
 
         _FT["step"] = "training"
-        adapter = str(_DOWNLOADS / "needle_playground_lora.pkl")
+        adapter = str(_DOWNLOADS / "needle_playground_lora.safetensors")
         finetune_local(types.SimpleNamespace(
             jsonl_path=data_path, checkpoint=None, epochs=3, batch_size=16, lr=1e-4,
             lora_rank=16, lora_alpha=32.0, max_len=1024, generate=0, model=None,
