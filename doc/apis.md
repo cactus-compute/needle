@@ -9,7 +9,7 @@
 | `agent.reset()` | Rewind the conversation, keep the tools loaded. |
 | `needle.tool` | Decorator that turns a function into a tool schema (attached as `fn._needle_tool`). |
 | `needle.Field(...)` | Per argument constraints, attached inline with `typing.Annotated` or passed as a default. |
-| `needle.extract(text, schema, system=None, max_new_tokens=256, weights=None, strict=True)` | One shot extraction. Returns a Pydantic instance if `schema` is a model, else a dict, or `None` if nothing matched. Strict mode rejects temporal values that contradict literal source years and engine-reported ungrounded values. |
+| `needle.extract(text, schema, system=None, max_new_tokens=256, weights=None, strict=True)` | One shot extraction. Returns a Pydantic instance if `schema` is a model, else a dict, or `None` if nothing matched. Strict mode rejects temporal values that contradict literal source years and engine-reported ungrounded values, except numbers whose value appears in the source text (thousands separators aside). |
 
 Audio tokenization is internal. Pass a WAV path or WAV bytes directly:
 
@@ -119,7 +119,7 @@ Needle solves every problem as a function call. The context declares what may be
 
 - A request no declared tool can serve is refused with the empty call `[]`. That is the whole contract for off-topic input; there is no free-text fallback.
 - Arguments contain only values evidenced by the input. An optional field with no evidence is omitted, not guessed; omission is the field-level `[]`.
-- A date argument whose year matches none of the years written in the conversation so far or in the `system` facts is reported in `validation.ungrounded` as `tool.field`, alongside anything the engine itself flags as ungrounded. `run()` does not execute such a call; its result is `{"error": "ungrounded field"}` and the model continues from it. Pass `strict=False` to execute anyway.
+- A date argument whose year matches none of the years written in the conversation so far or in the `system` facts is reported in `validation.ungrounded` as `tool.field`, alongside anything the engine itself flags as ungrounded. A number the engine flags is exempt when its value occurs in the source text, thousands separators aside - a source's `1,234` grounds an argument's `1234` - so only genuinely unsourced numbers are rejected. `run()` does not execute such a call; its result is `{"error": "ungrounded field"}` and the model continues from it. Pass `strict=False` to execute anyway.
 - `reasoning` is the model's short derivation of each argument from its source span (`'ten minutes' -> minutes 10`). It is generated unconstrained; only the call itself is grammar-constrained, so the JSON cannot be malformed while the derivation stays legible.
 - After you execute a call, pass the result back as the next `complete()`. The model continues from it, and later arguments may depend on earlier results: `search_for_contact` first, then `send_instant_message` with the returned `contact_id`. A final `"type": "respond"` with empty `function_calls` signals the loop is done; the answer is the tool results themselves, which `run()` collects on the final response as `results`. No free text is generated.
 - An agent shares one toolset. Later turns are bare queries against the same tools; `reset()` rewinds the conversation and keeps the tools loaded.
