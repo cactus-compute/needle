@@ -82,7 +82,7 @@ def _install_xla_log_filter():
     sys.stderr = os.fdopen(py_stderr_fd, "w", encoding="utf-8",
                            errors="replace", buffering=1)
 
-    out_fd = os.dup(2) 
+    out_fd = os.dup(2)
 
     r_fd, w_fd = os.pipe()
     os.dup2(w_fd, 2)
@@ -165,7 +165,7 @@ def main():
                    help="Random seed for LoRA init, validation split, and epoch shuffling")
     p.add_argument("--generate", type=int, default=0,
                    help="Generate N extra examples via OpenRouter before training (0 = off)")
-    p.add_argument("--model", type=str, default="deepseek/deepseek-v4-flash",
+    p.add_argument("--model", type=str, default="deepseek/deepseek-flash-latest",
                    help="OpenRouter model for --generate")
     p.add_argument("--workers", type=int, default=8,
                    help="Concurrent OpenRouter requests when generating (default: 8)")
@@ -180,7 +180,7 @@ def main():
     p.add_argument("--batch-size", type=int, default=25)
     p.add_argument("--workers", type=int, default=16,
                    help="Concurrent OpenRouter requests (default: 16)")
-    p.add_argument("--model", type=str, default="deepseek/deepseek-v4-flash")
+    p.add_argument("--model", type=str, default="deepseek/deepseek-flash-latest")
     p.add_argument("--output", type=str, default=None)
 
     p = sub.add_parser("build")
