@@ -121,7 +121,7 @@ needle finetune data.jsonl --epochs 10
 needle finetune data.jsonl --epochs 10 --generate 300 --lora-rank 16 --lora-alpha 32
 ```
 
-Key options: `--epochs` (default 3), `--lora-rank` (16), `--lora-alpha` (32), `--lr` (1e-4), `--batch-size` (16), `--max-len` (1024), `--val-split` (0.1), `--checkpoint <base.pkl>`, `--checkpoint-dir <dir>` (default `checkpoints`), `--out <adapter.pkl>`, `--generate <n>`, `--model <id>` (default `deepseek/deepseek-v4-flash`), and `--workers <n>` (default 8). `--generate` uses the configured OpenRouter endpoint to synthesize extra examples before training. The adapter is written to `checkpoints/needle_lora.pkl` by default. A validation loss prints each epoch from the held out split.
+Key options: `--epochs` (default 3), `--lora-rank` (16), `--lora-alpha` (32), `--lr` (1e-4), `--batch-size` (16), `--max-len` (1024), `--val-split` (0.1), `--checkpoint <base.pkl>`, `--checkpoint-dir <dir>` (default `checkpoints`), `--out <adapter.safetensors>`, `--generate <n>`, `--model <id>` (default `deepseek/deepseek-v4-flash`), and `--workers <n>` (default 8). `--generate` uses the configured OpenRouter endpoint to synthesize extra examples before training. The adapter is written to `checkpoints/needle_lora.safetensors` by default. A validation loss prints each epoch from the held out split.
 
 Training is plain JAX and runs on any accelerator jax supports. On an NVIDIA machine install the CUDA build and the same command trains on the GPU:
 
@@ -138,7 +138,7 @@ pip install "cactus-needle[train,metal]"
 **3. Build a tuned `.cact`.** Merge the adapter into the base and quantize. The base auto-downloads if absent.
 
 ```sh
-needle build checkpoints/needle2.pkl --lora checkpoints/needle_lora.pkl --out my_needle.cact
+needle build checkpoints/needle2.pkl --lora checkpoints/needle_lora.safetensors --out my_needle.cact
 ```
 
 Add `--bits 2` for a smaller model (by default the export follows the checkpoint's declared per-layer bit map, falling back to 4 when the checkpoint declares none), or set `NEEDLE_HF_REPO=<you>/<model>` and pass `--upload` to publish the `.cact`. The counterpart `needle download <you>/<model>/my_needle.cact` pulls a published archive on any machine, and `needle download <platform>` (e.g. `macos-arm64`) fetches that platform's engine runner.

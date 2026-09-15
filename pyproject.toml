@@ -16,6 +16,7 @@ train = [
   "jaxlib",
   "flax>=0.10.2",
   "optax",
+  "safetensors",
   "sentencepiece"
 ]
 gpu = ["jax[cuda12]"]

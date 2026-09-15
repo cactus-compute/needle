@@ -149,7 +149,8 @@ def main():
     p.add_argument("--workers", type=int, default=8,
                    help="Concurrent OpenRouter requests when generating (default: 8)")
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    p.add_argument("--out", type=str, default=None, help="Output adapter path (.pkl)")
+    p.add_argument("--out", type=str, default=None,
+                   help="Output adapter path (default: checkpoints/needle_lora.safetensors)")
     p.add_argument(
         "--qat-bits", choices=["auto", "none", "2", "4"], default="auto",
         help="LoRA training numerics: auto matches the checkpoint export scheme "
@@ -167,7 +168,8 @@ def main():
 
     p = sub.add_parser("build")
     p.add_argument("checkpoint", type=str, help="Base checkpoint (.pkl) to export")
-    p.add_argument("--lora", type=str, default=None, help="LoRA adapter to merge before export")
+    p.add_argument("--lora", type=str, default=None,
+                   help="Safetensors LoRA adapter to merge before export")
     p.add_argument("--out", type=str, default=None, help="Output .cact path")
     p.add_argument("--upload", action="store_true", help="Push the .cact to $NEEDLE_HF_REPO")
     p.add_argument("--bits", type=str, default=None, choices=["2", "4"])

@@ -1,7 +1,6 @@
 import concurrent.futures
 import json
 import os
-import pickle
 import sys
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -297,6 +296,51 @@ def merge_lora(params, lora, scale):
     return unflatten_dict(flat)
 
 
+def _adapter_tensor_key(path, matrix):
+    encoded_path = json.dumps(list(path), ensure_ascii=False, separators=(",", ":"))
+    return f"lora:{encoded_path}:{matrix}"
+
+
+def _save_lora_adapter(path, lora, scale, base, rank, qat_bits=None,
+                      qat_bits_map=None, seed=None):
+    from safetensors.numpy import save_file
+
+    tensors = {}
+    for lora_path, matrices in lora.items():
+        for matrix in ("A", "B"):
+            tensors[_adapter_tensor_key(lora_path, matrix)] = np.ascontiguousarray(
+                np.asarray(matrices[matrix]))
+    # safetensors metadata values must be strings, so the non-tensor fields are
+    # JSON-encoded and decoded back to their original types on load.
+    save_file(tensors, path, metadata={
+        "base": str(base),
+        "rank": str(rank),
+        "scale": repr(float(scale)),
+        "qat_bits": json.dumps(qat_bits),
+        "qat_bits_map": json.dumps(qat_bits_map),
+        "seed": json.dumps(seed),
+    })
+
+
+def _load_lora_adapter(path):
+    from safetensors import safe_open
+
+    lora = {}
+    with safe_open(path, framework="np") as adapter:
+        metadata = adapter.metadata() or {}
+        scale = float(metadata["scale"])
+        meta = {name: json.loads(metadata[name]) if name in metadata else None
+                for name in ("qat_bits", "qat_bits_map", "seed")}
+        for key in adapter.keys():
+            if not key.startswith("lora:") or key[-2:] not in (":A", ":B"):
+                raise ValueError(f"invalid LoRA adapter tensor key: {key}")
+            lora_path = tuple(json.loads(key[len("lora:"):-2]))
+            lora.setdefault(lora_path, {})[key[-1]] = adapter.get_tensor(key)
+    if not lora or any(set(matrices) != {"A", "B"} for matrices in lora.values()):
+        raise ValueError("LoRA adapter must contain A and B tensors for every path")
+    return lora, scale, meta
+
+
 def finetune_local(args, progress=None):
     import jax
     import jax.numpy as jnp
@@ -426,18 +470,9 @@ def finetune_local(args, progress=None):
             emit(f"  {'epoch':<9} {epoch + 1}/{args.epochs}  loss {last:.4f}")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    out = args.out or os.path.join(args.checkpoint_dir, "needle_lora.pkl")
-    with open(out, "wb") as handle:
-        pickle.dump({
-            "lora": {"/".join(p): {"A": np.asarray(v["A"]), "B": np.asarray(v["B"])}
-                     for p, v in lora.items()},
-            "scale": float(scale),
-            "base": base_path,
-            "rank": args.lora_rank,
-            "qat_bits": qat_bits,
-            "qat_bits_map": qat_bits_map,
-            "seed": seed,
-        }, handle)
+    out = args.out or os.path.join(args.checkpoint_dir, "needle_lora.safetensors")
+    _save_lora_adapter(out, lora, scale, base_path, args.lora_rank,
+                       qat_bits=qat_bits, qat_bits_map=qat_bits_map, seed=seed)
     print(f"  {'adapter':<9} {out}")
     print(f"  {'next':<9} needle build {base_path} --lora {out}")
     print(f"  {'note':<9} confidence reports None with tuned weights; the head is not tuned")
@@ -454,14 +489,13 @@ def build_main(args):
     adapter_qat_bits = None
     adapter_qat_bits_map = None
     if args.lora:
-        with open(args.lora, "rb") as handle:
-            adapter = pickle.load(handle)
-        lora = {tuple(key.split("/")): {"A": jnp.asarray(v["A"]), "B": jnp.asarray(v["B"])}
-                for key, v in adapter["lora"].items()}
-        params = merge_lora(params, lora, adapter["scale"])
+        adapter, scale, adapter_meta = _load_lora_adapter(args.lora)
+        lora = {path: {name: jnp.asarray(value) for name, value in matrices.items()}
+                for path, matrices in adapter.items()}
+        params = merge_lora(params, lora, scale)
         print(f"  {'merged':<9} {len(lora)} weight groups  {args.lora}")
-        adapter_qat_bits = adapter.get("qat_bits")
-        adapter_qat_bits_map = adapter.get("qat_bits_map")
+        adapter_qat_bits = adapter_meta.get("qat_bits")
+        adapter_qat_bits_map = adapter_meta.get("qat_bits_map")
 
     bits = args.bits
     if adapter_qat_bits_map is not None:
