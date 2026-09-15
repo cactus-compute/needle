@@ -24,7 +24,30 @@ Needle 2 is a Simple Attention Network, our dense small-model recipe: a Hadamard
 
 Each block carries its update rule. Here x̂ is the RMS-normalised flattening of the four residual streams, H the orthonormal Walsh-Hadamard transform (a fixed matrix, applied in n log n time with no weights to read), (kₜ, vₜ) rows gathered from hashed n-gram tables, and P the doubly-stochastic normalisation of the routing logits A, computed by Sinkhorn iteration; a, b, g and all σ-gates are learned and input-dependent. Both attention and MLP residuals are sandwich-normed and gated, the engram sites fire at two layers, and decoding is constrained by a byte-level grammar compiled from the declared schemas.
 
+## 从安装开始（CPU）
+
+面向本仓库源码的首次使用，推荐先按[安装指南](doc/installation.md)用 `uv`
+创建环境、安装 `.[train,test]` extras，并显式运行 `needle fetch` 获取当前
+平台的原生引擎。完整指南还说明了引擎、checkpoint、tokenizer 和 `.cact`
+文件的职责，以及默认缓存和 `HF_HUB_OFFLINE=1` 离线检查。
+
+最短路径如下（macOS/Linux）：
+
+```sh
+uv venv
+source .venv/bin/activate
+uv pip install -e ".[train,test]"
+needle fetch
+```
+
+Phase 1 只验证 CPU；CUDA 和 Metal 的安装与验证会在后续阶段补充。完成安装
+后可继续阅读[首次推理指南](doc/inference.md)，先用 CLI，再使用等价的
+`Needle` Python API。
+
 ## Quickstart
+
+如果只想使用已发布到 PyPI 的运行时包（不修改当前 checkout），可以使用下面
+的简化安装命令；源码开发和训练请优先使用上面的 uv editable 流程。
 
 ```sh
 pip install cactus-needle
