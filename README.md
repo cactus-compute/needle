@@ -92,7 +92,7 @@ smart_home.agent.complete("dim the study lights to 30 percent")
 smart_home.run_tests()
 ```
 
-`python -m needle.environments.smart_home` runs a suite from the shell. To adapt an environment to your product, swap the `Literal` values (rooms, contacts, categories) for your own and keep the shapes: closed sets as enums, bounded numbers, verbatim copy for free text, five tools or fewer. The full tool surfaces and the suite contract are in [doc/environments.md](doc/environments.md).
+`python -m needle.environments.smart_home` runs a suite from the shell. A suite scores the model's output rather than this package, so it can fail on the shipped base model. To adapt an environment to your product, swap the `Literal` values (rooms, contacts, categories) for your own and keep the shapes: closed sets as enums, bounded numbers, verbatim copy for free text, five tools or fewer. The full tool surfaces, the suite contract, and what a failing suite reports are in [doc/environments.md](doc/environments.md).
 
 ## Fine-tuning
 
