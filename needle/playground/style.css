@@ -394,6 +394,76 @@ textarea::placeholder { color: var(--muted-foreground); }
 .modal-input:focus { border-color: var(--ring); box-shadow: 0 0 0 3px rgba(38, 38, 38, 0.5); }
 .modal-input::placeholder { color: var(--muted-foreground); }
 .modal-input-sm { font-family: 'Geist Mono', monospace; }
+.modal-input:disabled { opacity: 0.6; }
+
+select.modal-input {
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted-foreground) 50%),
+                    linear-gradient(135deg, var(--muted-foreground) 50%, transparent 50%);
+  background-position: calc(100% - 17px) 16px, calc(100% - 12px) 16px;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 32px;
+  cursor: pointer;
+}
+
+.model-status { font-size: 12px; color: var(--muted-foreground); line-height: 1.5; }
+.model-status.ok { color: #4ade80; }
+.model-status.warn { color: #fbbf24; }
+
+/* The durable, always-masked credential line under the two methods. */
+.credential-state { font-size: 12px; font-family: 'Geist Mono', monospace;
+  color: var(--muted-foreground); padding-top: 2px; }
+.credential-state.ok { color: #4ade80; }
+.credential-state.warn { color: #fbbf24; }
+
+/* Declares the non-text modality a prompt actually carries. */
+.modality-toggle { display: flex; align-items: center; gap: 8px; font-size: 13px;
+  color: var(--muted-foreground); cursor: pointer; margin-bottom: 8px; }
+.modality-toggle input { accent-color: var(--foreground); }
+
+/* Two explicit authentication choices, shown side by side for one provider. */
+.auth-methods { display: flex; flex-direction: column; gap: 10px; }
+.auth-method {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.auth-method[hidden] { display: none; }
+.auth-method-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.auth-method-head img { display: block; }
+.auth-method-note { font-size: 12px; color: var(--muted-foreground); line-height: 1.5; }
+.auth-row { display: flex; align-items: center; gap: 8px; }
+.auth-row .modal-input { flex: 1; min-width: 0; }
+.auth-btn { white-space: nowrap; height: 36px; }
+
+.connect-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+}
+.connect-panel[hidden] { display: none; }
+.connect-hint { font-size: 12px; color: var(--muted-foreground); line-height: 1.5; }
+.connect-url {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  word-break: break-all;
+  text-decoration: underline;
+  line-height: 1.5;
+}
+.connect-url:empty { display: none; }
 
 .modal-steps { display: none; gap: 4px; }
 .modal-steps.visible { display: flex; flex-direction: column; }

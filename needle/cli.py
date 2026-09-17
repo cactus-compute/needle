@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import re
 import sys
@@ -8,7 +9,9 @@ HELP = """usage: needle <command> [options]
 
   run            run a checkpoint on a query (JAX, Needle 3)
   finetune       train a LoRA adapter on JSONL data (--layers N for a rung)
-  generate-data  synthesise training data via OpenRouter
+  generate-data  synthesise training data via a gateway (OpenRouter or OrcaRouter)
+  connect        connect an OrcaRouter account (OAuth 2.0 + PKCE) and store the key
+  models         list the models a provider offers, filtered by capability
   build          export a checkpoint (+ adapter) to a .cact archive
   download       needle3 | needle3.safetensors | <platform> | <org>/<repo>[/<file>.cact]
   fetch          fetch the engine library for this platform
@@ -162,11 +165,19 @@ def main():
     p.add_argument("--seed", type=int, default=0,
                    help="Random seed for LoRA init, validation split, and epoch shuffling")
     p.add_argument("--generate", type=int, default=0,
-                   help="Generate N extra examples via OpenRouter before training (0 = off)")
-    p.add_argument("--model", type=str, default="deepseek/deepseek-v4-flash",
-                   help="OpenRouter model for --generate")
+                   help="Generate N extra examples via the gateway before training (0 = off)")
+    p.add_argument("--provider", type=str, default=None,
+                   help="Provider for generated data: orcarouter or openrouter "
+                        "(default: openrouter, or $ORCAROUTER_API_KEY when set)")
+    p.add_argument("--model", type=str, default=None,
+                   help="Model for --generate (defaults to the provider's)")
+    p.add_argument("--input-modality", type=str, default=None,
+                   choices=["text", "image"],
+                   help="Modality the generated prompts carry (with --generate)")
+    p.add_argument("--image-url", type=str, default=None,
+                   help="Image sent with every generated prompt when the modality is image")
     p.add_argument("--workers", type=int, default=8,
-                   help="Concurrent OpenRouter requests when generating (default: 8)")
+                   help="Concurrent gateway requests when generating (default: 8)")
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--out", type=str, default=None,
                    help="Output adapter path (.safetensors, or .pkl)")
@@ -184,9 +195,45 @@ def main():
     p.add_argument("--num-samples", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=25)
     p.add_argument("--workers", type=int, default=16,
-                   help="Concurrent OpenRouter requests (default: 16)")
-    p.add_argument("--model", type=str, default="deepseek/deepseek-v4-flash")
+                   help="Concurrent gateway requests (default: 16)")
+    p.add_argument("--provider", type=str, default=None,
+                   help="orcarouter or openrouter (default: openrouter, or "
+                        "$ORCAROUTER_API_KEY when that is the only key set)")
+    p.add_argument("--model", type=str, default=None,
+                   help="Model id (defaults to the provider's own default)")
+    p.add_argument("--input-modality", type=str, default=None,
+                   choices=["text", "image"],
+                   help="Modality the prompts carry; image requires a model that "
+                        "declares an image input, and is rejected otherwise")
+    p.add_argument("--image-url", type=str, default=None,
+                   help="Image sent with every prompt when --input-modality image")
     p.add_argument("--output", type=str, default=None)
+
+    p = sub.add_parser("connect")
+    p.add_argument("--oob", action="store_true",
+                   help="Use the out-of-band code flow instead of a loopback redirect")
+    p.add_argument("--app-name", type=str, default=None,
+                   help="Name shown on the consent screen (default: Needle)")
+    p.add_argument("--scope", type=str, default="api", choices=["api", "connector"],
+                   help="Requested scope (default: api)")
+    p.add_argument("--no-browser", action="store_true",
+                   help="Print the authorization URL instead of opening a browser")
+    p.add_argument("--login-hint", type=str, default=None,
+                   help="Pre-fill the account email on the consent screen")
+    p.add_argument("--workspace-hint", type=str, default=None,
+                   help="Pre-select a workspace on the consent screen")
+    p.add_argument("--timeout", type=int, default=600,
+                   help="Seconds to wait for the loopback callback (default: 600)")
+
+    p = sub.add_parser("models")
+    p.add_argument("--provider", type=str, default=None,
+                   help="orcarouter or openrouter (default: orcarouter)")
+    p.add_argument("--capability", type=str, default="chat",
+                   choices=["chat", "embedding", "image", "video", "rerank"],
+                   help="Only list models that can serve this (default: chat)")
+    p.add_argument("--input-modality", type=str, default=None,
+                   help="Require a declared input modality, e.g. image")
+    p.add_argument("--json", action="store_true", help="Print the full records as JSON")
 
     p = sub.add_parser("build")
     p.add_argument("checkpoint", type=str, nargs="?", default=None,
@@ -301,3 +348,100 @@ def main():
     elif args.command == "playground":
         from .playground.server import main as playground_main
         playground_main(args)
+    elif args.command == "connect":
+        _connect_main(args)
+    elif args.command == "models":
+        _models_main(args)
+
+
+def _connect_main(args):
+    """`needle connect` — obtain an OrcaRouter key through OAuth 2.0 + PKCE."""
+    import webbrowser
+
+    from .model.credentials import (CredentialError, CredentialStore, begin_connect,
+                                    finish_connect, mask_secret)
+    from .model.providers import resolve_orcarouter_origins
+
+    auth_base, _ = resolve_orcarouter_origins()
+    flow = "oob" if args.oob else "loopback"
+    try:
+        session, public = begin_connect(
+            flow=flow, app_name=args.app_name or "Needle", scope=args.scope,
+            login_hint=args.login_hint, workspace_hint=args.workspace_hint)
+    except CredentialError as exc:
+        raise SystemExit("  %-9s %s" % ("error", exc)) from None
+
+    print(f"  {'auth':<9} {auth_base}")
+    print(f"  {'flow':<9} {'B (out-of-band code)' if flow == 'oob' else 'A (loopback redirect)'}")
+    print(f"  {'scope':<9} {public['scope']}")
+    if flow == "oob":
+        print("  Authorize in your browser, then paste the code back here:")
+    elif not args.no_browser:
+        print("  Opening your browser to authorize...")
+    print("  " + public["url"])
+    if flow == "loopback" and not args.no_browser:
+        try:
+            webbrowser.open(public["url"])
+        except Exception:
+            pass  # the URL is already printed
+
+    code = None
+    if flow == "oob":
+        try:
+            code = input("  Code: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            session.close()
+            raise SystemExit("  %-9s cancelled" % "cancelled") from None
+        if not code:
+            session.close()
+            raise SystemExit("  %-9s no code entered" % "cancelled")
+
+    try:
+        result = finish_connect(session, code=code,
+                                store=CredentialStore(), timeout=args.timeout)
+    except CredentialError as exc:
+        raise SystemExit("  %-9s %s" % ("failed", exc)) from None
+
+    print(f"  {'stored':<9} {mask_secret(result.api_key)}  "
+          f"(key {result.generation}, account {result.account})")
+    if result.scope_downgraded:
+        print(f"  {'note':<9} granted scope is {result.scope!r}, not "
+              f"{args.scope!r} — re-run with a workspace that allows it")
+    print(f"  {'next':<9} needle generate-data --tools tools.json --provider orcarouter")
+
+
+def _models_main(args):
+    """`needle models` — the provider's real catalog, filtered by capability."""
+    from .model.credentials import CredentialError, CredentialStore, mask_secret
+    from .model.providers import (discover_models, filter_models, get_provider)
+
+    provider = get_provider(args.provider or "orcarouter")
+    api_key = None
+    try:
+        from .model.credentials import credential_for
+        api_key = credential_for(provider.id, store=CredentialStore()).api_key
+    except CredentialError as exc:
+        print(f"  {'key':<9} {exc}")
+        print(f"  {'note':<9} listing the unauthenticated catalog; "
+              f"run `needle connect` for your workspace's models")
+
+    catalog = discover_models(provider, api_key=api_key)
+    modalities = [args.input_modality] if args.input_modality else None
+    models = filter_models(catalog.models, capability=args.capability,
+                           input_modalities=modalities)
+    if args.json:
+        print(json.dumps(models, indent=2))
+        return
+    if catalog.degraded:
+        print(f"  {'catalog':<9} {catalog.source} (degraded: {catalog.error})")
+    else:
+        print(f"  {'catalog':<9} live  {len(catalog.models)} models from {provider.models_url}")
+    if not models:
+        print(f"  {'models':<9} none match capability {args.capability!r}")
+        return
+    for model in models:
+        context = model.get("context_length")
+        suffix = f"  ctx {context}" if context else ""
+        architecture = model.get("architecture") or {}
+        inputs = ",".join(architecture.get("input_modalities") or [])
+        print(f"  {model['id']:<44} {inputs or 'undeclared':<12}{suffix}")

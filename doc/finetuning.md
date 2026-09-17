@@ -57,13 +57,31 @@ To share a tuned model, set `NEEDLE_HF_REPO=<you>/<model>` and pass `--upload` t
 
 Defaults: batch size 16, learning rate 0.0001 with warmup and cosine decay, gradient clipping at norm 1, rank 16, alpha 32, max length 1024, validation split 0.1, random seed 0. Use `--seed` to reproduce or intentionally vary LoRA initialization, validation selection, and epoch shuffling. The base checkpoint downloads from Hugging Face on first run.
 
-To grow a small hand written set, seed the generator with it (needs `OPENROUTER_API_KEY`; set `OPENROUTER_URL` to use another OpenAI compatible gateway):
+To grow a small hand written set, seed the generator with it (needs an API key; `--provider` picks
+`orcarouter` or the default `openrouter`, and `OPENROUTER_URL` points the OpenRouter entry at another
+OpenAI compatible gateway):
 
 ```sh
 needle generate-data --augment data.jsonl --num-samples 1000
+needle generate-data --augment data.jsonl --num-samples 1000 --provider orcarouter
+```
+
+For OrcaRouter, `needle connect` authorizes with your account over OAuth 2.0 + PKCE and stores the
+resulting key; `needle models --provider orcarouter` lists what that key can reach.
+
+Synthesis prompts are text by default. Adding `--input-modality image --image-url <url|data: URI>`
+sends one image with every prompt instead; the model is then re-checked against the live catalog and
+one that does not declare an image input is refused rather than guessed at.
+
+```sh
+needle generate-data --tools my_tools.json --provider orcarouter \
+  --model deepseek/deepseek-v4.1-flash --input-modality image --image-url receipt.png
 ```
 
 The playground button labelled Finetune on these tools runs the same pipeline from the browser.
+The playground offers the same two choices: paste an API key, or connect an OrcaRouter account. Its
+finetune dialog also carries the image toggle, which re-filters the model dropdown to image-input
+models and drops a selected model that no longer qualifies.
 
 Training is plain JAX, so it runs on any accelerator jax supports. On an NVIDIA machine install the CUDA build and the same command trains on the GPU, nothing else changes:
 

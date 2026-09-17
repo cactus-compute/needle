@@ -95,3 +95,5 @@ needle-ui.*
 *.vocab 
 *.model
 *.cact
+# Generated UI evidence (tests/test_gui_evidence.py); rebuilt, never committed.
+/orca-evidence/

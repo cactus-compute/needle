@@ -104,24 +104,57 @@ Needle fine-tunes with LoRA on the frozen base and merges the adapter at export,
 {"query": "dim the kitchen to 10", "tools": [{"name": "set_lights", "parameters": {"type": "object", "properties": {"room": {"type": "string"}, "brightness": {"type": "integer"}}, "required": ["room"]}}], "answers": [{"name": "set_lights", "arguments": {"room": "kitchen", "brightness": 10}}], "reasoning": "'kitchen' -> room; 'dim to 10' -> brightness 10"}
 ```
 
-**1. Synthesize data (optional).** Needs `OPENROUTER_API_KEY`. Seed from a tool schema file, or expand an existing set:
+**1. Synthesize data (optional).** Needs an API key for the gateway you use. [OrcaRouter](https://www.orcarouter.ai) and OpenRouter both work; OpenRouter is the default. Seed from a tool schema file, or expand an existing set:
 
 ```sh
-export OPENROUTER_API_KEY=sk-or-...
+export OPENROUTER_API_KEY=sk-or-...            # or: export ORCAROUTER_API_KEY=sk-orca-...
 needle generate-data --tools my_tools.json --num-samples 500 --output data.jsonl
 needle generate-data --augment data.jsonl --num-samples 500      # expand an existing JSONL
 ```
 
-Set `OPENROUTER_URL` to use an OpenAI-compatible gateway instead of the default OpenRouter endpoint.
+Pass `--provider orcarouter` to synthesize through `https://api.orcarouter.ai/v1`, an OpenAI-compatible
+gateway for both models and agents. Set `OPENROUTER_URL` to use a different OpenAI-compatible gateway
+instead of the default OpenRouter endpoint.
 
-**2. LoRA fine-tune.** The base checkpoint auto-downloads from Hugging Face if you do not pass `--checkpoint`. `--generate N` first synthesizes N more examples from the tools in your data (also needs `OPENROUTER_API_KEY`).
+**OrcaRouter.** Rather than pasting a key, you can authorize with your own account; the consent screen
+issues an `sk-orca-…` key that is billed to you and revocable from your console at any time:
+
+```sh
+needle connect                                  # OAuth 2.0 + PKCE, loopback redirect
+needle connect --oob                            # no callback reachable: paste the code instead
+needle models --provider orcarouter             # the real catalog, filtered by capability
+needle generate-data --tools my_tools.json --provider orcarouter --model orcarouter/auto
+```
+
+`needle models` reads `GET /v1/models` with your key, so the list is what your workspace can actually
+call, and it keeps the vendor/model namespace. The model selection in the playground is that same live
+list, filtered by capability — not a hand-written sample and not a free-text field. `ORCA_AUTH_BASE_URL`
+and `ORCA_API_BASE_URL` override the two origins separately, and `ORCA_BASE_URL` supplies both for a
+self-hosted deployment.
+
+**Image inputs.** Prompts can carry one image alongside the text, which makes the run multimodal. The
+image requirement narrows the model list to the models whose catalog entry declares an `image` input —
+declared ones only, never inferred from a model's name — and a model that does not declare it is refused
+before any request is sent:
+
+```sh
+needle models --provider orcarouter --input-modality image            # what may receive an image
+needle generate-data --tools my_tools.json --provider orcarouter \
+  --model deepseek/deepseek-v4.1-flash --input-modality image --image-url receipt.png
+```
+
+`--image-url` takes an `https://` URL or a `data:` URI. The playground exposes the same thing as a
+checkbox in the finetune dialog: turning it on re-filters the model dropdown and clears a selection
+that no longer qualifies.
+
+**2. LoRA fine-tune.** The base checkpoint auto-downloads from Hugging Face if you do not pass `--checkpoint`. `--generate N` first synthesizes N more examples from the tools in your data (also needs an API key).
 
 ```sh
 needle finetune data.jsonl --epochs 10
 needle finetune data.jsonl --epochs 10 --generate 300 --lora-rank 16 --lora-alpha 32
 ```
 
-Key options: `--epochs` (default 3), `--layers <n>` (fine-tune the n-layer rung of the base, see below), `--lora-rank` (16), `--lora-alpha` (32), `--lr` (1e-4), `--batch-size` (16), `--max-len` (1024), `--val-split` (0.1), `--checkpoint <base.safetensors or .pkl>`, `--checkpoint-dir <dir>` (default `checkpoints`), `--out <adapter.safetensors or .pkl>`, `--generate <n>`, `--model <id>` (default `deepseek/deepseek-v4-flash`), and `--workers <n>` (default 8). `--generate` uses the configured OpenRouter endpoint to synthesize extra examples before training. The adapter is written to `checkpoints/needle_lora.pkl` by default. A validation loss prints each epoch from the held out split.
+Key options: `--epochs` (default 3), `--layers <n>` (fine-tune the n-layer rung of the base, see below), `--lora-rank` (16), `--lora-alpha` (32), `--lr` (1e-4), `--batch-size` (16), `--max-len` (1024), `--val-split` (0.1), `--checkpoint <base.safetensors or .pkl>`, `--checkpoint-dir <dir>` (default `checkpoints`), `--out <adapter.safetensors or .pkl>`, `--generate <n>`, `--provider <id>`, `--model <id>` (default: the provider's own), and `--workers <n>` (default 8). `--generate` uses the configured gateway to synthesize extra examples before training. The adapter is written to `checkpoints/needle_lora.pkl` by default. A validation loss prints each epoch from the held out split.
 
 Training is plain JAX and runs on any accelerator jax supports. On an NVIDIA machine install the CUDA build and the same command trains on the GPU:
 

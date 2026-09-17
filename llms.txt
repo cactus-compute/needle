@@ -168,8 +168,10 @@ LoRA on the frozen base, merged at export. Data is JSONL, one example per line; 
 
 ```sh
 pip install "cactus-needle[train]"                                                 # training deps (JAX, flax, optax)
-export OPENROUTER_API_KEY=sk-or-...
+export OPENROUTER_API_KEY=sk-or-...                                                # or ORCAROUTER_API_KEY=sk-orca-...
 needle generate-data --tools my_tools.json --num-samples 500 --output data.jsonl   # optional
+needle generate-data --tools my_tools.json --provider orcarouter                   # via OrcaRouter
+needle connect                                                                     # OrcaRouter OAuth 2.0 + PKCE
 needle finetune data.jsonl --epochs 3 --generate 300                                # LoRA; auto-downloads base
 needle build checkpoints/needle3.safetensors --lora checkpoints/needle_lora.safetensors --out my.cact
 ```
@@ -181,7 +183,9 @@ agent = needle.Needle(weights="my.cact", tools=[...])
 agent.run("...")
 ```
 
-Options: `finetune --layers <n> (fine-tune the n-layer rung of the depth ladder; build exports the same rung) --lora-rank 16 --lora-alpha 32 --lr 1e-4 --batch-size 16 --max-len 1024 --val-split 0.1 --checkpoint <base.safetensors or .pkl> --checkpoint-dir <dir> --out <adapter.safetensors or .pkl> --generate <n> --model <id> --workers <n>`; `--model` defaults to `deepseek/deepseek-v4-flash`, `--workers` defaults to `8`, and `--checkpoint-dir` defaults to `checkpoints`. `--generate` synthesizes extra examples through the configured OpenRouter endpoint before training. `build --bits 2|4 --upload` (with `NEEDLE_HF_REPO=<you>/<model>`).
+Options: `finetune --layers <n> (fine-tune the n-layer rung of the depth ladder; build exports the same rung) --lora-rank 16 --lora-alpha 32 --lr 1e-4 --batch-size 16 --max-len 1024 --val-split 0.1 --checkpoint <base.safetensors or .pkl> --checkpoint-dir <dir> --out <adapter.safetensors or .pkl> --generate <n> --provider <orcarouter|openrouter> --model <id> --workers <n>`; `--model` defaults to the selected provider's own default (`deepseek/deepseek-v4-flash` for OpenRouter, `orcarouter/auto` for OrcaRouter), `--workers` defaults to `8`, and `--checkpoint-dir` defaults to `checkpoints`. `--generate` synthesizes extra examples through the configured gateway before training. `build --bits 2|4 --upload` (with `NEEDLE_HF_REPO=<you>/<model>`).
+
+OrcaRouter is a first-class provider alongside OpenRouter: `needle connect` obtains a key through OAuth 2.0 + PKCE (`--oob` for the out-of-band code flow), `needle models --provider orcarouter` lists the real catalog from `GET https://api.orcarouter.ai/v1/models` filtered by capability, and inference runs against `https://api.orcarouter.ai/v1`. `ORCA_AUTH_BASE_URL` / `ORCA_API_BASE_URL` override the auth and inference origins separately; `ORCA_BASE_URL` supplies both for self-hosted deployments. Prompts can carry one image with `--input-modality image --image-url <https URL or data: URI>`, which filters the model list to catalog records that explicitly declare an `image` input and refuses any other model before sending.
 
 ## Playground (browser)
 

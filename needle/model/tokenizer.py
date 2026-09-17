@@ -1,6 +1,14 @@
 import os
 
-import sentencepiece as spm
+# ``sentencepiece`` ships in the ``train`` extra, but the marker and id constants
+# below are imported by inference, export, rendering and dataset-synthesis paths
+# that must keep working on a runtime-only install. Only :class:`SANTokenizer`
+# actually needs the native library, so the import stays soft and the failure is
+# reported when a tokenizer is loaded rather than when this module is imported.
+try:
+    import sentencepiece as spm
+except ImportError:  # pragma: no cover - exercised by tests/test_tokenizer.py
+    spm = None
 
 TOKENIZER_DIR = os.path.dirname(__file__)
 TOKENIZER_PREFIX = os.path.join(TOKENIZER_DIR, "tokenizer")
@@ -53,6 +61,11 @@ _HF_TOKENIZER_DIR = "tokenizer"
 class SANTokenizer:
 
     def __init__(self, model_path):
+        if spm is None:
+            raise RuntimeError(
+                "Loading a tokenizer needs the sentencepiece runtime, which is not "
+                "installed. Install the training extras with "
+                "`pip install cactus-needle[train]` (or `pip install sentencepiece`).")
         self.sp = spm.SentencePieceProcessor()
         self.sp.Load(model_path)
         self.model_path = model_path
