@@ -4,6 +4,7 @@ import os
 
 from .checkpoints import read_adapter, write_adapter
 import sys
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -20,6 +21,9 @@ from .tokenizer import (
     IM_START, IM_END, THINK_START, THINK_END,
     TOOLS_START, TOOLS_END, TOOL_CALL_START, TOOL_CALL_END,
 )
+from .credentials import (CredentialError, CredentialResult, CredentialStore,
+                          credential_for, mark_rejected_generation, mask_secret)
+from .providers import chat_completions_url, get_provider
 
 LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "gate_proj", "out_proj")
 
@@ -30,10 +34,15 @@ def _training_rng(seed):
 
 DEFAULT_BASE = "checkpoints/needle3.safetensors"
 
+# Kept as a module attribute for backwards compatibility; the request itself is
+# routed through the provider registry, which resolves the same value.
 OPENROUTER_URL = os.environ.get(
     "OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions"
 )
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
+
+#: Models we will accept from a live catalog for this entry point (text chat).
+DEFAULT_CAPABILITY = "chat"
 
 _GEN_SYSTEM = (
     "You generate training data for a tool-calling and extraction model. Given a "
@@ -60,17 +69,128 @@ Rules:
 - Vary phrasing, values, and which schemas are used. Return ONLY the JSON array."""
 
 
-def _openrouter(messages, model, api_key, temperature=0.9):
+def _openrouter(messages, model, api_key, temperature=0.9, provider=None,
+                required_modalities=None):
+    """Send one chat completion through the resolved provider.
+
+    ``provider`` defaults to the historical OpenRouter entry so existing callers
+    keep working; OrcaRouter reaches the same code path with its own origin and
+    key. A ``401`` is terminal: the stored key was revoked or is wrong, and
+    retrying it only burns the caller's time.
+
+    When the prompt carries a non-text modality the model is checked against the
+    provider's own catalog first, so a model chosen before an attachment was
+    added can never reach the wire even if a cached list went stale.
+    """
+    provider = provider or get_provider(None)
+    if required_modalities:
+        _require_modalities(provider, model, api_key, required_modalities)
     payload = json.dumps({"model": model, "messages": messages,
                           "temperature": temperature}).encode("utf-8")
-    request = urllib.request.Request(OPENROUTER_URL, data=payload, headers={
+    request = urllib.request.Request(chat_completions_url(provider), data=payload,
+                                     headers={
         "Authorization": "Bearer " + api_key,
         "Content-Type": "application/json",
         "HTTP-Referer": "https://github.com/cactus-compute/needle",
         "X-Title": "needle",
     })
-    with urllib.request.urlopen(request, timeout=180) as response:
-        return json.loads(response.read().decode("utf-8"))["choices"][0]["message"]["content"]
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            return json.loads(response.read().decode("utf-8"))["choices"][0]["message"]["content"]
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise CredentialError(
+                "the %s key was rejected (401); it may have been revoked — "
+                "reconnect the account or paste a new key" % provider.label,
+                needs_reauth=True, status=401) from None
+        if exc.code == 403:
+            # The catalog is the workspace's, but a key can be scoped to a
+            # subset of it, so a listed model is not always callable by the
+            # credential in hand. Point the user at the key's own access list.
+            raise CredentialError(
+                "%s denied access to model %r with this key (403); pick a model "
+                "this key is allowed to use, or widen its access in the OrcaRouter "
+                "console" % (provider.label, model), status=403) from None
+        if exc.code == 429:
+            raise CredentialError(
+                "%s is rate limiting requests (429); reduce --workers or retry later"
+                % provider.label, status=429) from None
+        raise CredentialError(
+            "%s request failed with HTTP %s" % (provider.label, exc.code),
+            status=exc.code) from None
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        detail = " (%s)" % type(reason).__name__ if reason is not None else ""
+        raise CredentialError(
+            "could not reach %s%s" % (provider.label, detail)) from None
+
+
+def _require_modalities(provider, model, api_key, required_modalities):
+    """Fail closed unless the catalog declares every modality the prompt carries.
+
+    Only a provider whose catalog carries modality metadata can be checked; any
+    other provider is left with its existing behaviour rather than guessed at.
+    """
+    from .providers import discover_models
+
+    if provider.id != "orcarouter":
+        return
+    catalog = discover_models(provider, api_key=api_key)
+    record = None
+    for candidate in catalog.models:
+        if candidate.get("id") == model:
+            record = candidate
+            break
+    if record is None:
+        raise CredentialError(
+            "%s is not in the %s catalog%s; pick a model from the list"
+            % (model, provider.label,
+               "" if not catalog.degraded else " (the live catalog is unavailable)"))
+    declared = set((record.get("architecture") or {}).get("input_modalities") or [])
+    missing = [m for m in required_modalities if m not in declared]
+    if missing:
+        raise CredentialError(
+            "%s does not declare %s input, so it cannot be sent this prompt; "
+            "pick a model that lists it" % (model, ", ".join(missing)))
+
+
+def resolve_credential(provider_id=None, api_key=None, store=None):
+    """Pick up a credential for ``provider_id``, preferring an explicit one.
+
+    Both adapters land here: an explicit key (the API-key path), the environment,
+    or the store — which is where a PKCE login leaves its key. Nothing below this
+    point knows which one it got. An explicit key that the store also holds keeps
+    that record's generation, so a later ``401`` can invalidate exactly the
+    credential that was rejected rather than one that replaced it.
+    """
+    provider = get_provider(provider_id)
+    if api_key:
+        record = (store or CredentialStore()).get(provider.id)
+        if record and record.get("key") == api_key:
+            return CredentialResult(provider_id=provider.id, api_key=api_key,
+                                    source=record.get("source") or "api_key",
+                                    scope=record.get("scope"), account=provider.id,
+                                    generation=int(record.get("generation") or 0))
+        return CredentialResult(provider_id=provider.id, api_key=api_key,
+                                source="api_key", account=provider.id)
+    return credential_for(provider.id, store=store)
+
+
+def resolve_credentials(provider_id=None, api_key=None, store=None):
+    """The credential's key, for callers that only need the string."""
+    provider = get_provider(provider_id)
+    return provider, resolve_credential(provider_id, api_key, store=store).api_key
+
+
+def _mark_terminal_rejection(credential, store):
+    """A rejected credential is marked, never refreshed and never deleted.
+
+    ``401`` from the relay means the key was revoked or replaced; there is no
+    refresh grant to reach for. Only the generation that made the rejected
+    request is flagged, so a late failure cannot break a credential that has
+    already been replaced.
+    """
+    return mark_rejected_generation(credential, store=store)
 
 
 def _parse_array(text):
@@ -84,14 +204,34 @@ def _parse_array(text):
     return [r for r in rows if isinstance(r, dict) and "query" in r and "answers" in r]
 
 
-def generate_examples(tools, n=25, model=DEFAULT_MODEL, api_key=None, refusals=3):
-    api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        raise RuntimeError("set OPENROUTER_API_KEY to generate data")
+def generate_examples(tools, n=25, model=DEFAULT_MODEL, api_key=None, refusals=3,
+                      provider_id=None, store=None, input_modality=None,
+                      image_url=None, credential=None):
+    provider = get_provider(provider_id)
+    credential = credential or resolve_credential(provider_id, api_key, store=store)
+    api_key = credential.api_key
+    model = model or provider.default_model
     tools_json = tools if isinstance(tools, str) else json.dumps(tools, indent=2)
     prompt = _GEN_TEMPLATE.format(tools=tools_json, n=n, refusals=refusals)
-    text = _openrouter([{"role": "system", "content": _GEN_SYSTEM},
-                        {"role": "user", "content": prompt}], model, api_key)
+    # A declared non-text modality turns the prompt into the multimodal content
+    # form, so the same tools and instructions are sent either way.
+    if input_modality and input_modality != "text":
+        content = [{"type": "text", "text": prompt}]
+        if image_url:
+            content.append({"type": "image_url", "image_url": {"url": image_url}})
+        user_message = {"role": "user", "content": content}
+    else:
+        user_message = {"role": "user", "content": prompt}
+    try:
+        text = _openrouter([{"role": "system", "content": _GEN_SYSTEM}, user_message],
+                           model, api_key, provider=provider,
+                           required_modalities=[input_modality] if input_modality
+                           and input_modality != "text" else None)
+    except CredentialError as exc:
+        if exc.status == 401:
+            # Terminal: the relay rejected this exact credential generation.
+            _mark_terminal_rejection(credential, store)
+        raise
     rows = _parse_array(text)
     for row in rows:
         row.setdefault("tools", tools if isinstance(tools, list) else json.loads(tools))
@@ -104,10 +244,12 @@ def _dedup_key(example):
 
 
 def generate_dataset(tools, num_samples, model=DEFAULT_MODEL, batch_size=25,
-                     api_key=None, workers=8, progress=None):
-    api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        raise RuntimeError("set OPENROUTER_API_KEY to generate data")
+                     api_key=None, workers=8, progress=None, provider_id=None,
+                     store=None, input_modality=None, image_url=None):
+    provider = get_provider(provider_id)
+    credential = resolve_credential(provider_id, api_key, store=store)
+    api_key = credential.api_key
+    model = model or provider.default_model
 
     target = int(num_samples * 1.3)
     max_submissions = max(1, target // batch_size * 3)
@@ -118,7 +260,9 @@ def generate_dataset(tools, num_samples, model=DEFAULT_MODEL, batch_size=25,
     def _submit():
         nonlocal submitted
         pending.add(pool.submit(generate_examples, tools, batch_size,
-                                model=model, api_key=api_key))
+                                model=model, api_key=api_key, provider_id=provider.id,
+                                store=store, credential=credential,
+                                input_modality=input_modality, image_url=image_url))
         submitted += 1
 
     for _ in range(min(workers, max(1, -(-target // batch_size)))):
@@ -162,7 +306,9 @@ def _collect_tools(examples):
     return tools
 
 
-def augment_jsonl(path, num_samples, model=DEFAULT_MODEL, batch_size=25, out_path=None, workers=8):
+def augment_jsonl(path, num_samples, model=DEFAULT_MODEL, batch_size=25, out_path=None,
+                  workers=8, provider_id=None, store=None, input_modality=None,
+                  image_url=None):
     with open(path) as handle:
         examples = [json.loads(line) for line in handle if line.strip()]
     tools = _collect_tools(examples)
@@ -170,7 +316,9 @@ def augment_jsonl(path, num_samples, model=DEFAULT_MODEL, batch_size=25, out_pat
         raise RuntimeError("no tool schemas found in " + path)
     out_path = out_path or path.replace(".jsonl", "") + ".augmented.jsonl"
     generated = generate_dataset(tools, num_samples, model=model or DEFAULT_MODEL,
-                                 batch_size=batch_size, workers=workers)
+                                 batch_size=batch_size, workers=workers,
+                                 provider_id=provider_id, store=store,
+                                 input_modality=input_modality, image_url=image_url)
     with open(out_path, "w") as handle:
         for example in examples + generated:
             handle.write(json.dumps(example) + "\n")
@@ -179,23 +327,42 @@ def augment_jsonl(path, num_samples, model=DEFAULT_MODEL, batch_size=25, out_pat
 
 
 def generate_main(args):
-    model = args.model or DEFAULT_MODEL
+    from .credentials import CredentialError, CredentialStore
+
+    provider_id = getattr(args, "provider", None)
+    provider = get_provider(provider_id)
+    model = args.model or provider.default_model
     workers = getattr(args, "workers", 8)
-    if args.tools:
-        with open(args.tools) as handle:
-            tools = json.load(handle)
-        out = args.output or "needle_data.jsonl"
-        rows = generate_dataset(tools, args.num_samples, model=model,
-                                batch_size=args.batch_size, workers=workers)
-        with open(out, "w") as handle:
-            for row in rows:
-                handle.write(json.dumps(row) + "\n")
-        print(f"  {'wrote':<9} {len(rows)} examples  {out}")
-    elif args.augment:
-        augment_jsonl(args.augment, args.num_samples, model=model,
-                      batch_size=args.batch_size, out_path=args.output, workers=workers)
-    else:
-        raise SystemExit("pass --tools <schemas.json> or --augment <data.jsonl>")
+    modality = getattr(args, "input_modality", None)
+    image_url = getattr(args, "image_url", None)
+    # The real CLI path holds the project's credential store, which is what lets
+    # a terminal 401 mark the exact rejected generation as needing reauth.
+    store = CredentialStore()
+    if modality and modality != "text" and not image_url:
+        raise SystemExit("--input-modality %s needs --image-url" % modality)
+    try:
+        if args.tools:
+            with open(args.tools) as handle:
+                tools = json.load(handle)
+            out = args.output or "needle_data.jsonl"
+            rows = generate_dataset(tools, args.num_samples, model=model,
+                                    batch_size=args.batch_size, workers=workers,
+                                    provider_id=provider_id, store=store,
+                                    input_modality=modality,
+                                    image_url=image_url)
+            with open(out, "w") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row) + "\n")
+            print(f"  {'wrote':<9} {len(rows)} examples  {out}")
+        elif args.augment:
+            augment_jsonl(args.augment, args.num_samples, model=model,
+                          batch_size=args.batch_size, out_path=args.output,
+                          workers=workers, provider_id=provider_id, store=store,
+                          input_modality=modality, image_url=image_url)
+        else:
+            raise SystemExit("pass --tools <schemas.json> or --augment <data.jsonl>")
+    except CredentialError as exc:
+        raise SystemExit("  %-9s %s" % ("failed", exc)) from None
 
 
 def render_example(example):
@@ -329,7 +496,10 @@ def finetune_local(args, progress=None):
     data_path = args.jsonl_path
     if getattr(args, "generate", 0):
         data_path = augment_jsonl(data_path, args.generate, model=getattr(args, "model", None),
-                                  workers=getattr(args, "workers", 8))
+                                  workers=getattr(args, "workers", 8),
+                                  provider_id=getattr(args, "provider", None),
+                                  input_modality=getattr(args, "input_modality", None),
+                                  image_url=getattr(args, "image_url", None))
 
     params, config = load_checkpoint(base_path)
     layers = getattr(args, "layers", None)

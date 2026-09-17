@@ -80,10 +80,56 @@
         <button class="modal-close" id="modalCloseBtn" onclick="closeModal()">&times;</button>
       </div>
       <div class="modal-body">
-        <p class="modal-note">We generate tool-calling data for the tools in the sidebar with OpenRouter, LoRA-finetune the base model, and merge + export a tuned <span class="mono">.cact</span> you can download and run.</p>
+        <p class="modal-note">We generate tool-calling data for the tools in the sidebar, LoRA-finetune the base model, and merge + export a tuned <span class="mono">.cact</span> you can download and run.</p>
         <div class="modal-field">
-          <label class="modal-label">OpenRouter API Key</label>
-          <input type="password" id="ftApiKey" class="modal-input" placeholder="sk-or-..." autocomplete="off" spellcheck="false">
+          <label class="modal-label" for="ftProvider">Provider</label>
+          <select id="ftProvider" class="modal-input" onchange="onProviderChange()"></select>
+        </div>
+        <div class="modal-field">
+          <label class="modal-label" for="ftModel">Model</label>
+          <select id="ftModel" class="modal-input modal-input-sm"></select>
+          <div class="model-status" id="ftModelStatus"></div>
+        </div>
+        <div class="modal-field">
+          <label class="modal-label" for="ftImageUrl">Inputs</label>
+          <label class="modality-toggle" for="ftImageToggle">
+            <input type="checkbox" id="ftImageToggle" onchange="onInputModalityChange()">
+            <span>Send an image with every prompt</span>
+          </label>
+          <input type="text" id="ftImageUrl" class="modal-input modal-input-sm" hidden
+                 placeholder="Image URL, or a data: URI, sent with each prompt"
+                 autocomplete="off" spellcheck="false">
+          <div class="model-status" id="ftModalityStatus"></div>
+        </div>
+        <div class="auth-methods" id="ftAuthMethods">
+          <div class="auth-method" id="ftApiKeyMethod">
+            <div class="auth-method-head">API key</div>
+            <p class="auth-method-note">Already have a key? Paste it here.</p>
+            <div class="auth-row">
+              <input type="password" id="ftApiKey" class="modal-input" placeholder="sk-orca-..." autocomplete="off" spellcheck="false">
+              <button class="btn-ghost auth-btn" id="ftApiKeyBtn" onclick="saveApiKey()">Use key</button>
+            </div>
+          </div>
+          <div class="auth-method" id="ftConnectMethod">
+            <div class="auth-method-head">
+              <img src="https://www.orcarouter.ai/orca-logo-classic.png" alt="" width="18" height="18">
+              <span>Connect with OrcaRouter</span>
+            </div>
+            <p class="auth-method-note">Sign in and approve access. Your account issues the key.</p>
+            <div class="auth-row">
+              <button class="btn-ghost auth-btn" id="ftConnectBtn" onclick="startConnect()">Connect</button>
+              <button class="btn-ghost auth-btn" id="ftConnectCxl" onclick="cancelConnect()" hidden>Cancel</button>
+            </div>
+          </div>
+          <div class="credential-state" id="ftCredState" hidden></div>
+        </div>
+        <div class="connect-panel" id="ftConnectPanel" hidden>
+          <div class="connect-hint" id="ftConnectHint"></div>
+          <div class="auth-row" id="ftOobRow" hidden>
+            <input type="text" id="ftOobCode" class="modal-input modal-input-sm" placeholder="Paste the code shown in your browser" autocomplete="off" spellcheck="false">
+            <button class="btn-ghost auth-btn" id="ftOobBtn" onclick="submitOobCode()">Submit</button>
+          </div>
+          <a class="connect-url mono" id="ftConnectUrl" target="_blank" rel="noopener"></a>
         </div>
         <div class="modal-field">
           <label class="modal-label">Synthetic examples</label>

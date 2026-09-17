@@ -171,17 +171,373 @@ function togglePanel() {
 var _pollTimer = null;
 var _ftRunning = false;
 
+// ---------------------------------------------------------------------------
+// Providers, credentials and the model catalog.
+// The browser only ever names a provider and a model. Credentials stay on the
+// server: a key pasted here is forwarded once and then reported back masked.
+// ---------------------------------------------------------------------------
+
+var _providers = [];
+var _catalog = null;
+var _modelValue = "";
+
+// The modality the current prompt actually carries. It is the only thing that
+// decides which models the selector may offer: "image" is set by the attachment
+// toggle, never guessed from a model name.
+var _inputModality = null;
+
+// Monotonic attempt id. Every async reply carries the generation it belongs to
+// and is dropped if a newer attempt has started, so a late URL or key from one
+// login can never surface under the next.
+var _gen = 0;
+var _connect = { attempt: 0, status: "idle", flow: null, timer: null };
+var _modelRequest = 0;
+
+function _bumpGeneration() {
+  _gen += 1;
+  return _gen;
+}
+
+function fetchProviders() {
+  return fetch("/providers").then(function (r) { return r.json(); })
+    .then(function (d) {
+      _providers = d.providers || [];
+      var sel = document.getElementById("ftProvider");
+      sel.innerHTML = "";
+      _providers.forEach(function (p) {
+        var o = document.createElement("option");
+        o.value = p.id;
+        o.textContent = p.label;
+        sel.appendChild(o);
+      });
+      var preferred = _providers.filter(function (p) { return p.connected; })[0]
+        || _providers[0];
+      if (preferred) sel.value = preferred.id;
+      onProviderChange();
+    })
+    .catch(function () {});
+}
+
+function currentProvider() {
+  var id = document.getElementById("ftProvider").value;
+  return _providers.filter(function (p) { return p.id === id; })[0] || null;
+}
+
+function onProviderChange() {
+  var p = currentProvider();
+  if (!p) return;
+  var canConnect = (p.methods || []).indexOf("pkce") !== -1;
+  document.getElementById("ftConnectMethod").hidden = !canConnect;
+  document.getElementById("ftApiKey").placeholder = p.id === "orcarouter"
+    ? "sk-orca-..." : "sk-or-...";
+  showCredentialState(p);
+  loadModels(p.id);
+}
+
+// The durable statement of what the panel is holding: which method produced
+// the credential and its masked form. Always masked — the full key lives on
+// the server and is never rendered here.
+function showCredentialState(p) {
+  var el = document.getElementById("ftCredState");
+  if (!p || !p.connected || !p.masked_key) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  el.hidden = false;
+  el.className = "credential-state" + (p.connection_degraded ? " warn" : " ok");
+  el.textContent = "Connected via " + (p.key_source === "pkce" ? "OrcaRouter sign-in"
+    : "API key") + " · " + p.masked_key
+    + (p.connection_degraded ? " · needs reauthentication" : "");
+}
+
+function showModelStatus(text, kind) {
+  var el = document.getElementById("ftModelStatus");
+  el.textContent = text || "";
+  el.className = "model-status" + (kind ? " " + kind : "");
+}
+
+function loadModels(providerId) {
+  var request = ++_modelRequest;
+  var select = document.getElementById("ftModel");
+  select.disabled = true;
+  showModelStatus("Loading models...", "");
+  fetch("/provider/models?provider=" + encodeURIComponent(providerId)
+        + "&capability=chat"
+        + (_inputModality ? "&input_modality=" + encodeURIComponent(_inputModality) : ""))
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (request !== _modelRequest) return;   // a newer provider won
+      _catalog = d;
+      renderModels(d);
+    })
+    .catch(function (e) {
+      if (request !== _modelRequest) return;
+      _catalog = null;
+      showModelStatus("Could not load models: " + e.message, "warn");
+      select.innerHTML = "";
+      select.disabled = true;
+    });
+}
+
+function renderModels(d) {
+  var select = document.getElementById("ftModel");
+  select.innerHTML = "";
+  (d.models || []).forEach(function (m) {
+    var o = document.createElement("option");
+    o.value = m.id;
+    o.textContent = m.id + (m.context_length ? "  ·  " + m.context_length : "");
+    select.appendChild(o);
+  });
+  select.disabled = (d.models || []).length === 0;
+  if (d.degraded) {
+    showModelStatus("Live catalog unavailable (" + (d.error || "unknown")
+      + "). Showing " + d.source + " models — refresh when the network is back.",
+      "warn");
+  } else {
+    showModelStatus(d.models.length + " of " + d.total + " models for " + d.capability
+      + " · live from " + d.api_base, "ok");
+  }
+  // A previously chosen model is restored only if it is still in the filtered
+  // list; otherwise the selection is cleared rather than silently kept.
+  if (_modelValue && (d.models || []).some(function (m) { return m.id === _modelValue; })) {
+    select.value = _modelValue;
+  } else {
+    _modelValue = "";
+    if ((d.models || []).length) select.value = d.models[0].id;
+  }
+  saveModelChoice(select.value);
+}
+
+function saveModelChoice(value) {
+  _modelValue = value || "";
+  try { localStorage.setItem("needle.model", _modelValue); } catch (e) {}
+}
+
+function restoreModelChoice() {
+  try { _modelValue = localStorage.getItem("needle.model") || ""; } catch (e) {}
+}
+
+// The attachment toggle is the only thing that may widen what the selector
+// offers. Turning it on makes the requirement stricter, so the catalog is
+// re-requested with the modality and any model that does not declare an
+// image input is dropped from the list (and from the current selection).
+function onInputModalityChange() {
+  var on = document.getElementById("ftImageToggle").checked;
+  _inputModality = on ? "image" : null;
+  document.getElementById("ftImageUrl").hidden = !on;
+  showModalityStatus(on
+    ? "Only models that declare an image input are listed."
+    : "", "");
+  var p = currentProvider();
+  if (p) loadModels(p.id);
+}
+
+function showModalityStatus(text, kind) {
+  var el = document.getElementById("ftModalityStatus");
+  el.textContent = text || "";
+  el.className = "model-status" + (kind ? " " + kind : "");
+}
+
+// Second line of defence. The selector never offers an incompatible model, so
+// this only fires if the catalog changed under a stale selection.
+function attachmentBlocksSend() {
+  if (!_inputModality) return null;
+  var p = currentProvider();
+  if (!p || p.id !== "orcarouter") return null;   // other providers keep their behaviour
+  var imageUrl = document.getElementById("ftImageUrl").value.trim();
+  if (!imageUrl) return "Add the image URL to send, or turn the image input off";
+  var m = (_catalog && _catalog.models || []).filter(function (x) {
+    return x.id === selectedModel(); })[0];
+  if (!m) return null;
+  if ((m.input_modalities || []).indexOf(_inputModality) === -1) {
+    return "The selected model does not declare an image input; pick another";
+  }
+  return null;
+}
+
+// The model always comes from the provider's own catalog: there is no free-text
+// path, so a user cannot type a model the workspace cannot reach.
+function selectedModel() {
+  return document.getElementById("ftModel").value;
+}
+
+function startConnect() {
+  var p = currentProvider();
+  if (!p) return;
+  var cxl = document.getElementById("ftConnectCxl");
+  var btn = document.getElementById("ftConnectBtn");
+  btn.disabled = true;
+  cxl.hidden = false;
+  document.getElementById("ftConnectPanel").hidden = false;
+  document.getElementById("ftOobRow").hidden = true;
+  document.getElementById("ftConnectUrl").textContent = "";
+  document.getElementById("ftConnectHint").textContent = "Requesting an authorization URL...";
+  var generation = _bumpGeneration();
+  fetch("/provider/connect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider: p.id, flow: "loopback", app_name: "Needle",
+                           scope: "api" }),
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    if (generation !== _gen) return;            // superseded: leave state alone
+    _connect.attempt = d.attempt;
+    _connect.status = d.status;
+    _connect.flow = d.flow;
+    if (d.error) { _connectFailed(d.error); return; }
+    _showAuthorization(d);
+    _connect.timer = setInterval(pollConnect, 1500);
+  }).catch(function (e) {
+    if (generation !== _gen) return;
+    _connectFailed("Could not start the connection: " + e.message);
+  });
+  try { window.open("", "_blank"); } catch (e) {}
+}
+
+function _showAuthorization(d) {
+  document.getElementById("ftConnectHint").textContent =
+    "Approve access in the browser window. This panel updates on its own.";
+  var link = document.getElementById("ftConnectUrl");
+  link.textContent = d.url || "";
+  link.href = d.url || "#";
+  if (d.url) { try { window.open(d.url, "_blank"); } catch (e) {} }
+  // The consent screen also offers "show me a code", which a human then pastes
+  // back, so the out-of-band input is always available.
+  document.getElementById("ftOobRow").hidden = false;
+}
+
+function pollConnect() {
+  var generation = _gen;
+  fetch("/provider/connect/status").then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (generation !== _gen) return;
+      if (d.attempt !== _connect.attempt) return;
+      if (d.status === "done") {
+        _connectDone(d);
+      } else if (d.status === "failed" || d.status === "cancelled") {
+        _connectFailed(d.error || "the connection was cancelled");
+      } else if (d.hint) {
+        document.getElementById("ftConnectHint").textContent = d.hint;
+      }
+    })
+    .catch(function () {});
+}
+
+function _connectDone(d) {
+  _stopConnectTimer();
+  _connect.status = "done";
+  // The panel stays visible so the "connected via" line below the methods can
+  // report what was stored, always masked.
+  document.getElementById("ftConnectPanel").hidden = true;
+  document.getElementById("ftConnectBtn").disabled = false;
+  document.getElementById("ftConnectCxl").hidden = true;
+  document.getElementById("ftApiKey").value = "";
+  showModelStatus("Connected · " + (d.masked_key || "key stored on the server"),
+                  "ok");
+  fetchProviders();
+}
+
+function _connectFailed(message) {
+  _stopConnectTimer();
+  _connect.status = "failed";
+  document.getElementById("ftConnectBtn").disabled = false;
+  document.getElementById("ftConnectCxl").hidden = true;
+  document.getElementById("ftConnectPanel").hidden = true;
+  showModelStatus(message || "connection failed", "warn");
+}
+
+function _stopConnectTimer() {
+  if (_connect.timer) { clearInterval(_connect.timer); _connect.timer = null; }
+}
+
+function cancelConnect() {
+  // Cancelling invalidates the generation first, so the cancelled attempt's
+  // own finally-handler cannot write over the state we are clearing now.
+  _bumpGeneration();
+  _stopConnectTimer();
+  document.getElementById("ftConnectPanel").hidden = true;
+  document.getElementById("ftOobRow").hidden = true;
+  document.getElementById("ftConnectBtn").disabled = false;
+  document.getElementById("ftConnectCxl").hidden = true;
+  showModelStatus("Connection cancelled", "");
+  var attempt = _connect.attempt;
+  _connect.status = "cancelled";
+  fetch("/provider/connect/cancel", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ attempt: attempt }),
+  }).catch(function () {});
+}
+
+function submitOobCode() {
+  var code = document.getElementById("ftOobCode").value.trim();
+  if (!code) { showError("Paste the code shown on the consent screen"); return; }
+  document.getElementById("ftOobCode").value = "";
+  document.getElementById("ftConnectHint").textContent = "Exchanging the code...";
+  fetch("/provider/connect/code", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code: code }),
+  }).catch(function () {});
+}
+
+function saveApiKey() {
+  var key = document.getElementById("ftApiKey").value.trim();
+  var p = currentProvider();
+  if (!p) return;
+  if (!key) { showError("Enter an API key, or use Connect instead"); return; }
+  fetch("/provider/connect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider: p.id, api_key: key }),
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    document.getElementById("ftApiKey").value = "";
+    if (d.error) { showModelStatus(d.error, "warn"); return; }
+    showModelStatus(p.label + " key stored · " + (d.masked_key || ""), "ok");
+    loadModels(p.id);
+    fetchProviders();   // refresh the masked credential line from the server
+  }).catch(function (e) { showModelStatus("Could not store the key: " + e.message, "warn"); });
+}
+
+// pagehide fires when the page enters the back-forward cache. The generation
+// guard below would (correctly) refuse to mutate state afterwards, so the busy
+// flags and hint are cleared synchronously here, and the server-side login is
+// cancelled with keepalive. Without this, a restored page stays busy forever.
+window.addEventListener("pagehide", function () {
+  _bumpGeneration();
+  _stopConnectTimer();
+  _connect.status = "idle";
+  _connect.attempt = 0;
+  document.getElementById("ftConnectBtn").disabled = false;
+  document.getElementById("ftConnectCxl").hidden = true;
+  document.getElementById("ftConnectPanel").hidden = true;
+  document.getElementById("ftConnectHint").textContent = "";
+  try {
+    fetch("/provider/connect/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+      keepalive: true,
+    });
+  } catch (e) {}
+});
+
 function openFinetuneModal() {
   var tools = document.getElementById("tools").value.trim() || "[]";
   try { JSON.parse(tools); } catch (e) { showError("Invalid tools JSON"); return; }
   _resetModal();
+  restoreModelChoice();
   document.getElementById("modalOverlay").classList.add("visible");
+  fetchProviders();
   document.getElementById("ftApiKey").focus();
 }
 
 function closeModal(e) {
   if (e && e.target && e.target !== document.getElementById("modalOverlay")) return;
   if (_ftRunning) return;
+  // Closing the modal is a terminal path for a login in progress; release the
+  // server-side lock rather than leaving it held.
+  if (_connect.status === "pending") cancelConnect();
   document.getElementById("modalOverlay").classList.remove("visible");
 }
 
@@ -201,11 +557,18 @@ function _resetModal() {
 }
 
 async function startFinetune() {
-  var apiKey = document.getElementById("ftApiKey").value.trim();
-  if (!apiKey) { showError("OpenRouter API key is required"); return; }
+  var p = currentProvider();
+  if (!p) { showError("Pick a provider"); return; }
   var tools = document.getElementById("tools").value.trim() || "[]";
   try { JSON.parse(tools); } catch (e) { showError("Invalid tools JSON"); return; }
   var samples = parseInt(document.getElementById("ftSamples").value, 10) || 200;
+  var model = selectedModel();
+  if (!model) {
+    showError("Pick a model — the list comes from the provider's own catalog");
+    return;
+  }
+  var blocked = attachmentBlocksSend();
+  if (blocked) { showError(blocked); return; }
 
   var btn = document.getElementById("ftStartBtn");
   btn.disabled = true;
@@ -215,10 +578,16 @@ async function startFinetune() {
   _ftRunning = true;
 
   try {
+    // The key is not sent: the server uses the credential it already holds for
+    // this provider, whichever of the two methods produced it.
     var r = await fetch("/finetune", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tools: tools, api_key: apiKey, samples: samples }),
+      body: JSON.stringify({ tools: tools, provider: p.id, model: model,
+                             samples: samples,
+                             image_url: _inputModality
+                               ? document.getElementById("ftImageUrl").value.trim()
+                               : "" }),
     });
     var data = await r.json();
     if (data.error) { showError(data.error); _ftRunning = false; _resetModal(); return; }
