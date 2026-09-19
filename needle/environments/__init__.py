@@ -3,6 +3,10 @@ bounds, and descriptions map cleanly onto Needle's constrained decoding.
 Each module ships TOOLS, SYSTEM, a ready agent, and a frozen acceptance
 suite runnable as `python -m needle.environments.<name>`.
 
+Note: The frozen acceptance suites are aspirational targets designed for
+fine-tuning. They are not expected to pass out-of-the-box on the base
+shipped engine without fine-tuning on the environment's tools.
+
     from needle.environments import smart_home
 
     smart_home.agent.complete("dim the study lights to 30 percent")
