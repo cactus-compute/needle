@@ -28,20 +28,19 @@ class Engine:
         self.tools_json = "[]"
 
     def complete(self, tools_json, query):
-        from .. import Needle, _lib
+        from .. import Needle
         with self.lock:
             if self.agent is None or tools_json != self.tools_json:
                 self.agent = Needle(tools=tools_json, weights=self.weights)
                 self.tools_json = tools_json
             else:
-                _lib().needle_reset()
+                self.agent.reset()
             return self.agent.complete(query)
 
     def reset(self):
-        from .. import _lib
         with self.lock:
             if self.agent is not None:
-                _lib().needle_reset()
+                self.agent.close()
             self.agent = None
             self.tools_json = None
 
