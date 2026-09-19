@@ -1,0 +1,13 @@
+category,source name,tool name,required args,total args (required+not)
+Data & ML Repositories,huggingface,hf_hub_repo_search,1,4  
+Data & ML Repositories,kaggle,kaggle_datasets_list,0,4
+Data & ML Repositories,github,github_search_repositories,1,3
+Academic & Literature Search,arxiv,arxiv_search_papers,1,7  
+Academic & Literature Search,pubmed,pubmed_search_articles,1,3  
+Academic & Literature Search,Semantic Scholar,semantic_scholar_search_papers,1,3
+General Knowledge & Web,wikipedia,wikipedia_search_wikipedia,,1 ,2   
+General Knowledge & Web,google,google_web_search,1,4
+Academic & Literature Search,unpaywall,unpaywall_get_paper_by_doi,1,1
+Scholarly Metadata,crossref,crossref_search_works_by_query,1,2
+Scholarly Metadata,OpenAlex,openalex_search_entities,1,8
+
