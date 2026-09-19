@@ -60,69 +60,63 @@ def _int_or_none(text):
 
 
 def read_checkpoint(path):
-    if is_safetensors(path):
-        library = _safetensors_numpy()
-        from safetensors import safe_open
+    if not is_safetensors(path):
+        raise ValueError(f"checkpoint must be a .safetensors file for security (got {path})")
+    library = _safetensors_numpy()
+    from safetensors import safe_open
 
-        with safe_open(os.fspath(path), framework="np") as handle:
-            metadata = handle.metadata() or {}
-        return {
-            "format_version": _int_or_none(metadata.get("format_version")),
-            "params": unflatten(library.load_file(os.fspath(path))),
-            "config": _json_or_default(metadata.get("config"), {}),
-            "step": _int_or_none(metadata.get("step")),
-            "run": _json_or_default(metadata.get("run"), {}),
-        }
-    with open(path, "rb") as handle:
-        return pickle.load(handle)
+    with safe_open(os.fspath(path), framework="np") as handle:
+        metadata = handle.metadata() or {}
+    return {
+        "format_version": _int_or_none(metadata.get("format_version")),
+        "params": unflatten(library.load_file(os.fspath(path))),
+        "config": _json_or_default(metadata.get("config"), {}),
+        "step": _int_or_none(metadata.get("step")),
+        "run": _json_or_default(metadata.get("run"), {}),
+    }
 
 
 def write_checkpoint(path, checkpoint):
-    if is_safetensors(path):
-        library = _safetensors_numpy()
-        metadata = {
-            "format_version": str(checkpoint.get("format_version", "")),
-            "config": json.dumps(checkpoint.get("config", {}), default=str),
-            "step": "" if checkpoint.get("step") is None else str(checkpoint["step"]),
-            "run": json.dumps(checkpoint.get("run") or {}, default=str),
-        }
-        library.save_file(flatten(checkpoint["params"]), os.fspath(path), metadata=metadata)
-        return
-    with open(path, "wb") as handle:
-        pickle.dump(checkpoint, handle)
+    if not is_safetensors(path):
+        raise ValueError(f"checkpoint must be a .safetensors file for security (got {path})")
+    library = _safetensors_numpy()
+    metadata = {
+        "format_version": str(checkpoint.get("format_version", "")),
+        "config": json.dumps(checkpoint.get("config", {}), default=str),
+        "step": "" if checkpoint.get("step") is None else str(checkpoint["step"]),
+        "run": json.dumps(checkpoint.get("run") or {}, default=str),
+    }
+    library.save_file(flatten(checkpoint["params"]), os.fspath(path), metadata=metadata)
 
 
 _ADAPTER_FIELDS = ("scale", "base", "rank", "seed")
 
 
 def write_adapter(path, adapter):
-    if is_safetensors(path):
-        library = _safetensors_numpy()
-        tensors = {}
-        for name, value in adapter["lora"].items():
-            tensors[f"lora/{name}/A"] = _contiguous(value["A"])
-            tensors[f"lora/{name}/B"] = _contiguous(value["B"])
-        metadata = {key: json.dumps(adapter.get(key), default=str) for key in _ADAPTER_FIELDS}
-        library.save_file(tensors, os.fspath(path), metadata=metadata)
-        return
-    with open(path, "wb") as handle:
-        pickle.dump(adapter, handle)
+    if not is_safetensors(path):
+        raise ValueError(f"adapter must be a .safetensors file for security (got {path})")
+    library = _safetensors_numpy()
+    tensors = {}
+    for name, value in adapter["lora"].items():
+        tensors[f"lora/{name}/A"] = _contiguous(value["A"])
+        tensors[f"lora/{name}/B"] = _contiguous(value["B"])
+    metadata = {key: json.dumps(adapter.get(key), default=str) for key in _ADAPTER_FIELDS}
+    library.save_file(tensors, os.fspath(path), metadata=metadata)
 
 
 def read_adapter(path):
-    if is_safetensors(path):
-        library = _safetensors_numpy()
-        from safetensors import safe_open
+    if not is_safetensors(path):
+        raise ValueError(f"adapter must be a .safetensors file for security (got {path})")
+    library = _safetensors_numpy()
+    from safetensors import safe_open
 
-        with safe_open(os.fspath(path), framework="np") as handle:
-            metadata = handle.metadata() or {}
-        lora = {}
-        for name, value in library.load_file(os.fspath(path)).items():
-            _, key, matrix = name.rsplit("/", 2) if name.count("/") == 2 else (None, *name[5:].rsplit("/", 1))
-            lora.setdefault(key, {})[matrix] = value
-        adapter = {"lora": lora}
-        for key in _ADAPTER_FIELDS:
-            adapter[key] = _json_or_default(metadata.get(key), None)
-        return adapter
-    with open(path, "rb") as handle:
-        return pickle.load(handle)
+    with safe_open(os.fspath(path), framework="np") as handle:
+        metadata = handle.metadata() or {}
+    lora = {}
+    for name, value in library.load_file(os.fspath(path)).items():
+        _, key, matrix = name.rsplit("/", 2) if name.count("/") == 2 else (None, *name[5:].rsplit("/", 1))
+        lora.setdefault(key, {})[matrix] = value
+    adapter = {"lora": lora}
+    for key in _ADAPTER_FIELDS:
+        adapter[key] = _json_or_default(metadata.get(key), None)
+    return adapter
