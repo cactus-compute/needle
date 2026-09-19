@@ -1,4 +1,5 @@
 import json
+import os
 import warnings
 
 import pytest
@@ -40,17 +41,12 @@ class _WorkerStub:
         type(self).next_pid += 1
         self.calls.append(("worker_start", self.pid, library, weights))
 
-    def complete(self, text, max_new_tokens, audio=None):
-        if audio:
-            self.calls.append(("worker_complete_audio", self.pid, text,
-                               audio))
-        else:
-            self.calls.append(("worker_complete", self.pid, text))
+    def complete(self, text, max_new_tokens):
+        self.calls.append(("worker_complete", self.pid, text))
         return ENVELOPE.decode("utf-8")
 
-    def embed(self, text, audio=None):
-        self.calls.append(("worker_embed", self.pid, text,
-                           audio))
+    def embed(self, text):
+        self.calls.append(("worker_embed", self.pid, text))
         return [0.6, 0.8]
 
     def reset(self):
@@ -61,7 +57,7 @@ class _WorkerStub:
 
 
 @pytest.fixture
-def engine(monkeypatch):
+def engine(monkeypatch, tmp_path):
     import needle
 
     calls = []
@@ -76,6 +72,10 @@ def engine(monkeypatch):
             _WorkerStub(calls, library, weights, system, tools, tool_index,
                         buffer_size, generation))
     monkeypatch.setattr(needle, "_active", {})
+    monkeypatch.setattr(needle, "_loaded_base", {})
+    base = tmp_path / "needle3.cact"
+    base.write_bytes((0x05E12A84).to_bytes(4, "little") + b"base weights")
+    monkeypatch.setattr(needle, "_base_weights_path", lambda generation: str(base))
     return calls
 
 
@@ -101,35 +101,45 @@ def _tuned_agent(path):
         return needle.Needle(tools="[]", weights=path)
 
 
-def test_generation_3_without_weights_runs_the_base_archive(engine, tuned_v3, monkeypatch):
+def test_generation_3_without_weights_loads_the_base_archive_in_process(engine):
     import needle
 
-    monkeypatch.setattr(needle, "_base_weights_path", lambda generation: tuned_v3)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         agent = needle.Needle(tools="[]", generation=3)
-    assert agent._generation == 3 and agent._tuned is False
+    assert agent._generation == 3 and agent._tuned is False and agent._weights is None
     response = agent.complete("hello")
     assert response.get("confidence", "kept") is not None
-    assert any(call[0] == "worker_start" and call[3] == tuned_v3
-               for call in engine if isinstance(call, tuple))
+    assert engine.count("load") == 1 and "complete" in engine
+    assert not any(call[0] == "worker_start" for call in engine if isinstance(call, tuple))
+    needle.Needle(tools="[]", generation=3).complete("again")
+    assert engine.count("load") == 1
     assert agent._track_props()["tuned"] is False
 
 
-def test_default_agent_is_still_the_embedded_needle_2(engine):
+def test_default_agent_is_needle_3(engine):
     import needle
 
     agent = needle.Needle(tools="[]")
+    assert agent._generation == 3 and agent._weights is None and agent._tuned is False
+    agent.complete("hello")
+    assert engine.count("load") == 1 and "complete" in engine
+
+
+def test_generation_2_runs_its_embedded_engine(engine):
+    import needle
+
+    agent = needle.Needle(tools="[]", generation=2)
     assert agent._generation == 2 and agent._weights is None
     agent.complete("hello")
-    assert "complete" in engine
+    assert engine.count("load") == 0 and "complete" in engine
 
 
 def test_base_agent_and_tuned_worker_coexist(engine, tuned):
     import needle
 
     tuned_agent = _tuned_agent(tuned)
-    base = needle.Needle(tools="[]")
+    base = needle.Needle(tools="[]", generation=2)
     tuned_agent.complete("tuned")
     base.complete("base")
     assert any(call[0] == "worker_complete" for call in engine if isinstance(call, tuple))
@@ -139,7 +149,7 @@ def test_base_agent_and_tuned_worker_coexist(engine, tuned):
 def test_tuned_worker_does_not_rebind_existing_base_agent(engine, tuned):
     import needle
 
-    base = needle.Needle(tools="[]")
+    base = needle.Needle(tools="[]", generation=2)
     base.complete("hello")
     tuned_agent = _tuned_agent(tuned)
     tuned_agent.complete("hello")
@@ -188,14 +198,10 @@ def test_v2_and_v3_weights_route_to_independent_engines(engine, tuned, tuned_v3,
     assert routed == [2, 3]
 
 
-def test_v3_routes_audio_and_embeddings_to_its_worker(engine, tuned_v3):
+def test_v3_routes_embeddings_to_its_worker(engine, tuned_v3):
     agent = _tuned_agent(tuned_v3)
-    wav = b"RIFFordinary wav bytes"
-    agent.complete("transcribe", audio=wav)
-    assert agent.embed("schema", audio=wav) == [0.6, 0.8]
-    payload = {"data": wav, "format": 1, "sample_rate": 0, "channels": 1}
-    assert ("worker_complete_audio", agent._worker.pid, "transcribe", payload) in engine
-    assert ("worker_embed", agent._worker.pid, "schema", payload) in engine
+    assert agent.embed("schema") == [0.6, 0.8]
+    assert ("worker_embed", agent._worker.pid, "schema") in engine
 
 
 def test_unknown_archive_tag_is_rejected_before_loading(engine, tmp_path):
@@ -247,3 +253,27 @@ def test_extraction_rejects_fabricated_temporal_year():
     assert needle._source_years("due September 5") == set()
     assert needle._source_years("due 5th September 42") == {42}
     assert needle._source_years("Invoice 42 is due tomorrow at 5") == set()
+
+
+def test_tool_index_path_takes_a_path_object(engine, tmp_path):
+    import needle
+
+    index = tmp_path / "tools.idx"
+    agent = needle.Needle(tools="[]", tool_index_path=index)
+
+    assert agent._tool_index_path == os.fspath(index).encode("utf-8")
+
+
+def test_tool_index_path_agrees_between_the_base_and_tuned_paths(engine, tuned, tmp_path):
+    import needle
+
+    index = tmp_path / "tools.idx"
+    base = needle.Needle(tools="[]", tool_index_path=index)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        needle.Needle(tools="[]", weights=tuned, tool_index_path=index)
+
+    started = [call for call in engine
+               if isinstance(call, tuple) and call[0] == "worker_start"]
+    assert started
+    assert base._tool_index_path.decode("utf-8") == os.fspath(index)

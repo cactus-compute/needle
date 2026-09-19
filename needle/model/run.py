@@ -1,6 +1,5 @@
 import os
 import json
-import re
 import sys
 
 import jax
@@ -9,79 +8,20 @@ import numpy as np
 
 from .tokenizer import get_tokenizer, BOS_ID, EOS_ID, PAD_ID
 from .architecture import SimpleAttentionNetwork, TransformerConfig
-from .checkpoints import read_checkpoint, write_checkpoint
+from .checkpoints import read_checkpoint
 
 CHECKPOINT_FORMAT_VERSION = 2
 BUF_BUCKET = 128
 _decode_fn_cache = {}
 
 
-def average_checkpoints(paths, out):
-    acc, meta, steps = None, None, []
-
-    def add(dst, src, scale):
-        for k, v in src.items():
-            if isinstance(v, dict):
-                add(dst.setdefault(k, {}), v, scale)
-            else:
-                arr = np.asarray(v, np.float32) * scale
-                dst[k] = dst[k] + arr if k in dst else arr
-
-    scale = 1.0 / len(paths)
-    for p in paths:
-        ckpt = read_checkpoint(p)
-        if ckpt.get("format_version") != CHECKPOINT_FORMAT_VERSION:
-            raise ValueError(f"{p} is not a format-v{CHECKPOINT_FORMAT_VERSION} checkpoint")
-        acc = acc if acc is not None else {}
-        add(acc, ckpt["params"], scale)
-        meta = ckpt
-        steps.append(ckpt.get("step"))
-
-    def to_fp16(t):
-        return {k: to_fp16(v) if isinstance(v, dict) else v.astype(np.float16)
-                for k, v in t.items()}
-
-    write_checkpoint(out, {
-        "format_version": CHECKPOINT_FORMAT_VERSION,
-        "params": to_fp16(acc),
-        "config": meta["config"],
-        "step": meta.get("step"),
-        "run": {**(meta.get("run") or {}), "averaged_from": steps},
-    })
-    print(f"Averaged {len(paths)} checkpoints (steps {steps}) -> {out}")
-
-
-def head_output_name(checkpoint, suffix):
-    stem = os.path.splitext(os.path.basename(checkpoint))[0]
-    stem = re.sub(r"_step_\d+$", "", stem)
-    return f"{stem}_{suffix}"
-
 
 def load_checkpoint(path, return_run=False):
     if not os.path.exists(path):
-        from huggingface_hub import hf_hub_download
-        from huggingface_hub.errors import EntryNotFoundError
-        from .tokenizer import HF_REPO
+        from ..agent import fetch
         print(f"  {'fetch':<9} {path}  downloading from Hugging Face", flush=True)
-        rel = os.path.normpath(path).replace(os.sep, "/")
-        names = []
-        if not os.path.isabs(path):
-            names.append(rel if rel.startswith("checkpoints/") else "checkpoints/" + rel)
-        flat = "checkpoints/" + os.path.basename(path)
-        if flat not in names:
-            names.append(flat)
-        root = os.path.basename(path)
-        if root not in names:
-            names.append(root)
-        err = None
-        for name in names:
-            try:
-                path = hf_hub_download(HF_REPO, name, repo_type="model", local_dir=".")
-                break
-            except EntryNotFoundError as e:
-                err = e
-        else:
-            raise err
+        dest_dir = os.path.dirname(path) or fetch.CHECKPOINT_PREFIX
+        path = fetch.fetch_checkpoint(os.path.basename(path), dest_dir, generation=3)
     ckpt = read_checkpoint(path)
     version = ckpt.get("format_version") if isinstance(ckpt, dict) else None
     if version != CHECKPOINT_FORMAT_VERSION:
@@ -119,63 +59,6 @@ def _step_stats(step_logits):
     entropy = -jnp.sum(p * logp, axis=-1)
     return np.asarray(chosen), np.asarray(entropy)
 
-
-def batch_generate(model, params, tokenizer, prompts, max_new_tokens=96,
-                   return_signals=False):
-    enc = [([BOS_ID] + tokenizer.encode(p))[:model.config.max_seq_len - 1] for p in prompts]
-    plens = [len(e) for e in enc]
-    buf_len = min(model.config.max_seq_len,
-                  -(-(max(plens) + max_new_tokens) // BUF_BUCKET) * BUF_BUCKET)
-    B = len(prompts)
-    buffer = np.full((B, buf_len), PAD_ID, dtype=np.int32)
-    for i, e in enumerate(enc):
-        buffer[i, :plens[i]] = e[:buf_len]
-    decode_fn = _get_decode_fn(model, buf_len)
-    params = jax.device_put(params)
-
-    done = [plens[i] >= buf_len for i in range(B)]
-    gen = [[] for _ in range(B)]
-    probs = [[] for _ in range(B)]
-    ents = [[] for _ in range(B)]
-    for pos in range(min(plens) - 1, buf_len - 1):
-        logits = decode_fn(params, jnp.asarray(buffer))
-        step = logits[:, pos]
-        nxt = np.asarray(jnp.argmax(step, axis=-1))
-        chosen_p, chosen_h = _step_stats(step) if return_signals else (None, None)
-        for i in range(B):
-            if done[i] or pos < plens[i] - 1:
-                continue
-            t = int(nxt[i])
-            if t == EOS_ID:
-                done[i] = True
-                continue
-            gen[i].append(t)
-            if return_signals:
-                probs[i].append(float(chosen_p[i]))
-                ents[i].append(float(chosen_h[i]))
-            buffer[i, pos + 1] = t
-            if len(gen[i]) >= max_new_tokens:
-                done[i] = True
-        if all(done):
-            break
-
-    texts = [tokenizer.decode(g) for g in gen]
-    if not return_signals:
-        return texts
-
-    out = []
-    for i in range(B):
-        pr = probs[i]
-        out.append({
-            "text": texts[i],
-            "tokens": gen[i],
-            "token_probs": pr,
-            "token_entropies": ents[i],
-            "min_prob": min(pr) if pr else 0.0,
-            "mean_logprob": float(np.mean(np.log(np.clip(pr, 1e-12, 1.0)))) if pr else float("-inf"),
-            "max_entropy": max(ents[i]) if ents[i] else 0.0,
-        })
-    return out
 
 
 def generate(model, params, tokenizer, prompt, max_new_tokens=256, temperature=0.0,

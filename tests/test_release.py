@@ -106,3 +106,15 @@ def test_tag_step_tolerates_already_versioned_files(repo):
     run_block(repo, tag_block("2.0.13"))
     assert git(repo, "rev-parse", "v2.0.13^{commit}") == head
     assert version_output(repo, published="2.0.13") == "skip=true"
+
+
+def test_declared_version_above_everything_published_is_released_as_is(repo):
+    git(repo, "tag", "v2.0.15")
+    (repo / "pyproject.toml").write_text('version = "3.0.0"\n')
+    (repo / "needle/__init__.py").write_text('__version__ = "3.0.0"\n')
+    git(repo, "commit", "-am", "Needle 3")
+
+    assert version_output(repo, published="2.0.15") == "next=3.0.0"
+
+    run_block(repo, tag_block("3.0.0"))
+    assert version_output(repo, published="3.0.0") == "skip=true"

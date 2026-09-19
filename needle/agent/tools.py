@@ -170,6 +170,11 @@ def pydantic_schema(model: type) -> dict:
     return out
 
 
-def tool(fn: Callable) -> Callable:
-    fn._needle_tool = build_schema(fn)
-    return fn
+def tool(fn: Callable | None = None, *, triggers: list[str] | None = None) -> Callable:
+    def attach(target: Callable) -> Callable:
+        schema = build_schema(target)
+        if triggers:
+            schema["triggers"] = list(triggers)
+        target._needle_tool = schema
+        return target
+    return attach(fn) if fn is not None else attach

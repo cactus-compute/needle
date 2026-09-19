@@ -78,7 +78,14 @@ jobs:
           # PyPI ahead of the tags; the next version follows whichever is newer.
           published=$(curl -sf https://pypi.org/pypi/cactus-needle/json | python3 -c 'import json,sys; print(json.loads(sys.stdin.read(), strict=False)["info"]["version"])' || true)
           current=$(printf '%s\n%s\n' "${last#v}" "$published" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
-          echo "next=$(echo "$current" | awk -F. '{printf "%d.%d.%d", $1, $2, $3 + 1}')" >> "$GITHUB_OUTPUT"
+          # A version in pyproject.toml above everything published is a deliberate
+          # bump (a new major or minor): release exactly that, otherwise step the patch.
+          declared=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          if [ "$(printf '%s\n%s\n' "$current" "$declared" | sort -V | tail -1)" = "$declared" ] && [ "$declared" != "$current" ]; then
+            echo "next=$declared" >> "$GITHUB_OUTPUT"
+          else
+            echo "next=$(echo "$current" | awk -F. '{printf "%d.%d.%d", $1, $2, $3 + 1}')" >> "$GITHUB_OUTPUT"
+          fi
       - if: steps.version.outputs.skip != 'true'
         run: |
           next="${{ steps.version.outputs.next }}"

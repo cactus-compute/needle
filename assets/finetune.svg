@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 540" width="900" height="540" role="img" aria-label="Each Needle 3 subnetwork before and after fine-tuning on DroidCall and on Mobile Actions, against DeepSeek V4 Flash">
+<style>svg{--t0:0.0s}.s{animation-duration:13.0s;animation-iteration-count:infinite;animation-fill-mode:both;animation-delay:calc(0s - var(--t0))}@keyframes sc0{0%{opacity:0}0.00%{opacity:0}2.69%{opacity:1}47.31%{opacity:1}50.00%{opacity:0}100%{opacity:0}}.sc0{animation-name:sc0}@keyframes bar0{0%{transform:scaleY(0)}2.31%{transform:scaleY(0)}8.46%{transform:scaleY(1)}47.31%{transform:scaleY(1)}100%{transform:scaleY(0)}}.bar0{animation-name:bar0;transform-box:fill-box;transform-origin:center bottom;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@keyframes val0{0%{opacity:0}7.69%{opacity:0}10.77%{opacity:1}47.31%{opacity:1}100%{opacity:0}}.val0{animation-name:val0}@keyframes ref0{0%{transform:scaleX(0)}9.23%{transform:scaleX(0)}16.92%{transform:scaleX(1)}47.31%{transform:scaleX(1)}100%{transform:scaleX(0)}}.ref0{animation-name:ref0;transform-box:fill-box;transform-origin:left center;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@keyframes sc1{0%{opacity:0}50.00%{opacity:0}52.69%{opacity:1}97.31%{opacity:1}100.00%{opacity:0}100%{opacity:0}}.sc1{animation-name:sc1}@keyframes bar1{0%{transform:scaleY(0)}52.31%{transform:scaleY(0)}58.46%{transform:scaleY(1)}97.31%{transform:scaleY(1)}100%{transform:scaleY(0)}}.bar1{animation-name:bar1;transform-box:fill-box;transform-origin:center bottom;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@keyframes val1{0%{opacity:0}57.69%{opacity:0}60.77%{opacity:1}97.31%{opacity:1}100%{opacity:0}}.val1{animation-name:val1}@keyframes ref1{0%{transform:scaleX(0)}59.23%{transform:scaleX(0)}66.92%{transform:scaleX(1)}97.31%{transform:scaleX(1)}100%{transform:scaleX(0)}}.ref1{animation-name:ref1;transform-box:fill-box;transform-origin:left center;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@media (prefers-reduced-motion:reduce){.s{animation:none!important;opacity:1;transform:none}.sc1{display:none}}</style>
+<rect x="0" y="0" width="900" height="540" rx="18" fill="#0e0e10"/>
+<line x1="90" y1="332.5" x2="850" y2="332.5" stroke="#232326" stroke-width="1"/>
+<line x1="90" y1="245.0" x2="850" y2="245.0" stroke="#232326" stroke-width="1"/>
+<line x1="90" y1="157.5" x2="850" y2="157.5" stroke="#232326" stroke-width="1"/>
+<line x1="90" y1="70.0" x2="850" y2="70.0" stroke="#232326" stroke-width="1"/>
+<line x1="90" y1="420" x2="850" y2="420" stroke="#8a877f" stroke-width="1"/>
+<text x="78" y="424.0" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#85827a">0</text>
+<text x="78" y="336.5" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#85827a">25</text>
+<text x="78" y="249.0" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#85827a">50</text>
+<text x="78" y="161.5" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#85827a">75</text>
+<text x="78" y="74.0" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#85827a">100</text>
+<text x="30" y="245" text-anchor="middle" transform="rotate(-90 30 245)" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#85827a">accuracy (%)</text>
+<text x="166.0" y="444" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#85827a">2L · 25M</text>
+<text x="318.0" y="444" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#85827a">4L · 29M</text>
+<text x="470.0" y="444" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#85827a">8L · 52M</text>
+<text x="622.0" y="444" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#85827a">16L · 98M</text>
+<text x="774.0" y="444" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#85827a">20L · 121M</text>
+<text x="450" y="520" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#6b6862">base and tuned scored with forced calls · DeepSeek V4 Flash through its cloud API</text>
+<g class="s sc0">
+<text x="90" y="40" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#e8e6df">Every subnetwork, fine-tuned on DroidCall</text>
+<text x="850" y="40" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#85827a">1 of 2</text>
+<line class="s ref0" x1="90" y1="208.2" x2="850" y2="208.2" stroke="#c9c6bd" stroke-width="1.2" stroke-dasharray="1 5" stroke-linecap="round"/>
+<text class="s val0" x="854" y="212.2" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#c9c6bd">60.5</text>
+<rect class="s bar0" style="animation-delay:calc(0.00s - var(--t0))" x="122.0" y="348.2" width="40" height="71.8" fill="#6e6c66"/>
+<text class="s val0" style="animation-delay:calc(0.00s - var(--t0))" x="142.0" y="342.2" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="400" fill="#85827a">20.5</text>
+<rect class="s bar0" style="animation-delay:calc(0.06s - var(--t0))" x="170.0" y="222.3" width="40" height="197.7" fill="#e8593d"/>
+<text class="s val0" style="animation-delay:calc(0.06s - var(--t0))" x="190.0" y="216.3" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#e8e6df">56.5</text>
+<rect class="s bar0" style="animation-delay:calc(0.10s - var(--t0))" x="274.0" y="299.2" width="40" height="120.8" fill="#6e6c66"/>
+<text class="s val0" style="animation-delay:calc(0.10s - var(--t0))" x="294.0" y="293.2" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="400" fill="#85827a">34.5</text>
+<rect class="s bar0" style="animation-delay:calc(0.16s - var(--t0))" x="322.0" y="201.2" width="40" height="218.8" fill="#e8593d"/>
+<text class="s val0" style="animation-delay:calc(0.16s - var(--t0))" x="342.0" y="195.2" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#e8e6df">62.5</text>
+<rect class="s bar0" style="animation-delay:calc(0.20s - var(--t0))" x="426.0" y="271.2" width="40" height="148.8" fill="#6e6c66"/>
+<text class="s val0" style="animation-delay:calc(0.20s - var(--t0))" x="446.0" y="265.2" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="400" fill="#85827a">42.5</text>
+<rect class="s bar0" style="animation-delay:calc(0.26s - var(--t0))" x="474.0" y="182.0" width="40" height="238.0" fill="#e8593d"/>
+<text class="s val0" style="animation-delay:calc(0.26s - var(--t0))" x="494.0" y="176.0" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#e8e6df">68.0</text>
+<rect class="s bar0" style="animation-delay:calc(0.30s - var(--t0))" x="578.0" y="246.8" width="40" height="173.2" fill="#6e6c66"/>
+<text class="s val0" style="animation-delay:calc(0.30s - var(--t0))" x="598.0" y="240.8" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="400" fill="#85827a">49.5</text>
+<rect class="s bar0" style="animation-delay:calc(0.36s - var(--t0))" x="626.0" y="178.5" width="40" height="241.5" fill="#e8593d"/>
+<text class="s val0" style="animation-delay:calc(0.36s - var(--t0))" x="646.0" y="172.5" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#e8e6df">69.0</text>
+<rect class="s bar0" style="animation-delay:calc(0.40s - var(--t0))" x="730.0" y="238.0" width="40" height="182.0" fill="#6e6c66"/>
+<text class="s val0" style="animation-delay:calc(0.40s - var(--t0))" x="750.0" y="232.0" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="400" fill="#85827a">52.0</text>
+<rect class="s bar0" style="animation-delay:calc(0.46s - var(--t0))" x="778.0" y="175.0" width="40" height="245.0" fill="#e8593d"/>
+<text class="s val0" style="animation-delay:calc(0.46s - var(--t0))" x="798.0" y="169.0" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#e8e6df">70.0</text>
+<rect x="175.0" y="478" width="10" height="10" fill="#6e6c66"/>
+<text x="191.0" y="487" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#9a978f">Needle 3 base</text>
+<rect x="325.0" y="478" width="10" height="10" fill="#e8593d"/>
+<text x="341.0" y="487" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#9a978f">fine-tuned on DroidCall</text>
+<line x1="565.0" y1="483" x2="575.0" y2="483" stroke="#c9c6bd" stroke-width="1.2" stroke-dasharray="1 3" stroke-linecap="round"/>
+<text x="581.0" y="487" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#9a978f">DeepSeek V4 Flash</text>
+</g>
+<g class="s sc1">
+<text x="90" y="40" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#e8e6df">Every subnetwork, fine-tuned on Mobile Actions</text>
+<text x="850" y="40" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#85827a">2 of 2</text>
+<line class="s ref1" x1="90" y1="110.6" x2="850" y2="110.6" stroke="#c9c6bd" stroke-width="1.2" stroke-dasharray="1 5" stroke-linecap="round"/>
+<text class="s val1" x="854" y="114.6" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#c9c6bd">88.4</text>
+<rect class="s bar1" style="animation-delay:calc(0.00s - var(--t0))" x="122.0" y="416.9" width="40" height="3.1" fill="#6e6c66"/>
+<text class="s val1" style="animation-delay:calc(0.00s - var(--t0))" x="142.0" y="410.9" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="400" fill="#85827a">0.9</text>
+<rect class="s bar1" style="animation-delay:calc(0.06s - var(--t0))" x="170.0" y="186.5" width="40" height="233.5" fill="#e8593d"/>
+<text class="s val1" style="animation-delay:calc(0.06s - var(--t0))" x="190.0" y="180.5" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#e8e6df">66.7</text>
+<rect class="s bar1" style="animation-delay:calc(0.10s - var(--t0))" x="274.0" y="353.5" width="40" height="66.5" fill="#6e6c66"/>
+<text class="s val1" style="animation-delay:calc(0.10s - var(--t0))" x="294.0" y="347.5" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="400" fill="#85827a">19.0</text>
+<rect class="s bar1" style="animation-delay:calc(0.16s - var(--t0))" x="322.0" y="143.2" width="40" height="276.8" fill="#e8593d"/>
+<text class="s val1" style="animation-delay:calc(0.16s - var(--t0))" x="342.0" y="137.2" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#e8e6df">79.1</text>
+<rect class="s bar1" style="animation-delay:calc(0.20s - var(--t0))" x="426.0" y="261.8" width="40" height="158.2" fill="#6e6c66"/>
+<text class="s val1" style="animation-delay:calc(0.20s - var(--t0))" x="446.0" y="255.8" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="400" fill="#85827a">45.2</text>
+<rect class="s bar1" style="animation-delay:calc(0.26s - var(--t0))" x="474.0" y="127.0" width="40" height="293.0" fill="#e8593d"/>
+<text class="s val1" style="animation-delay:calc(0.26s - var(--t0))" x="494.0" y="121.0" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#e8e6df">83.7</text>
+<rect class="s bar1" style="animation-delay:calc(0.30s - var(--t0))" x="578.0" y="139.3" width="40" height="280.7" fill="#6e6c66"/>
+<text class="s val1" style="animation-delay:calc(0.30s - var(--t0))" x="598.0" y="133.3" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="400" fill="#85827a">80.2</text>
+<rect class="s bar1" style="animation-delay:calc(0.36s - var(--t0))" x="626.0" y="123.9" width="40" height="296.1" fill="#e8593d"/>
+<text class="s val1" style="animation-delay:calc(0.36s - var(--t0))" x="646.0" y="117.9" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#e8e6df">84.6</text>
+<rect class="s bar1" style="animation-delay:calc(0.40s - var(--t0))" x="730.0" y="116.6" width="40" height="303.4" fill="#6e6c66"/>
+<text class="s val1" style="animation-delay:calc(0.40s - var(--t0))" x="750.0" y="110.6" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="400" fill="#85827a">86.7</text>
+<rect class="s bar1" style="animation-delay:calc(0.46s - var(--t0))" x="778.0" y="124.2" width="40" height="295.8" fill="#e8593d"/>
+<text class="s val1" style="animation-delay:calc(0.46s - var(--t0))" x="798.0" y="118.2" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#e8e6df">84.5</text>
+<rect x="175.0" y="478" width="10" height="10" fill="#6e6c66"/>
+<text x="191.0" y="487" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#9a978f">Needle 3 base</text>
+<rect x="325.0" y="478" width="10" height="10" fill="#e8593d"/>
+<text x="341.0" y="487" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#9a978f">fine-tuned on Mobile Actions</text>
+<line x1="565.0" y1="483" x2="575.0" y2="483" stroke="#c9c6bd" stroke-width="1.2" stroke-dasharray="1 3" stroke-linecap="round"/>
+<text x="581.0" y="487" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#9a978f">DeepSeek V4 Flash</text>
+</g>
+</svg>

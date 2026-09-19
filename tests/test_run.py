@@ -58,16 +58,20 @@ def test_main_loads_tools_file_and_runs(tiny_checkpoint, tmp_path, capsys):
 def test_missing_checkpoint_is_looked_up_under_checkpoints_then_at_the_repo_root(monkeypatch, tmp_path):
     from huggingface_hub.errors import EntryNotFoundError
     import huggingface_hub
+    from needle.agent import fetch
     from needle.model import run
 
     attempted = []
+    registered = []
 
-    def fake_download(repo, name, repo_type, local_dir):
-        attempted.append(name)
+    def fake_download(**kwargs):
+        attempted.append(kwargs["filename"])
         raise EntryNotFoundError("missing")
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    monkeypatch.setattr(fetch, "_register_download", lambda generation: registered.append(generation))
     monkeypatch.chdir(tmp_path)
-    with pytest.raises(EntryNotFoundError):
+    with pytest.raises(FileNotFoundError):
         run.load_checkpoint("needle3.safetensors")
     assert attempted == ["checkpoints/needle3.safetensors", "needle3.safetensors"]
+    assert registered == [3]

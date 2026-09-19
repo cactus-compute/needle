@@ -34,9 +34,15 @@ import urllib.request
 
 os.environ.setdefault("NEEDLE_CACHE_DIR", tempfile.mkdtemp(prefix="needle-evidence-cache-"))
 
+import pytest  # noqa: E402
+
+pytest.importorskip("numpy", reason="UI evidence measures the captured pixels")
+pytest.importorskip("PIL", reason="UI evidence measures the captured pixels")
+sync_playwright = pytest.importorskip(
+    "playwright.sync_api", reason="UI evidence drives a real browser").sync_playwright
+
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
-from playwright.sync_api import sync_playwright  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 EVIDENCE = ROOT / "orca-evidence"

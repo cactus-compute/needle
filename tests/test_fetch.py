@@ -21,6 +21,8 @@ def test_legacy_lib_override_cannot_capture_v3(tmp_path, monkeypatch):
     assert needle._library_path(3) == str(v3)
 
     monkeypatch.delenv("NEEDLE3_LIB_PATH")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr(fetch, "fetch_library", lambda *args, **kwargs: str(v3))
     assert needle._library_path(3) == str(v3)
 
@@ -33,7 +35,6 @@ def test_download_target_kinds():
     assert _download_target("needle3") == ("base", 3)
     assert _download_target("needle2.cact") == ("base", 2)
     assert _download_target("needle3.safetensors") == ("checkpoint", "needle3.safetensors")
-    assert _download_target("needle3_enterprise.safetensors") == ("checkpoint", "needle3_enterprise.safetensors")
     assert _download_target("acme/tuned/model.cact") == ("hub", "acme/tuned/model.cact")
     with pytest.raises(SystemExit, match="unknown download"):
         _download_target("needle4")
@@ -127,11 +128,11 @@ def test_engine_gate_finds_the_cache_the_runtime_loads_from(tmp_path, monkeypatc
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.delenv("NEEDLE_LIB_PATH", raising=False)
-    monkeypatch.delenv("NEEDLE2_LIB_PATH", raising=False)
+    monkeypatch.delenv("NEEDLE3_LIB_PATH", raising=False)
 
     assert not _engine_available()
 
-    cache = tmp_path / ".cache" / "cactus-needle" / "v2" / fetch.engine_version(2)
+    cache = tmp_path / ".cache" / "cactus-needle" / "v3" / fetch.engine_version(3)
     cache.mkdir(parents=True)
     (cache / fetch._lib_name()).write_bytes(b"")
 
@@ -151,8 +152,8 @@ def test_engine_gate_honours_the_library_override(tmp_path, monkeypatch):
 
     engine = tmp_path / fetch._lib_name()
     engine.write_bytes(b"")
-    monkeypatch.setenv("NEEDLE_LIB_PATH", str(engine))
+    monkeypatch.setenv("NEEDLE3_LIB_PATH", str(engine))
     assert _engine_available()
 
-    monkeypatch.setenv("NEEDLE_LIB_PATH", str(tmp_path / "gone"))
+    monkeypatch.setenv("NEEDLE3_LIB_PATH", str(tmp_path / "gone"))
     assert not _engine_available()

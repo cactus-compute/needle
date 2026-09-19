@@ -150,7 +150,7 @@ def test_openrouter_path_is_unchanged(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", transport)
     finetune.generate_examples(TOOLS, n=1, provider_id="openrouter", api_key="sk-or-fake")
     assert calls[0]["url"] == "https://openrouter.ai/api/v1/chat/completions"
-    assert calls[0]["body"]["model"] == "deepseek/deepseek-v4-flash"
+    assert calls[0]["body"]["model"] == "deepseek/deepseek-flash-latest"
 
 
 def test_synthesis_reads_the_environment_when_no_key_is_passed(monkeypatch):

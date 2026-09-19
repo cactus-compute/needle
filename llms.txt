@@ -1,8 +1,8 @@
-# Needle 2 (cactus-needle)
+# Needle 3 (cactus-needle)
 
-> Needle 2 is an open 45M-parameter on-device model for tool calling, device control, and structured extraction. This Python package (`cactus-needle`) is inference + LoRA fine-tuning + export. Text goes in, a JSON tool call comes back; a byte-level grammar compiled from your schemas constrains every token, so the call is always well-formed. The inference engine is a 14MB binary fetched once from Hugging Face and cached; a full session runs in ~28MB RAM.
+> Needle 3 is a 29-121M parameter on-device model for tool calling, device control, and structured extraction. This Python package (`cactus-needle`) is inference + LoRA fine-tuning + export. Text goes in, a JSON tool call comes back; a byte-level grammar compiled from your schemas constrains every token, so the call is always well-formed. A sub-1 MB engine and the 35 MB `needle3.cact` weights are fetched once from Hugging Face and cached; nothing is compiled locally.
 
-This file is written for AI coding assistants. It is enough to write correct Needle code without reading the source. Copy the patterns; do not invent API that is not listed here.
+This file is written for AI coding assistants. It is enough to write correct Needle code without reading the source. Copy the patterns; do not invent API that is not listed here. The human guides are at https://cactuscompute.com/blog/needle-python-docs, https://cactuscompute.com/blog/designing-tools-for-needle, https://cactuscompute.com/blog/needle-confidence, https://cactuscompute.com/blog/structured-extraction-with-needle, https://cactuscompute.com/blog/finetuning-needle, https://cactuscompute.com/blog/needle-supported-devices, https://cactuscompute.com/blog/cact-format and https://cactuscompute.com/blog/porting-needle.
 
 ## Install
 
@@ -23,7 +23,7 @@ pip install "cactus-needle[train]"       # adds JAX + training deps for finetune
 - `agent.run(query, max_steps=8, max_new_tokens=512) -> dict` - full agentic loop: model picks calls, Needle executes your Python functions, feeds results back, returns the final response with the executed tool results attached as `results`.
 - `agent.complete(text, max_new_tokens=512) -> dict` - one turn; you execute the call and feed the result back yourself via the next `complete(...)`.
 - `agent.reset()` - rewind the conversation, keep the tools loaded.
-- `needle.tool` - decorator that turns a function into a tool schema (attached as `fn._needle_tool`).
+- `needle.tool` - decorator that turns a function into a tool schema (attached as `fn._needle_tool`); `@needle.tool(triggers=[r"\b(turn|switch)\b.*\b(on|off)\b"])` adds case-insensitive regexes that route a matching request to this tool and require a call; a triggered call ships even below the confidence floor (raw schemas take the same `"triggers"` list beside `description`).
 - `needle.Field(default=..., *, description, enum, const, ge, le, gt, lt, multiple_of, min_length, max_length, pattern, format, min_items, max_items, unique_items)` - per-argument constraints; attach inline with `typing.Annotated`.
 - `needle.extract(text, schema, system=None, max_new_tokens=512, weights=None)` - one-shot extraction; returns a Pydantic instance if `schema` is a model, else a dict (or `None` if nothing matched). `weights` selects a tuned `.cact` and defaults to whatever the engine already has loaded, so extraction inherits the active tuned model unless you pass another path.
 
@@ -103,12 +103,11 @@ Every turn returns one dict:
 - `function_calls` is a list of `{"name", "arguments"}`. Read `arguments` directly; it is grammar-guaranteed to match your schema.
 - `reasoning` is a short unconstrained derivation of each argument from its source span.
 - `confidence` is a calibrated score in [0,1] (see Confidence gating).
-- `suppressed_calls` holds a call the engine withheld because `escalate` is true (confidence below 0.1 or a grounding gate fired); `function_calls` is then empty. Show it to the user to confirm, or treat the turn as a refusal.
+- `suppressed_calls` holds a call the engine withheld (confidence below 0.1 or a grounding gate fired); `function_calls` is then empty. Show it to the user to confirm, or treat the turn as a refusal.
 - `Needle(system=...)` prefixes the local `date:` fact automatically unless the text already carries a date; pass `auto_date=False` to opt out.
 - `validation.ungrounded`, when present, lists `tool.field` names whose value is not grounded in the input, including date arguments whose year matches nothing in the conversation or the `system` facts. `run()` refuses those calls with `{"error": "ungrounded field"}` unless `strict=False`.
-- Speech: `complete(text, audio=clip)` transcribes the clip in a clean context, then answers a text turn that carries the transcript wrapped in `<context>` followed by `text` (or "Fulfill the spoken request." when `text` is empty); the speech codes are not part of that turn and the transcript is returned as `transcript` with `transcript_confidence` (geometric mean token probability of the transcription decode).
-- `extract()` declares the record as the only tool; a turn with a single declared tool is a record extraction, so an escalated record is returned with the `escalate` flag rather than withheld, and `strict` handles grounding.
-- Arguments arrive after the engine's deterministic repair step, which grounds them in the request text: a full name in one of a first/last pair is split, a truncated phone number is completed, quoted titles are restored verbatim, place queries recover dropped words and a following street address, weekday and `March 4th` style dates resolve against the `date:` fact, empty optional strings and duplicate calls are dropped. Enumerated parameters are never altered.
+- `extract()` declares the record as the only tool and takes the record from `function_calls` or, when the engine withheld it, from `suppressed_calls`; `strict` handles grounding.
+- Arguments arrive after the engine's deterministic repair step, which grounds them in the request text: a full name in one of a first/last pair is split, a truncated phone number is completed, quoted titles are restored verbatim, place queries recover dropped words and a following street address, weekday and `March 4th` style dates resolve against the `date:` fact, polar enums and booleans follow the request verb (turn on, unlock, louder, turn down), an enum moves to the one option the request names, pickup and destination are read from `from X to Y` wording, a paired tool follows the request's polarity (`lock_door` to `unlock_door`), `by N` fills a tool's only number argument, an invented required slot is refilled from the request or its schema default, a required number with a default takes the default when no quantity is named, optional strings and numbers the conversation never states are dropped, empty optional strings and duplicate calls are dropped, and so is a call for something the request excludes or negates in its own clause.
 
 ## Behaviour contract (important for correct code)
 
@@ -129,16 +128,21 @@ if r["type"] == "call":
 
 ## Confidence gating
 
-`confidence` is the min of a post-hoc calibration head and the decode probability of the call. Calibration holds for the base model only: an agent constructed with `weights=` reports `confidence` as None (fine-tuning does not update the head). Pick a threshold per product; act at/above it, escalate below it (`escalate` in the response applies the engine default of 0.1):
+`confidence` is the min of a post-hoc calibration head and the decode probability of the call. Calibration holds for the base model only: an agent constructed with `weights=` reports `confidence` as None (fine-tuning does not update the head). Pick a threshold per product; act at/above it, escalate below it:
 
 ```python
 r = agent.complete(user_text)
-calls = r.get("function_calls") or []
-if calls and r["confidence"] >= 0.8:
-    execute(calls[0])
+calls = r["function_calls"]
+held = r["suppressed_calls"]
+if calls and r["confidence"] >= 0.7:
+    execute(calls)                             # sure: act
+elif calls or held:
+    confirm(calls or held, r["reasoning"])     # unsure: show the call, ask
 else:
-    escalate_or_reask()
+    say("I can't do that here")                # nothing to do: refuse
 ```
+
+The engine already withholds calls below 0.1 into `suppressed_calls`; a tool with `triggers` always produces a call for a matching request, so the score decides whether to run it or confirm it.
 
 ## System facts (optional)
 
@@ -183,18 +187,13 @@ agent = needle.Needle(weights="my.cact", tools=[...])
 agent.run("...")
 ```
 
-Options: `finetune --layers <n> (fine-tune the n-layer rung of the depth ladder; build exports the same rung) --lora-rank 16 --lora-alpha 32 --lr 1e-4 --batch-size 16 --max-len 1024 --val-split 0.1 --checkpoint <base.safetensors or .pkl> --checkpoint-dir <dir> --out <adapter.safetensors or .pkl> --generate <n> --provider <orcarouter|openrouter> --model <id> --workers <n>`; `--model` defaults to the selected provider's own default (`deepseek/deepseek-v4-flash` for OpenRouter, `orcarouter/auto` for OrcaRouter), `--workers` defaults to `8`, and `--checkpoint-dir` defaults to `checkpoints`. `--generate` synthesizes extra examples through the configured gateway before training. `build --bits 2|4 --upload` (with `NEEDLE_HF_REPO=<you>/<model>`).
+Options: `finetune --lora-rank 16 --lora-alpha 32 --lr 1e-4 --batch-size 16 --max-len 1024 --val-split 0.1 --checkpoint <base.safetensors or .pkl> --checkpoint-dir <dir> --out <adapter.safetensors or .pkl> --generate <n> --provider <orcarouter|openrouter> --model <id> --workers <n>`; `--model` defaults to the selected provider's own default (`deepseek/deepseek-flash-latest` for OpenRouter, `orcarouter/auto` for OrcaRouter), `--workers` defaults to `8`, and `--checkpoint-dir` defaults to `checkpoints`. `--generate` synthesizes extra examples through the configured gateway before training. `build --bits 2|4 --upload` (with `NEEDLE_HF_REPO=<you>/<model>`).
 
 OrcaRouter is a first-class provider alongside OpenRouter: `needle connect` obtains a key through OAuth 2.0 + PKCE (`--oob` for the out-of-band code flow), `needle models --provider orcarouter` lists the real catalog from `GET https://api.orcarouter.ai/v1/models` filtered by capability, and inference runs against `https://api.orcarouter.ai/v1`. `ORCA_AUTH_BASE_URL` / `ORCA_API_BASE_URL` override the auth and inference origins separately; `ORCA_BASE_URL` supplies both for self-hosted deployments. Prompts can carry one image with `--input-modality image --image-url <https URL or data: URI>`, which filters the model list to catalog records that explicitly declare an `image` input and refuses any other model before sending.
 
 ## Playground (browser)
 
-```sh
-needle playground                    # base model at http://127.0.0.1:7860
-needle playground --weights my.cact  # a tuned model
-```
-
-Preset demos, editable tools/prompt, multi-turn follow-ups, and a "Finetune on these tools" button that runs the pipeline above and returns a downloadable `.cact`.
+Hosted at https://cactuscompute.com/needle: preset demos, editable tools/prompt, multi-turn follow-ups, and a "Finetune on these tools" button that runs the pipeline above and returns a downloadable `.cact`. `needle playground [--weights my.cact]` serves the same UI locally at http://127.0.0.1:7860. Local fine-tuning is 4-bit; the 2-bit post-training and quantisation behind the shipped model, enriched with Cactus proprietary datasets, run on the Cactus Platform at https://cactuscompute.com/dashboard.
 
 ## Environments (ready-made tool surfaces)
 
@@ -210,10 +209,10 @@ Adapt by swapping the Literal values for your own and keeping the shapes: closed
 ## CLI summary
 
 - `needle run --checkpoint <base.safetensors or .pkl> --query "..." --tools tools.json` - JAX reference inference from a checkpoint (dev path; normal inference is the Python `Needle` API above).
-- `needle generate-data` / `needle finetune [--layers N]` / `needle build [checkpoint] [--lora adapter] [--layers N]` - the fine-tuning pipeline; `build` defaults to the adapter's base (auto-downloaded Needle 3 base otherwise) and exports only the chosen rung.
-- `needle playground` - browser UI.
-- `needle fetch [--platform-tag <tag>] [--out <dir>]` - pre-download the inference engine for this machine (or another platform) into the cache; prints the path. For air-gapped devices, also see `NEEDLE_LIB_PATH` and `HF_HUB_OFFLINE` in doc/apis.md.
-- `needle download needle3 | needle3.safetensors | needle3_enterprise.safetensors | <org>/<repo>[/<file>.cact] | <platform> [--out <dir>]` - pull the base Needle 3 archive, a checkpoint to fine-tune, a published `.cact` (single-archive repos need only `<org>/<repo>`), or pass a platform folder name (`macos-arm64`, `linux-x86_64`, `wasm`, `wasm-component`, ...) to fetch that platform's engine files into `<out>/<platform>/`. Native runners are marked executable; `wasm-component` contains the WASI Preview 2 component and WIT contract.
+- `needle generate-data` / `needle finetune` / `needle build [checkpoint] [--lora adapter] [--layers N] [--platform <folder>] [--out <path>]` - the fine-tuning pipeline; fine-tuning runs at the full 20 layers, `build` merges the adapter, slices the `--layers` rung (default 20), exports at 4 bits, and fetches the published `needle3.cact` on every run (without an adapter at full depth it ships that published 2-bit archive as is). `--platform` also downloads that platform's engine and header and makes `--out` a folder holding them plus `needle3.cact`.
+- `needle playground` - the browser UI locally (hosted at https://cactuscompute.com/needle).
+- `needle fetch [--platform-tag <tag>] [--out <dir>]` - pre-download the inference engine for this machine (or another platform) into the cache; prints the path. For air-gapped devices, also see `NEEDLE3_LIB_PATH` and `HF_HUB_OFFLINE` at https://cactuscompute.com/blog/needle-python-docs.
+- `needle download needle3 | needle3.safetensors | <org>/<repo>[/<file>.cact] | <platform> [--out <dir>]` - pull the base Needle 3 archive, a checkpoint to fine-tune, a published `.cact` (single-archive repos need only `<org>/<repo>`), or pass a platform folder name (`macos-arm64`, `linux-x86_64`, `wasm`, `wasm-component`, ...) to fetch that platform's engine files into `<out>/<platform>/`. Native runners are marked executable; `wasm-component` contains the WASI Preview 2 component and WIT contract.
 
 ## Common mistakes to avoid
 
@@ -221,8 +220,8 @@ Adapt by swapping the Literal values for your own and keeping the shapes: closed
 - Do not read `arguments` keys that were not evidenced in the input; optional fields may be absent.
 - Do not create one `Needle` per turn for a conversation; reuse the instance so context carries. New tools = new instance.
 - `import needle` does not import JAX; only `needle finetune`/`build` do.
-- `weights=` expects a `.cact` (from `needle build`), not a `.safetensors` or `.pkl` checkpoint. `Needle(tools=..., generation=3)` runs the base Needle 3 archive (fetched once, cached next to the engine); the default without arguments stays the embedded Needle 2.
-- Checkpoints and adapters are `.safetensors`; pickle checkpoints still load. The base is `checkpoints/needle3.safetensors` (16 layers); `needle3_enterprise.safetensors` is the 20-layer parent.
+- `weights=` expects a `.cact` (from `needle build`), not a `.safetensors` or `.pkl` checkpoint. `Needle(tools=...)` runs the base Needle 3 archive (fetched once, cached next to the engine); pass `generation=2` for the embedded Needle 2 engine.
+- Checkpoints and adapters are `.safetensors`; pickle checkpoints still load. The base is `checkpoints/needle3.safetensors` (20 layers); `needle build --layers N` exports any rung from 2 to 20 of it.
 - The engine cannot unload weights: once a tuned `.cact` is bound, constructing or calling a base-model agent raises instead of silently answering with those weights. Construct agents that want the base model before any tuned one, or run them in separate processes.
 
 ## Telemetry

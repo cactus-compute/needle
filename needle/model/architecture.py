@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import numpy as np
 import jax
@@ -72,13 +72,6 @@ class TransformerConfig:
     mhc_lanes: int = 4
     qkv_conv_taps: int = 3
     out_vocab: int = 0
-    image_code_offset: int = 0
-    image_sem_codes: int = 0
-    image_sem_dim: int = 0
-    image_tex_books: int = 0
-    image_tex_codes: int = 0
-    image_tex_stages: int = 0
-    image_tex_dim: int = 0
     kv_window: int = 0
     kv_bits: int = 8
     act_bits: int = 8
@@ -119,11 +112,7 @@ class TransformerConfig:
                          ("ladder_depths", ()), ("ladder_sample", False),
                          ("ladder_widths", ()), ("ladder_order", ()),
                          ("engram_seed_heads", 0),
-                         ("qkv_conv_taps", 0), ("out_vocab", 0),
-                         ("image_code_offset", 0), ("image_sem_codes", 0),
-                         ("image_sem_dim", 0), ("image_tex_books", 0),
-                         ("image_tex_codes", 0), ("image_tex_stages", 0),
-                         ("image_tex_dim", 0)):
+                         ("qkv_conv_taps", 0), ("out_vocab", 0)):
             saved.setdefault(key, off)
         return cls(**saved)
 
@@ -174,6 +163,7 @@ def ladder_order(spec):
     return _ladder_layer_order(spec.num_layers)
 
 
+
 def ladder_layer_indices(spec, depth):
     """Return the stable, nested original-layer indices for a depth rung.
 
@@ -187,15 +177,6 @@ def ladder_layer_indices(spec, depth):
         raise ValueError(
             f"ladder depth must be in [2, {num_layers}], got {depth}")
     return tuple(sorted(ladder_order(spec)[:depth]))
-
-
-def ladder_layer_ranks(spec):
-    """Map each original block to its selection rank in the nested ladder."""
-    order = ladder_order(spec)
-    ranks = [0] * len(order)
-    for rank, layer in enumerate(order):
-        ranks[layer] = rank
-    return tuple(ranks)
 
 
 def ladder_config(config, depth):
@@ -213,14 +194,6 @@ def ladder_config(config, depth):
     fields["ladder_depths"] = ()
     fields["ladder_sample"] = False
     return TransformerConfig(**fields)
-
-
-def ladder_row_keep(config, exit_depth=None):
-    if exit_depth is None:
-        return None
-    ranks = jnp.asarray(ladder_layer_ranks(config), jnp.int32)
-    return jnp.concatenate([jnp.ones((1,), jnp.float32),
-                            (ranks < exit_depth).astype(jnp.float32)])
 
 
 def ladder_slice(params, config, depth):
@@ -251,15 +224,23 @@ def ladder_slice(params, config, depth):
     return out
 
 
-def parse_ladder_depths(raw):
-    if ".." in raw:
-        lo, hi = raw.split("..")
-        return tuple(range(int(lo), int(hi) + 1)), True
-    return tuple(int(v) for v in raw.split(",") if v), False
+def ladder_layer_ranks(spec):
+    """Map each original block to its selection rank in the nested ladder."""
+    order = ladder_order(spec)
+    ranks = [0] * len(order)
+    for rank, layer in enumerate(order):
+        ranks[layer] = rank
+    return tuple(ranks)
 
 
-def parse_ladder_widths(raw):
-    return tuple(int(v) for v in raw.split(",") if v)
+
+def ladder_row_keep(config, exit_depth=None):
+    if exit_depth is None:
+        return None
+    ranks = jnp.asarray(ladder_layer_ranks(config), jnp.int32)
+    return jnp.concatenate([jnp.ones((1,), jnp.float32),
+                            (ranks < exit_depth).astype(jnp.float32)])
+
 
 
 def width_config(config, w):
@@ -361,33 +342,10 @@ def width_slice(params, config, w):
             return a[..., :w]
         if p == "embedding/embedding":
             return a[..., :w]
-        if p.endswith("image_projection/kernel"):
-            return a[..., :w]
         return a
 
     return jax.tree_util.tree_map_with_path(cut, params)
 
-
-def ladder_pool(config, weight):
-    pool = []
-    for depth in (d for d in config.ladder_depths if d < config.num_layers):
-        dcfg = ladder_config(config, depth)
-        pool.append((depth, config.d_model,
-                     SimpleAttentionNetwork(dcfg).apply,
-                     (lambda p, _d=depth: ladder_slice(p, config, _d)),
-                     weight * depth / config.num_layers))
-        for w in config.ladder_widths:
-            pool.append((depth, w,
-                         SimpleAttentionNetwork(width_config(dcfg, w)).apply,
-                         (lambda p, _d=depth, _dc=dcfg, _w=w:
-                          width_slice(ladder_slice(p, config, _d), _dc, _w)),
-                         weight * (depth / config.num_layers) * (w / config.d_model)))
-    for w in config.ladder_widths:
-        pool.append((config.num_layers, w,
-                     SimpleAttentionNetwork(width_config(config, w)).apply,
-                     (lambda p, _w=w: width_slice(p, config, _w)),
-                     weight * w / config.d_model))
-    return pool
 
 
 def precompute_rope_freqs(head_dim, seq_len, theta=10000.0):
@@ -919,10 +877,6 @@ def probe_pool(cells, keep, probes, gain, query, bias, row_keep=None,
                       ).reshape(b, q * d).astype(dtype)
 
 
-def head_config(config, key, probes, queries):
-    name = key.removesuffix("_head")
-    return replace(config, **{f"{name}_probes": probes, f"{name}_queries": queries})
-
 
 class HeadProjection(nn.Module):
     features: int
@@ -1015,14 +969,6 @@ HEADS = (EmbeddingHead, ConfidenceHead, RouterHead)
 HEAD_KEYS = tuple(head.key for head in HEADS)
 
 
-def init_head(params, model, head, seed):
-    cfg = model.config
-    f32 = lambda tree: jax.tree.map(lambda x: jnp.asarray(x, jnp.float32), tree)
-    dummy = jnp.zeros((1, 8, cfg.num_layers + 1, cfg.d_model))
-    init = head.init({"params": jax.random.PRNGKey(seed)}, dummy,
-                     keep=jnp.ones((1, 8)))["params"]
-    return f32({k: v for k, v in params.items() if k != head.key}), {head.key: f32(init)}
-
 
 class SimpleAttentionNetwork(nn.Module):
     config: TransformerConfig
@@ -1030,20 +976,6 @@ class SimpleAttentionNetwork(nn.Module):
     def setup(self):
         cfg = self.config
         self.embedding = nn.Embed(cfg.vocab_size, cfg.d_model, embedding_init=jinit.normal(stddev=0.02))
-        if cfg.image_sem_codes:
-            if (cfg.image_sem_dim <= 0 or cfg.image_tex_books <= 0
-                    or cfg.image_tex_codes <= 0 or cfg.image_tex_stages <= 0
-                    or cfg.image_tex_dim <= 0):
-                raise ValueError("incomplete composite-image embedding geometry")
-            self.image_sem_embedding = nn.Embed(
-                cfg.image_sem_codes, cfg.image_sem_dim,
-                embedding_init=jinit.normal(stddev=0.02))
-            self.image_texture_embedding = nn.Embed(
-                cfg.image_tex_books * cfg.image_tex_codes * cfg.image_tex_stages,
-                cfg.image_tex_dim, embedding_init=jinit.normal(stddev=0.02))
-            self.image_projection = nn.Dense(
-                cfg.d_model, use_bias=False, kernel_init=default_init())
-            self.image_input_norm = ZCRMSNorm(dtype=cfg.jax_dtype)
         self.embed_scale = math.sqrt(cfg.d_model)
         self.stack = Stack(cfg)
         self.embedding_head = EmbeddingHead(cfg)
@@ -1074,48 +1006,14 @@ class SimpleAttentionNetwork(nn.Module):
         pairs = [e(indices, ngram_ok, tap_ok, quant=quant) for e in self.engrams]
         return jnp.stack([k for k, _ in pairs]), jnp.stack([v for _, v in pairs])
 
-    def _input_embeddings(self, tokens, image_texture=None):
-        cfg = self.config
-        x = self.embedding(tokens) * self.embed_scale
-        if image_texture is None:
-            if not (self.is_initializing() and cfg.image_sem_codes):
-                return x
-            image_texture = jnp.full(
-                tokens.shape + (cfg.image_tex_books * cfg.image_tex_stages,),
-                255, dtype=jnp.uint8)
-        if not cfg.image_sem_codes:
-            raise ValueError("image components were provided to a text-only model")
-        expected = cfg.image_tex_books * cfg.image_tex_stages
-        if image_texture.shape != tokens.shape + (expected,):
-            raise ValueError(
-                f"image components must have shape tokens+({expected},)")
-        active = image_texture[..., 0] != 255
-        texture = jnp.where(active[..., None], image_texture, 0).astype(jnp.int32)
-        semantic = jnp.clip(
-            tokens.astype(jnp.int32) - cfg.image_code_offset,
-            0, cfg.image_sem_codes - 1)
-        sem = self.image_sem_embedding(semantic)
-        offsets = (jnp.arange(expected, dtype=jnp.int32)
-                   * cfg.image_tex_codes)
-        tex = self.image_texture_embedding(texture + offsets)
-        tex = tex.reshape(
-            *tokens.shape, cfg.image_tex_stages, cfg.image_tex_books,
-            cfg.image_tex_dim).sum(axis=-3)
-        composite = jnp.concatenate(
-            [sem, tex.reshape(*tokens.shape,
-                              cfg.image_tex_books * cfg.image_tex_dim)],
-            axis=-1)
-        image_x = self.image_projection(composite)
-        image_x = (self.image_input_norm(image_x)
-                   * (0.02 * self.embed_scale)).astype(x.dtype)
-        return jnp.where(active[..., None], image_x, x)
+    def _input_embeddings(self, tokens):
+        return self.embedding(tokens) * self.embed_scale
 
     def __call__(self, tokens, mask=None, quant=False,
-                 image_texture=None, exit_depth=None, exit_only=False,
-                 subnetwork_only=False):
+                 exit_depth=None, exit_only=False, subnetwork_only=False):
         if mask is None:
             mask = make_causal_mask(tokens.shape[1])
-        x = self._input_embeddings(tokens, image_texture)
+        x = self._input_embeddings(tokens)
         rope = self._rope(tokens.shape[1])
         engram_kv = self._engram_kv(tokens, mask, quant)
         stack_out = self.stack(
@@ -1141,8 +1039,7 @@ class SimpleAttentionNetwork(nn.Module):
         logits = _aq(x, quant).astype(jnp.float32) @ head.T
         return (logits, exit_logits) if exit_x is not None else logits
 
-    def hidden_cells(self, tokens, quant=False, window=0, sink=None,
-                     image_texture=None, exit_depth=None):
+    def hidden_cells(self, tokens, quant=False, window=0, sink=None, exit_depth=None):
         cfg = self.config
         mask = (make_causal_mask(tokens.shape[1])
                 & make_padding_mask(tokens, cfg.pad_token_id))
@@ -1151,7 +1048,7 @@ class SimpleAttentionNetwork(nn.Module):
             recent = ((pos[:, None] - pos[None, :]) < window)[None, None, :, :]
             keep = recent if sink is None else (recent | sink[:, None, None, :])
             mask = mask & keep
-        x0 = self._input_embeddings(tokens, image_texture)
+        x0 = self._input_embeddings(tokens)
         rope = self._rope(tokens.shape[1])
         engram_kv = self._engram_kv(tokens, mask, quant)
         hidden = self.stack(
@@ -1182,10 +1079,10 @@ class SimpleAttentionNetwork(nn.Module):
         return self.router_head(
             *self._head_cells(tokens, quant, window, sink, exit_depth), quant=quant)
 
-    def hidden_states(self, tokens, mask=None, image_texture=None):
+    def hidden_states(self, tokens, mask=None):
         if mask is None:
             mask = make_causal_mask(tokens.shape[1])
-        x = self._input_embeddings(tokens, image_texture)
+        x = self._input_embeddings(tokens)
         rope = self._rope(tokens.shape[1])
         engram_kv = self._engram_kv(tokens, mask, False)
         _, hidden = self.stack(x, mask=mask, rope=rope, engram_kv=engram_kv,
@@ -1237,17 +1134,3 @@ def effective_kv_window(config):
     return min(budget, config.kv_window) if config.kv_window else budget
 
 
-def make_causal_packing_mask(seg_ids, prefix=None, window=0):
-    T = seg_ids.shape[1]
-    causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
-    block = (seg_ids[:, :, None] == seg_ids[:, None, :]) & (seg_ids[:, :, None] > 0)
-    mask = block & causal[None, :, :]
-    static_zero = isinstance(window, (int, np.integer)) and int(window) == 0
-    if window is not None and not static_zero:
-        pos = jnp.arange(T)
-        limit = jnp.where(jnp.asarray(window) > 0, window, T + 1)
-        recent = (pos[:, None] - pos[None, :]) < limit
-        sink = (jnp.zeros_like(seg_ids, dtype=jnp.bool_) if prefix is None
-                else prefix > 0)
-        mask = mask & (recent[None, :, :] | sink[:, None, :])
-    return mask[:, None, :, :]

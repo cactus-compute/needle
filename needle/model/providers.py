@@ -151,7 +151,7 @@ def _openrouter() -> Provider:
         label="OpenRouter",
         api_base=api_base,
         env_key="OPENROUTER_API_KEY",
-        default_model="deepseek/deepseek-v4-flash",
+        default_model="deepseek/deepseek-flash-latest",
         completions_url=completions_url,
     )
 

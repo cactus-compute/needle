@@ -92,7 +92,7 @@ def write_checkpoint(path, checkpoint):
         pickle.dump(checkpoint, handle)
 
 
-_ADAPTER_FIELDS = ("scale", "base", "rank", "qat_bits", "qat_bits_map", "seed", "layers")
+_ADAPTER_FIELDS = ("scale", "base", "rank", "seed")
 
 
 def write_adapter(path, adapter):

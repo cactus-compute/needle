@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 346" width="900" height="346" role="img" aria-label="Needle 3 at a glance: inputs, outputs, model, training, speed and customisation">
+<style>svg{--t0:0.0s}.s{animation-duration:9.0s;animation-iteration-count:infinite;animation-fill-mode:both;animation-delay:calc(0s - var(--t0))}@keyframes r0{0%{opacity:0;transform:translateX(-10px)}3.33%{opacity:0;transform:translateX(-10px)}8.33%{opacity:1;transform:translateX(0)}93.33%{opacity:1;transform:translateX(0)}98.89%{opacity:0}100%{opacity:0;transform:translateX(-10px)}}.r0{animation-name:r0;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@keyframes l0{0%{transform:scaleX(0)}3.33%{transform:scaleX(0)}10.00%{transform:scaleX(1)}93.33%{transform:scaleX(1)}98.89%{transform:scaleX(1);opacity:0}100%{transform:scaleX(0);opacity:1}}.l0{animation-name:l0;transform-box:fill-box;transform-origin:left center;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@keyframes r1{0%{opacity:0;transform:translateX(-10px)}9.44%{opacity:0;transform:translateX(-10px)}14.44%{opacity:1;transform:translateX(0)}93.33%{opacity:1;transform:translateX(0)}98.89%{opacity:0}100%{opacity:0;transform:translateX(-10px)}}.r1{animation-name:r1;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@keyframes l1{0%{transform:scaleX(0)}9.44%{transform:scaleX(0)}16.11%{transform:scaleX(1)}93.33%{transform:scaleX(1)}98.89%{transform:scaleX(1);opacity:0}100%{transform:scaleX(0);opacity:1}}.l1{animation-name:l1;transform-box:fill-box;transform-origin:left center;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@keyframes r2{0%{opacity:0;transform:translateX(-10px)}15.56%{opacity:0;transform:translateX(-10px)}20.56%{opacity:1;transform:translateX(0)}93.33%{opacity:1;transform:translateX(0)}98.89%{opacity:0}100%{opacity:0;transform:translateX(-10px)}}.r2{animation-name:r2;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@keyframes l2{0%{transform:scaleX(0)}15.56%{transform:scaleX(0)}22.22%{transform:scaleX(1)}93.33%{transform:scaleX(1)}98.89%{transform:scaleX(1);opacity:0}100%{transform:scaleX(0);opacity:1}}.l2{animation-name:l2;transform-box:fill-box;transform-origin:left center;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@keyframes r3{0%{opacity:0;transform:translateX(-10px)}21.67%{opacity:0;transform:translateX(-10px)}26.67%{opacity:1;transform:translateX(0)}93.33%{opacity:1;transform:translateX(0)}98.89%{opacity:0}100%{opacity:0;transform:translateX(-10px)}}.r3{animation-name:r3;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@keyframes l3{0%{transform:scaleX(0)}21.67%{transform:scaleX(0)}28.33%{transform:scaleX(1)}93.33%{transform:scaleX(1)}98.89%{transform:scaleX(1);opacity:0}100%{transform:scaleX(0);opacity:1}}.l3{animation-name:l3;transform-box:fill-box;transform-origin:left center;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@keyframes r4{0%{opacity:0;transform:translateX(-10px)}27.78%{opacity:0;transform:translateX(-10px)}32.78%{opacity:1;transform:translateX(0)}93.33%{opacity:1;transform:translateX(0)}98.89%{opacity:0}100%{opacity:0;transform:translateX(-10px)}}.r4{animation-name:r4;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@keyframes l4{0%{transform:scaleX(0)}27.78%{transform:scaleX(0)}34.44%{transform:scaleX(1)}93.33%{transform:scaleX(1)}98.89%{transform:scaleX(1);opacity:0}100%{transform:scaleX(0);opacity:1}}.l4{animation-name:l4;transform-box:fill-box;transform-origin:left center;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@keyframes r5{0%{opacity:0;transform:translateX(-10px)}33.89%{opacity:0;transform:translateX(-10px)}38.89%{opacity:1;transform:translateX(0)}93.33%{opacity:1;transform:translateX(0)}98.89%{opacity:0}100%{opacity:0;transform:translateX(-10px)}}.r5{animation-name:r5;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@keyframes l5{0%{transform:scaleX(0)}33.89%{transform:scaleX(0)}40.56%{transform:scaleX(1)}93.33%{transform:scaleX(1)}98.89%{transform:scaleX(1);opacity:0}100%{transform:scaleX(0);opacity:1}}.l5{animation-name:l5;transform-box:fill-box;transform-origin:left center;animation-timing-function:cubic-bezier(.2,.8,.2,1)}@media (prefers-reduced-motion:reduce){.s{animation:none!important;opacity:1;transform:none}}</style>
+<rect width="900" height="346" rx="18" fill="#0e0e10"/>
+<text x="40" y="38" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#e8e6df">Needle 3 at a glance</text>
+<line class="s l0" x1="40" y1="66" x2="860" y2="66" stroke="#232326" stroke-width="1"/>
+<g class="s r0">
+<text x="40" y="90" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" letter-spacing="1.5" fill="#e8593d">INPUTS</text>
+<text x="210" y="90" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" fill="#e8e6df">Text prompts, plus tool definitions or an extraction schema</text>
+</g>
+<line class="s l1" x1="40" y1="104" x2="860" y2="104" stroke="#232326" stroke-width="1"/>
+<g class="s r1">
+<text x="40" y="128" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" letter-spacing="1.5" fill="#e8593d">OUTPUTS</text>
+<text x="210" y="128" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" fill="#e8e6df">Tool calls or structured extraction, always well-formed</text>
+</g>
+<line class="s l2" x1="40" y1="142" x2="860" y2="142" stroke="#232326" stroke-width="1"/>
+<g class="s r2">
+<text x="40" y="166" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" letter-spacing="1.5" fill="#e8593d">MODEL</text>
+<text x="210" y="166" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" fill="#e8e6df">29-121M Laddered Simple Attention Networks, CQ2 quantisation</text>
+</g>
+<line class="s l3" x1="40" y1="180" x2="860" y2="180" stroke="#232326" stroke-width="1"/>
+<g class="s r3">
+<text x="40" y="204" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" letter-spacing="1.5" fill="#e8593d">TRAINING</text>
+<text x="210" y="204" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" fill="#e8e6df">360B tokens of proprietary structured dataset</text>
+</g>
+<line class="s l4" x1="40" y1="218" x2="860" y2="218" stroke="#232326" stroke-width="1"/>
+<g class="s r4">
+<text x="40" y="242" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" letter-spacing="1.5" fill="#e8593d">SPEED</text>
+<text x="210" y="242" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" fill="#e8e6df">Up to 4k tokens/s decode and 10k tokens/s prefill on a Raspberry Pi 5</text>
+</g>
+<line class="s l5" x1="40" y1="256" x2="860" y2="256" stroke="#232326" stroke-width="1"/>
+<g class="s r5">
+<text x="40" y="280" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" letter-spacing="1.5" fill="#e8593d">CUSTOMISATION</text>
+<text x="210" y="280" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" fill="#e8e6df">Fine-tuning lifts every subnetwork 18 to 36 points on DroidCall;</text>
+<text x="210" y="302" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" fill="#e8e6df">from 4 layers (29M) up the tuned subnetwork passes DeepSeek V4 Flash</text>
+</g>
+<line x1="40" y1="316" x2="860" y2="316" stroke="#232326" stroke-width="1"/>
+</svg>

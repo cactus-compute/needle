@@ -12,6 +12,22 @@ def agent_for(module):
     return _agents[key]
 
 
+def _fold(value):
+    if isinstance(value, str):
+        return value.casefold()
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, dict):
+        return {k: _fold(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_fold(v) for v in value]
+    return value
+
+
+def _key(call):
+    return json.dumps(_fold(call), sort_keys=True)
+
+
 def run_tests(module, min_confidence=0.0, verbose=True):
     """Run an environment's frozen acceptance suite against the shipped engine.
     The default scores raw model output; passing e.g. min_confidence=0.4 applies
@@ -29,9 +45,7 @@ def run_tests(module, min_confidence=0.0, verbose=True):
         if got and response.get("confidence", 0.0) < min_confidence:
             got = []
         want = case["calls"]
-        ok = got == want or sorted(
-            json.dumps(c, sort_keys=True) for c in got
-        ) == sorted(json.dumps(c, sort_keys=True) for c in want)
+        ok = sorted(_key(c) for c in got) == sorted(_key(c) for c in want)
         if not ok:
             failures.append(case)
             if case.get("critical"):

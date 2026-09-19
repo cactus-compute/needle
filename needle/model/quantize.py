@@ -1,6 +1,5 @@
 import functools
 import math
-import re
 
 import numpy as np
 import jax
@@ -59,17 +58,11 @@ def maybe_quant_kv(x, quant):
         quant, quantize, lambda t: t, x)
 
 
-QAT_EVERY = 0
-_WEIGHT_GROUP = 128
-_WEIGHT_BITS = 4
+WEIGHT_BITS = 4
 ACT_BITS = 8
 KV_BITS = 0
 _KV_GROUP = 64
 
-
-def configure_qat(every, weight_group=128, weight_bits=4):
-    global QAT_EVERY, _WEIGHT_GROUP, _WEIGHT_BITS
-    QAT_EVERY, _WEIGHT_GROUP, _WEIGHT_BITS = int(every), int(weight_group), int(weight_bits)
 
 
 def configure_deploy(act_bits=8, kv_bits=8, kv_group=64):
@@ -80,29 +73,6 @@ def configure_deploy(act_bits=8, kv_bits=8, kv_group=64):
     if changed:
         jax.clear_caches()
 
-
-def quantize_params_configured(params):
-    return cq_ste_params(params, _WEIGHT_BITS, _WEIGHT_GROUP)
-
-
-def deploy_quantize(params, config):
-    spec = getattr(config, "weight_bits", "") or ""
-    if spec:
-        bits_map, default_bits = parse_bits_map(spec)
-        return cq_mixed_params(params, bits_map, default_bits), spec
-    return (cq_quantize_params(params, _WEIGHT_BITS, _WEIGHT_GROUP),
-            f"CQ W{_WEIGHT_BITS}")
-
-
-def weight_bits():
-    return _WEIGHT_BITS
-
-
-def maybe_quant_weights(params, do_quantize):
-    if not QAT_EVERY:
-        return params
-    return jax.lax.cond(
-        do_quantize, quantize_params_configured, lambda p: p, params)
 
 
 @functools.lru_cache(maxsize=None)
@@ -121,6 +91,7 @@ def _lloyd_max_gaussian(bits, iters=200, samples=400000, seed=0):
             if m.any():
                 c[k] = x[m].mean()
     return np.sort(c)
+
 
 TERNARY_BITS = 1.58
 _TERNARY_CB = np.array([-1.2240064, 0.0, 1.2240064])
@@ -187,125 +158,9 @@ def _ab_of(params):
     return params.get(AB_KEY) if hasattr(params, "get") else None
 
 
-def ab_init_params(params, seed=0, signs=False):
-    """a = b = 1 (exact no-op at step 0; the PTQ default) or, with signs=True,
-    a = b = random +-1 (randomized-Hadamard init for from-scratch/SFT runs).
-    a*b = 1 either way, so effective FP weights are unchanged. A tree that
-    already carries AB (a resumed QAPT checkpoint) is returned unchanged."""
-    if _ab_of(params):
-        return dict(params)
-    rng = np.random.RandomState(seed)
-    ab = {}
-
-    def visit(path, leaf):
-        if _is_quant_leaf(path, leaf):
-            r = leaf.shape[-2] if _reduces_second_last(path) else leaf.shape[-1]
-            v = ((rng.randint(0, 2, r) * 2 - 1) if signs else np.ones(r))
-            ab[leaf_name(path)] = {"a": jnp.asarray(v, jnp.float32),
-                                   "b": jnp.asarray(v, jnp.float32)}
-        return leaf
-
-    jax.tree_util.tree_map_with_path(visit, params)
-    out = dict(params)
-    out[AB_KEY] = ab
-    return out
-
-
-def freeze_quant_grads(grads):
-    """Zero the gradients of every CQ-quantized leaf (signs stay frozen);
-    norms, gates, AB scales and other smooth params keep theirs."""
-    def z(path, leaf):
-        return jnp.zeros_like(leaf) if _is_quant_leaf(path, leaf) else leaf
-    return jax.tree_util.tree_map_with_path(z, grads)
-
-
-def ab_fold_params(params):
-    """FP-effective tree of an AB-carrying model (w <- a*b*w, AB_KEY dropped):
-    the clean-forward reference of the function the quant transforms deploy."""
-    if not _ab_of(params):
-        return params
-    folded = dict(_map_quant_leaves(params, lambda w, i: w))
-    folded.pop(AB_KEY)
-    return folded
-
-
-def cq_model_bytes(params, bits, group_size=128):
-    acc = {"q": 0, "groups": 0, "other": 0}
-
-    def visit(path, leaf):
-        n = int(np.prod(leaf.shape))
-        if _is_quant_leaf(path, leaf):
-            acc["q"] += n
-            per = leaf.shape[-2] if _reduces_second_last(path) else leaf.shape[-1]
-            acc["groups"] += (n // per) * (-(-per // group_size))
-        else:
-            acc["other"] += n
-        return leaf
-
-    jax.tree_util.tree_map_with_path(visit, params)
-    return acc["q"] * bits / 8 + acc["groups"] * 2 + acc["other"] * 2
-
-
-def model_bytes_fp16(params):
-    return 2 * sum(int(np.prod(l.shape)) for l in jax.tree_util.tree_leaves(params))
-
-
-
 
 CQ_GROUP_SIZE = 128
-CQ_BITS = (1, 2, 3, 4)
-MIN_BITS, MAX_BITS = 1, 8
 
-
-def canonical_tensor_name(name):
-    n = re.sub(r"^layer\d+\.", "attn.", name)
-    n = re.sub(r"^engrams?_?(\d+)[./]?", r"engram\1.", n)
-    if n.startswith("stack/"):
-        n = n[len("stack/"):]
-    n = n.replace("layers/block/self_attn/", "attn.")
-    n = n.replace("mtp_block/self_attn/", "mtp.")
-    if n.endswith("/kernel"):
-        n = n[:-len("/kernel")]
-    if n == "embedding/embedding":
-        n = "embedding"
-    n = re.sub(r"^(engram\d+\.)embedding$", r"\1tables", n)
-    return n.replace("/", ".")
-
-
-def _bits_for(name, bits_map, default_bits):
-    canon = canonical_tensor_name(name)
-    hits = [k for k in bits_map if canon.startswith(k)]
-    return bits_map[max(hits, key=len)] if hits else default_bits
-
-
-@functools.lru_cache(maxsize=None)
-def cq_distortion(bits, group_size=CQ_GROUP_SIZE, rows=2048, seed=0):
-    w = np.random.RandomState(seed).randn(rows, 4 * group_size).astype(np.float32)
-    deq = np.asarray(cq_quantize(jnp.asarray(w), bits, group_size))
-    return float(np.mean((deq - w) ** 2) / np.mean(w ** 2))
-
-
-def noise_scale(bits, group_size=CQ_GROUP_SIZE):
-    b = min(max(float(bits), MIN_BITS), MAX_BITS)
-    lo, hi = int(np.floor(b)), int(np.ceil(b))
-    d_lo = cq_distortion(lo, group_size)
-    if hi == lo:
-        return float(np.sqrt(d_lo))
-    d_hi = cq_distortion(hi, group_size)
-    t = b - lo
-    return float(np.sqrt(np.exp((1.0 - t) * np.log(d_lo) + t * np.log(d_hi))))
-
-
-def add_cq_noise(w, key, scale, group_size=CQ_GROUP_SIZE):
-    D, g = w.shape[-1], group_size
-    pad = (-D) % g
-    wp = jnp.pad(w, [(0, 0)] * (w.ndim - 1) + [(0, pad)]) if pad else w
-    groups = wp.reshape(*wp.shape[:-1], -1, g).astype(jnp.float32)
-    rms = jnp.sqrt(jnp.mean(jnp.square(groups), axis=-1, keepdims=True))
-    sigma = jax.lax.stop_gradient(rms) * scale
-    eps = jax.random.normal(key, groups.shape, dtype=jnp.float32)
-    noisy = (groups + sigma * eps).reshape(wp.shape).astype(w.dtype)
-    return noisy[..., :D] if pad else noisy
 
 
 def _map_quant_leaves(params, fn):
@@ -332,21 +187,6 @@ def _map_quant_leaves(params, fn):
     return jax.tree_util.tree_map_with_path(q, params)
 
 
-def noise_params(params, key, scale, group_size=CQ_GROUP_SIZE):
-    return _map_quant_leaves(
-        params,
-        lambda w, i: add_cq_noise(w, jax.random.fold_in(key, i), scale, group_size),
-    )
-
-
-def noise_params_only(params, key, scale, name, group_size=CQ_GROUP_SIZE):
-    names = [n for n, _ in quant_leaf_names(params)]
-    return _map_quant_leaves(
-        params,
-        lambda w, i: (add_cq_noise(w, key, scale, group_size)
-                      if names[i].startswith(name) else w),
-    )
-
 
 def leaf_name(path):
     # Partitioned/AxisMetadata leaves add a trailing GetAttrKey("value").
@@ -369,58 +209,6 @@ def quant_leaf_names(params):
     jax.tree_util.tree_map_with_path(visit, params)
     return out
 
-
-def parse_bits_map(spec):
-    m, default = {}, None
-    for part in str(spec or "").split(","):
-        if not part.strip():
-            continue
-        k, v = part.split("=", 1)
-        b = TERNARY_BITS if float(v) == TERNARY_BITS else int(v)
-        if k.strip() == "default":
-            default = b
-        else:
-            m[canonical_tensor_name(k.strip())] = b
-    if default is None:
-        raise ValueError(f"bits map {spec!r} needs a default=<b> entry")
-    bad = {b for b in list(m.values()) + [default]
-           if b not in CQ_BITS and b != TERNARY_BITS}
-    if bad:
-        raise ValueError(f"bits map {spec!r} has unsupported widths {sorted(bad)}")
-    return m, default
-
-
-def cq_mixed_params(params, bits_map, default_bits, group_size=CQ_GROUP_SIZE):
-    names = [n for n, _ in quant_leaf_names(params)]
-
-    def fn(w, i):
-        b = _bits_for(names[i], bits_map, default_bits)
-        return cq_quantize(w, b, group_size)
-
-    return _map_quant_leaves(params, fn)
-
-
-def cq_mixed_stats(params, bits_map, default_bits, group_size=CQ_GROUP_SIZE):
-    qbits = qn = 0
-    other = 0
-    groups = 0
-
-    def visit(path, leaf):
-        nonlocal qbits, qn, other, groups
-        n = int(np.prod(leaf.shape))
-        if _is_quant_leaf(path, leaf):
-            b = _bits_for(leaf_name(path), bits_map, default_bits)
-            qbits += b * n
-            qn += n
-            per = leaf.shape[-2] if _reduces_second_last(path) else leaf.shape[-1]
-            groups += (n // per) * (-(-per // group_size))
-        else:
-            other += n
-        return leaf
-
-    jax.tree_util.tree_map_with_path(visit, params)
-    mb = (qbits / 8 + groups * 2 + other * 2) / 1e6
-    return qbits / max(qn, 1), mb
 
 
 def cq_ste(w, bits, group_size=CQ_GROUP_SIZE):
@@ -445,53 +233,3 @@ def cq_ste_params(params, bits, group_size=CQ_GROUP_SIZE):
     return _map_quant_leaves(params, lambda w, i: cq_ste(w, bits, group_size))
 
 
-def cq_ste_mixed_params(params, bits_map, default_bits, group_size=CQ_GROUP_SIZE):
-    names = [n for n, _ in quant_leaf_names(params)]
-    return _map_quant_leaves(
-        params,
-        lambda w, i: cq_ste(w, _bits_for(names[i], bits_map, default_bits), group_size))
-
-
-def kurtosis_penalty(params, group_size=None):
-    g = _WEIGHT_GROUP if group_size is None else group_size
-    ab = _ab_of(params)
-    H = jnp.asarray(_cq_hadamard_np(g))
-    terms = []
-
-    def visit(path, leaf):
-        if not _is_quant_leaf(path, leaf):
-            return leaf
-        s = ab.get(leaf_name(path)) if ab else None
-        w = jnp.swapaxes(leaf, -1, -2) if _reduces_second_last(path) else leaf
-        if s is not None:
-            w = w * s["b"]
-        pad = (-w.shape[-1]) % g
-        wp = jnp.pad(w, [(0, 0)] * (w.ndim - 1) + [(0, pad)]) if pad else w
-        rot = wp.reshape(*wp.shape[:-1], -1, g).astype(jnp.float32) @ H
-        m2 = jnp.mean(rot ** 2, axis=-1)
-        m4 = jnp.mean(rot ** 4, axis=-1)
-        kurt = m4 / jnp.maximum(m2 ** 2, 1e-12)
-        dev = (kurt - 3.0) ** 2
-        terms.append((jnp.sum(dev), dev.size))
-        return leaf
-
-    jax.tree_util.tree_map_with_path(visit, params)
-    return sum(t for t, _ in terms) / max(sum(n for _, n in terms), 1)
-
-
-def attractor_penalty(params, bits=None, group_size=None):
-    b = _WEIGHT_BITS if bits is None else bits
-    g = _WEIGHT_GROUP if group_size is None else group_size
-    terms = []
-
-    def fn(w, i):
-        q = jax.lax.stop_gradient(cq_quantize(w, b, g))
-        d = (w - q).astype(jnp.float32)
-        ref = jax.lax.stop_gradient(w.astype(jnp.float32))
-        terms.append((jnp.sum(d * d), jnp.sum(ref * ref)))
-        return w
-
-    _map_quant_leaves(params, fn)
-    num = sum(t for t, _ in terms)
-    den = sum(r for _, r in terms)
-    return num / jnp.maximum(den, 1e-12)

@@ -30,13 +30,17 @@ class _Stub:
 
 
 @pytest.fixture
-def stub(monkeypatch):
+def stub(monkeypatch, tmp_path):
     import needle
 
     engine = _Stub()
-    monkeypatch.setattr(needle, "_lib", lambda generation=2: engine)
-    monkeypatch.setattr(needle, "_library_path", lambda generation=2: "/tmp/libneedle2")
+    base = tmp_path / "needle3.cact"
+    base.write_bytes((0x05E12A84).to_bytes(4, "little") + b"base weights")
+    monkeypatch.setattr(needle, "_lib", lambda generation=3: engine)
+    monkeypatch.setattr(needle, "_library_path", lambda generation=3: "/tmp/libneedle3")
+    monkeypatch.setattr(needle, "_base_weights_path", lambda generation: str(base))
     monkeypatch.setattr(needle, "_active", {})
+    monkeypatch.setattr(needle, "_loaded_base", {})
     return engine
 
 
@@ -116,6 +120,27 @@ def test_input_without_a_year_is_not_checked(stub):
     response = agent.complete("Send Acme an invoice due next Friday")
 
     assert "validation" not in response
+
+
+def test_a_slash_date_does_not_mint_a_year_from_its_day_or_month(stub):
+    import needle
+
+    stub.envelopes = [_call("2024-05-06")]
+    agent = needle.Needle(tools=[Invoice])
+    response = agent.complete("Send an invoice to Acme due on 5/6/24")
+
+    assert "validation" not in response
+    assert needle._source_years("due on 5/6/24") == set()
+    assert needle._source_years("due on 2024-05-06") == {2024}
+
+
+def test_extract_accepts_a_date_written_with_slashes(stub):
+    import needle
+
+    stub.envelopes = [_call("2024-12-31")]
+    invoice = needle.extract("Invoice from Acme Corp due 12/31/24", Invoice)
+
+    assert invoice.due_date == datetime.date(2024, 12, 31)
 
 
 def test_run_refuses_ungrounded_calls_unless_strict_is_off(stub):
