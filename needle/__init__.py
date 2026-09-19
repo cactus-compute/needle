@@ -349,7 +349,10 @@ def _source_years(text):
         rf"\b{months}\s+\d{{1,2}}(?:st|nd|rd|th)?\s*,?\s+(\d{{1,4}})(?![0-9A-Za-z])",
         rf"\b{months}[\s,]+(\d{{3,4}})(?![0-9A-Za-z])",
         r"\byear\s+(\d{1,4})(?![0-9A-Za-z])",
-        r"(?<![0-9])(\d{1,4})(?=[-/]\d{1,2}[-/]\d{1,2}(?![0-9]))",
+        # Year-first numeric dates only (2024-03-15, 2024/03/15).  A day- or
+        # month-first date such as 5/6/24 must not mint its leading component
+        # as a year: no ISO argument can ever match it, so every date would fail.
+        r"(?<![0-9])(\d{4})(?=[-/]\d{1,2}[-/]\d{1,2}(?![0-9]))",
     ]
     lowered = text.lower()
     return {int(match.group(1)) for pattern in patterns
