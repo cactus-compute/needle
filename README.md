@@ -58,7 +58,7 @@ Every turn returns one JSON object with `function_calls`, the model's `reasoning
 
 ## Customisation
 
-Needle was designed to be customised. Its capacity is a ladder, and a subnetwork as small as 2 layers, fine-tuned on one product's tools, runs optimally on devices far smaller than the full model needs. Fine-tuning on DroidCall lifts every subnetwork by 18 to 36 points, and from 4 layers up the tuned subnetwork passes DeepSeek V4 Flash, starting at 29M parameters.
+Needle was designed to be customised. Its capacity is a ladder, and a subnetwork as small as 2 layers, fine-tuned on one product's tools, runs optimally on devices far smaller than the full model needs. Fine-tuning on DroidCall lifts every subnetwork by 18 to 36 points, and from 4 layers up the tuned subnetwork passes DeepSeek V4.1 Flash, starting at 29M parameters.
 
 ![Every subnetwork before and after fine-tuning on DroidCall and on Mobile Actions](assets/finetune.svg)
 
@@ -84,7 +84,7 @@ needle build --platform linux-arm64 --layers 8 --out ./pi
 
 The [devices guide](https://cactuscompute.com/blog/needle-supported-devices) lists every folder and what ships in it.
 
-By default, telemetry is turned on in the binary. To turn it off, set environment variables NEEDLE_TELEMETRY=0 and DO_NOT_TRACK=1. 
+By default, telemetry is turned on in the binary. To turn it off, set environment variables NEEDLE_TELEMETRY=0 and DO_NOT_TRACK=1.
 
 ## Citation
 

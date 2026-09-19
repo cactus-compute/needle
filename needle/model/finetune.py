@@ -33,7 +33,7 @@ DEFAULT_BASE = "checkpoints/needle3.safetensors"
 OPENROUTER_URL = os.environ.get(
     "OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions"
 )
-DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
+DEFAULT_MODEL = "deepseek/deepseek-flash-latest"
 
 _GEN_SYSTEM = (
     "You generate training data for a tool-calling and extraction model. Given a "
