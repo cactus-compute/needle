@@ -148,7 +148,8 @@ class Needle:
         self._tool_schemas = [entry for entry in (parsed_tools or [])
                               if isinstance(entry, dict)]
         self._seen_years = set()
-        self._tool_index_path = tool_index_path.encode("utf-8") if tool_index_path else None
+        self._tool_index_path = (os.fspath(tool_index_path).encode("utf-8")
+                                 if tool_index_path else None)
         self._buffer = ctypes.create_string_buffer(buffer_size)
         if self._weights:
             self._worker = FineTuneWorker(
