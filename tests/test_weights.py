@@ -244,6 +244,9 @@ def test_extraction_rejects_fabricated_temporal_year():
         needle._validate_extraction("due on 5th September 2034", Invoice,
                                     fabricated, response)
 
+    # A one- or two-digit written year can never license a four-digit ISO
+    # date, so it mints no year and the argument is left unchecked instead
+    # of rejected.
     with pytest.raises(needle.ExtractionValidationError, match="due_date"):
         needle._validate_extraction(
             "due on 5th September 42", Invoice,
@@ -251,7 +254,7 @@ def test_extraction_rejects_fabricated_temporal_year():
 
     assert needle._source_years("due September 5, 2034") == {2034}
     assert needle._source_years("due September 5") == set()
-    assert needle._source_years("due 5th September 42") == {42}
+    assert needle._source_years("due 5th September 42") == set()
     assert needle._source_years("Invoice 42 is due tomorrow at 5") == set()
 
 
