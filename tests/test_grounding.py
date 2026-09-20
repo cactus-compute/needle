@@ -134,6 +134,40 @@ def test_a_slash_date_does_not_mint_a_year_from_its_day_or_month(stub):
     assert needle._source_years("due on 2024-05-06") == {2024}
 
 
+def test_a_two_digit_written_year_does_not_mint_an_unmatchable_year(stub):
+    import needle
+
+    stub.envelopes = [_call("2031-09-05")]
+    agent = needle.Needle(tools=[Invoice])
+    response = agent.complete("Send an invoice to Acme due on 5th September 31")
+
+    assert "validation" not in response
+    assert needle._source_years("due on 5th September 31") == set()
+    assert needle._source_years("due on 5th September 2031") == {2031}
+    assert needle._source_years("due September 5, 24") == set()
+    assert needle._source_years("in the year 99") == set()
+    assert needle._source_years("in the year 1999") == {1999}
+
+
+def test_extract_accepts_a_date_written_with_a_two_digit_year(stub):
+    import needle
+
+    stub.envelopes = [_call("2024-12-31")]
+    invoice = needle.extract("Invoice from Acme Corp due December 31, 24", Invoice)
+
+    assert invoice.due_date == datetime.date(2024, 12, 31)
+
+
+def test_run_executes_a_call_whose_date_uses_a_two_digit_year(stub):
+    import needle
+
+    stub.envelopes = [_call("2031-09-05"), {"type": "respond", "function_calls": []}]
+    agent = needle.Needle(tools=[Invoice])
+    response = agent.run("Send an invoice to Acme due on 5th September 31")
+
+    assert response["results"][0].due_date == datetime.date(2031, 9, 5)
+
+
 def test_extract_accepts_a_date_written_with_slashes(stub):
     import needle
 

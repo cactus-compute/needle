@@ -346,10 +346,15 @@ def _source_years(text):
               r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|"
               r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
     patterns = [
-        rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+{months}[\s,]+(\d{{1,4}})(?![0-9A-Za-z])",
-        rf"\b{months}\s+\d{{1,2}}(?:st|nd|rd|th)?\s*,?\s+(\d{{1,4}})(?![0-9A-Za-z])",
+        # Written dates only license years a four-digit ISO date argument can
+        # carry.  A one- or two-digit year ("5th September 31", "September 5,
+        # 24", "year 99") can never match one, so minting it only turns every
+        # date the engine returns into validation.ungrounded; like a year-less
+        # input, such dates are left unchecked instead of rejected.
+        rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+{months}[\s,]+(\d{{3,4}})(?![0-9A-Za-z])",
+        rf"\b{months}\s+\d{{1,2}}(?:st|nd|rd|th)?\s*,?\s+(\d{{3,4}})(?![0-9A-Za-z])",
         rf"\b{months}[\s,]+(\d{{3,4}})(?![0-9A-Za-z])",
-        r"\byear\s+(\d{1,4})(?![0-9A-Za-z])",
+        r"\byear\s+(\d{3,4})(?![0-9A-Za-z])",
         # Year-first numeric dates only (2024-03-15, 2024/03/15).  A day- or
         # month-first date such as 5/6/24 must not mint its leading component
         # as a year: no ISO argument can ever match it, so every date would fail.
