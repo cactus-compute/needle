@@ -7,7 +7,7 @@ import threading
 HELP = """usage: needle <command> [options]
 
   run            run a checkpoint on a query (JAX, Needle 3)
-  finetune       train a LoRA adapter on JSONL data (--layers N for a rung)
+  finetune       train a LoRA adapter on JSONL data
   generate-data  synthesise training data via OpenRouter
   build          export a checkpoint (+ adapter) to a .cact archive
   platform       fine-tune, generate data and download models on cactuscompute.com
@@ -316,7 +316,7 @@ def main():
             path = fetch.fetch_checkpoint(target, os.path.join(args.out, fetch.CHECKPOINT_PREFIX),
                                           generation=generation)
             print(f"  {'file':<9} {path}  {os.path.getsize(path) / 1e6:.2f} MB")
-            print(f"  {'next':<9} needle finetune data.jsonl --checkpoint {path} [--layers N]")
+            print(f"  {'next':<9} needle finetune data.jsonl --checkpoint {path}")
         else:
             fetch._register_download(args.generation)
             repo, filename = _weights_spec(args.spec)
