@@ -1,6 +1,6 @@
 [project]
 name = "cactus-needle"
-version = "3.0.1"
+version = "3.0.5"
 description = "A 14MB foundation tool-calling model for tiny devices: inference, LoRA finetuning, and build."
 requires-python = ">=3.9"
 readme = "README.md"
