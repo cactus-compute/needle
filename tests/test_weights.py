@@ -337,3 +337,66 @@ def test_tool_result_turns_do_not_count_as_queries(engine):
         warnings.simplefilter("error")
         for _ in range(needle.UNRESET_TURNS):
             agent.run("go")
+
+
+def test_agent_extract_carries_its_own_system_facts(engine, monkeypatch):
+    import needle
+
+    seen = {}
+
+    def spy(text, schema, system=None, max_new_tokens=512, weights=None, strict=True, generation=None):
+        seen.update(text=text, system=system, weights=weights, strict=strict, generation=generation)
+        return None
+
+    monkeypatch.setattr(needle, "extract", spy)
+    facts = "date: 2026-07-21 Tue 14:30; locale: en-US"
+    agent = needle.Needle(tools="[]", system=facts)
+
+    assert agent.extract("dinner tomorrow at 7", {"type": "object"}) is None
+    assert seen["system"] == facts
+    assert seen["text"] == "dinner tomorrow at 7"
+
+
+def test_agent_extract_without_system_facts_sends_none_when_autodate_disabled(engine, monkeypatch):
+    import needle
+
+    seen = {}
+    monkeypatch.setattr(
+        needle, "extract",
+        lambda text, schema, system=None, **kwargs: seen.update(system=system))
+    needle.Needle(tools="[]", auto_date=False).extract("anything", {"type": "object"})
+
+    assert seen["system"] is None
+
+
+def test_agent_extract_without_system_facts_carries_date_line(engine, monkeypatch):
+    import needle
+
+    seen = {}
+    monkeypatch.setattr(
+        needle, "extract",
+        lambda text, schema, system=None, **kwargs: seen.update(system=system))
+    needle.Needle(tools="[]").extract("anything", {"type": "object"})
+
+    assert seen["system"] is not None
+    assert seen["system"].startswith("date: ")
+
+
+def test_agent_extract_still_carries_weights_strict_and_generation(engine, tuned, monkeypatch):
+    import needle
+
+    seen = {}
+    monkeypatch.setattr(
+        needle, "extract",
+        lambda text, schema, system=None, max_new_tokens=512, weights=None, strict=True, generation=None:
+            seen.update(system=system, weights=weights, strict=strict, generation=generation))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        agent = needle.Needle(tools="[]", weights=tuned, system="device: phone", generation=3)
+    agent.extract("anything", {"type": "object"}, strict=False)
+
+    assert seen["weights"] == tuned
+    assert seen["strict"] is False
+    assert seen["generation"] == agent._generation
+    assert "device: phone" in seen["system"]
+    assert seen["system"].startswith("date: ")
