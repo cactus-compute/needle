@@ -164,3 +164,16 @@ def _perturbed_model(**overrides):
                         for k, v in flatten(jax.device_get(params)).items()})
     tokens = rng.integers(1, config.out_vocab, size=(2, 24)).astype(np.int32)
     return model, config, params, tokens
+
+
+@pytest.fixture
+def deploy_numerics():
+    from needle.model import quantize
+
+    saved = quantize.ACT_BITS, quantize.KV_BITS, quantize._KV_GROUP
+
+    def configure(config):
+        quantize.configure_deploy(act_bits=config.act_bits, kv_bits=config.kv_bits)
+
+    yield configure
+    quantize.configure_deploy(*saved)
