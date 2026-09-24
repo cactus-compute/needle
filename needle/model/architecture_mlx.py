@@ -9,6 +9,7 @@ from .architecture import (
     engram_geometry, head_dims, ladder_layer_ranks,
 )
 from .checkpoints import flatten
+from .quantize_mlx import Numerics
 
 MX_DTYPES = {"float32": mx.float32, "bfloat16": mx.bfloat16, "float16": mx.float16}
 BLOCK = "stack/layers/block/"
@@ -96,7 +97,7 @@ def engram_indices(tokens, orders, heads, slots, seed_heads=0):
     return mx.stack(idx, axis=-1)
 
 
-def engram_kv(p, cfg, tokens, mask, dtype):
+def engram_kv(p, cfg, tokens, mask, num, dtype):
     if not cfg.engram_layers:
         return None
     orders, heads, _ = engram_geometry(cfg)
@@ -112,7 +113,7 @@ def engram_kv(p, cfg, tokens, mask, dtype):
         num_tables, slots, sub_dim = tables.shape
         flat = indices + mx.arange(num_tables, dtype=mx.int32) * slots
         fetched = tables.reshape(num_tables * slots, sub_dim)[flat] * ngram_ok[..., None]
-        e = fetched.reshape(*indices.shape[:2], num_tables * sub_dim).astype(dtype)
+        e = num.act(fetched.reshape(*indices.shape[:2], num_tables * sub_dim).astype(dtype))
         k = _dense(e, p[name + "key_proj/kernel"], dtype)
         v = _dense(e, p[name + "value_proj/kernel"], dtype)
         taps = p[name + "taps"].astype(dtype)
@@ -123,10 +124,11 @@ def engram_kv(p, cfg, tokens, mask, dtype):
     return ks, vs
 
 
-def attention(lp, cfg, x, mask, rope, dtype):
+def attention(lp, cfg, x, mask, rope, num, dtype):
     qk_hd, v_hd = head_dims(cfg)
     H, KV = cfg.num_heads, cfg.num_kv_heads
     B, T, _ = x.shape
+    x = num.act(x)
     q = _dense(x, lp["self_attn/q_proj/kernel"], dtype)
     k = _dense(x, lp["self_attn/k_proj/kernel"], dtype)
     v = _dense(x, lp["self_attn/v_proj/kernel"], dtype)
@@ -151,11 +153,12 @@ def attention(lp, cfg, x, mask, rope, dtype):
     k = zc_rms_norm(k, lp["self_attn/k_norm/scale"], dtype)
     cos, sin = rope
     q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+    q, k, v = num.query(q), num.kv(k), num.kv(v)
 
     out = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0 / math.sqrt(qk_hd), mask=mask)
     out = out.transpose(0, 2, 1, 3).reshape(B, T, H * v_hd)
     out = out * mx.sigmoid(_dense(x, lp["self_attn/gate_proj/kernel"], dtype))
-    return _dense(out, lp["self_attn/out_proj/kernel"], dtype)
+    return _dense(num.act(out), lp["self_attn/out_proj/kernel"], dtype)
 
 
 def _kron_apply(z, a, b):
@@ -189,7 +192,7 @@ def hadamard_mlp(lp, cfg, x, dtype):
     return (w["d4"] * z)[..., :d_model]
 
 
-def block(lp, cfg, x, mask, rope, dtype, site_kv):
+def block(lp, cfg, x, mask, rope, num, dtype, site_kv):
     if site_kv is not None:
         ek, ev = site_kv
         alpha = mx.sigmoid(mx.sum(_rms_unit(x) * _rms_unit(ek), axis=-1) / math.sqrt(cfg.d_model))
@@ -197,7 +200,7 @@ def block(lp, cfg, x, mask, rope, dtype, site_kv):
 
     skip = x
     x = zc_rms_norm(x, lp["ZCRMSNorm_0/scale"], dtype)
-    x = attention(lp, cfg, x, mask, rope, dtype)
+    x = attention(lp, cfg, x, mask, rope, num, dtype)
     x = zc_rms_norm(x, lp["post_attn_norm/scale"], dtype)
     x = skip + mx.sigmoid(lp["attn_gate"]).astype(dtype) * x
 
@@ -206,13 +209,13 @@ def block(lp, cfg, x, mask, rope, dtype, site_kv):
     return skip + hadamard_mlp(lp, cfg, x, dtype)
 
 
-def _advance(cfg, dtype, stream, lp, pre_off, post_off, mask, rope, site_kv):
+def _advance(cfg, num, dtype, stream, lp, pre_off, post_off, mask, rope, site_kv):
     B, T, n, C = stream.shape
     xf = stream.astype(mx.float32)
-    nx = _rms_unit(stream.reshape(B, T, n * C))
+    nx = num.act(_rms_unit(stream.reshape(B, T, n * C)))
     hpre = mx.sigmoid(lp["a_pre"] * (nx @ lp["phi_pre"]) + lp["b_pre"] + pre_off)
     u = mx.sum(hpre[..., None] * xf, axis=2).astype(dtype)
-    y = block(lp, cfg, u, mask, rope, dtype, site_kv) - u
+    y = block(lp, cfg, u, mask, rope, num, dtype, site_kv) - u
     hpost = 2 * mx.sigmoid(lp["a_post"] * (nx @ lp["phi_post"]) + lp["b_post"] + post_off)
     hres = _sinkhorn(lp["a_res"] * (nx @ lp["phi_res"]).reshape(B, T, n, n) + lp["b_res"])
     return (hres @ xf + hpost[..., None] * y.astype(mx.float32)[:, :, None, :]).astype(dtype)
@@ -231,7 +234,7 @@ def _lane_offsets(positions, n):
     return 8 * lane - 4, -4 * (1 - lane)
 
 
-def stack(p, cfg, x, mask, rope, ekv, dtype, exit_depth=None, subnetwork_only=False):
+def stack(p, cfg, x, mask, rope, ekv, num, dtype, exit_depth=None, subnetwork_only=False):
     if subnetwork_only and exit_depth is None:
         raise ValueError("subnetwork_only requires exit_depth")
     L, n = cfg.num_layers, cfg.mhc_lanes
@@ -256,7 +259,7 @@ def stack(p, cfg, x, mask, rope, ekv, dtype, exit_depth=None, subnetwork_only=Fa
         layer_mask = mask if local_mask is None or layer in cfg.global_layers else local_mask
         s = sites.get(layer)
         site_kv = (ekv[0][s], ekv[1][s]) if ekv is not None and s is not None else None
-        step = functools.partial(_advance, cfg, dtype)
+        step = functools.partial(_advance, cfg, num, dtype)
         if cfg.remat:
             step = mx.checkpoint(step)
         in_sub = exit_depth is not None and ranks[layer] < exit_depth
@@ -276,24 +279,27 @@ def stack(p, cfg, x, mask, rope, ekv, dtype, exit_depth=None, subnetwork_only=Fa
     return x, None
 
 
-def forward(p, cfg, tokens, mask=None, exit_depth=None, exit_only=False, subnetwork_only=False):
+def forward(p, cfg, tokens, mask=None, quant=False, exit_depth=None, exit_only=False,
+            subnetwork_only=False):
     """SimpleAttentionNetwork.__call__ on MLX: logits, or (logits, exit_logits) with exit_depth.
 
-    `p` is the flat dict to_mlx returns.
+    `p` comes from to_mlx; under quant it must already hold the CQ weights, as the
+    JAX path passes cq_ste_params(...) to model.apply.
     """
     dtype = MX_DTYPES[cfg.dtype]
+    num = Numerics(cfg, quant)
     if mask is None:
         mask = make_causal_mask(tokens.shape[1])
     embedding = p["embedding/embedding"]
     x = embedding[tokens] * math.sqrt(cfg.d_model)
     rope = precompute_rope_freqs(head_dims(cfg)[0], tokens.shape[1], cfg.rope_theta)
-    ekv = engram_kv(p, cfg, tokens, mask, dtype)
-    x, exit_x = stack(p, cfg, x, mask, rope, ekv, dtype, exit_depth=exit_depth,
+    ekv = engram_kv(p, cfg, tokens, mask, num, dtype)
+    x, exit_x = stack(p, cfg, x, mask, rope, ekv, num, dtype, exit_depth=exit_depth,
                       subnetwork_only=subnetwork_only)
     head = embedding[: cfg.out_vocab] if cfg.out_vocab else embedding
 
     def logits(h):
-        return h.astype(mx.float32) @ head.T
+        return num.act(h).astype(mx.float32) @ head.T
 
     if exit_x is None:
         return logits(x)
