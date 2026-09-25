@@ -2,6 +2,7 @@ import os
 import platform
 import sysconfig
 import sys
+import warnings
 import zipfile
 
 ENGINE_REPOS = {
@@ -10,7 +11,7 @@ ENGINE_REPOS = {
 }
 ENGINE_VERSIONS = {
     2: "2.0.4",
-    3: "3.0.2",
+    3: "3.0.1",
 }
 
 BASE_WEIGHTS = {
@@ -93,6 +94,43 @@ def other_libc_tag():
     if tag.startswith("musllinux_1_2_"):
         return tag.replace("musllinux_1_2_", "manylinux2014_")
     return None
+
+
+def _wheel_name(version, tag):
+    return f"cactus_needle-{version}-py3-none-{tag}.whl"
+
+
+def _version_key(version):
+    """Numeric sort key, so 3.0.10 ranks above 3.0.9 rather than below it."""
+    return tuple(int(part) if part.isdigit() else -1 for part in version.split("."))
+
+
+def published_engine_versions(repo, tag):
+    """Engine versions whose ``tag`` wheel is actually in ``repo``, newest first.
+
+    ``ENGINE_VERSIONS`` names the engine the Python side is written against, and
+    the wheels for it are uploaded to the Hub separately.  A bump that reaches
+    ``main`` before its own upload therefore names an engine nobody can fetch,
+    and this is what ``fetch_library`` falls back to when that happens.
+    """
+    from huggingface_hub import list_repo_files
+
+    prefix, suffix = "python/cactus_needle-", f"-py3-none-{tag}.whl"
+    found = set()
+    for name in list_repo_files(repo):
+        if not (name.startswith(prefix) and name.endswith(suffix)):
+            continue
+        version = name[len(prefix):-len(suffix)]
+        if version and "/" not in version:
+            found.add(version)
+    return sorted(found, key=_version_key, reverse=True)
+
+
+def _download_wheel(repo, version, tag):
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id=repo, filename="python/" + _wheel_name(version, tag),
+                           repo_type="model")
 
 
 def engine_repo(generation=2):
@@ -203,23 +241,41 @@ def fetch_checkpoint(name, dest_dir, generation=3, force=False):
 
 
 def fetch_library(version=None, dest_dir=None, tag=None, generation=2):
-    from huggingface_hub import hf_hub_download
-
     if dest_dir is None:
         raise TypeError("dest_dir is required")
+    from huggingface_hub.errors import EntryNotFoundError
+
     version = version or engine_version(generation)
     tag = tag or _platform_tag()
-    wheel = "cactus_needle-{}-py3-none-{}.whl".format(version, tag)
     repo = engine_repo(generation)
     _register_download(generation)
-    path = hf_hub_download(repo_id=repo, filename="python/" + wheel, repo_type="model")
+    fell_back = False
+    try:
+        path = _download_wheel(repo, version, tag)
+    except EntryNotFoundError:
+        # The pinned engine is not on the Hub for this platform.  Take the newest
+        # one that is, so a version bump that outruns its own upload costs a
+        # warning instead of a 404 that fails every fresh install.
+        published = published_engine_versions(repo, tag)
+        if not published or published[0] == version:
+            raise
+        fallback = published[0]
+        warnings.warn(
+            f"the {tag} engine {version} is not published in {repo}; using "
+            f"{fallback} instead (published: {', '.join(published)})", stacklevel=3)
+        fell_back = True
+        version, path = fallback, _download_wheel(repo, fallback, tag)
     lib = _lib_name_for(tag)
     stem, suffix = os.path.splitext(lib)
     member = f"{stem}{generation}{suffix}" if int(generation) >= 3 else lib
-    os.makedirs(dest_dir, exist_ok=True)
+    # A fallback engine is written under the version it actually is, so a cache
+    # directory named after the missing one cannot keep serving it once the real
+    # engine has been uploaded.
+    out_dir = os.path.join(dest_dir, version) if fell_back else dest_dir
+    os.makedirs(out_dir, exist_ok=True)
     with zipfile.ZipFile(path) as archive:
         data = archive.read("needle/" + member)
-    out = os.path.join(dest_dir, lib)
+    out = os.path.join(out_dir, lib)
     with open(out, "wb") as handle:
         handle.write(data)
     return out

@@ -121,6 +121,117 @@ def test_fetch_library_creates_destination(tmp_path, monkeypatch):
     assert out == str(tmp_path / "new" / "libneedle.so")
 
 
+def test_published_engine_versions_is_newest_first_for_the_tag(monkeypatch):
+    from needle.agent import fetch
+
+    files = [
+        "python/cactus_needle-3.0.9-py3-none-manylinux2014_x86_64.whl",
+        "python/cactus_needle-3.0.10-py3-none-manylinux2014_x86_64.whl",
+        "python/cactus_needle-3.0.10-py3-none-macosx_11_0_arm64.whl",
+        "needle3.cact",
+        "linux-x86_64/needle",
+    ]
+    monkeypatch.setattr("huggingface_hub.list_repo_files", lambda repo: files)
+    assert fetch.published_engine_versions("Cactus-Compute/needle3", "manylinux2014_x86_64") \
+        == ["3.0.10", "3.0.9"]
+
+
+def _engine_wheel(tmp_path):
+    import zipfile
+
+    wheel = tmp_path / "engine.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("needle/libneedle3.so", b"engine")
+    return str(wheel)
+
+
+def test_fetch_library_falls_back_when_the_pinned_engine_is_unpublished(tmp_path, monkeypatch):
+    from huggingface_hub.errors import EntryNotFoundError
+    from needle.agent import fetch
+
+    wheel = _engine_wheel(tmp_path)
+    published = {"python/cactus_needle-3.0.10-py3-none-manylinux2014_x86_64.whl",
+                 "python/cactus_needle-3.0.9-py3-none-manylinux2014_x86_64.whl"}
+    asked = []
+
+    def fake_download(**kwargs):
+        asked.append(kwargs["filename"])
+        if kwargs["filename"] not in published:
+            raise EntryNotFoundError("404")
+        return wheel
+
+    monkeypatch.setattr(fetch, "_register_download", lambda generation: None)
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_download)
+    monkeypatch.setattr("huggingface_hub.list_repo_files", lambda repo: sorted(published))
+
+    dest = tmp_path / "cache" / "v3" / "3.0.11"
+    with pytest.warns(UserWarning, match="engine 3.0.11 is not published"):
+        out = fetch.fetch_library("3.0.11", dest, tag="manylinux2014_x86_64", generation=3)
+
+    # The pin is tried first, the newest published engine second.
+    assert asked == ["python/cactus_needle-3.0.11-py3-none-manylinux2014_x86_64.whl",
+                     "python/cactus_needle-3.0.10-py3-none-manylinux2014_x86_64.whl"]
+    # A fallback is cached under the version it really is, so the directory named
+    # after the missing one never keeps serving it once 3.0.11 is uploaded.
+    assert out == str(dest / "3.0.10" / "libneedle.so")
+    assert (dest / "3.0.10" / "libneedle.so").read_bytes() == b"engine"
+    assert not (dest / "libneedle.so").exists()
+
+
+def test_fetch_library_keeps_the_cache_layout_when_the_pin_is_published(tmp_path, monkeypatch):
+    from needle.agent import fetch
+
+    wheel = _engine_wheel(tmp_path)
+    monkeypatch.setattr(fetch, "_register_download", lambda generation: None)
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **kwargs: wheel)
+    monkeypatch.setattr("huggingface_hub.list_repo_files",
+                        lambda repo: pytest.fail("no listing needed when the pin resolves"))
+
+    dest = tmp_path / "cache" / "v3" / "3.0.11"
+    out = fetch.fetch_library("3.0.11", dest, tag="manylinux2014_x86_64", generation=3)
+    assert out == str(dest / "libneedle.so")
+
+
+def test_fetch_library_reraises_when_no_engine_serves_the_platform(tmp_path, monkeypatch):
+    from huggingface_hub.errors import EntryNotFoundError
+    from needle.agent import fetch
+
+    def fake_download(**kwargs):
+        raise EntryNotFoundError("404")
+
+    monkeypatch.setattr(fetch, "_register_download", lambda generation: None)
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_download)
+    monkeypatch.setattr("huggingface_hub.list_repo_files", lambda repo: [])
+
+    with pytest.raises(EntryNotFoundError):
+        fetch.fetch_library("3.0.1", tmp_path / "cache", tag="macosx_11_0_arm64", generation=3)
+
+
+def test_pinned_engine_versions_are_published():
+    """Every pinned engine needs a wheel for this platform on the Hub.
+
+    ``ENGINE_VERSIONS`` and the Hub uploads land separately, so a bump can name
+    an engine that was never uploaded.  That 404s every fresh install, which is
+    what #142 and #146 report.  Set ``NEEDLE_SKIP_HUB_CHECK=1`` to opt out.
+    """
+    import os
+
+    from needle.agent import fetch
+
+    if os.environ.get("NEEDLE_SKIP_HUB_CHECK"):
+        pytest.skip("NEEDLE_SKIP_HUB_CHECK is set")
+    tag = fetch._platform_tag()
+    for generation, version in fetch.ENGINE_VERSIONS.items():
+        repo = fetch.engine_repo(generation)
+        try:
+            published = fetch.published_engine_versions(repo, tag)
+        except Exception as exc:  # offline, rate limited, repo renamed
+            pytest.skip(f"{repo} is not reachable: {exc}")
+        assert version in published, (
+            f"ENGINE_VERSIONS[{generation}] pins {version} but {repo} publishes "
+            f"{published or 'no engine'} for {tag}")
+
+
 def test_engine_gate_finds_the_cache_the_runtime_loads_from(tmp_path, monkeypatch):
     import needle
     from needle.agent import fetch
