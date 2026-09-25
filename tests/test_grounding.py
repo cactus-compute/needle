@@ -167,6 +167,21 @@ def test_system_facts_license_relative_dates(stub):
     assert "validation" not in response
 
 
+def test_a_key_ending_in_date_does_not_suppress_the_date_fact(stub):
+    import needle
+
+    tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+    stub.envelopes = [_call(tomorrow.isoformat())]
+    agent = needle.Needle(tools=[Invoice], system="user: Sam; last update: never")
+    response = agent.complete("invoice Acme tomorrow for the March 2019 order")
+
+    assert "validation" not in response
+    assert agent._system_text.startswith("date: ")
+    assert needle._with_date_fact("candidate: Sam").startswith("date: ")
+    for system in ("date: 2026-07-21 Tue 14:30", "locale: en-US; date: Tue"):
+        assert needle._with_date_fact(system) == system
+
+
 def test_years_carry_across_turns_until_reset(stub):
     import needle
 

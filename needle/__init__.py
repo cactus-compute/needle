@@ -443,11 +443,14 @@ def _source_years(text):
 
 
 _ISO_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}")
+# The `date:` key itself, not the tail of another key such as `update:` or
+# `candidate:`, which would otherwise leave the engine without a date.
+_DATE_KEY = re.compile(r"(?<![A-Za-z])date:")
 
 
 def _with_date_fact(system: str) -> str:
     """Prefix the local date fact unless the caller already supplied one."""
-    if "date:" in system or _ISO_STAMP.search(system):
+    if _DATE_KEY.search(system) or _ISO_STAMP.search(system):
         return system
     now = datetime.datetime.now()
     fact = now.strftime("date: %Y-%m-%d %a %H:%M")
