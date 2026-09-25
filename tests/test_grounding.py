@@ -143,6 +143,19 @@ def test_extract_accepts_a_date_written_with_slashes(stub):
     assert invoice.due_date == datetime.date(2024, 12, 31)
 
 
+def test_extract_licenses_a_relative_date_against_its_date_fact(stub):
+    import needle
+
+    tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+    text = "Invoice from Acme for the March 2019 order, due tomorrow"
+    stub.envelopes = [_call(tomorrow.isoformat())]
+    assert "validation" not in needle.Needle(tools=[Invoice]).complete(text)
+
+    invoice = needle.extract(text, Invoice)
+
+    assert invoice.due_date == tomorrow
+
+
 def test_run_refuses_ungrounded_calls_unless_strict_is_off(stub):
     import needle
 

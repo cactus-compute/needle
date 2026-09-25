@@ -627,6 +627,9 @@ def extract(text: str, schema: type | dict, system: str | None = None,
     _track("extract", {"n_tools": 1, "tuned": bool(selected),
                        "generation": generation})
     agent = Needle(tools=[schema], system=system, weights=selected, generation=generation)
+    # Validate against the facts the engine saw, including the automatic
+    # `date:` fact, so a relative date is licensed exactly as in complete().
+    facts = agent._system_text
     try:
         response = agent._complete(text, max_new_tokens)
     finally:
@@ -636,5 +639,5 @@ def extract(text: str, schema: type | dict, system: str | None = None,
         return None
     arguments = calls[0].get("arguments") or {}
     if strict:
-        _validate_extraction(text, schema, arguments, response, system)
+        _validate_extraction(text, schema, arguments, response, facts)
     return schema(**arguments) if _is_pydantic_model(schema) else arguments
