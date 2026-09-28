@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import shutil
+import socket
 import ssl
 import time
 import urllib.error
@@ -122,10 +124,35 @@ class Platform:
         return link
 
     def _fetch_to(self, link, dest):
+        """Download `link` to `dest`. The bytes land in a `.part` file that
+        replaces `dest` only once complete, so a download that fails keeps the
+        file it would have replaced, and the failure is a PlatformError like
+        every other call's."""
         os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+        partial = dest + ".part"
         request = urllib.request.Request(link, method="GET")
-        with self._follower.open(request, timeout=self.timeout) as response, open(dest, "wb") as out:
-            shutil.copyfileobj(response, out)
+        name = os.path.basename(dest)
+        try:
+            with self._follower.open(request, timeout=self.timeout) as response, open(partial, "wb") as out:
+                shutil.copyfileobj(response, out)
+                # http.client's read(n) returns what arrived when the server
+                # hangs up early, without the IncompleteRead a plain read()
+                # raises, so a cut download looks complete unless its length
+                # is checked against the one the server announced.
+                expected = response.headers.get("Content-Length")
+                if expected is not None and out.tell() != int(expected):
+                    raise PlatformError("network_error", f"downloading {name} ended after "
+                                        f"{out.tell()} of {int(expected)} bytes")
+            os.replace(partial, dest)
+        except urllib.error.HTTPError as error:
+            raise PlatformError(f"http_{error.code}", f"downloading {name} failed with HTTP {error.code}",
+                                error.code) from None
+        except (urllib.error.URLError, http.client.HTTPException, ConnectionError, socket.timeout) as error:
+            raise PlatformError("network_error", f"downloading {name} failed: "
+                                f"{getattr(error, 'reason', None) or error!r}") from None
+        finally:
+            if os.path.exists(partial):
+                os.remove(partial)
         return dest
 
     def plans(self):
