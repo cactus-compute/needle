@@ -219,6 +219,29 @@ def test_glibc_detected_from_maps(monkeypatch, tmp_path):
     assert fetch._is_musl() is False
 
 
+def test_platform_tag_names_only_the_architectures_the_engine_is_built_for(monkeypatch):
+    import platform
+    from needle.agent import fetch
+
+    monkeypatch.setattr(fetch, "_is_musl", lambda: False)
+    for system, machine, tag in (("linux", "x86_64", "manylinux2014_x86_64"),
+                                 ("linux", "aarch64", "manylinux2014_aarch64"),
+                                 ("win32", "AMD64", "win_amd64"),
+                                 ("win32", "ARM64", "win_arm64"),
+                                 ("darwin", "arm64", "macosx_11_0_arm64")):
+        monkeypatch.setattr(sys, "platform", system)
+        monkeypatch.setattr(platform, "machine", lambda machine=machine: machine)
+        assert fetch._platform_tag() == tag
+
+    # Every other machine was handed the x86_64 build, which cannot load there.
+    for system, machine in (("linux", "armv7l"), ("linux", "riscv64"), ("linux", "i686"),
+                            ("win32", "x86")):
+        monkeypatch.setattr(sys, "platform", system)
+        monkeypatch.setattr(platform, "machine", lambda machine=machine: machine)
+        with pytest.raises(RuntimeError, match=f"on {machine};.*NEEDLE3_LIB_PATH"):
+            fetch._platform_tag()
+
+
 def test_other_libc_tag_swaps_families(monkeypatch):
     from needle.agent import fetch
 
