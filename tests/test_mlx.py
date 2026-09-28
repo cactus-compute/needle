@@ -4,7 +4,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 jax = pytest.importorskip("jax")
 
-pytestmark = pytest.mark.slow
+pytestmark = [pytest.mark.slow, pytest.mark.usefixtures("mlx_cpu")]
 
 
 def _jax_logits(model, params, tokens, **kw):
@@ -76,4 +76,16 @@ def test_published_checkpoint_matches_jax(needle3_checkpoint):
     ref = np.asarray(_jax_logits(SimpleAttentionNetwork(config), params, tokens))
     got = np.asarray(_mlx_logits(config, params, tokens))
     np.testing.assert_allclose(got, ref, atol=5e-4)
+    assert (got.argmax(-1) == ref.argmax(-1)).all()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="no Metal device")
+def test_metal_forward_agrees_with_jax(perturbed_model):
+    """Metal is not bit-for-bit float32 on every Apple GPU, so the default device gets
+    argmax agreement and a 5e-3 band instead of the CPU tolerance."""
+    model, config, params, tokens = perturbed_model()
+    ref = np.asarray(_jax_logits(model, params, tokens))
+    with mx.stream(mx.gpu):
+        got = np.asarray(_mlx_logits(config, params, tokens))
+    np.testing.assert_allclose(got, ref, atol=5e-3)
     assert (got.argmax(-1) == ref.argmax(-1)).all()

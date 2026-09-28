@@ -137,6 +137,15 @@ def needle3_checkpoint():
 
 
 @pytest.fixture
+def mlx_cpu():
+    """Exact parity with JAX holds on the MLX CPU device; Metal is checked on its own."""
+    import mlx.core as mx
+
+    with mx.stream(mx.cpu):
+        yield
+
+
+@pytest.fixture
 def perturbed_model():
     return _perturbed_model
 

@@ -4,7 +4,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 jax = pytest.importorskip("jax")
 
-pytestmark = pytest.mark.slow
+pytestmark = [pytest.mark.slow, pytest.mark.usefixtures("mlx_cpu")]
 
 
 def _jax_logits(model, params, tokens):
