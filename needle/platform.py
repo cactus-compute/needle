@@ -346,7 +346,7 @@ def _cmd_finetune(client, args):
 
 def _cmd_generate(client, args):
     _print_usage(client)
-    with open(args.tools) as handle:
+    with open(args.tools, encoding="utf-8") as handle:
         tools = json.load(handle)
     job = client.generate(tools, args.examples, description=args.description,
                           messages=args.message, suffix=args.suffix)

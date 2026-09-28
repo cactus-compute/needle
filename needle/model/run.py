@@ -114,7 +114,7 @@ def main(args):
 
     prompt = args.query or "The most surprising thing about"
     if getattr(args, "tools", None):
-        with open(args.tools) as handle:
+        with open(args.tools, encoding="utf-8") as handle:
             prompt = build_prompt(prompt, json.load(handle))
     print(f"prompt: {prompt!r}")
     generate(
