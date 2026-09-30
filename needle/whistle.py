@@ -71,12 +71,12 @@ def _read_wav(path):
     mono = [(sum(frame) - offset * channels) / scale for frame in zip(*(values[c::channels] for c in range(channels)))]
     if rate == SAMPLE_RATE or not mono:
         return mono
-    step, last = rate / SAMPLE_RATE, len(mono) - 1
-    out = []
-    for i in range(int(len(mono) / step)):
-        at = int(i * step)
-        out.append(mono[at] + (mono[min(at + 1, last)] - mono[at]) * (i * step - at))
-    return out
+    try:
+        import numpy
+        import soxr
+    except ImportError:
+        raise RuntimeError(f"resampling {rate} Hz audio to {SAMPLE_RATE} Hz needs soxr: pip install cactus-needle[whistle]") from None
+    return soxr.resample(numpy.asarray(mono, numpy.float32), rate, SAMPLE_RATE, quality="HQ")
 
 
 def _samples(audio):
@@ -87,6 +87,8 @@ def _samples(audio):
         data.frombytes(audio)
     elif isinstance(audio, array.array) and audio.typecode == "f":
         data = audio
+    elif hasattr(audio, "tobytes") and getattr(audio, "dtype", None) is not None:
+        data.frombytes(audio.astype("float32", copy=False).tobytes())
     else:
         data.extend(audio)
     return (ctypes.c_float * len(data)).from_buffer(data) if len(data) else (ctypes.c_float * 1)(), len(data)

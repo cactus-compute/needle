@@ -25,6 +25,7 @@ metal = [
     "jaxlib==0.4.38",
     "jax-metal"
 ]
+whistle = ["numpy", "soxr"]
 test = ["pytest", "pydantic"]
 
 [project.scripts]

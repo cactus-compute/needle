@@ -43,6 +43,8 @@ def _write_wav(path, samples, rate, channels=1, width=2):
 def test_wav_files_become_16k_mono_floats(tmp_path, rate, channels, width):
     from needle.whistle import _read_wav
 
+    if rate != 16000:
+        pytest.importorskip("soxr")
     path = tmp_path / "tone.wav"
     _write_wav(path, _tone(0.5, rate), rate, channels, width)
     samples = _read_wav(str(path))
