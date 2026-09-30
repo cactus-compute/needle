@@ -4,18 +4,23 @@ import sysconfig
 import sys
 import zipfile
 
+WHISTLE = "whistle"
+
 ENGINE_REPOS = {
     2: "Cactus-Compute/needle2",
     3: "Cactus-Compute/needle3",
+    WHISTLE: "Cactus-Compute/whistle",
 }
 ENGINE_VERSIONS = {
     2: "2.0.4",
     3: "3.0.3",
+    WHISTLE: "1.0.0",
 }
 
 BASE_WEIGHTS = {
     2: "needle2.cact",
     3: "needle3.cact",
+    WHISTLE: "whistle.cact",
 }
 CHECKPOINT_PREFIX = "checkpoints"
 
@@ -48,6 +53,20 @@ def _lib_name():
     if sys.platform == "win32":
         return "libneedle.dll"
     return "libneedle.so"
+
+
+def _engine(generation):
+    """The key of an engine in the tables above: a Needle generation, or WHISTLE."""
+    return generation if generation == WHISTLE else int(generation)
+
+
+def lib_name(generation=2, tag=None):
+    name = _lib_name_for(tag) if tag else _lib_name()
+    return name.replace("needle", WHISTLE) if generation == WHISTLE else name
+
+
+def lib_path_env(generation=2):
+    return "NEEDLE_WHISTLE_LIB_PATH" if generation == WHISTLE else f"NEEDLE{generation}_LIB_PATH"
 
 
 def _is_musl():
@@ -100,8 +119,9 @@ def other_libc_tag():
     return None
 
 
-def engine_wheel(version, tag):
-    return "python/cactus_needle-{}-py3-none-{}.whl".format(version, tag)
+def engine_wheel(version, tag, generation=2):
+    name = WHISTLE if generation == WHISTLE else "needle"
+    return "python/cactus_{}-{}-py3-none-{}.whl".format(name, version, tag)
 
 
 def unpublished_engine_wheels():
@@ -114,11 +134,11 @@ def unpublished_engine_wheels():
     from huggingface_hub import list_repo_files
 
     missing = []
-    for generation in sorted(ENGINE_VERSIONS):
+    for generation in ENGINE_VERSIONS:
         repo = ENGINE_REPOS[generation]
         present = set(list_repo_files(repo))
         for tag in WHEEL_TAGS:
-            wheel = engine_wheel(ENGINE_VERSIONS[generation], tag)
+            wheel = engine_wheel(ENGINE_VERSIONS[generation], tag, generation)
             if wheel not in present:
                 missing.append(repo + "/" + wheel)
     return missing
@@ -126,14 +146,14 @@ def unpublished_engine_wheels():
 
 def engine_repo(generation=2):
     try:
-        return ENGINE_REPOS[int(generation)]
+        return ENGINE_REPOS[_engine(generation)]
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"unsupported Needle generation: {generation}") from exc
 
 
 def engine_version(generation=2):
     try:
-        return ENGINE_VERSIONS[int(generation)]
+        return ENGINE_VERSIONS[_engine(generation)]
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"unsupported Needle generation: {generation}") from exc
 
@@ -165,7 +185,7 @@ def download_platform(name, out_dir, generation=2, dest=None):
         cached = hf_hub_download(repo_id=repo, filename=f, repo_type="model")
         target = os.path.join(dest, os.path.basename(f))
         shutil.copyfile(cached, target)
-        if os.path.basename(target) in ("needle", "needle.exe"):
+        if os.path.basename(target) in ("needle", "needle.exe", "whistle", "whistle.exe"):
             os.chmod(target, os.stat(target).st_mode | stat.S_IXUSR
                      | stat.S_IXGRP | stat.S_IXOTH)
         out.append(target)
@@ -174,14 +194,15 @@ def download_platform(name, out_dir, generation=2, dest=None):
 
 def base_weights(generation=2):
     try:
-        return BASE_WEIGHTS[int(generation)]
+        return BASE_WEIGHTS[_engine(generation)]
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"unsupported Needle generation: {generation}") from exc
 
 
 def cache_dir(generation=2):
+    folder = WHISTLE if generation == WHISTLE else f"v{int(generation)}"
     return os.path.join(os.path.expanduser("~"), ".cache", "cactus-needle",
-                        f"v{int(generation)}", engine_version(generation))
+                        folder, engine_version(generation))
 
 
 def fetch_weights(generation=2, dest_dir=None, force=False):
@@ -240,10 +261,10 @@ def fetch_library(version=None, dest_dir=None, tag=None, generation=2):
     tag = tag or _platform_tag()
     repo = engine_repo(generation)
     _register_download(generation)
-    path = hf_hub_download(repo_id=repo, filename=engine_wheel(version, tag), repo_type="model")
-    lib = _lib_name_for(tag)
+    path = hf_hub_download(repo_id=repo, filename=engine_wheel(version, tag, generation), repo_type="model")
+    lib = lib_name(generation, tag)
     stem, suffix = os.path.splitext(lib)
-    member = f"{stem}{generation}{suffix}" if int(generation) >= 3 else lib
+    member = lib if generation == WHISTLE or int(generation) < 3 else f"{stem}{generation}{suffix}"
     os.makedirs(dest_dir, exist_ok=True)
     with zipfile.ZipFile(path) as archive:
         data = archive.read("needle/" + member)

@@ -6,41 +6,67 @@ import wave
 
 import pytest
 
-
-def _whistle_available():
-    from needle import whistle
-
-    engine = os.environ.get("NEEDLE_WHISTLE_LIB_PATH") or os.path.join(whistle._cache_dir(), whistle._lib_name())
-    weights = os.environ.get("NEEDLE_WHISTLE_WEIGHTS") or os.path.join(whistle._cache_dir(), whistle.WHISTLE_WEIGHTS)
-    return os.path.exists(engine) and os.path.exists(weights)
+from conftest import _engine_available
 
 
-requires_whistle = pytest.mark.skipif(not _whistle_available(), reason="no Whistle engine or whistle.cact on this machine (fetched on first real use)")
+def _whistle_weights():
+    from needle.agent import fetch
+
+    return os.environ.get("NEEDLE_WHISTLE_WEIGHTS") or os.path.join(fetch.cache_dir(fetch.WHISTLE), fetch.base_weights(fetch.WHISTLE))
+
+
+requires_whistle = pytest.mark.skipif(not (_engine_available("whistle") and os.path.exists(_whistle_weights())),
+                                      reason="Whistle engine or whistle.cact not installed (auto-fetched from HF on first real use)")
 
 
 def test_engine_and_weights_resolve_like_needle(tmp_path, monkeypatch):
     import zipfile
+    import needle
     from needle import whistle
+    from needle.agent import fetch
 
     monkeypatch.setattr(os.path, "expanduser", lambda path: str(tmp_path))
-    monkeypatch.setattr(whistle, "__file__", str(tmp_path / "package" / "whistle.py"))
+    monkeypatch.setattr(needle, "__file__", str(tmp_path / "package" / "__init__.py"))
+    monkeypatch.setattr(fetch, "_register_download", lambda generation: None)
     monkeypatch.delenv("NEEDLE_WHISTLE_WEIGHTS", raising=False)
     monkeypatch.setenv("NEEDLE_WHISTLE_LIB_PATH", "/opt/libwhistle.so")
-    assert whistle._library_path() == "/opt/libwhistle.so"
+    assert needle._library_path(fetch.WHISTLE) == "/opt/libwhistle.so"
     monkeypatch.delenv("NEEDLE_WHISTLE_LIB_PATH")
 
+    lib = fetch.lib_name(fetch.WHISTLE)
     wheel, weights, fetched = tmp_path / "engine.whl", tmp_path / "published.cact", []
     with zipfile.ZipFile(wheel, "w") as archive:
-        archive.writestr("needle/" + whistle._lib_name(), b"engine")
+        archive.writestr("needle/" + lib, b"engine")
     weights.write_bytes(b"weights")
     monkeypatch.setattr("huggingface_hub.hf_hub_download",
                         lambda **kwargs: fetched.append((kwargs["repo_id"], kwargs["filename"])) or str(weights if kwargs["filename"].endswith(".cact") else wheel))
-    cache = tmp_path / ".cache" / "cactus-needle" / "whistle" / whistle.ENGINE_VERSION
-    assert whistle._library_path() == str(cache / whistle._lib_name()) and (cache / whistle._lib_name()).read_bytes() == b"engine"
+    cache = tmp_path / ".cache" / "cactus-needle" / "whistle" / fetch.ENGINE_VERSIONS[fetch.WHISTLE]
+    assert lib.startswith("libwhistle.") and needle._library_path(fetch.WHISTLE) == str(cache / lib) and (cache / lib).read_bytes() == b"engine"
     assert whistle._weights_path() == str(cache / "whistle.cact") and (cache / "whistle.cact").read_bytes() == b"weights"
-    assert [repo for repo, _ in fetched] == ["Cactus-Compute/whistle"] * 2
-    assert fetched[0][1].startswith(f"python/cactus_whistle-{whistle.ENGINE_VERSION}-py3-none-") and fetched[1][1] == "whistle.cact"
-    assert whistle._library_path() and whistle._weights_path() and len(fetched) == 2
+    assert fetched == [("Cactus-Compute/whistle", f"python/cactus_whistle-{fetch.ENGINE_VERSIONS[fetch.WHISTLE]}-py3-none-{fetch._platform_tag()}.whl"),
+                       ("Cactus-Compute/whistle", "whistle.cact")]
+    assert needle._library_path(fetch.WHISTLE) and whistle._weights_path() and len(fetched) == 2
+    monkeypatch.setenv("NEEDLE_WHISTLE_WEIGHTS", "/opt/whistle.cact")
+    assert whistle._weights_path() == "/opt/whistle.cact"
+
+
+def test_cli_fetches_the_whistle_engine_and_weights(tmp_path, monkeypatch, capsys):
+    import sys
+    import needle._telemetry
+    import needle.cli
+    from needle.agent import fetch
+
+    calls = []
+    monkeypatch.setattr(needle._telemetry, "track", lambda *a, **k: None)
+    monkeypatch.setattr(fetch, "fetch_library", lambda version, dest, tag=None, generation=2: calls.append((version, tag, generation)) or os.path.join(dest, "libwhistle.so"))
+    monkeypatch.setattr(fetch, "fetch_weights", lambda generation, dest: calls.append((generation, dest)) or __file__)
+    monkeypatch.setattr(sys, "argv", ["needle", "whistle", "fetch", "--out", str(tmp_path), "--platform-tag", "manylinux2014_aarch64"])
+    needle.cli.main()
+    monkeypatch.setattr(sys, "argv", ["needle", "whistle", "download", "whistle", "--out", str(tmp_path)])
+    needle.cli.main()
+    assert calls == [(fetch.ENGINE_VERSIONS[fetch.WHISTLE], "manylinux2014_aarch64", fetch.WHISTLE), (fetch.WHISTLE, str(tmp_path))]
+    out = capsys.readouterr().out
+    assert "NEEDLE_WHISTLE_LIB_PATH" in out and "needle.Whistle(weights=" in out
 
 
 def _tone(seconds, rate=16000):

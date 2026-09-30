@@ -14,7 +14,7 @@ HELP = """usage: needle <command> [options]
   download       needle3 | needle3.safetensors | <platform> | model-<id> | <org>/<repo>[/<file>.cact]
   fetch          fetch the engine library for this platform
   playground     serve the browser playground
-  whistle        speech to text: playground | compare
+  whistle        speech to text: playground | compare | fetch | download
 
 needle <command> --help for the options of one command.
 Check the readme for the rest."""
@@ -40,6 +40,8 @@ def _download_target(spec):
     name = spec[:-5] if spec.endswith(".cact") else spec
     if name in ("needle2", "needle3"):
         return "base", int(name[-1])
+    if name == fetch.WHISTLE:
+        return "base", name
     if spec.endswith(".safetensors"):
         return "checkpoint", spec
     raise SystemExit(
@@ -282,6 +284,14 @@ def main():
                    help="A WAV file to run through every model once (default: press Enter to speak)")
     v.add_argument("--weights", type=str, default=None,
                    help="whistle.cact to load (default: the published weights)")
+    v = verbs.add_parser("fetch")
+    v.add_argument("--out", type=str, default=None,
+                   help="Directory to place the engine (default: the cache)")
+    v.add_argument("--platform-tag", type=str, default=None,
+                   help="Fetch the build for another device, e.g. manylinux2014_aarch64")
+    v = verbs.add_parser("download")
+    v.add_argument("spec", type=str, help="whistle (the weights) or a platform folder (e.g. macos-arm64)")
+    v.add_argument("--out", type=str, default=".", help="Directory to place the files")
 
     args = parser.parse_args()
 
@@ -292,6 +302,9 @@ def main():
     from ._telemetry import track
     track("cli:" + args.command,
           {"generation": getattr(args, "generation", 2)})
+
+    if args.command == "whistle" and args.verb in ("fetch", "download"):
+        args.command, args.generation = args.verb, "whistle"
 
     if args.command == "run":
         from .model.run import main as run_main
@@ -313,20 +326,24 @@ def main():
         if kind == "platform":
             paths = fetch.download_platform(target, args.out,
                                             generation=args.generation)
-            if args.generation >= 3:
+            if args.generation != 2:
                 paths.append(fetch.fetch_weights(args.generation, os.path.join(args.out, target)))
             for path in paths:
                 print(f"  {'file':<9} {path}  {os.path.getsize(path) / 1e6:.2f} MB")
             runner = next((p for p in paths
-                           if os.path.basename(p) in ("needle", "needle.exe")), None)
+                           if os.path.basename(p) in ("needle", "needle.exe", "whistle", "whistle.exe")), None)
             if runner:
-                weights = f" --model {fetch.base_weights(args.generation)}" if args.generation >= 3 else ""
-                print(f"  {'next':<9} {runner}{weights} --tools tools.json --serve")
+                weights = f" --model {fetch.base_weights(args.generation)}" if args.generation != 2 else ""
+                use = "--audio clip.wav" if args.generation == fetch.WHISTLE else "--tools tools.json --serve"
+                print(f"  {'next':<9} {runner}{weights} {use}")
         elif kind == "base":
             os.makedirs(args.out, exist_ok=True)
             path = fetch.fetch_weights(target, args.out)
             print(f"  {'weights':<9} {path}  {os.path.getsize(path) / 1e6:.2f} MB")
-            print(f"  {'next':<9} needle.Needle(weights={path!r}, tools=[...])")
+            if target == fetch.WHISTLE:
+                print(f"  {'next':<9} needle.Whistle(weights={path!r})")
+            else:
+                print(f"  {'next':<9} needle.Needle(weights={path!r}, tools=[...])")
         elif kind == "hosted":
             from .platform import Platform
             for path in Platform().download(target, args.out, depth=args.depth):
@@ -357,14 +374,13 @@ def main():
         from .agent import fetch
         generation = args.generation
         version = fetch.engine_version(generation)
-        dest = args.out or os.path.join(os.path.expanduser("~"), ".cache",
-                                        "cactus-needle", f"v{generation}", version)
+        dest = args.out or fetch.cache_dir(generation)
         os.makedirs(dest, exist_ok=True)
         path = fetch.fetch_library(version, dest, tag=args.platform_tag,
                                    generation=generation)
         print(f"  {'engine':<9} {path}")
-        print(f"  {'deploy':<9} copy to ~/.cache/cactus-needle/v{generation}/{version}/ "
-              f"on the device, or point NEEDLE{generation}_LIB_PATH at the file")
+        print(f"  {'deploy':<9} copy to {fetch.cache_dir(generation)}/ "
+              f"on the device, or point {fetch.lib_path_env(generation)} at the file")
     elif args.command == "platform":
         from .platform import main as platform_main
         platform_main(args)
@@ -377,5 +393,5 @@ def main():
         elif args.verb == "compare":
             from .playground.whistle_compare import main as whistle_main
         else:
-            raise SystemExit("needle whistle playground | compare")
+            raise SystemExit("needle whistle playground | compare | fetch | download")
         whistle_main(args)

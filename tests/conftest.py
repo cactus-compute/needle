@@ -13,24 +13,22 @@ def _engine_available(generation=3):
         import needle
         from needle.agent import fetch
 
-        override = os.environ.get(f"NEEDLE{generation}_LIB_PATH")
+        override = os.environ.get(fetch.lib_path_env(generation))
         if generation == 2 and not override:
             override = os.environ.get("NEEDLE_LIB_PATH")
         if override:
             return os.path.exists(override)
 
         here = os.path.dirname(needle.__file__)
-        name = fetch._lib_name()
+        name = fetch.lib_name(generation)
         stem, suffix = os.path.splitext(name)
-        local_names = [f"{stem}{generation}{suffix}"]
+        local_names = [name if generation == fetch.WHISTLE else f"{stem}{generation}{suffix}"]
         if generation == 2:
             local_names.append(name)
         if any(os.path.exists(os.path.join(here, local)) for local in local_names):
             return True
 
-        cache = os.path.join(os.path.expanduser("~"), ".cache", "cactus-needle",
-                             f"v{generation}", fetch.engine_version(generation), name)
-        return os.path.exists(cache)
+        return os.path.exists(os.path.join(fetch.cache_dir(generation), name))
     except Exception:
         return False
 

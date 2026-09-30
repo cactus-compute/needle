@@ -6,11 +6,7 @@ import json
 import os
 import sys
 import wave
-import zipfile
 
-WHISTLE_REPO = "Cactus-Compute/whistle"
-WHISTLE_WEIGHTS = "whistle.cact"
-ENGINE_VERSION = "1.0.0"
 SAMPLE_RATE = 16000
 LANGUAGES = ("en", "de", "fr", "es", "it", "nl", "pl")
 
@@ -18,72 +14,20 @@ _handle = None
 _loaded = None
 
 
-def _cache_dir():
-    return os.path.join(os.path.expanduser("~"), ".cache", "cactus-needle", "whistle", ENGINE_VERSION)
-
-
-def _lib_name(tag=None):
-    from .agent import fetch
-
-    return (fetch._lib_name_for(tag) if tag else fetch._lib_name()).replace("needle", "whistle")
-
-
-def _fetch(filename):
-    from huggingface_hub import hf_hub_download
-
-    os.makedirs(_cache_dir(), exist_ok=True)
-    return hf_hub_download(repo_id=WHISTLE_REPO, filename=filename, repo_type="model")
-
-
 def _weights_path():
-    override = os.environ.get("NEEDLE_WHISTLE_WEIGHTS")
-    if override:
-        return override
-    local = os.path.join(_cache_dir(), WHISTLE_WEIGHTS)
-    if not os.path.exists(local):
-        import shutil
-
-        shutil.copyfile(_fetch(WHISTLE_WEIGHTS), local)
-    return local
-
-
-def _fetch_library(tag=None):
+    from . import _base_weights_path
     from .agent import fetch
 
-    wheel = _fetch(f"python/cactus_whistle-{ENGINE_VERSION}-py3-none-{tag or fetch._platform_tag()}.whl")
-    out = os.path.join(_cache_dir(), _lib_name(tag))
-    with zipfile.ZipFile(wheel) as archive, open(out, "wb") as handle:
-        handle.write(archive.read("needle/" + _lib_name(tag)))
-    return out
-
-
-def _library_path():
-    override = os.environ.get("NEEDLE_WHISTLE_LIB_PATH")
-    if override:
-        return override
-    for folder in (os.path.dirname(os.path.abspath(__file__)), _cache_dir()):
-        local = os.path.join(folder, _lib_name())
-        if os.path.exists(local):
-            return local
-    return _fetch_library()
-
-
-def _load_cdll():
-    from .agent import fetch
-
-    try:
-        return ctypes.CDLL(_library_path())
-    except OSError:
-        other = fetch.other_libc_tag()
-        if other is None:
-            raise
-        return ctypes.CDLL(_fetch_library(other))
+    return os.environ.get("NEEDLE_WHISTLE_WEIGHTS") or _base_weights_path(fetch.WHISTLE)
 
 
 def _lib():
     global _handle
     if _handle is None:
-        lib = _load_cdll()
+        from . import _load_cdll
+        from .agent import fetch
+
+        lib = _load_cdll(fetch.WHISTLE)
         samples = ctypes.POINTER(ctypes.c_float)
         lib.whistle_load.argtypes = [ctypes.c_char_p, ctypes.c_uint64]
         lib.whistle_load.restype = ctypes.c_int

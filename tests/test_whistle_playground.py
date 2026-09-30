@@ -142,5 +142,5 @@ def test_cli_routes_the_whistle_commands(monkeypatch):
     assert (seen[0][1].audio, seen[0][1].lang, seen[0][1].keywords, seen[0][1].word_timestamps) == ("clip.wav", "de", "Siobhan, Krzysztof", True)
     assert (seen[1][1].audio, seen[1][1].weights) == (None, "w.cact")
     monkeypatch.setattr(sys, "argv", ["needle", "whistle"])
-    with pytest.raises(SystemExit, match="needle whistle playground \\| compare"):
+    with pytest.raises(SystemExit, match="needle whistle playground \\| compare \\| fetch \\| download"):
         needle.cli.main()

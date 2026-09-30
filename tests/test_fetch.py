@@ -109,9 +109,8 @@ def test_unpublished_engine_wheels_lists_every_missing_tag(monkeypatch):
     from needle.agent import fetch
 
     published = {
-        repo: {fetch.engine_wheel(version, tag) for tag in fetch.WHEEL_TAGS}
-        for repo, version in ((fetch.ENGINE_REPOS[2], fetch.ENGINE_VERSIONS[2]),
-                              (fetch.ENGINE_REPOS[3], fetch.ENGINE_VERSIONS[3]))
+        fetch.ENGINE_REPOS[generation]: {fetch.engine_wheel(version, tag, generation) for tag in fetch.WHEEL_TAGS}
+        for generation, version in fetch.ENGINE_VERSIONS.items()
     }
     monkeypatch.setattr("huggingface_hub.list_repo_files",
                         lambda repo: sorted(published[repo]) + ["needle3.cact"])
@@ -121,6 +120,12 @@ def test_unpublished_engine_wheels_lists_every_missing_tag(monkeypatch):
     dropped = fetch.engine_wheel(fetch.ENGINE_VERSIONS[3], "win_arm64")
     published[repo3].remove(dropped)
     assert fetch.unpublished_engine_wheels() == [repo3 + "/" + dropped]
+
+    whistle = fetch.ENGINE_REPOS[fetch.WHISTLE]
+    published[whistle].clear()
+    missing = fetch.unpublished_engine_wheels()
+    assert len(missing) == 1 + len(fetch.WHEEL_TAGS)
+    assert missing[-1] == f"{whistle}/python/cactus_whistle-{fetch.ENGINE_VERSIONS[fetch.WHISTLE]}-py3-none-win_arm64.whl"
 
 
 def test_release_gate_runs_before_the_publish_step():
