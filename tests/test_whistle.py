@@ -58,7 +58,10 @@ def test_samples_accept_lists_arrays_and_float32_bytes():
     from needle.whistle import _samples
 
     values = [0.0, 0.5, -0.25]
-    for audio in (values, array.array("f", values), struct.pack("<3f", *values), (v for v in values)):
+    inputs = [values, array.array("f", values), struct.pack("<3f", *values), (v for v in values)]
+    numpy = pytest.importorskip("numpy")
+    inputs.append(numpy.array(values, numpy.float64))
+    for audio in inputs:
         buffer, count = _samples(audio)
         assert count == 3 and list(buffer) == values
     assert _samples([])[1] == 0
@@ -101,9 +104,8 @@ def test_embed_and_the_30_second_limit():
         whistle.transcribe([0.0] * (30 * 16000 + 1))
 
 
+@requires_whistle
 def test_missing_weights_fail_clearly(tmp_path):
-    if not _whistle_available():
-        pytest.skip("no Needle engine with Whistle on this machine")
     from needle import Whistle
 
     broken = tmp_path / "broken.cact"
