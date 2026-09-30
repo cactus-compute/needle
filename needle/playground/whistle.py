@@ -20,7 +20,7 @@ CLEAR_ABOVE = "\x1b[1A\x1b[2K"
 def status(name, size, ttft, tokens, total):
     ttft = f"{ttft * 1000:.0f} ms" if ttft is not None else "-"
     tokens = f"{tokens:.0f} tok/s" if tokens is not None else "-"
-    return f"  {name:<18}{size / 1e6:.0f} MB  ttft {ttft}  decode {tokens}  total {total * 1000:.0f} ms"
+    return f"  {name:<18}{size / 1e6:>4.0f} MB  ttft {ttft:>6}  decode {tokens:>10}  total {total * 1000:>4.0f} ms"
 
 
 def record(path):

@@ -78,17 +78,17 @@ def test_compare_prints_one_line_per_model_with_dashes_for_missing_timing(capsys
     compare(models, [0.0] * 16000)
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 2
-    assert lines[0].startswith("  whistle           17 MB  ttft 13 ms  decode 1264 tok/s  total")
+    assert lines[0].startswith("  whistle             17 MB  ttft  13 ms  decode 1264 tok/s  total")
     assert lines[0].endswith("ms   hello there")
-    assert lines[1].startswith("  moonshine tiny v2 45 MB  ttft -  decode -  total")
+    assert lines[1].startswith("  moonshine tiny v2   45 MB  ttft      -  decode          -  total")
     assert lines[1].endswith("ms   (no speech)")
 
 
 def test_playground_and_compare_share_one_status_line():
     from needle.playground.whistle import status
 
-    assert status("whistle", 17e6, 0.0137, 1264.4, 0.048) == "  whistle           17 MB  ttft 14 ms  decode 1264 tok/s  total 48 ms"
-    assert status("moonshine tiny v2", 45e6, None, None, 0.21) == "  moonshine tiny v2 45 MB  ttft -  decode -  total 210 ms"
+    assert status("whistle", 17e6, 0.0137, 1264.4, 0.048) == "  whistle             17 MB  ttft  14 ms  decode 1264 tok/s  total   48 ms"
+    assert status("moonshine tiny v2", 145e6, None, None, 0.21) == "  moonshine tiny v2  145 MB  ttft      -  decode          -  total  210 ms"
 
 
 def test_playground_prints_text_words_and_timing(capsys):
@@ -101,7 +101,7 @@ def test_playground_prints_text_words_and_timing(capsys):
     assert whistle.calls == [("clip.wav", {"language": "en", "keywords": ["Siobhan"], "word_timestamps": True})]
     assert out[0] == "hello there"
     assert out[1].split() == ["0.10", "-", "0.40", "hello", "0.98"]
-    assert out[2].startswith("  whistle           ") and "ttft 13 ms  decode 900 tok/s  total" in out[2] and out[2].endswith("ms   en")
+    assert out[2].startswith("  whistle           ") and "ttft  13 ms  decode  900 tok/s  total" in out[2] and out[2].endswith("ms   en")
 
 
 def test_playground_reports_engine_errors_instead_of_raising(capsys):
