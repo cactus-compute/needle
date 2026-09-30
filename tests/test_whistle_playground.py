@@ -1,18 +1,6 @@
-import math
-import os
 import sys
-import wave
 
 import pytest
-
-
-def _write_wav(path, samples, rate, channels=1):
-    with wave.open(str(path), "wb") as out:
-        out.setnchannels(channels)
-        out.setsampwidth(2)
-        out.setframerate(rate)
-        for value in samples:
-            out.writeframes(int(value * 32767).to_bytes(2, "little", signed=True) * channels)
 
 
 class _Whistle:
@@ -27,51 +15,64 @@ class _Whistle:
         return self.result
 
 
-def test_read_mixes_channels_to_mono_floats(tmp_path):
+class _Microphone:
+    PortAudioError = OSError
+
+    def __init__(self, rate, seconds):
+        self.rate, self.seconds, self.opened = rate, seconds, None
+
+    def query_devices(self, kind):
+        return {"default_samplerate": float(self.rate)}
+
+    def InputStream(self, **options):
+        import numpy
+
+        microphone = self
+
+        class Stream:
+            def __enter__(self):
+                microphone.opened = options
+                options["callback"](numpy.full((microphone.rate * microphone.seconds, 1), 0.25, numpy.float32), None, None, None)
+
+            def __exit__(self, *_):
+                return False
+
+        return Stream()
+
+
+def test_record_resamples_the_microphone_to_16_khz_and_keeps_30_s(monkeypatch, capsys):
     numpy = pytest.importorskip("numpy")
-    from needle.playground.compare import read
-
-    tone = [0.5 * math.sin(2 * math.pi * 440 * i / 16000) for i in range(1600)]
-    path = tmp_path / "stereo.wav"
-    _write_wav(path, tone, 16000, channels=2)
-    audio = read(str(path))
-    assert audio.dtype == numpy.float32 and len(audio) == 1600
-    assert abs(float(audio.max()) - 0.5) < 0.01 and abs(float(audio.min()) + 0.5) < 0.01
-
-
-def test_read_resamples_to_16_khz(tmp_path):
-    pytest.importorskip("numpy")
     pytest.importorskip("soxr")
-    from needle.playground.compare import read
+    from needle.playground.whistle import record
 
-    path = tmp_path / "wide.wav"
-    _write_wav(path, [0.0] * 4800, 48000)
-    assert len(read(str(path))) == 1600
+    microphone = _Microphone(48000, 1)
+    monkeypatch.setitem(sys.modules, "sounddevice", microphone)
+    monkeypatch.setattr("builtins.input", lambda *_: "")
+    audio = record()
+    assert microphone.opened["samplerate"] == 48000 and microphone.opened["channels"] == 1
+    assert audio.dtype == numpy.float32 and len(audio) == 16000 and abs(float(audio[8000]) - 0.25) < 0.01
+    assert "recording, Enter to stop" in capsys.readouterr().out
+    monkeypatch.setitem(sys.modules, "sounddevice", _Microphone(16000, 31))
+    assert len(record()) == 30 * 16000
 
 
-def test_read_rejects_other_sample_widths(tmp_path):
-    pytest.importorskip("numpy")
-    from needle.playground.compare import read
+def test_record_says_what_is_missing(monkeypatch):
+    from needle.playground.whistle import record
 
-    path = tmp_path / "bytes.wav"
-    with wave.open(str(path), "wb") as out:
-        out.setnchannels(1)
-        out.setsampwidth(1)
-        out.setframerate(16000)
-        out.writeframes(bytes([128] * 160))
-    with pytest.raises(ValueError, match="16-bit"):
-        read(str(path))
+    monkeypatch.setitem(sys.modules, "sounddevice", None)
+    with pytest.raises(RuntimeError, match=r"cactus-needle\[whistle\]"):
+        record()
 
 
 def test_rate_counts_steps_after_the_first_mark():
-    from needle.playground.compare import rate
+    from needle.playground.whistle_compare import rate
 
     assert rate([1.0, 1.5, 2.0]) == 2.0
     assert rate([1.0]) == 0.0 and rate([]) == 0.0 and rate([2.0, 2.0]) == 0.0
 
 
 def test_compare_prints_one_line_per_model_with_dashes_for_missing_timing(capsys):
-    from needle.playground.compare import compare
+    from needle.playground.whistle_compare import compare
 
     models = [("whistle", 17e6, lambda audio: ("hello there", 0.013, 1264.0)),
               ("moonshine tiny v2", 45e6, lambda audio: ("", None, None))]
@@ -116,27 +117,30 @@ def test_playground_reports_engine_errors_instead_of_raising(capsys):
 
 
 def test_compare_needs_its_extra(monkeypatch):
-    from needle.playground import compare
+    from needle.playground import whistle_compare
 
     monkeypatch.setitem(sys.modules, "whisper", None)
-    with pytest.raises(SystemExit, match=r"cactus-needle\[compare\]"):
-        compare.main(type("Args", (), {"audio": None, "weights": None})())
+    with pytest.raises(SystemExit, match=r"cactus-needle\[whistle,whistle-compare\]"):
+        whistle_compare.main(type("Args", (), {"audio": None, "weights": None})())
 
 
-def test_cli_routes_whistle_and_compare(monkeypatch):
+def test_cli_routes_the_whistle_commands(monkeypatch):
     import needle._telemetry
     import needle.cli
-    import needle.playground.compare
     import needle.playground.whistle
+    import needle.playground.whistle_compare
 
     seen = []
     monkeypatch.setattr(needle._telemetry, "track", lambda *a, **k: None)
-    monkeypatch.setattr(needle.playground.whistle, "main", lambda args: seen.append(("whistle", args)))
-    monkeypatch.setattr(needle.playground.compare, "main", lambda args: seen.append(("compare", args)))
-    monkeypatch.setattr(sys, "argv", ["needle", "whistle", "clip.wav", "--lang", "de", "--keywords", "Siobhan, Krzysztof", "--word-timestamps"])
+    monkeypatch.setattr(needle.playground.whistle, "main", lambda args: seen.append(("playground", args)))
+    monkeypatch.setattr(needle.playground.whistle_compare, "main", lambda args: seen.append(("compare", args)))
+    monkeypatch.setattr(sys, "argv", ["needle", "whistle", "playground", "clip.wav", "--lang", "de", "--keywords", "Siobhan, Krzysztof", "--word-timestamps"])
     needle.cli.main()
-    monkeypatch.setattr(sys, "argv", ["needle", "compare", "--weights", "w.cact"])
+    monkeypatch.setattr(sys, "argv", ["needle", "whistle", "compare", "--weights", "w.cact"])
     needle.cli.main()
-    assert [s[0] for s in seen] == ["whistle", "compare"]
+    assert [s[0] for s in seen] == ["playground", "compare"]
     assert (seen[0][1].audio, seen[0][1].lang, seen[0][1].keywords, seen[0][1].word_timestamps) == ("clip.wav", "de", "Siobhan, Krzysztof", True)
     assert (seen[1][1].audio, seen[1][1].weights) == (None, "w.cact")
+    monkeypatch.setattr(sys, "argv", ["needle", "whistle"])
+    with pytest.raises(SystemExit, match="needle whistle playground \\| compare"):
+        needle.cli.main()

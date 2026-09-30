@@ -6,21 +6,41 @@ import wave
 
 import pytest
 
-from conftest import _engine_available
-
 
 def _whistle_available():
-    try:
-        from needle import whistle
+    from needle import whistle
 
-        weights = os.environ.get("NEEDLE_WHISTLE_WEIGHTS") or os.path.join(
-            os.path.expanduser("~"), ".cache", "cactus-needle", "whistle", whistle.WHISTLE_WEIGHTS)
-        return _engine_available(3) and os.path.exists(weights) and hasattr(whistle._lib(), "whistle_transcribe")
-    except Exception:
-        return False
+    engine = os.environ.get("NEEDLE_WHISTLE_LIB_PATH") or os.path.join(whistle._cache_dir(), whistle._lib_name())
+    weights = os.environ.get("NEEDLE_WHISTLE_WEIGHTS") or os.path.join(whistle._cache_dir(), whistle.WHISTLE_WEIGHTS)
+    return os.path.exists(engine) and os.path.exists(weights)
 
 
-requires_whistle = pytest.mark.skipif(not _whistle_available(), reason="no Needle engine with Whistle, or no whistle.cact, on this machine")
+requires_whistle = pytest.mark.skipif(not _whistle_available(), reason="no Whistle engine or whistle.cact on this machine (fetched on first real use)")
+
+
+def test_engine_and_weights_resolve_like_needle(tmp_path, monkeypatch):
+    import zipfile
+    from needle import whistle
+
+    monkeypatch.setattr(os.path, "expanduser", lambda path: str(tmp_path))
+    monkeypatch.setattr(whistle, "__file__", str(tmp_path / "package" / "whistle.py"))
+    monkeypatch.delenv("NEEDLE_WHISTLE_WEIGHTS", raising=False)
+    monkeypatch.setenv("NEEDLE_WHISTLE_LIB_PATH", "/opt/libwhistle.so")
+    assert whistle._library_path() == "/opt/libwhistle.so"
+    monkeypatch.delenv("NEEDLE_WHISTLE_LIB_PATH")
+
+    wheel, weights, fetched = tmp_path / "engine.whl", tmp_path / "published.cact", []
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("needle/" + whistle._lib_name(), b"engine")
+    weights.write_bytes(b"weights")
+    monkeypatch.setattr("huggingface_hub.hf_hub_download",
+                        lambda **kwargs: fetched.append((kwargs["repo_id"], kwargs["filename"])) or str(weights if kwargs["filename"].endswith(".cact") else wheel))
+    cache = tmp_path / ".cache" / "cactus-needle" / "whistle" / whistle.ENGINE_VERSION
+    assert whistle._library_path() == str(cache / whistle._lib_name()) and (cache / whistle._lib_name()).read_bytes() == b"engine"
+    assert whistle._weights_path() == str(cache / "whistle.cact") and (cache / "whistle.cact").read_bytes() == b"weights"
+    assert [repo for repo, _ in fetched] == ["Cactus-Compute/whistle"] * 2
+    assert fetched[0][1].startswith(f"python/cactus_whistle-{whistle.ENGINE_VERSION}-py3-none-") and fetched[1][1] == "whistle.cact"
+    assert whistle._library_path() and whistle._weights_path() and len(fetched) == 2
 
 
 def _tone(seconds, rate=16000):

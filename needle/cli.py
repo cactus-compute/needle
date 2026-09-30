@@ -14,8 +14,7 @@ HELP = """usage: needle <command> [options]
   download       needle3 | needle3.safetensors | <platform> | model-<id> | <org>/<repo>[/<file>.cact]
   fetch          fetch the engine library for this platform
   playground     serve the browser playground
-  whistle        speech to text in the terminal: Enter to speak
-  compare        the same speech through Whistle, Whisper and Moonshine
+  whistle        speech to text: playground | compare
 
 needle <command> --help for the options of one command.
 Check the readme for the rest."""
@@ -266,21 +265,22 @@ def main():
 
     from .whistle import LANGUAGES
     p = sub.add_parser("whistle")
-    p.add_argument("audio", type=str, nargs="?", default=None,
+    verbs = p.add_subparsers(dest="verb")
+    v = verbs.add_parser("playground")
+    v.add_argument("audio", type=str, nargs="?", default=None,
                    help="A WAV file to transcribe once (default: press Enter to speak)")
-    p.add_argument("--lang", type=str, default=None, choices=LANGUAGES,
+    v.add_argument("--lang", type=str, default=None, choices=LANGUAGES,
                    help="Force the language (default: detect it)")
-    p.add_argument("--keywords", type=str, default="",
+    v.add_argument("--keywords", type=str, default="",
                    help="Words and phrases to favour, comma separated")
-    p.add_argument("--word-timestamps", action="store_true",
+    v.add_argument("--word-timestamps", action="store_true",
                    help="Show each word's start, end and probability")
-    p.add_argument("--weights", type=str, default=None,
+    v.add_argument("--weights", type=str, default=None,
                    help="whistle.cact to load (default: the published weights)")
-
-    p = sub.add_parser("compare")
-    p.add_argument("audio", type=str, nargs="?", default=None,
+    v = verbs.add_parser("compare")
+    v.add_argument("audio", type=str, nargs="?", default=None,
                    help="A WAV file to run through every model once (default: press Enter to speak)")
-    p.add_argument("--weights", type=str, default=None,
+    v.add_argument("--weights", type=str, default=None,
                    help="whistle.cact to load (default: the published weights)")
 
     args = parser.parse_args()
@@ -372,8 +372,10 @@ def main():
         from .playground.server import main as playground_main
         playground_main(args)
     elif args.command == "whistle":
-        from .playground.whistle import main as whistle_main
+        if args.verb == "playground":
+            from .playground.whistle import main as whistle_main
+        elif args.verb == "compare":
+            from .playground.whistle_compare import main as whistle_main
+        else:
+            raise SystemExit("needle whistle playground | compare")
         whistle_main(args)
-    elif args.command == "compare":
-        from .playground.compare import main as compare_main
-        compare_main(args)

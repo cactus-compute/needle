@@ -1,10 +1,4 @@
 import os
-import select
-import shutil
-import signal
-import subprocess
-import sys
-import tempfile
 import time
 
 HELP = """  Enter          speak, Enter again to stop
@@ -13,8 +7,8 @@ HELP = """  Enter          speak, Enter again to stop
   /timestamps    toggle word times
   /file clip.wav transcribe a file
   /quit          leave"""
-CLEAR_LINE = "\r\x1b[2K"
 CLEAR_ABOVE = "\x1b[1A\x1b[2K"
+LIMIT_SECONDS = 30
 
 
 def status(name, size, ttft, tokens, total):
@@ -23,22 +17,29 @@ def status(name, size, ttft, tokens, total):
     return f"  {name:<18}{size / 1e6:>4.0f} MB  ttft {ttft:>6}  decode {tokens:>10}  total {total * 1000:>4.0f} ms"
 
 
-def record(path):
-    if shutil.which("rec"):
-        command = ["rec", "-q", "-b", "16", path, "channels", "1", "rate", "16000"]
-    elif shutil.which("ffmpeg"):
-        command = ["ffmpeg", "-loglevel", "error", "-y", "-f", "avfoundation", "-i", ":0", "-ac", "1", "-ar", "16000", path]
-    else:
-        return "recording needs sox (rec) or ffmpeg"
-    process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
-    print(CLEAR_ABOVE + "● recording, Enter to stop", end="", flush=True)
-    pressed = bool(select.select([sys.stdin], [], [], 30)[0])
-    if pressed:
-        sys.stdin.readline()
-    process.send_signal(signal.SIGINT)
-    process.wait()
-    print(CLEAR_ABOVE if pressed else CLEAR_LINE, end="", flush=True)
-    return None
+def record():
+    from ..whistle import SAMPLE_RATE
+
+    try:
+        import numpy
+        import sounddevice
+        import soxr
+    except ImportError as error:
+        raise RuntimeError(f'{error.name} is not installed: pip install "cactus-needle[whistle]"') from None
+    chunks = []
+    try:
+        rate = int(sounddevice.query_devices(kind="input")["default_samplerate"])
+        with sounddevice.InputStream(samplerate=rate, channels=1, dtype="float32", callback=lambda data, *_: chunks.append(data.copy())):
+            print(CLEAR_ABOVE + "● recording, Enter to stop", end="", flush=True)
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                print()
+    except sounddevice.PortAudioError as error:
+        raise RuntimeError(f"no microphone: {error}") from None
+    print(CLEAR_ABOVE, end="", flush=True)
+    audio = numpy.concatenate(chunks)[:LIMIT_SECONDS * rate, 0] if chunks else numpy.zeros(0, numpy.float32)
+    return audio if rate == SAMPLE_RATE else soxr.resample(audio, rate, SAMPLE_RATE, quality="HQ")
 
 
 def prompt():
@@ -71,7 +72,6 @@ def main(args):
     whistle = Whistle(weights=args.weights)
     if args.audio:
         return transcribe(whistle, args.audio, state)
-    recording = os.path.join(tempfile.mkdtemp(prefix="needle-whistle-"), "recording.wav")
     print(HELP)
     while True:
         line = prompt()
@@ -90,7 +90,9 @@ def main(args):
         elif command == "/file":
             transcribe(whistle, rest.strip(), state)
         elif line == "":
-            error = record(recording)
-            print(error) if error else transcribe(whistle, recording, state)
+            try:
+                transcribe(whistle, record(), state)
+            except RuntimeError as error:
+                print(f"  {error}")
         else:
             print(HELP)

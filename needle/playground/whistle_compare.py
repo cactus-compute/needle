@@ -1,30 +1,11 @@
 import os
-import tempfile
 import time
-import wave
 
 from .whistle import prompt, record, status
 
-RATE = 16000
 HELP = """  Enter          speak, Enter again to stop
   /quit          leave"""
-INSTALL = 'pip install "cactus-needle[compare]"'
-
-
-def read(path):
-    import numpy
-
-    with wave.open(path, "rb") as file:
-        channels, width, rate = file.getnchannels(), file.getsampwidth(), file.getframerate()
-        data = file.readframes(file.getnframes())
-    if width != 2:
-        raise ValueError(f"{path}: only 16-bit WAV is supported")
-    audio = numpy.frombuffer(data, numpy.int16).reshape(-1, channels).mean(axis=1) / 32768.0
-    if rate != RATE:
-        import soxr
-
-        audio = soxr.resample(audio.astype(numpy.float32), rate, RATE, quality="HQ")
-    return audio.astype(numpy.float32)
+INSTALL = 'pip install "cactus-needle[whistle,whistle-compare]"'
 
 
 def rate(marks):
@@ -63,11 +44,13 @@ def load_whisper(size):
 def load_moonshine():
     import moonshine_voice
 
+    from ..whistle import SAMPLE_RATE
+
     path, arch = moonshine_voice.get_model_for_language("en", moonshine_voice.ModelArch.TINY_STREAMING)
     model = moonshine_voice.Transcriber(model_path=path, model_arch=arch)
 
     def transcribe(audio):
-        lines = model.transcribe_without_streaming(audio.tolist(), RATE).lines
+        lines = model.transcribe_without_streaming(audio.tolist(), SAMPLE_RATE).lines
         return " ".join(line.text.strip() for line in lines).strip(), None, None
 
     return sum(os.path.getsize(os.path.join(path, f)) for f in os.listdir(path)), transcribe
@@ -81,6 +64,8 @@ def compare(models, audio):
 
 
 def main(args):
+    from ..whistle import SAMPLE_RATE, _read_wav
+
     try:
         import moonshine_voice  # noqa: F401
         import numpy
@@ -93,12 +78,12 @@ def main(args):
         ("whisper base", *load_whisper("base")),
         ("moonshine tiny v2", *load_moonshine()),
     ]
-    warmup = numpy.sin(numpy.arange(RATE) * (2 * numpy.pi * 220 / RATE)) * numpy.abs(numpy.sin(numpy.arange(RATE) * (3 * numpy.pi / RATE)))
+    beat = numpy.arange(SAMPLE_RATE) * (numpy.pi / SAMPLE_RATE)
+    warmup = (numpy.sin(440 * beat) * numpy.abs(numpy.sin(3 * beat))).astype(numpy.float32)
     for _, _, transcribe in models:
-        transcribe(warmup.astype(numpy.float32))
+        transcribe(warmup)
     if args.audio:
-        return compare(models, read(args.audio))
-    recording = os.path.join(tempfile.mkdtemp(prefix="needle-compare-"), "recording.wav")
+        return compare(models, numpy.asarray(_read_wav(args.audio), numpy.float32))
     print(HELP)
     while True:
         line = prompt()
@@ -107,5 +92,7 @@ def main(args):
         if line:
             print(HELP)
             continue
-        error = record(recording)
-        print(error) if error else compare(models, read(recording))
+        try:
+            compare(models, numpy.asarray(record(), numpy.float32))
+        except RuntimeError as error:
+            print(f"  {error}")
