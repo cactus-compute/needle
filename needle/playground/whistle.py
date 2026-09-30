@@ -2,7 +2,7 @@ import os
 import time
 
 HELP = """  Enter          speak, Enter again to stop
-  /lang de       force a language (en de fr es it nl pl), bare to detect it
+  /language de   force a language (en de fr es it nl pl), bare to detect it
   /keywords      Siobhan, Krzysztof
   /timestamps    toggle word times
   /file clip.wav transcribe a file
@@ -53,7 +53,7 @@ def prompt():
 def transcribe(whistle, audio, state):
     started = time.perf_counter()
     try:
-        result = whistle.transcribe(audio, language=state["lang"], keywords=state["keywords"], word_timestamps=state["timestamps"])
+        result = whistle.transcribe(audio, language=state["language"], keywords=state["keywords"], word_timestamps=state["timestamps"])
     except (RuntimeError, OSError, EOFError) as error:
         print(f"  {error}")
         return
@@ -68,7 +68,7 @@ def transcribe(whistle, audio, state):
 def main(args):
     from ..whistle import LANGUAGES, Whistle
 
-    state = {"lang": args.lang, "keywords": [k.strip() for k in args.keywords.split(",") if k.strip()], "timestamps": args.word_timestamps}
+    state = {"language": args.language, "keywords": [k.strip() for k in args.keywords.split(",") if k.strip()], "timestamps": args.word_timestamps}
     whistle = Whistle(weights=args.weights)
     if args.audio:
         return transcribe(whistle, args.audio, state)
@@ -78,9 +78,9 @@ def main(args):
         command, _, rest = line.partition(" ")
         if command == "/quit":
             return
-        if command == "/lang":
-            state["lang"] = rest.strip() if rest.strip() in LANGUAGES else None
-            print("  language", state["lang"] or "detected")
+        if command == "/language":
+            state["language"] = rest.strip() if rest.strip() in LANGUAGES else None
+            print("  language", state["language"] or "detected")
         elif command in ("/keywords", "/keyword"):
             state["keywords"] = [k.strip() for k in rest.split(",") if k.strip()]
             print("  keywords", ", ".join(state["keywords"]) or "none")

@@ -97,7 +97,7 @@ def test_playground_prints_text_words_and_timing(capsys):
 
     whistle = _Whistle({"text": "hello there", "language": "en", "ttft_ms": 12.6, "decode_tps": 900.4,
                         "words": [{"word": "hello", "start": 0.1, "end": 0.4, "probability": 0.98}]})
-    transcribe(whistle, "clip.wav", {"lang": "en", "keywords": ["Siobhan"], "timestamps": True})
+    transcribe(whistle, "clip.wav", {"language": "en", "keywords": ["Siobhan"], "timestamps": True})
     out = capsys.readouterr().out.splitlines()
     assert whistle.calls == [("clip.wav", {"language": "en", "keywords": ["Siobhan"], "word_timestamps": True})]
     assert out[0] == "hello there"
@@ -112,7 +112,7 @@ def test_playground_reports_engine_errors_instead_of_raising(capsys):
         def transcribe(self, audio, **options):
             raise RuntimeError("audio limit is 30 s")
 
-    transcribe(Broken(), "long.wav", {"lang": None, "keywords": [], "timestamps": False})
+    transcribe(Broken(), "long.wav", {"language": None, "keywords": [], "timestamps": False})
     assert capsys.readouterr().out == "  audio limit is 30 s\n"
 
 
@@ -134,12 +134,12 @@ def test_cli_routes_the_whistle_commands(monkeypatch):
     monkeypatch.setattr(needle._telemetry, "track", lambda *a, **k: None)
     monkeypatch.setattr(needle.playground.whistle, "main", lambda args: seen.append(("playground", args)))
     monkeypatch.setattr(needle.playground.whistle_compare, "main", lambda args: seen.append(("compare", args)))
-    monkeypatch.setattr(sys, "argv", ["needle", "whistle", "playground", "clip.wav", "--lang", "de", "--keywords", "Siobhan, Krzysztof", "--word-timestamps"])
+    monkeypatch.setattr(sys, "argv", ["needle", "whistle", "playground", "clip.wav", "--language", "de", "--keywords", "Siobhan, Krzysztof", "--word-timestamps"])
     needle.cli.main()
     monkeypatch.setattr(sys, "argv", ["needle", "whistle", "compare", "--weights", "w.cact"])
     needle.cli.main()
     assert [s[0] for s in seen] == ["playground", "compare"]
-    assert (seen[0][1].audio, seen[0][1].lang, seen[0][1].keywords, seen[0][1].word_timestamps) == ("clip.wav", "de", "Siobhan, Krzysztof", True)
+    assert (seen[0][1].audio, seen[0][1].language, seen[0][1].keywords, seen[0][1].word_timestamps) == ("clip.wav", "de", "Siobhan, Krzysztof", True)
     assert (seen[1][1].audio, seen[1][1].weights) == (None, "w.cact")
     monkeypatch.setattr(sys, "argv", ["needle", "whistle"])
     with pytest.raises(SystemExit, match="needle whistle playground \\| compare \\| fetch \\| download"):

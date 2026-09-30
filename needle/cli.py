@@ -271,7 +271,7 @@ def main():
     v = verbs.add_parser("playground")
     v.add_argument("audio", type=str, nargs="?", default=None,
                    help="A WAV file to transcribe once (default: press Enter to speak)")
-    v.add_argument("--lang", type=str, default=None, choices=LANGUAGES,
+    v.add_argument("--language", type=str, default=None, choices=LANGUAGES,
                    help="Force the language (default: detect it)")
     v.add_argument("--keywords", type=str, default="",
                    help="Words and phrases to favour, comma separated")
