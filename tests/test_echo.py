@@ -81,7 +81,7 @@ def test_transcribe_returns_text_language_and_timed_words(tmp_path):
     assert set(plain) == {"text", "language"} and plain["language"] in LANGUAGES + ("",)
     path = tmp_path / "sound.wav"
     _write_wav(path, sound, 16000)
-    timed = echo.transcribe(path, language="en", phrases=["Siobhan", "Krzysztof"], word_timestamps=True)
+    timed = echo.transcribe(path, language="en", keywords=["Siobhan", "Krzysztof"], word_timestamps=True)
     assert timed["language"] == "en" and isinstance(timed["text"], str)
     starts = [word["start"] for word in timed["words"]]
     assert starts == sorted(starts)

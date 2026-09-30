@@ -117,18 +117,18 @@ class Echo:
         _loaded = self._weights
         return lib
 
-    def transcribe(self, audio, language=None, phrases=None, word_timestamps=False) -> dict:
+    def transcribe(self, audio, language=None, keywords=None, word_timestamps=False) -> dict:
         """Returns {"text", "language"}, plus "words" with start, end and probability when word_timestamps is set.
 
-        language is one of LANGUAGES, or None to detect it. phrases are words or phrases to favour.
+        language is one of LANGUAGES, or None to detect it. keywords are words or phrases to favour.
         """
         lib = self._bind()
         samples, count = _samples(audio)
-        if phrases is not None and not isinstance(phrases, str):
-            phrases = "\n".join(phrases)
+        if keywords is not None and not isinstance(keywords, str):
+            keywords = "\n".join(keywords)
         detected = ctypes.create_string_buffer(4)
         code = lib.echo_transcribe(samples, count, language.encode("utf-8") if language else None,
-                                   phrases.encode("utf-8") if phrases else None, int(bool(word_timestamps)),
+                                   keywords.encode("utf-8") if keywords else None, int(bool(word_timestamps)),
                                    self._buffer, len(self._buffer), detected)
         if code < 0:
             raise RuntimeError(lib.echo_last_error().decode("utf-8", "replace"))
