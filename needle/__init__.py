@@ -11,9 +11,10 @@ import warnings
 from .agent.tools import Field, build_schema, pydantic_schema, tool, _is_pydantic_model
 from ._telemetry import track as _track
 from ._worker import FineTuneWorker
+from .echo import Echo
 
 __version__ = "3.0.1"
-__all__ = ["Needle", "ExtractionValidationError", "tool", "Field", "extract",
+__all__ = ["Needle", "Echo", "ExtractionValidationError", "tool", "Field", "extract",
            "__version__"]
 
 
