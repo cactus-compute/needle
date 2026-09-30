@@ -72,7 +72,7 @@ def test_silence_is_an_empty_transcript():
     from needle import Whistle
 
     result = Whistle().transcribe([0.0] * 16000, word_timestamps=True)
-    assert result == {"text": "", "words": [], "language": ""}
+    assert result == {"text": "", "language": "", "words": [], "ttft_ms": 0.0, "decode_tps": 0.0}
 
 
 @requires_whistle
@@ -83,7 +83,8 @@ def test_transcribe_returns_text_language_and_timed_words(tmp_path):
     whistle = Whistle()
     sound = [v * (0.2 + 0.8 * abs(math.sin(math.pi * 3 * i / 16000))) for i, v in enumerate(_tone(3))]
     plain = whistle.transcribe(sound)
-    assert set(plain) == {"text", "language"} and plain["language"] in LANGUAGES + ("",)
+    assert set(plain) == {"text", "language", "ttft_ms", "decode_tps"} and plain["language"] in LANGUAGES + ("",)
+    assert (plain["ttft_ms"] > 0) == bool(plain["language"]) and plain["decode_tps"] >= 0
     path = tmp_path / "sound.wav"
     _write_wav(path, sound, 16000)
     timed = whistle.transcribe(path, language="en", keywords=["Siobhan", "Krzysztof"], word_timestamps=True)
@@ -112,4 +113,5 @@ def test_missing_weights_fail_clearly(tmp_path):
     broken.write_bytes(b"not a model at all")
     with pytest.raises(RuntimeError):
         Whistle(weights=broken)
-    assert Whistle().transcribe([0.0] * 16000)["text"] == ""
+    whistle = Whistle()
+    assert os.path.getsize(whistle.weights) > 0 and whistle.transcribe([0.0] * 16000)["text"] == ""

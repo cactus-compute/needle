@@ -45,7 +45,7 @@ def _lib():
         lib.whistle_load.argtypes = [ctypes.c_char_p, ctypes.c_uint64]
         lib.whistle_load.restype = ctypes.c_int
         lib.whistle_transcribe.argtypes = [samples, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int,
-                                        ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
+                                        ctypes.c_char_p, ctypes.c_int]
         lib.whistle_transcribe.restype = ctypes.c_int
         lib.whistle_embed.argtypes = [samples, ctypes.c_int, samples, ctypes.c_int]
         lib.whistle_embed.restype = ctypes.c_int
@@ -102,25 +102,25 @@ class Whistle:
     """
 
     def __init__(self, weights=None, buffer_size=1 << 18):
-        self._weights = os.fspath(weights) if weights is not None else _weights_path()
+        self.weights = os.fspath(weights) if weights is not None else _weights_path()
         self._buffer = ctypes.create_string_buffer(buffer_size)
         self._bind()
 
     def _bind(self):
         global _loaded
         lib = _lib()
-        if _loaded == self._weights:
+        if _loaded == self.weights:
             return lib
-        with open(self._weights, "rb") as handle:
+        with open(self.weights, "rb") as handle:
             data = handle.read()
         if lib.whistle_load(data, len(data)) < 0:
             _loaded = None
             raise RuntimeError(lib.whistle_last_error().decode("utf-8", "replace"))
-        _loaded = self._weights
+        _loaded = self.weights
         return lib
 
     def transcribe(self, audio, language=None, keywords=None, word_timestamps=False) -> dict:
-        """Returns {"text", "language"}, plus "words" with start, end and probability when word_timestamps is set.
+        """Returns {"text", "language", "ttft_ms", "decode_tps"}, plus "words" with start, end and probability when word_timestamps is set.
 
         language is one of LANGUAGES, or None to detect it. keywords are words or phrases for keyword biasing.
         """
@@ -128,16 +128,12 @@ class Whistle:
         samples, count = _samples(audio)
         if keywords is not None and not isinstance(keywords, str):
             keywords = "\n".join(keywords)
-        detected = ctypes.create_string_buffer(4)
         code = lib.whistle_transcribe(samples, count, language.encode("utf-8") if language else None,
                                    keywords.encode("utf-8") if keywords else None, int(bool(word_timestamps)),
-                                   self._buffer, len(self._buffer), detected)
+                                   self._buffer, len(self._buffer))
         if code < 0:
             raise RuntimeError(lib.whistle_last_error().decode("utf-8", "replace"))
-        text = self._buffer.value.decode("utf-8", "replace")
-        result = json.loads(text) if word_timestamps else {"text": text}
-        result["language"] = detected.value.decode("utf-8")
-        return result
+        return json.loads(self._buffer.value.decode("utf-8", "replace"))
 
     def embed(self, audio) -> list[float]:
         """The encoder output, one row of floats per 80 ms frame, flattened."""
