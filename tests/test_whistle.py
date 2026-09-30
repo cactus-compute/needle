@@ -9,18 +9,18 @@ import pytest
 from conftest import _engine_available
 
 
-def _echo_available():
+def _whistle_available():
     try:
-        from needle import echo
+        from needle import whistle
 
-        weights = os.environ.get("NEEDLE_ECHO_WEIGHTS") or os.path.join(
-            os.path.expanduser("~"), ".cache", "cactus-needle", "echo", echo.ECHO_WEIGHTS)
-        return _engine_available(3) and os.path.exists(weights) and hasattr(echo._lib(), "echo_transcribe")
+        weights = os.environ.get("NEEDLE_WHISTLE_WEIGHTS") or os.path.join(
+            os.path.expanduser("~"), ".cache", "cactus-needle", "whistle", whistle.WHISTLE_WEIGHTS)
+        return _engine_available(3) and os.path.exists(weights) and hasattr(whistle._lib(), "whistle_transcribe")
     except Exception:
         return False
 
 
-requires_echo = pytest.mark.skipif(not _echo_available(), reason="no Needle engine with Echo, or no echo.cact, on this machine")
+requires_whistle = pytest.mark.skipif(not _whistle_available(), reason="no Needle engine with Whistle, or no whistle.cact, on this machine")
 
 
 def _tone(seconds, rate=16000):
@@ -41,7 +41,7 @@ def _write_wav(path, samples, rate, channels=1, width=2):
 
 @pytest.mark.parametrize("rate,channels,width", [(16000, 1, 2), (8000, 1, 2), (44100, 2, 2), (16000, 1, 1), (22050, 2, 3), (48000, 1, 4)])
 def test_wav_files_become_16k_mono_floats(tmp_path, rate, channels, width):
-    from needle.echo import _read_wav
+    from needle.whistle import _read_wav
 
     path = tmp_path / "tone.wav"
     _write_wav(path, _tone(0.5, rate), rate, channels, width)
@@ -53,7 +53,7 @@ def test_wav_files_become_16k_mono_floats(tmp_path, rate, channels, width):
 
 
 def test_samples_accept_lists_arrays_and_float32_bytes():
-    from needle.echo import _samples
+    from needle.whistle import _samples
 
     values = [0.0, 0.5, -0.25]
     for audio in (values, array.array("f", values), struct.pack("<3f", *values), (v for v in values)):
@@ -62,50 +62,50 @@ def test_samples_accept_lists_arrays_and_float32_bytes():
     assert _samples([])[1] == 0
 
 
-@requires_echo
+@requires_whistle
 def test_silence_is_an_empty_transcript():
-    from needle import Echo
+    from needle import Whistle
 
-    result = Echo().transcribe([0.0] * 16000, word_timestamps=True)
+    result = Whistle().transcribe([0.0] * 16000, word_timestamps=True)
     assert result == {"text": "", "words": [], "language": ""}
 
 
-@requires_echo
+@requires_whistle
 def test_transcribe_returns_text_language_and_timed_words(tmp_path):
-    from needle import Echo
-    from needle.echo import LANGUAGES
+    from needle import Whistle
+    from needle.whistle import LANGUAGES
 
-    echo = Echo()
+    whistle = Whistle()
     sound = [v * (0.2 + 0.8 * abs(math.sin(math.pi * 3 * i / 16000))) for i, v in enumerate(_tone(3))]
-    plain = echo.transcribe(sound)
+    plain = whistle.transcribe(sound)
     assert set(plain) == {"text", "language"} and plain["language"] in LANGUAGES + ("",)
     path = tmp_path / "sound.wav"
     _write_wav(path, sound, 16000)
-    timed = echo.transcribe(path, language="en", keywords=["Siobhan", "Krzysztof"], word_timestamps=True)
+    timed = whistle.transcribe(path, language="en", keywords=["Siobhan", "Krzysztof"], word_timestamps=True)
     assert timed["language"] == "en" and isinstance(timed["text"], str)
     starts = [word["start"] for word in timed["words"]]
     assert starts == sorted(starts)
     assert all(0 <= word["start"] <= word["end"] <= 3.01 and 0 <= word["probability"] <= 1 for word in timed["words"])
 
 
-@requires_echo
+@requires_whistle
 def test_embed_and_the_30_second_limit():
-    from needle import Echo
+    from needle import Whistle
 
-    echo = Echo()
-    embedding = echo.embed(_tone(1))
+    whistle = Whistle()
+    embedding = whistle.embed(_tone(1))
     assert len(embedding) > 0 and all(isinstance(v, float) for v in embedding[:8])
     with pytest.raises(RuntimeError, match="30 s"):
-        echo.transcribe([0.0] * (30 * 16000 + 1))
+        whistle.transcribe([0.0] * (30 * 16000 + 1))
 
 
 def test_missing_weights_fail_clearly(tmp_path):
-    if not _echo_available():
-        pytest.skip("no Needle engine with Echo on this machine")
-    from needle import Echo
+    if not _whistle_available():
+        pytest.skip("no Needle engine with Whistle on this machine")
+    from needle import Whistle
 
     broken = tmp_path / "broken.cact"
     broken.write_bytes(b"not a model at all")
     with pytest.raises(RuntimeError):
-        Echo(weights=broken)
-    assert Echo().transcribe([0.0] * 16000)["text"] == ""
+        Whistle(weights=broken)
+    assert Whistle().transcribe([0.0] * 16000)["text"] == ""

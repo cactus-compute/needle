@@ -7,8 +7,8 @@ import os
 import sys
 import wave
 
-ECHO_REPO = "Cactus-Compute/echo"
-ECHO_WEIGHTS = "echo.cact"
+WHISTLE_REPO = "Cactus-Compute/whistle"
+WHISTLE_WEIGHTS = "whistle.cact"
 SAMPLE_RATE = 16000
 LANGUAGES = ("en", "de", "fr", "es", "it", "nl", "pl")
 
@@ -17,17 +17,17 @@ _loaded = None
 
 
 def _weights_path():
-    override = os.environ.get("NEEDLE_ECHO_WEIGHTS")
+    override = os.environ.get("NEEDLE_WHISTLE_WEIGHTS")
     if override:
         return override
-    cache = os.path.join(os.path.expanduser("~"), ".cache", "cactus-needle", "echo")
-    local = os.path.join(cache, ECHO_WEIGHTS)
+    cache = os.path.join(os.path.expanduser("~"), ".cache", "cactus-needle", "whistle")
+    local = os.path.join(cache, WHISTLE_WEIGHTS)
     if os.path.exists(local):
         return local
     import shutil
     from huggingface_hub import hf_hub_download
 
-    cached = hf_hub_download(repo_id=ECHO_REPO, filename=ECHO_WEIGHTS, repo_type="model")
+    cached = hf_hub_download(repo_id=WHISTLE_REPO, filename=WHISTLE_WEIGHTS, repo_type="model")
     os.makedirs(cache, exist_ok=True)
     shutil.copyfile(cached, local)
     return local
@@ -39,18 +39,18 @@ def _lib():
         from . import _load_cdll
 
         lib = _load_cdll(3)
-        if not hasattr(lib, "echo_transcribe"):
-            raise RuntimeError("this Needle engine was built without Echo; point NEEDLE3_LIB_PATH at an engine that has it")
+        if not hasattr(lib, "whistle_transcribe"):
+            raise RuntimeError("this Needle engine was built without Whistle; point NEEDLE3_LIB_PATH at an engine that has it")
         samples = ctypes.POINTER(ctypes.c_float)
-        lib.echo_load.argtypes = [ctypes.c_char_p, ctypes.c_uint64]
-        lib.echo_load.restype = ctypes.c_int
-        lib.echo_transcribe.argtypes = [samples, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int,
+        lib.whistle_load.argtypes = [ctypes.c_char_p, ctypes.c_uint64]
+        lib.whistle_load.restype = ctypes.c_int
+        lib.whistle_transcribe.argtypes = [samples, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int,
                                         ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
-        lib.echo_transcribe.restype = ctypes.c_int
-        lib.echo_embed.argtypes = [samples, ctypes.c_int, samples, ctypes.c_int]
-        lib.echo_embed.restype = ctypes.c_int
-        lib.echo_last_error.argtypes = []
-        lib.echo_last_error.restype = ctypes.c_char_p
+        lib.whistle_transcribe.restype = ctypes.c_int
+        lib.whistle_embed.argtypes = [samples, ctypes.c_int, samples, ctypes.c_int]
+        lib.whistle_embed.restype = ctypes.c_int
+        lib.whistle_last_error.argtypes = []
+        lib.whistle_last_error.restype = ctypes.c_char_p
         _handle = lib
     return _handle
 
@@ -92,7 +92,7 @@ def _samples(audio):
     return (ctypes.c_float * len(data)).from_buffer(data) if len(data) else (ctypes.c_float * 1)(), len(data)
 
 
-class Echo:
+class Whistle:
     """Speech-to-text in English, German, French, Spanish, Italian, Dutch and Polish.
 
     Audio is a WAV file path or 16 kHz mono float samples in [-1, 1], at most 30 s.
@@ -111,27 +111,27 @@ class Echo:
             return lib
         with open(self._weights, "rb") as handle:
             data = handle.read()
-        if lib.echo_load(data, len(data)) < 0:
+        if lib.whistle_load(data, len(data)) < 0:
             _loaded = None
-            raise RuntimeError(lib.echo_last_error().decode("utf-8", "replace"))
+            raise RuntimeError(lib.whistle_last_error().decode("utf-8", "replace"))
         _loaded = self._weights
         return lib
 
     def transcribe(self, audio, language=None, keywords=None, word_timestamps=False) -> dict:
         """Returns {"text", "language"}, plus "words" with start, end and probability when word_timestamps is set.
 
-        language is one of LANGUAGES, or None to detect it. keywords are words or phrases to favour.
+        language is one of LANGUAGES, or None to detect it. keywords are words or phrases for keyword biasing.
         """
         lib = self._bind()
         samples, count = _samples(audio)
         if keywords is not None and not isinstance(keywords, str):
             keywords = "\n".join(keywords)
         detected = ctypes.create_string_buffer(4)
-        code = lib.echo_transcribe(samples, count, language.encode("utf-8") if language else None,
+        code = lib.whistle_transcribe(samples, count, language.encode("utf-8") if language else None,
                                    keywords.encode("utf-8") if keywords else None, int(bool(word_timestamps)),
                                    self._buffer, len(self._buffer), detected)
         if code < 0:
-            raise RuntimeError(lib.echo_last_error().decode("utf-8", "replace"))
+            raise RuntimeError(lib.whistle_last_error().decode("utf-8", "replace"))
         text = self._buffer.value.decode("utf-8", "replace")
         result = json.loads(text) if word_timestamps else {"text": text}
         result["language"] = detected.value.decode("utf-8")
@@ -141,10 +141,10 @@ class Echo:
         """The encoder output, one row of floats per 80 ms frame, flattened."""
         lib = self._bind()
         samples, count = _samples(audio)
-        size = lib.echo_embed(samples, count, None, 0)
+        size = lib.whistle_embed(samples, count, None, 0)
         if size < 0:
-            raise RuntimeError(lib.echo_last_error().decode("utf-8", "replace"))
+            raise RuntimeError(lib.whistle_last_error().decode("utf-8", "replace"))
         output = (ctypes.c_float * size)()
-        if lib.echo_embed(samples, count, output, size) != size:
-            raise RuntimeError(lib.echo_last_error().decode("utf-8", "replace"))
+        if lib.whistle_embed(samples, count, output, size) != size:
+            raise RuntimeError(lib.whistle_last_error().decode("utf-8", "replace"))
         return list(output)
