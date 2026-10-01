@@ -92,7 +92,7 @@ def _library_path(generation=2):
     here = os.path.dirname(os.path.abspath(__file__))
     lib_name = fetch.lib_name(generation)
     stem, suffix = os.path.splitext(lib_name)
-    local_names = [lib_name if generation == fetch.WHISTLE else f"{stem}{generation}{suffix}"]
+    local_names = [lib_name if generation in fetch.NAMED_ENGINES else f"{stem}{generation}{suffix}"]
     if generation == 2:
         # Wheels published before the split shipped Needle 2 as libneedle.*.
         local_names.append(lib_name)

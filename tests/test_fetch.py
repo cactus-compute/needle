@@ -108,10 +108,11 @@ def test_component_platform_is_downloadable():
 def test_unpublished_engine_wheels_lists_every_missing_tag(monkeypatch):
     from needle.agent import fetch
 
-    published = {
-        fetch.ENGINE_REPOS[generation]: {fetch.engine_wheel(version, tag, generation) for tag in fetch.WHEEL_TAGS}
-        for generation, version in fetch.ENGINE_VERSIONS.items()
-    }
+    published = {}
+    for generation, version in fetch.ENGINE_VERSIONS.items():
+        # needle3 hosts both its own engine and needle3_whistle, so the sets merge.
+        published.setdefault(fetch.ENGINE_REPOS[generation], set()).update(
+            fetch.engine_wheel(version, tag, generation) for tag in fetch.WHEEL_TAGS)
     monkeypatch.setattr("huggingface_hub.list_repo_files",
                         lambda repo: sorted(published[repo]) + ["needle3.cact"])
     assert fetch.unpublished_engine_wheels() == []
@@ -121,11 +122,28 @@ def test_unpublished_engine_wheels_lists_every_missing_tag(monkeypatch):
     published[repo3].remove(dropped)
     assert fetch.unpublished_engine_wheels() == [repo3 + "/" + dropped]
 
+    audio = fetch.engine_wheel(fetch.ENGINE_VERSIONS[fetch.NEEDLE3_WHISTLE], "win_arm64", fetch.NEEDLE3_WHISTLE)
+    published[repo3].remove(audio)
+    assert fetch.unpublished_engine_wheels() == [repo3 + "/" + dropped, repo3 + "/" + audio]
+    published[repo3].add(audio)
+
     whistle = fetch.ENGINE_REPOS[fetch.WHISTLE]
     published[whistle].clear()
     missing = fetch.unpublished_engine_wheels()
     assert len(missing) == 1 + len(fetch.WHEEL_TAGS)
     assert missing[-1] == f"{whistle}/python/cactus_whistle-{fetch.ENGINE_VERSIONS[fetch.WHISTLE]}-py3-none-win_arm64.whl"
+
+
+def test_a_repo_that_cannot_be_listed_holds_none_of_its_wheels(monkeypatch):
+    """The whistle repo is private until release; the gate must report, not raise."""
+    from needle.agent import fetch
+
+    def refuse(repo):
+        raise OSError("401 private repo")
+
+    monkeypatch.setattr("huggingface_hub.list_repo_files", refuse)
+    missing = fetch.unpublished_engine_wheels()
+    assert len(missing) == len(fetch.ENGINE_VERSIONS) * len(fetch.WHEEL_TAGS)
 
 
 def test_release_gate_runs_before_the_publish_step():

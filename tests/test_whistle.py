@@ -350,3 +350,33 @@ def test_cli_routes_the_whistle_commands(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["needle", "whistle"])
     with pytest.raises(SystemExit, match="needle whistle playground \\| compare \\| fetch \\| download"):
         needle.cli.main()
+
+
+def test_needle3_whistle_resolves_inside_the_needle3_repo(tmp_path, monkeypatch):
+    """The combined engine shares needle3's repo, so every path it fetches is prefixed."""
+    import zipfile
+    import needle
+    from needle.agent import fetch
+
+    audio = fetch.NEEDLE3_WHISTLE
+    assert fetch.engine_repo(audio) == fetch.engine_repo(3)
+    assert fetch.engine_version(audio) == "3.0.0"
+    assert fetch.lib_name(audio) == fetch.lib_name(3).replace("needle", audio)
+    assert fetch.engine_wheel("3.0.0", "win_arm64", audio).startswith(audio + "/python/")
+    assert fetch.engine_wheel("3.0.3", "win_arm64", 3).startswith("python/")
+
+    monkeypatch.setattr(os.path, "expanduser", lambda path: str(tmp_path))
+    monkeypatch.setattr(needle, "__file__", str(tmp_path / "package" / "__init__.py"))
+    monkeypatch.setattr(fetch, "_register_download", lambda generation: None)
+    monkeypatch.setenv(fetch.lib_path_env(audio), "/opt/libneedle3_whistle.so")
+    assert needle._library_path(audio) == "/opt/libneedle3_whistle.so"
+    monkeypatch.delenv(fetch.lib_path_env(audio))
+
+    wheel, fetched = tmp_path / "engine.whl", []
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("needle/" + fetch.lib_name(audio), b"engine")
+    monkeypatch.setattr("huggingface_hub.hf_hub_download",
+                        lambda **kwargs: fetched.append(kwargs["filename"]) or str(wheel))
+    resolved = needle._library_path(audio)
+    assert resolved == str(tmp_path / ".cache" / "cactus-needle" / audio / "3.0.0" / fetch.lib_name(audio))
+    assert fetched == [fetch.engine_wheel("3.0.0", fetch._platform_tag(), audio)]
