@@ -11,10 +11,19 @@ CLEAR_ABOVE = "\x1b[1A\x1b[2K"
 LIMIT_SECONDS = 30
 
 
+def audio_path(rest):
+    """The path in a /file line, as a terminal hands it over: quoted, or with escaped spaces."""
+    path = rest.strip()
+    if len(path) > 1 and path[0] == path[-1] and path[0] in "'\"":
+        return path[1:-1]
+    return path.replace("\\ ", " ")
+
+
 def status(name, size, ttft, tokens, total):
     ttft = f"{ttft * 1000:.0f} ms" if ttft is not None else "-"
     tokens = f"{tokens:.0f} tok/s" if tokens is not None else "-"
-    return f"  {name:<18}{size / 1e6:>4.0f} MB  ttft {ttft:>6}  decode {tokens:>10}  total {total * 1000:>4.0f} ms"
+    spent = f"{total:.1f} s" if total >= 10 else f"{total * 1000:.0f} ms"
+    return f"  {name:<18}{size / 1e6:>4.0f} MB  ttft {ttft:>6}  decode {tokens:>10}  total {spent:>7}"
 
 
 def record():
@@ -38,7 +47,10 @@ def record():
     except sounddevice.PortAudioError as error:
         raise RuntimeError(f"no microphone: {error}") from None
     print(CLEAR_ABOVE, end="", flush=True)
-    audio = numpy.concatenate(chunks)[:LIMIT_SECONDS * rate, 0] if chunks else numpy.zeros(0, numpy.float32)
+    heard = numpy.concatenate(chunks)[:, 0] if chunks else numpy.zeros(0, numpy.float32)
+    audio = heard[:LIMIT_SECONDS * rate]
+    if len(audio) < len(heard):
+        print(f"  keeping the first {LIMIT_SECONDS} s")
     return audio if rate == SAMPLE_RATE else soxr.resample(audio, rate, SAMPLE_RATE, quality="HQ")
 
 
@@ -69,6 +81,7 @@ def main(args):
     from ..whistle import LANGUAGES, Whistle
 
     state = {"language": args.language, "keywords": [k.strip() for k in args.keywords.split(",") if k.strip()], "timestamps": args.word_timestamps}
+    print("whistle playground: downloading and initializing the model...", flush=True)
     whistle = Whistle(weights=args.weights)
     if args.audio:
         return transcribe(whistle, args.audio, state)
@@ -79,7 +92,11 @@ def main(args):
         if command == "/quit":
             return
         if command == "/language":
-            state["language"] = rest.strip() if rest.strip() in LANGUAGES else None
+            language = rest.strip()
+            if language and language not in LANGUAGES:
+                print("  language is one of", " ".join(LANGUAGES))
+                continue
+            state["language"] = language or None
             print("  language", state["language"] or "detected")
         elif command in ("/keywords", "/keyword"):
             state["keywords"] = [k.strip() for k in rest.split(",") if k.strip()]
@@ -88,7 +105,7 @@ def main(args):
             state["timestamps"] = not state["timestamps"]
             print("  word timestamps", "on" if state["timestamps"] else "off")
         elif command == "/file":
-            transcribe(whistle, rest.strip(), state)
+            transcribe(whistle, audio_path(rest), state)
         elif line == "":
             try:
                 transcribe(whistle, record(), state)

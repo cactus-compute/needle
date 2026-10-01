@@ -1,9 +1,10 @@
 import os
 import time
 
-from .whistle import prompt, record, status
+from .whistle import audio_path, prompt, record, status
 
 HELP = """  Enter          speak, Enter again to stop
+  /file clip.wav run a file through every model
   /quit          leave"""
 INSTALL = 'pip install "cactus-needle[whistle,whistle-compare]"'
 
@@ -72,6 +73,7 @@ def main(args):
         import whisper  # noqa: F401
     except ImportError as error:
         raise SystemExit(f"{error.name} is not installed: {INSTALL}")
+    print("whistle compare: downloading and initializing the models...", flush=True)
     models = [
         ("whistle", *load_whistle(args.weights)),
         ("whisper tiny", *load_whisper("tiny")),
@@ -87,12 +89,18 @@ def main(args):
     print(HELP)
     while True:
         line = prompt()
-        if line == "/quit":
+        command, _, rest = line.partition(" ")
+        if command == "/quit":
             return
-        if line:
+        if command == "/file":
+            try:
+                compare(models, numpy.asarray(_read_wav(audio_path(rest)), numpy.float32))
+            except OSError as error:
+                print(f"  {error}")
+        elif line == "":
+            try:
+                compare(models, numpy.asarray(record(), numpy.float32))
+            except RuntimeError as error:
+                print(f"  {error}")
+        else:
             print(HELP)
-            continue
-        try:
-            compare(models, numpy.asarray(record(), numpy.float32))
-        except RuntimeError as error:
-            print(f"  {error}")

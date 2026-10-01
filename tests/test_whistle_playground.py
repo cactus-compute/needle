@@ -54,6 +54,7 @@ def test_record_resamples_the_microphone_to_16_khz_and_keeps_30_s(monkeypatch, c
     assert "recording, Enter to stop" in capsys.readouterr().out
     monkeypatch.setitem(sys.modules, "sounddevice", _Microphone(16000, 31))
     assert len(record()) == 30 * 16000
+    assert "keeping the first 30 s" in capsys.readouterr().out
 
 
 def test_record_says_what_is_missing(monkeypatch):
@@ -92,6 +93,22 @@ def test_playground_and_compare_share_one_status_line():
     assert status("moonshine tiny v2", 145e6, None, None, 0.21) == "  moonshine tiny v2  145 MB  ttft      -  decode          -  total  210 ms"
 
 
+def test_status_reads_a_slow_run_in_seconds():
+    from needle.playground.whistle import status
+
+    assert status("whistle", 17e6, 0.0137, 1264.4, 12.5).endswith("total  12.5 s")
+    assert status("whistle", 17e6, 0.0137, 1264.4, 9.9).endswith("total 9900 ms")
+
+
+def test_audio_path_takes_a_path_as_a_terminal_hands_it_over():
+    from needle.playground.whistle import audio_path
+
+    assert audio_path(" clip.wav ") == "clip.wav"
+    assert audio_path('"my clips/a b.wav"') == "my clips/a b.wav"
+    assert audio_path("'my clips/a b.wav'") == "my clips/a b.wav"
+    assert audio_path("my\\ clips/a\\ b.wav") == "my clips/a b.wav"
+
+
 def test_playground_prints_text_words_and_timing(capsys):
     from needle.playground.whistle import transcribe
 
@@ -114,6 +131,34 @@ def test_playground_reports_engine_errors_instead_of_raising(capsys):
 
     transcribe(Broken(), "long.wav", {"language": None, "keywords": [], "timestamps": False})
     assert capsys.readouterr().out == "  audio limit is 30 s\n"
+
+
+def test_playground_keeps_the_language_when_the_code_is_not_one_of_ours(monkeypatch, capsys):
+    from needle.playground import whistle as playground
+
+    lines = iter(["/language de", "/language EN", "/language", "/quit"])
+    monkeypatch.setattr(playground, "prompt", lambda: next(lines))
+    monkeypatch.setattr("needle.whistle.Whistle", lambda weights=None: _Whistle({}))
+    playground.main(type("Args", (), {"audio": None, "language": None, "keywords": "",
+                                      "word_timestamps": False, "weights": None})())
+    out = capsys.readouterr().out
+    assert "language de" in out and "language is one of en de fr es it nl pl" in out and "language detected" in out
+
+
+def test_compare_runs_a_file_the_same_way_the_playground_does(monkeypatch, capsys):
+    pytest.importorskip("numpy")
+    from needle.playground import whistle_compare
+
+    seen, read = [], []
+    monkeypatch.setattr(whistle_compare, "compare", lambda models, audio: seen.append(len(audio)))
+    monkeypatch.setattr("needle.whistle._read_wav", lambda path: read.append(path) or [0.0] * 16000)
+    lines = iter(['/file "my clips/a b.wav"', "/quit"])
+    monkeypatch.setattr(whistle_compare, "prompt", lambda: next(lines))
+    monkeypatch.setattr(whistle_compare, "load_whistle", lambda weights: (17e6, lambda audio: ("", None, None)))
+    monkeypatch.setattr(whistle_compare, "load_whisper", lambda size: (76e6, lambda audio: ("", None, None)))
+    monkeypatch.setattr(whistle_compare, "load_moonshine", lambda: (45e6, lambda audio: ("", None, None)))
+    whistle_compare.main(type("Args", (), {"audio": None, "weights": None})())
+    assert read == ["my clips/a b.wav"] and seen == [16000]
 
 
 def test_compare_needs_its_extra(monkeypatch):
