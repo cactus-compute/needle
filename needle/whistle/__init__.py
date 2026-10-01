@@ -15,8 +15,8 @@ _loaded = None
 
 
 def _weights_path():
-    from . import _base_weights_path
-    from .agent import fetch
+    from .. import _base_weights_path
+    from ..agent import fetch
 
     return os.environ.get("NEEDLE_WHISTLE_WEIGHTS") or _base_weights_path(fetch.WHISTLE)
 
@@ -24,8 +24,8 @@ def _weights_path():
 def _lib():
     global _handle
     if _handle is None:
-        from . import _load_cdll
-        from .agent import fetch
+        from .. import _load_cdll
+        from ..agent import fetch
 
         lib = _load_cdll(fetch.WHISTLE)
         samples = ctypes.POINTER(ctypes.c_float)

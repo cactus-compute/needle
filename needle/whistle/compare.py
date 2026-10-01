@@ -1,7 +1,7 @@
 import os
 import time
 
-from .whistle import audio_path, prompt, record, status
+from .playground import audio_path, prompt, record, status
 
 HELP = """  Enter          speak, Enter again to stop
   /file clip.wav run a file through every model
@@ -14,7 +14,7 @@ def rate(marks):
 
 
 def load_whistle(weights):
-    from ..whistle import Whistle
+    from . import Whistle
 
     whistle = Whistle(weights=weights)
 
@@ -45,7 +45,7 @@ def load_whisper(size):
 def load_moonshine():
     import moonshine_voice
 
-    from ..whistle import SAMPLE_RATE
+    from . import SAMPLE_RATE
 
     path, arch = moonshine_voice.get_model_for_language("en", moonshine_voice.ModelArch.TINY_STREAMING)
     model = moonshine_voice.Transcriber(model_path=path, model_arch=arch)
@@ -65,7 +65,7 @@ def compare(models, audio):
 
 
 def main(args):
-    from ..whistle import SAMPLE_RATE, _read_wav
+    from . import SAMPLE_RATE, _read_wav
 
     try:
         import moonshine_voice  # noqa: F401

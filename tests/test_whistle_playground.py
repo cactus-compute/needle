@@ -43,7 +43,7 @@ class _Microphone:
 def test_record_resamples_the_microphone_to_16_khz_and_keeps_30_s(monkeypatch, capsys):
     numpy = pytest.importorskip("numpy")
     pytest.importorskip("soxr")
-    from needle.playground.whistle import record
+    from needle.whistle.playground import record
 
     microphone = _Microphone(48000, 1)
     monkeypatch.setitem(sys.modules, "sounddevice", microphone)
@@ -58,7 +58,7 @@ def test_record_resamples_the_microphone_to_16_khz_and_keeps_30_s(monkeypatch, c
 
 
 def test_record_says_what_is_missing(monkeypatch):
-    from needle.playground.whistle import record
+    from needle.whistle.playground import record
 
     monkeypatch.setitem(sys.modules, "sounddevice", None)
     with pytest.raises(RuntimeError, match=r"cactus-needle\[whistle\]"):
@@ -66,14 +66,14 @@ def test_record_says_what_is_missing(monkeypatch):
 
 
 def test_rate_counts_steps_after_the_first_mark():
-    from needle.playground.whistle_compare import rate
+    from needle.whistle.compare import rate
 
     assert rate([1.0, 1.5, 2.0]) == 2.0
     assert rate([1.0]) == 0.0 and rate([]) == 0.0 and rate([2.0, 2.0]) == 0.0
 
 
 def test_compare_prints_one_line_per_model_with_dashes_for_missing_timing(capsys):
-    from needle.playground.whistle_compare import compare
+    from needle.whistle.compare import compare
 
     models = [("whistle", 17e6, lambda audio: ("hello there", 0.013, 1264.0)),
               ("moonshine tiny v2", 45e6, lambda audio: ("", None, None))]
@@ -87,21 +87,21 @@ def test_compare_prints_one_line_per_model_with_dashes_for_missing_timing(capsys
 
 
 def test_playground_and_compare_share_one_status_line():
-    from needle.playground.whistle import status
+    from needle.whistle.playground import status
 
     assert status("whistle", 17e6, 0.0137, 1264.4, 0.048) == "  whistle             17 MB  ttft  14 ms  decode 1264 tok/s  total   48 ms"
     assert status("moonshine tiny v2", 145e6, None, None, 0.21) == "  moonshine tiny v2  145 MB  ttft      -  decode          -  total  210 ms"
 
 
 def test_status_reads_a_slow_run_in_seconds():
-    from needle.playground.whistle import status
+    from needle.whistle.playground import status
 
     assert status("whistle", 17e6, 0.0137, 1264.4, 12.5).endswith("total  12.5 s")
     assert status("whistle", 17e6, 0.0137, 1264.4, 9.9).endswith("total 9900 ms")
 
 
 def test_audio_path_takes_a_path_as_a_terminal_hands_it_over():
-    from needle.playground.whistle import audio_path
+    from needle.whistle.playground import audio_path
 
     assert audio_path(" clip.wav ") == "clip.wav"
     assert audio_path('"my clips/a b.wav"') == "my clips/a b.wav"
@@ -110,7 +110,7 @@ def test_audio_path_takes_a_path_as_a_terminal_hands_it_over():
 
 
 def test_playground_prints_text_words_and_timing(capsys):
-    from needle.playground.whistle import transcribe
+    from needle.whistle.playground import transcribe
 
     whistle = _Whistle({"text": "hello there", "language": "en", "ttft_ms": 12.6, "decode_tps": 900.4,
                         "words": [{"word": "hello", "start": 0.1, "end": 0.4, "probability": 0.98}]})
@@ -123,7 +123,7 @@ def test_playground_prints_text_words_and_timing(capsys):
 
 
 def test_playground_reports_engine_errors_instead_of_raising(capsys):
-    from needle.playground.whistle import transcribe
+    from needle.whistle.playground import transcribe
 
     class Broken:
         def transcribe(self, audio, **options):
@@ -134,7 +134,7 @@ def test_playground_reports_engine_errors_instead_of_raising(capsys):
 
 
 def test_playground_keeps_the_language_when_the_code_is_not_one_of_ours(monkeypatch, capsys):
-    from needle.playground import whistle as playground
+    from needle.whistle import playground
 
     lines = iter(["/language de", "/language EN", "/language", "/quit"])
     monkeypatch.setattr(playground, "prompt", lambda: next(lines))
@@ -147,7 +147,7 @@ def test_playground_keeps_the_language_when_the_code_is_not_one_of_ours(monkeypa
 
 def test_compare_runs_a_file_the_same_way_the_playground_does(monkeypatch, capsys):
     pytest.importorskip("numpy")
-    from needle.playground import whistle_compare
+    from needle.whistle import compare as whistle_compare
 
     seen, read = [], []
     monkeypatch.setattr(whistle_compare, "compare", lambda models, audio: seen.append(len(audio)))
@@ -162,7 +162,7 @@ def test_compare_runs_a_file_the_same_way_the_playground_does(monkeypatch, capsy
 
 
 def test_compare_needs_its_extra(monkeypatch):
-    from needle.playground import whistle_compare
+    from needle.whistle import compare as whistle_compare
 
     monkeypatch.setitem(sys.modules, "whisper", None)
     with pytest.raises(SystemExit, match=r"cactus-needle\[whistle,whistle-compare\]"):
@@ -172,13 +172,13 @@ def test_compare_needs_its_extra(monkeypatch):
 def test_cli_routes_the_whistle_commands(monkeypatch):
     import needle._telemetry
     import needle.cli
-    import needle.playground.whistle
-    import needle.playground.whistle_compare
+    import needle.whistle.playground
+    import needle.whistle.compare
 
     seen = []
     monkeypatch.setattr(needle._telemetry, "track", lambda *a, **k: None)
-    monkeypatch.setattr(needle.playground.whistle, "main", lambda args: seen.append(("playground", args)))
-    monkeypatch.setattr(needle.playground.whistle_compare, "main", lambda args: seen.append(("compare", args)))
+    monkeypatch.setattr(needle.whistle.playground, "main", lambda args: seen.append(("playground", args)))
+    monkeypatch.setattr(needle.whistle.compare, "main", lambda args: seen.append(("compare", args)))
     monkeypatch.setattr(sys, "argv", ["needle", "whistle", "playground", "clip.wav", "--language", "de", "--keywords", "Siobhan, Krzysztof", "--word-timestamps"])
     needle.cli.main()
     monkeypatch.setattr(sys, "argv", ["needle", "whistle", "compare", "--weights", "w.cact"])

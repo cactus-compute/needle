@@ -389,9 +389,9 @@ def main():
         playground_main(args)
     elif args.command == "whistle":
         if args.verb == "playground":
-            from .playground.whistle import main as whistle_main
+            from .whistle.playground import main as whistle_main
         elif args.verb == "compare":
-            from .playground.whistle_compare import main as whistle_main
+            from .whistle.compare import main as whistle_main
         else:
             raise SystemExit("needle whistle playground | compare | fetch | download")
         whistle_main(args)

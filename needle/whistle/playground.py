@@ -27,7 +27,7 @@ def status(name, size, ttft, tokens, total):
 
 
 def record():
-    from ..whistle import SAMPLE_RATE
+    from . import SAMPLE_RATE
 
     try:
         import numpy
@@ -78,7 +78,7 @@ def transcribe(whistle, audio, state):
 
 
 def main(args):
-    from ..whistle import LANGUAGES, Whistle
+    from . import LANGUAGES, Whistle
 
     state = {"language": args.language, "keywords": [k.strip() for k in args.keywords.split(",") if k.strip()], "timestamps": args.word_timestamps}
     print("whistle playground: downloading and initializing the model...", flush=True)
