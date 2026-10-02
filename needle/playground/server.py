@@ -73,7 +73,7 @@ def _finetune_worker(tools_json, api_key, samples, engine):
             tools, samples, api_key=api_key,
             progress=lambda done, total: _log(f"generated {done}/{total}"))
         data_path = str(_DOWNLOADS / "needle_playground_data.jsonl")
-        with open(data_path, "w") as handle:
+        with open(data_path, "w", encoding="utf-8") as handle:
             for row in rows:
                 handle.write(json.dumps(row) + "\n")
 

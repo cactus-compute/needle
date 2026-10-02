@@ -221,3 +221,65 @@ def test_confidence_head_detected_from_manifest(tmp_path, fake_cact):
     assert needle._confidence_head_present(str(tmp_path / "platform.cact")) is True
     assert needle._confidence_head_present(str(tmp_path / "local.cact")) is False
     assert needle._confidence_head_present(str(tmp_path / "bare.cact")) is False
+
+
+def _locale_open(encoding):
+    """open() as it behaves where the locale's encoding is `encoding` (Windows'
+    ANSI code page): a text-mode open without an encoding decodes with it."""
+    import builtins
+
+    def locale_open(file, mode="r", *args, **kwargs):
+        if "b" not in mode and not args and kwargs.get("encoding") is None:
+            kwargs["encoding"] = encoding
+        return builtins.open(file, mode, *args, **kwargs)
+    return locale_open
+
+
+@pytest.mark.parametrize("locale_encoding", ["cp1252", "cp949"])
+def test_data_and_tool_files_are_utf8_whatever_the_locale(tmp_path, monkeypatch, locale_encoding):
+    # The JSON these commands read is UTF-8, but a text-mode open() without an
+    # encoding decodes with the locale's. On Windows "café" came back as
+    # "cafÃ©" (cp1252) or "caf챕" (cp949) with no error, and an emoji stopped
+    # the read with UnicodeDecodeError.
+    import types
+
+    import needle.model.finetune as finetune
+    import needle.platform as platform
+
+    for module in (finetune, platform):
+        monkeypatch.setattr(module, "open", _locale_open(locale_encoding), raising=False)
+    query = "set the café lights to 22°C and play 🎵"
+    tools = [{"name": "set_lights", "description": "Réglez la lumière à 22°C",
+              "parameters": {"type": "object", "properties": {}}}]
+    tools_path = tmp_path / "tools.json"
+    tools_path.write_text(json.dumps(tools, ensure_ascii=False), encoding="utf-8")
+    data = tmp_path / "data.jsonl"
+    data.write_text(json.dumps({"query": query, "tools": tools, "answers": []}, ensure_ascii=False) + "\n",
+                    encoding="utf-8")
+
+    assert [row["query"] for row in finetune.read_examples(str(data))] == [query]
+
+    seen = {}
+
+    def generate_dataset(tools, num_samples, **kwargs):
+        seen["generate"] = tools
+        return [{"query": query, "tools": tools, "answers": []}]
+    monkeypatch.setattr(finetune, "generate_dataset", generate_dataset)
+    out = tmp_path / "generated.jsonl"
+    finetune.generate_main(types.SimpleNamespace(
+        model=None, workers=1, tools=str(tools_path), output=str(out), num_samples=1,
+        batch_size=1, augment=None))
+    assert seen["generate"] == tools
+    assert [row["query"] for row in finetune.read_examples(str(out))] == [query]
+
+    class Client:
+        def billing(self):
+            return {}
+
+        def generate(self, tools, examples, **kwargs):
+            seen["platform"] = tools
+            return {"id": "gen-1"}
+    platform._cmd_generate(Client(), types.SimpleNamespace(
+        tools=str(tools_path), examples=10, description=None, message=None, suffix=None,
+        no_wait=True))
+    assert seen["platform"] == tools
