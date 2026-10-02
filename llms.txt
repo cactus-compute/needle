@@ -233,7 +233,7 @@ Adapt by swapping the Literal values for your own and keeping the shapes: closed
 
 ## CLI summary
 
-- `needle run --checkpoint <base.safetensors> --query "..." --tools tools.json` - JAX reference inference from a checkpoint (dev path; normal inference is the Python `Needle` API above).
+- `needle run --checkpoint <base.safetensors> --query "..." --tools tools.json [--temperature <t>]` - JAX reference inference from a checkpoint (dev path; normal inference is the Python `Needle` API above); `--temperature` defaults to 0 (greedy).
 - `needle generate-data` / `needle finetune` / `needle build [checkpoint] [--lora adapter] [--layers N] [--platform <folder>] [--out <path>]` - the fine-tuning pipeline; fine-tuning runs at the full 20 layers, `build` merges the adapter, slices the `--layers` rung (default 20), exports at 4 bits, and fetches the published `needle3.cact` on every run (without an adapter at full depth it ships that published 2-bit archive as is). `--platform` also downloads that platform's engine and header and makes `--out` a folder holding them plus `needle3.cact`.
 - `needle playground` - the browser UI locally (hosted at https://cactuscompute.com/needle).
 - `needle whistle playground [clip.wav] [--language en] [--keywords "Siobhan, Krzysztof"] [--word-timestamps] [--weights whistle.cact]` - Whistle speech to text in the terminal: press Enter to speak, Enter again to stop, or pass a WAV file; `/language`, `/keywords`, `/timestamps` and `/file` change the settings between recordings. Recording from the microphone needs the `[mic]` extra. `whistle.cact` is fetched from `Cactus-Compute/whistle` on first use and runs on the same engine as Needle; `NEEDLE_WHISTLE_WEIGHTS` points at a local copy and `NEEDLE3_LIB_PATH` at a local engine.
