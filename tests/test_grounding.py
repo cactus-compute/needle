@@ -410,3 +410,26 @@ def test_extract_accepts_a_date_followed_by_a_time(stub):
     invoice = needle.extract("Invoice from Acme Corp due March 3 14:00", Invoice)
 
     assert invoice.due_date == datetime.date(2026, 3, 3)
+
+
+@pytest.mark.parametrize("text", [
+    "due Dec. 25, 2026",
+    "due 25 Dec. 2026",
+    "due Sept. 12, 2025",
+    "due 12 Sept. 2025",
+    "due Sep. 2025",
+])
+def test_an_abbreviated_month_with_a_period_still_gives_its_year(text):
+    import needle
+
+    assert needle._source_years(text) in ({2026}, {2025})
+    assert needle._source_years(text)
+
+
+def test_extract_accepts_dates_written_with_abbreviated_months_and_periods(stub):
+    import needle
+
+    stub.envelopes = [_call("2026-12-25")]
+    invoice = needle.extract("Invoice from Acme, issued Jun 5, 2025 and due Dec. 25, 2026", Invoice)
+
+    assert invoice.due_date == datetime.date(2026, 12, 25)
