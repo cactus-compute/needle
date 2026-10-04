@@ -429,7 +429,7 @@ def _resolve_ref(node, root):
 def _source_years(text):
     months = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
               r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|"
-              r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
+              r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?")
     patterns = [
         # The number after a day and month is its year, unless it is the hour of
         # a time ("5 June 19:30", "June 5 7 pm"): no ISO argument can carry
