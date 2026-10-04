@@ -11,6 +11,7 @@ import warnings
 from .agent.tools import Field, build_schema, pydantic_schema, tool, _is_pydantic_model
 from ._telemetry import track as _track
 from ._worker import FineTuneWorker
+from .agent import whistle as _whistle
 from .agent.whistle import Whistle, stream, transcribe
 
 __version__ = "3.1.0"
@@ -176,6 +177,8 @@ def _lib(generation=2):
                 ctypes.c_char_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int,
                 ctypes.POINTER(ctypes.c_float), ctypes.c_int]
             lib.needle_embed.restype = ctypes.c_int
+            lib.needle_set_audio.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+            lib.needle_set_audio.restype = None
         lib.needle_reset.argtypes = []
         lib.needle_reset.restype = None
         lib.needle_load.argtypes = [ctypes.c_char_p, ctypes.c_uint64]
@@ -263,12 +266,14 @@ class Needle:
         return {"n_tools": self._n_tools, "tuned": self._tuned,
                 "generation": self._generation}
 
-    def complete(self, text: str = "", max_new_tokens: int = 512) -> dict:
-        _track("complete", self._track_props())
+    def complete(self, text: str = "", max_new_tokens: int = 512, audio=None, language=None, keywords=None,
+                 word_timestamps=False, tool_schema_keywords=True) -> dict:
+        _track("complete", {**self._track_props(), "audio": audio is not None})
         if self._stateless:
             self.reset()
         self._count_query()
-        return self._complete(text, max_new_tokens)
+        return self._complete(text, max_new_tokens, audio=audio, language=language, keywords=keywords,
+                              word_timestamps=word_timestamps, tool_schema_keywords=tool_schema_keywords)
 
     def _count_query(self):
         self._turns += 1
@@ -279,33 +284,51 @@ class Needle:
                 "Call reset() between independent queries, or construct with stateless=True",
                 stacklevel=3)
 
-    def _complete(self, text: str, max_new_tokens: int = 512,
-                  ground: bool = True) -> dict:
+    def _complete(self, text: str, max_new_tokens: int = 512, ground: bool = True, audio=None, language=None,
+                  keywords=None, word_timestamps=False, tool_schema_keywords=True) -> dict:
+        if audio is not None and text:
+            raise ValueError("complete takes text or audio, not both")
         self._bind()
-        self._seen_years |= _source_years(text or "")
-        if self._worker is not None:
-            raw = self._worker.complete(text, max_new_tokens)
+        if audio is not None:
+            samples, count = _whistle._samples(audio)
+            speech = _whistle._shared_model(_whistle._loaded)
+            flags = int(bool(word_timestamps)), int(bool(tool_schema_keywords))
+            if self._worker is not None:
+                raw = self._worker.complete(None, max_new_tokens, audio=bytes(samples)[:count * 4], speech=speech.weights,
+                                            options=(language, keywords, *flags))
+            else:
+                speech._bind()
+                lib = _lib(self._generation)
+                lib.needle_set_audio(*_whistle._options(language, keywords), *flags)
+                raw = self._native(lib, None, samples, count, max_new_tokens)
         else:
-            lib = _lib(self._generation)
-            rc = lib.needle_complete(
-                text.encode("utf-8"), None, 0, int(max_new_tokens), self._buffer,
-                len(self._buffer))
-            if rc < 0:
-                detail = self._buffer.value.decode("utf-8", "replace")
-                raise RuntimeError(detail or f"needle_complete failed (code {rc})")
-            raw = self._buffer.value.decode("utf-8")
+            self._seen_years |= _source_years(text or "")
+            if self._worker is not None:
+                raw = self._worker.complete(text, max_new_tokens)
+            else:
+                raw = self._native(_lib(self._generation), text.encode("utf-8"), None, 0, max_new_tokens)
         try:
             response = json.loads(raw)
         except json.JSONDecodeError as err:
             raise RuntimeError(
                 f"engine returned an unparseable envelope ({err}); this is an "
                 f"engine bug - please report it with the prompt and schema") from err
+        if audio is not None:
+            text = response.get("audio_text") or ""
+            self._seen_years |= _source_years(text)
         if not self._calibrated:
             response["confidence"] = None
         if ground:
             _annotate_ungrounded(response, self._tool_schemas, self._seen_years,
                                  self._system_text, text)
         return response
+
+    def _native(self, lib, text, samples, count, max_new_tokens):
+        rc = lib.needle_complete(text, samples, count, int(max_new_tokens), self._buffer, len(self._buffer))
+        if rc < 0:
+            detail = self._buffer.value.decode("utf-8", "replace")
+            raise RuntimeError(detail or f"needle_complete failed (code {rc})")
+        return self._buffer.value.decode("utf-8")
 
     def embed(self, text: str = "") -> list[float]:
         if self._generation < 3:
@@ -323,13 +346,16 @@ class Needle:
             raise RuntimeError(f"needle_embed failed (code {rc})")
         return list(output)
 
-    def run(self, query: str = "", max_steps: int = 8,
-            max_new_tokens: int = 512, strict: bool = True) -> dict:
-        _track("run", self._track_props())
+    def run(self, query: str = "", max_steps: int = 8, max_new_tokens: int = 512, strict: bool = True, audio=None,
+            language=None, keywords=None, word_timestamps=False, tool_schema_keywords=True) -> dict:
+        _track("run", {**self._track_props(), "audio": audio is not None})
         if self._stateless:
             self.reset()
         self._count_query()
-        response = self._complete(query, max_new_tokens)
+        response = self._complete(query, max_new_tokens, audio=audio, language=language, keywords=keywords,
+                                  word_timestamps=word_timestamps, tool_schema_keywords=tool_schema_keywords)
+        if audio is not None:
+            query = response.get("audio_text") or ""
         executed = []
         for _ in range(max_steps):
             calls = response.get("function_calls") or []

@@ -42,7 +42,7 @@ print(agent.run("what's it like in Lagos right now?")["results"])
 # [{'city': 'Lagos', 'temp_c': 27, 'sky': 'clear'}]
 ```
 
-Every turn returns one JSON object with `function_calls`, the model's `reasoning` and a calibrated `confidence`; an off-topic request returns an empty list rather than a guess. `needle.Needle(tools=[...], generation=2)` keeps running Needle 2 for existing deployments.
+Every turn returns one JSON object with `function_calls`, the model's `reasoning` and a calibrated `confidence`; an off-topic request returns an empty list rather than a guess. `agent.run(audio="clip.wav")` speaks the request instead: the engine transcribes it with Whistle and answers in one call. `needle.Needle(tools=[...], generation=2)` keeps running Needle 2 for existing deployments.
 
 ## Whistle
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import ctypes
 import json
 import os
@@ -57,9 +58,11 @@ def _load_library(path, generation=2):
                                     ctypes.c_char_p, ctypes.c_int]
     lib.needle_complete.restype = ctypes.c_int
     if int(generation) >= 3:
-        lib.needle_embed.argtypes = [
-            ctypes.c_char_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int]
+        lib.needle_embed.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                                     ctypes.POINTER(ctypes.c_float), ctypes.c_int]
         lib.needle_embed.restype = ctypes.c_int
+        lib.needle_set_audio.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        lib.needle_set_audio.restype = None
     lib.needle_reset.argtypes = []
     lib.needle_reset.restype = None
     lib.needle_load.argtypes = [ctypes.c_char_p, ctypes.c_uint64]
@@ -89,6 +92,7 @@ def _child():
         if prefix < 0:
             raise RuntimeError(f"needle_init failed (code {prefix})")
         output = ctypes.create_string_buffer(int(config["buffer_size"]))
+        speech = None
         _write_message(protocol, {"status": "ready", "prefix_tokens": prefix})
         while True:
             request = _read_message(source)
@@ -96,8 +100,24 @@ def _child():
                 break
             operation = request.get("operation")
             if operation == "complete":
+                text, pcm, samples = request.get("text"), None, 0
+                if request.get("audio") is not None:
+                    if request["speech"] != speech:
+                        with open(request["speech"], "rb") as handle:
+                            weights = handle.read()
+                        if lib.needle_load(weights, len(weights)) < 0:
+                            _write_message(protocol, {"status": "error",
+                                                      "message": f"needle_load failed for {request['speech']}"})
+                            continue
+                        speech = request["speech"]
+                    language, keywords, word_timestamps, tool_schema_keywords = request["options"]
+                    lib.needle_set_audio(language.encode("utf-8") if language else None,
+                                         keywords.encode("utf-8") if keywords else None, word_timestamps, tool_schema_keywords)
+                    raw = base64.b64decode(request["audio"])
+                    samples = len(raw) // 4
+                    pcm = (ctypes.c_float * max(samples, 1)).from_buffer_copy(raw.ljust(4, b"\0"))
                 code = lib.needle_complete(
-                    request["text"].encode("utf-8"), None, 0,
+                    text.encode("utf-8") if text is not None else None, pcm, samples,
                     int(request["max_new_tokens"]), output, len(output))
                 if code < 0:
                     _write_message(protocol, {
@@ -117,7 +137,7 @@ def _child():
                     })
                     continue
                 text = request["text"].encode("utf-8")
-                dim = lib.needle_embed(text, None, 0)
+                dim = lib.needle_embed(text, None, 0, None, 0)
                 if dim <= 0:
                     _write_message(protocol, {
                         "status": "error",
@@ -125,7 +145,7 @@ def _child():
                     })
                     continue
                 embedding = (ctypes.c_float * dim)()
-                code = lib.needle_embed(text, embedding, dim)
+                code = lib.needle_embed(text, None, 0, embedding, dim)
                 if code != dim:
                     _write_message(protocol, {
                         "status": "error",
@@ -239,12 +259,15 @@ class FineTuneWorker:
                 raise RuntimeError(response.get("message", "Needle worker failed"))
             return response
 
-    def complete(self, text, max_new_tokens):
-        return self._request({
-            "operation": "complete",
-            "text": text,
-            "max_new_tokens": int(max_new_tokens),
-        })["response"]
+    def complete(self, text, max_new_tokens, audio=None, speech=None, options=None):
+        request = {"operation": "complete", "text": text, "max_new_tokens": int(max_new_tokens)}
+        if audio is not None:
+            language, keywords, word_timestamps, tool_schema_keywords = options
+            if keywords is not None and not isinstance(keywords, str):
+                keywords = "\n".join(keywords)
+            request.update(audio=base64.b64encode(audio).decode("ascii"), speech=speech,
+                           options=[language, keywords, word_timestamps, tool_schema_keywords])
+        return self._request(request)["response"]
 
     def embed(self, text):
         return self._request({

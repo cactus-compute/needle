@@ -45,14 +45,35 @@ int needle_init(const char* system, const char* tools, const char* index) {
     return 7;
 }
 
-int needle_complete(const char* input, const float* pcm, int samples,
-                    int max_new_tokens, char* output, int capacity) {
+static char language[8];
+
+int needle_embed(const char* text, const float* pcm, int samples, float* output, int capacity) {
+    (void)text;
     (void)pcm;
     (void)samples;
+    (void)output;
+    (void)capacity;
+    return 0;
+}
+
+void needle_set_audio(const char* lang, const char* keywords, int word_timestamps, int tool_schema_keywords) {
+    (void)keywords;
+    (void)word_timestamps;
+    (void)tool_schema_keywords;
+    snprintf(language, sizeof(language), "%s", lang ? lang : "");
+}
+
+int needle_complete(const char* input, const float* pcm, int samples,
+                    int max_new_tokens, char* output, int capacity) {
     (void)max_new_tokens;
-    snprintf(output, (size_t)capacity,
-             "{\"type\":\"text\",\"model\":%d,\"resets\":%d,"
-             "\"input\":\"%s\"}", model_id, resets, input);
+    if (!input)
+        snprintf(output, (size_t)capacity,
+                 "{\"type\":\"text\",\"model\":%d,\"resets\":%d,\"samples\":%d,"
+                 "\"last\":%.2f,\"language\":\"%s\"}", model_id, resets, samples, samples ? pcm[samples - 1] : 0.0f, language);
+    else
+        snprintf(output, (size_t)capacity,
+                 "{\"type\":\"text\",\"model\":%d,\"resets\":%d,"
+                 "\"input\":\"%s\"}", model_id, resets, input);
     return 1;
 }
 
@@ -117,6 +138,20 @@ def test_tuned_agents_use_independent_workers(stub_engine, tmp_path,
     finally:
         first.close()
         second.close()
+
+
+def test_worker_carries_audio_turns(stub_engine, tmp_path):
+    import struct
+
+    weights = _weights(tmp_path / "tuned.cact", 5)
+    speech = _weights(tmp_path / "whistle.cact", 9)
+    worker = FineTuneWorker(stub_engine, weights, "", "[]", None, 4096, generation=3)
+    try:
+        heard = json.loads(worker.complete(None, 8, audio=struct.pack("<3f", 0.1, 0.2, 0.75), speech=str(speech), options=("de", None, 0, 1)))
+        assert heard["samples"] == 3 and heard["last"] == 0.75 and heard["language"] == "de" and heard["model"] == 9
+        assert json.loads(worker.complete("text", 8))["input"] == "text"
+    finally:
+        worker.close()
 
 
 def test_worker_propagates_native_load_failure(stub_engine, tmp_path):
