@@ -34,6 +34,11 @@ def _lib():
         lib.needle_transcribe.argtypes = [samples, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int,
                                           ctypes.c_char_p, ctypes.c_int]
         lib.needle_transcribe.restype = ctypes.c_int
+        lib.needle_stream_transcribe_process.argtypes = [samples, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+                                                         ctypes.c_int]
+        lib.needle_stream_transcribe_process.restype = ctypes.c_int
+        lib.needle_stream_transcribe_stop.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        lib.needle_stream_transcribe_stop.restype = ctypes.c_int
         lib.needle_embed.argtypes = [ctypes.c_char_p, samples, ctypes.c_int, samples, ctypes.c_int]
         lib.needle_embed.restype = ctypes.c_int
         lib.needle_last_error.argtypes = []
@@ -64,6 +69,12 @@ def _read_wav(path):
     except ImportError:
         raise RuntimeError(f"resampling {rate} Hz audio to {SAMPLE_RATE} Hz needs soxr: pip install cactus-needle[mic]") from None
     return soxr.resample(numpy.asarray(mono, numpy.float32), rate, SAMPLE_RATE, quality="HQ")
+
+
+def _options(language, keywords):
+    if keywords is not None and not isinstance(keywords, str):
+        keywords = "\n".join(keywords)
+    return language.encode("utf-8") if language else None, keywords.encode("utf-8") if keywords else None
 
 
 def _samples(audio):
@@ -106,6 +117,11 @@ class Whistle:
         _loaded = self.weights
         return lib
 
+    def _result(self, code):
+        if code < 0:
+            raise RuntimeError(_lib().needle_last_error().decode("utf-8", "replace"))
+        return json.loads(self._buffer.value.decode("utf-8", "replace"))
+
     def transcribe(self, audio, language=None, keywords=None, word_timestamps=False) -> dict:
         """Returns {"text", "language", "ttft_ms", "decode_tps"}, plus "words" with start, end and probability when word_timestamps is set.
 
@@ -113,14 +129,28 @@ class Whistle:
         """
         lib = self._bind()
         samples, count = _samples(audio)
-        if keywords is not None and not isinstance(keywords, str):
-            keywords = "\n".join(keywords)
-        code = lib.needle_transcribe(samples, count, language.encode("utf-8") if language else None,
-                                     keywords.encode("utf-8") if keywords else None, int(bool(word_timestamps)),
-                                     self._buffer, len(self._buffer))
-        if code < 0:
-            raise RuntimeError(lib.needle_last_error().decode("utf-8", "replace"))
-        return json.loads(self._buffer.value.decode("utf-8", "replace"))
+        language, keywords = _options(language, keywords)
+        return self._result(lib.needle_transcribe(samples, count, language, keywords, int(bool(word_timestamps)),
+                                                  self._buffer, len(self._buffer)))
+
+    def stream(self, chunks, language=None, keywords=None):
+        """Live transcription: one dict per chunk, then one for the tail when the chunks end.
+
+        chunks are 16 kHz mono float sample buffers, about a second each, with no limit on the total. Each dict has the
+        "text" and "words" committed by that chunk, with times from the start of the stream, the unconfirmed "pending"
+        tail, the "language", the seconds "received" and the "pass_ms" it took. Join the texts with a space.
+        """
+        lib = self._bind()
+        language, keywords = _options(language, keywords)
+        try:
+            for chunk in chunks:
+                samples, count = _samples(chunk)
+                yield self._result(lib.needle_stream_transcribe_process(samples, count, language, keywords, self._buffer,
+                                                                        len(self._buffer)))
+        except BaseException:
+            lib.needle_stream_transcribe_stop(self._buffer, len(self._buffer))
+            raise
+        yield self._result(lib.needle_stream_transcribe_stop(self._buffer, len(self._buffer)))
 
     def embed(self, audio) -> list[float]:
         """The encoder output, one row of floats per 80 ms frame, flattened."""
@@ -160,10 +190,24 @@ def transcribe(audio, language=None, keywords=None, word_timestamps=False, weigh
                                              word_timestamps=word_timestamps)
 
 
+def stream(chunks, language=None, keywords=None, weights=None):
+    """Live transcription on the model this process already has loaded: Whistle.stream with no limit on length.
+
+    chunks are 16 kHz mono float sample buffers, about a second each. Yields one dict per chunk with the "text"
+    and "words" committed by it, the unconfirmed "pending" tail, the "language", the seconds "received" and
+    "pass_ms", then one for the tail when the chunks end.
+    """
+    from .._telemetry import track
+
+    track("stream", {"tuned": bool(weights)})
+    return _shared_model(weights).stream(chunks, language=language, keywords=keywords)
+
+
 PLAYGROUND_HELP = """  Enter          speak, Enter again to stop
   /language de   force a language (en de fr es it nl pl), bare to detect it
   /keywords      Siobhan, Krzysztof
   /timestamps    toggle word times
+  /stream        toggle live transcription, the words printing as they are committed
   /file clip.wav transcribe a file
   /quit          leave"""
 COMPARE_HELP = """  Enter          speak, Enter again to stop
@@ -171,6 +215,8 @@ COMPARE_HELP = """  Enter          speak, Enter again to stop
   /quit          leave"""
 COMPARE_INSTALL = 'pip install "cactus-needle[mic,compare]"'
 CLEAR_ABOVE = "\x1b[1A\x1b[2K"
+DIM = "\x1b[90m"
+PLAIN = "\x1b[0m"
 LIMIT_SECONDS = 30
 
 
@@ -215,6 +261,78 @@ def record():
     return audio if rate == SAMPLE_RATE else soxr.resample(audio, rate, SAMPLE_RATE, quality="HQ")
 
 
+def listen(whistle, state):
+    try:
+        import numpy
+        import sounddevice
+        import soxr
+    except ImportError as error:
+        raise RuntimeError(f'{error.name} is not installed: pip install "cactus-needle[mic]"') from None
+    import queue
+    import threading
+    heard, steps, failed = queue.Queue(), [], []
+
+    def chunks():
+        block, held = [], 0
+        while True:
+            data = heard.get()
+            if data is not None:
+                block.append(data)
+                held += len(data)
+            if block and (held >= SAMPLE_RATE or data is None):
+                yield numpy.concatenate(block)
+                block, held = [], 0
+            if data is None:
+                return
+
+    def show():
+        import shutil
+        committed, drawn = "", ()
+        try:
+            for step in whistle.stream(chunks(), language=state["language"], keywords=state["keywords"]):
+                steps.append(step)
+                committed += (" " if committed and step["text"] else "") + step["text"]
+                columns = max(shutil.get_terminal_size().columns, 1)
+                up = sum((len(line) - 1) // columns for line in drawn if line) + 1 if drawn else 0
+                drawn = (committed, step["pending"])
+                print((f"\r\x1b[{up}A\x1b[J" if up else "\r\x1b[J") + committed + "\n" + DIM + step["pending"] + PLAIN, end="", flush=True)
+        except (RuntimeError, OSError) as error:
+            failed.append(error)
+
+    worker = threading.Thread(target=show, daemon=True)
+    try:
+        rate = int(sounddevice.query_devices(kind="input")["default_samplerate"])
+        resampler = soxr.ResampleStream(rate, SAMPLE_RATE, 1, dtype="float32", quality="HQ") if rate != SAMPLE_RATE else None
+        capture = lambda data, *_: heard.put(resampler.resample_chunk(data[:, 0]) if resampler else data[:, 0].copy())
+        with sounddevice.InputStream(samplerate=rate, channels=1, dtype="float32", callback=capture):
+            print(CLEAR_ABOVE + "● recording, Enter to stop")
+            worker.start()
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                print()
+            print("\x1b[1A", end="", flush=True)
+        if resampler:
+            heard.put(resampler.resample_chunk(numpy.zeros(0, numpy.float32), last=True))
+    except sounddevice.PortAudioError as error:
+        raise RuntimeError(f"no microphone: {error}") from None
+    finally:
+        heard.put(None)
+        if worker.is_alive():
+            worker.join()
+    if failed:
+        raise RuntimeError(failed[0])
+    words = [word for step in steps for word in step["words"]]
+    if not words:
+        print("(no speech)")
+    if state["timestamps"]:
+        for word in words:
+            print(f"  {word['start']:6.2f} - {word['end']:5.2f}  {word['word']:<20} {word['probability']:.2f}")
+    passes = [step["pass_ms"] for step in steps if step["pass_ms"]]
+    print(f"  {'whistle':<18}{os.path.getsize(whistle.weights) / 1e6:>4.0f} MB  audio {steps[-1]['received']:5.1f} s"
+          f"  pass {sum(passes) / max(len(passes), 1):4.0f} ms   {steps[-1]['language'] or 'no speech'}")
+
+
 def prompt():
     try:
         return input("› ").strip()
@@ -239,7 +357,8 @@ def show_transcript(whistle, audio, state):
 
 
 def playground(args):
-    state = {"language": args.language, "keywords": [k.strip() for k in args.keywords.split(",") if k.strip()], "timestamps": args.word_timestamps}
+    state = {"language": args.language, "keywords": [k.strip() for k in args.keywords.split(",") if k.strip()], "timestamps": args.word_timestamps,
+             "stream": False}
     print("whistle playground: downloading and initializing the model...", flush=True)
     whistle = Whistle(weights=args.weights)
     if args.audio:
@@ -263,11 +382,14 @@ def playground(args):
         elif command == "/timestamps":
             state["timestamps"] = not state["timestamps"]
             print("  word timestamps", "on" if state["timestamps"] else "off")
+        elif command == "/stream":
+            state["stream"] = not state["stream"]
+            print("  live transcription", "on" if state["stream"] else "off")
         elif command == "/file":
             show_transcript(whistle, audio_path(rest), state)
         elif line == "":
             try:
-                show_transcript(whistle, record(), state)
+                listen(whistle, state) if state["stream"] else show_transcript(whistle, record(), state)
             except RuntimeError as error:
                 print(f"  {error}")
         else:

@@ -1,4 +1,5 @@
 import array
+import json
 import math
 import os
 import struct
@@ -242,6 +243,151 @@ def test_record_says_what_is_missing(monkeypatch):
     monkeypatch.setitem(sys.modules, "sounddevice", None)
     with pytest.raises(RuntimeError, match=r"cactus-needle\[mic\]"):
         record()
+
+
+class _StreamEngine:
+    def __init__(self):
+        self.calls = []
+
+    def needle_load(self, data, size):
+        return 0
+
+    def needle_last_error(self):
+        return b"stream broke"
+
+    def _write(self, out, text, received):
+        payload = json.dumps({"text": text, "words": [{"word": text, "start": 0.0, "end": 0.5, "probability": 1.0}] if text else [],
+                              "pending": "tail", "language": "en", "received": received, "pass_ms": 7.0}).encode()
+        out.value = payload
+        return len(text.split())
+
+    def needle_stream_transcribe_process(self, samples, count, language, keywords, out, capacity):
+        self.calls.append(("feed", count, language, keywords))
+        if count < 0:
+            return -1
+        return self._write(out, str(count), len(self.calls))
+
+    def needle_stream_transcribe_stop(self, out, capacity):
+        self.calls.append(("finish",))
+        return self._write(out, "tail", len(self.calls))
+
+
+def test_stream_feeds_each_chunk_and_flushes_the_tail(monkeypatch):
+    from needle.agent import whistle
+
+    engine = _StreamEngine()
+    monkeypatch.setattr(whistle, "_lib", lambda: engine)
+    monkeypatch.setattr(whistle, "_loaded", None)
+    model = whistle.Whistle(weights=__file__)
+    steps = list(model.stream([[0.0] * 3, [0.0] * 2], language="de", keywords=["Siobhan", "Krzysztof"]))
+    assert [step["text"] for step in steps] == ["3", "2", "tail"] and steps[-1]["received"] == 3
+    assert engine.calls == [("feed", 3, b"de", b"Siobhan\nKrzysztof"), ("feed", 2, b"de", b"Siobhan\nKrzysztof"), ("finish",)]
+    engine.calls.clear()
+    live = model.stream([[0.0]])
+    assert next(live)["text"] == "1"
+    live.close()
+    assert engine.calls == [("feed", 1, None, None), ("finish",)]
+
+
+def test_module_level_stream_reuses_one_model(monkeypatch):
+    import needle
+    from needle.agent import whistle
+
+    class _Fake:
+        def __init__(self, weights=None):
+            self.weights = weights
+
+        def stream(self, chunks, language=None, keywords=None):
+            for chunk in chunks:
+                yield {"text": f"{len(chunk)} {language} {keywords} {self.weights}"}
+
+    monkeypatch.setattr(whistle, "Whistle", _Fake)
+    monkeypatch.setattr(whistle, "_shared", {})
+    monkeypatch.setattr("needle._telemetry.track", lambda *a, **k: None)
+    assert [s["text"] for s in needle.stream([[0.0] * 2], language="de", keywords=["Siobhan"])] == ["2 de ['Siobhan'] None"]
+    assert next(needle.stream([[0.0]], weights="tuned.cact"))["text"] == "1 None None tuned.cact"
+    assert set(whistle._shared) == {None, "tuned.cact"}
+
+
+def test_stream_raises_the_engine_error(monkeypatch):
+    from needle.agent import whistle
+
+    class Broken(_StreamEngine):
+        def needle_stream_transcribe_process(self, *args):
+            return -1
+
+    monkeypatch.setattr(whistle, "_lib", lambda: Broken())
+    monkeypatch.setattr(whistle, "_loaded", None)
+    with pytest.raises(RuntimeError, match="stream broke"):
+        list(whistle.Whistle(weights=__file__).stream([[0.0]]))
+
+
+class _LiveWhistle:
+    weights = __file__
+
+    def __init__(self):
+        self.chunks, self.options = [], None
+
+    def stream(self, chunks, **options):
+        self.options = options
+        for chunk in chunks:
+            self.chunks.append(len(chunk))
+            yield {"text": f"chunk{len(self.chunks)}", "words": [{"word": f"chunk{len(self.chunks)}", "start": 0.1, "end": 0.4, "probability": 0.9}],
+                   "pending": "tail", "language": "en", "received": float(len(self.chunks)), "pass_ms": 20.0}
+        yield {"text": "tail", "words": [{"word": "tail", "start": 0.5, "end": 0.9, "probability": 0.8}], "pending": "", "language": "en",
+               "received": float(len(self.chunks)), "pass_ms": 0.0}
+
+
+def test_listen_feeds_the_microphone_in_seconds_and_prints_words_live(monkeypatch, capsys):
+    pytest.importorskip("numpy")
+    pytest.importorskip("soxr")
+    from needle.agent.whistle import listen
+
+    monkeypatch.setitem(sys.modules, "sounddevice", _Microphone(48000, 3))
+    monkeypatch.setattr("builtins.input", lambda *_: "")
+    whistle = _LiveWhistle()
+    listen(whistle, {"language": "de", "keywords": ["Siobhan"], "timestamps": True})
+    assert whistle.options == {"language": "de", "keywords": ["Siobhan"]}
+    assert abs(sum(whistle.chunks) - 3 * 16000) <= 2 and all(n >= 16000 for n in whistle.chunks[:-1])
+    out = capsys.readouterr().out
+    assert "recording, Enter to stop" in out and "chunk1 " in out and " tail" in out
+    assert "\r\x1b[J" + "chunk1\n\x1b[90mtail\x1b[0m" in out and "\r\x1b[1A\x1b[J" + "chunk1 chunk2\n" in out
+    assert " ".join(f"chunk{n}" for n in range(1, len(whistle.chunks) + 1)) + " tail\n\x1b[90m\x1b[0m" in out
+    assert "0.10 -  0.40  chunk1" in out and "0.50 -  0.90  tail" in out
+    assert f"audio   {len(whistle.chunks):.1f} s" in out and "pass   20 ms   en" in out
+
+
+def test_listen_reports_a_broken_stream(monkeypatch, capsys):
+    pytest.importorskip("numpy")
+    pytest.importorskip("soxr")
+    from needle.agent.whistle import listen
+
+    class Broken:
+        weights = __file__
+
+        def stream(self, chunks, **options):
+            raise RuntimeError("no speech model loaded")
+            yield
+
+    monkeypatch.setitem(sys.modules, "sounddevice", _Microphone(16000, 1))
+    monkeypatch.setattr("builtins.input", lambda *_: "")
+    with pytest.raises(RuntimeError, match="no speech model loaded"):
+        listen(Broken(), {"language": None, "keywords": [], "timestamps": False})
+
+
+def test_playground_listens_on_enter_once_streaming_is_on(monkeypatch, capsys):
+    from needle.agent import whistle
+
+    lines = iter(["", "/stream", "", "/stream", "", "/quit"])
+    heard = []
+    monkeypatch.setattr(whistle, "prompt", lambda: next(lines))
+    monkeypatch.setattr(whistle, "record", lambda: heard.append("recorded") or [0.0])
+    monkeypatch.setattr(whistle, "show_transcript", lambda model, audio, state: heard.append(audio))
+    monkeypatch.setattr(whistle, "listen", lambda model, state: heard.append(state["language"]))
+    monkeypatch.setattr("needle.agent.whistle.Whistle", lambda weights=None: _Whistle({}))
+    whistle.playground(type("Args", (), {"audio": None, "language": "en", "keywords": "", "word_timestamps": False, "weights": None})())
+    assert heard == ["recorded", [0.0], "en", "recorded", [0.0]]
+    assert "live transcription on" in capsys.readouterr().out
 
 
 def test_rate_counts_steps_after_the_first_mark():

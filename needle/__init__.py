@@ -11,11 +11,11 @@ import warnings
 from .agent.tools import Field, build_schema, pydantic_schema, tool, _is_pydantic_model
 from ._telemetry import track as _track
 from ._worker import FineTuneWorker
-from .agent.whistle import Whistle, transcribe
+from .agent.whistle import Whistle, stream, transcribe
 
 __version__ = "3.1.0"
 __all__ = ["Needle", "Whistle", "ExtractionValidationError", "tool", "Field", "extract",
-           "transcribe", "__version__"]
+           "transcribe", "stream", "__version__"]
 
 
 class ExtractionValidationError(ValueError):
