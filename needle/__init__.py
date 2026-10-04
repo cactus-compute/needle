@@ -288,6 +288,8 @@ class Needle:
                   keywords=None, word_timestamps=False, tool_schema_keywords=True) -> dict:
         if audio is not None and text:
             raise ValueError("complete takes text or audio, not both")
+        if audio is not None and self._generation < 3:
+            raise ValueError("audio turns require a Needle 3 model")
         self._bind()
         if audio is not None:
             samples, count = _whistle._samples(audio)
@@ -354,8 +356,9 @@ class Needle:
         self._count_query()
         response = self._complete(query, max_new_tokens, audio=audio, language=language, keywords=keywords,
                                   word_timestamps=word_timestamps, tool_schema_keywords=tool_schema_keywords)
+        heard = {key: value for key, value in response.items() if key.startswith("audio_")}
         if audio is not None:
-            query = response.get("audio_text") or ""
+            query = heard.get("audio_text") or ""
         executed = []
         for _ in range(max_steps):
             calls = response.get("function_calls") or []
@@ -386,6 +389,7 @@ class Needle:
             response = self._complete(json.dumps(results, default=_jsonable),
                                       max_new_tokens, ground=False)
         response["results"] = executed
+        response.update(heard)
         return response
 
     def extract(self, text: str, schema: type | dict, max_new_tokens: int = 512,

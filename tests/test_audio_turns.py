@@ -75,6 +75,7 @@ def test_an_audio_turn_passes_samples_and_reports_the_transcript(engine):
     assert 2031 in agent._seen_years
     response = agent.run(audio=struct.pack("<3f", 0.1, 0.2, 0.3))
     assert engine.calls[1] == (None, 3) and response["results"] == [{"room": "kitchen", "on": True}]
+    assert response["audio_text"] == "heard 3 samples in June 2031" and response["audio_language"] == "en", "run keeps the transcript"
     assert engine.calls[2][0] is not None, "the tool result goes back as text"
 
 
@@ -96,6 +97,14 @@ def test_text_and_audio_together_are_refused(engine):
         agent.complete("hello", audio=[0.0] * 10)
     with pytest.raises(ValueError, match="not both"):
         agent.run("hello", audio=[0.0] * 10)
+    assert engine.calls == []
+
+
+def test_audio_turns_need_needle_3(engine):
+    import needle
+
+    with pytest.raises(ValueError, match="Needle 3"):
+        needle.Needle(tools="[]", generation=2).complete(audio=[0.0] * 10)
     assert engine.calls == []
 
 
