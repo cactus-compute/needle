@@ -4,7 +4,10 @@ import array
 import ctypes
 import json
 import os
+import queue
+import shutil
 import sys
+import threading
 import time
 import wave
 
@@ -268,8 +271,6 @@ def listen(whistle, state):
         import soxr
     except ImportError as error:
         raise RuntimeError(f'{error.name} is not installed: pip install "cactus-needle[mic]"') from None
-    import queue
-    import threading
     heard, steps, failed = queue.Queue(), [], []
 
     def chunks():
@@ -286,7 +287,6 @@ def listen(whistle, state):
                 return
 
     def show():
-        import shutil
         committed, drawn = "", ()
         try:
             for step in whistle.stream(chunks(), language=state["language"], keywords=state["keywords"]):
