@@ -115,7 +115,7 @@ def _child():
                                          keywords.encode("utf-8") if keywords else None, word_timestamps, tool_schema_keywords)
                     raw = base64.b64decode(request["audio"])
                     samples = len(raw) // 4
-                    pcm = (ctypes.c_float * max(samples, 1)).from_buffer_copy(raw.ljust(4, b"\0"))
+                    pcm = (ctypes.c_float * samples).from_buffer_copy(raw)
                 code = lib.needle_complete(
                     text.encode("utf-8") if text is not None else None, pcm, samples,
                     int(request["max_new_tokens"]), output, len(output))
