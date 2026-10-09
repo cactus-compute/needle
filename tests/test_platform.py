@@ -31,9 +31,15 @@ class FakePlatform(BaseHTTPRequestHandler):
     def do_GET(self):
         s = self.state
         s["requests"].append(("GET", self.path, self.headers.get("Authorization")))
-        if self.path.startswith("/blob/"):
+        if self.path == "/blob/expired":
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path.startswith("/blob/"):
             self.send_response(200)
-            self.send_header("Content-Length", "5")
+            # "cut" promises ten bytes and hangs up after five, the way a
+            # dropped connection ends a download.
+            self.send_header("Content-Length", "10" if self.path == "/blob/cut" else "5")
             self.end_headers()
             self.wfile.write(b"CACT!")
         elif self.path.startswith("/v1/") and self.headers.get("Authorization") != "Bearer needle_ft_test":
@@ -168,6 +174,31 @@ def test_errors_carry_code_param_and_url(server, tmp_path):
 
     state["rate_limit_once"] = True
     assert client.billing()["plan"] == "standard"
+
+
+def test_a_failed_download_keeps_the_file_it_would_replace(server, tmp_path):
+    # The download opened its destination for writing before the first byte
+    # arrived, so a dropped connection left the previous model truncated to
+    # whatever came through, and the failure escaped as a raw urllib or
+    # http.client exception that `needle platform` does not catch.
+    from needle.platform import Platform, PlatformError
+
+    base, state = server
+    host = base[:-len("/v1")]
+    client = Platform(api_key="needle_ft_test", base_url=base)
+    dest = tmp_path / "smart-home-8L.cact"
+    dest.write_bytes(b"previous model")
+
+    for blob, code in (("cut", "network_error"), ("expired", "http_403")):
+        with pytest.raises(PlatformError) as caught:
+            client._fetch_to(f"{host}/blob/{blob}", str(dest))
+        assert caught.value.code == code
+        assert dest.read_bytes() == b"previous model"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["smart-home-8L.cact"]
+
+    assert client._fetch_to(f"{host}/blob/model-1-8", str(dest)) == str(dest)
+    assert dest.read_bytes() == b"CACT!"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["smart-home-8L.cact"]
 
 
 def test_download_target_routes_hosted_models():
