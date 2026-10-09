@@ -13,7 +13,7 @@ from ._telemetry import track as _track
 from ._worker import FineTuneWorker
 from .agent.whistle import Whistle, stream, transcribe
 
-__version__ = "3.1.0"
+__version__ = "3.1.4"
 __all__ = ["Needle", "Whistle", "ExtractionValidationError", "tool", "Field", "extract",
            "transcribe", "stream", "__version__"]
 
