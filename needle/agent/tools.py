@@ -112,11 +112,27 @@ def _parse_doc(doc):
     while i < len(lines) and lines[i].strip().lower() not in heads:
         desc.append(lines[i].strip())
         i += 1
+    head = _indent(lines[i]) if i < len(lines) else 0
+    name, depth = None, 0
     for line in lines[i + 1:]:
+        if not line.strip():
+            continue
+        # A section after the arguments ("Returns:", "Raises:") ends them.
+        if _indent(line) <= head and re.match(r"\s*[A-Za-z][\w ]*:\s*$", line):
+            break
         m = re.match(r"\s+(\w+)\s*(?:\([^)]*\))?\s*:\s*(.+)", line)
-        if m:
-            args[m.group(1)] = m.group(2).strip()
+        if m and (name is None or _indent(line) <= depth):
+            name, depth = m.group(1), _indent(line)
+            args[name] = m.group(2).strip()
+        elif name and _indent(line) > depth:
+            # A Google-style description wraps onto lines indented under
+            # its argument; those lines are the rest of it.
+            args[name] += " " + line.strip()
     return " ".join(w for w in desc if w).strip(), args
+
+
+def _indent(line):
+    return len(line) - len(line.lstrip())
 
 
 def build_schema(fn: Callable) -> dict:

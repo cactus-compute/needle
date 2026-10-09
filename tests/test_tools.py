@@ -135,6 +135,45 @@ def test_docstring_description_falls_back_to_args():
     assert props["city"]["description"] == "the city to look up"
 
 
+def test_docstring_arg_description_keeps_its_wrapped_lines():
+    # A Google-style description that wraps continues on lines indented under
+    # its argument. Only the first line reached the schema, so the constraint
+    # on the second never reached the model.
+    def f(time: str, label: str = ""):
+        """Set an alarm.
+
+        Args:
+            time: The alarm time in 24-hour HH:MM form, for example 07:30
+                or 18:45. Never a relative time like "in ten minutes".
+            label (str): A short name
+                shown when it rings.
+
+        Returns:
+            dict: The alarm that was set.
+        """
+
+    props = build_schema(f)["parameters"]["properties"]
+    assert props["time"]["description"] == (
+        'The alarm time in 24-hour HH:MM form, for example 07:30 '
+        'or 18:45. Never a relative time like "in ten minutes".')
+    assert props["label"]["description"] == "A short name shown when it rings."
+
+    # The Returns section is not arguments: an entry there that shares a
+    # parameter's name overwrote the parameter's description.
+    def g(count: int):
+        """Count things.
+
+        Args:
+            count: How many to count.
+
+        Returns:
+            count: How many were counted.
+        """
+
+    props = build_schema(g)["parameters"]["properties"]
+    assert props["count"]["description"] == "How many to count."
+
+
 def test_pydantic_model_schema():
     import pydantic
 
