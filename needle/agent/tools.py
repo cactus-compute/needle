@@ -50,6 +50,8 @@ class Field:
 
 
 def _is_optional(annotation):
+    if typing.get_origin(annotation) is typing.Annotated:
+        return _is_optional(typing.get_args(annotation)[0])
     return (typing.get_origin(annotation) in _UNION_ORIGINS
             and type(None) in typing.get_args(annotation))
 

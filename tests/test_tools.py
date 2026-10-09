@@ -178,3 +178,23 @@ def test_numeric_literal_and_int_enum_schema():
     assert props["port"] == {"type": "integer", "enum": [80, 443, 8080]}
     assert props["level"] == {"type": "integer", "enum": [1, 2, 3]}
     assert props["mode"] == {"type": "string", "enum": ["fast", "slow"]}
+
+
+def test_annotated_optional_is_not_required():
+    def f(city: str, units: typing.Annotated[typing.Optional[str], Field(description="metric or imperial")]):
+        pass
+
+    def g(city: str, units: typing.Optional[str]):
+        pass
+
+    assert build_schema(f)["parameters"]["required"] == ["city"]
+    assert build_schema(f)["parameters"]["required"] == build_schema(g)["parameters"]["required"]
+    assert build_schema(f)["parameters"]["properties"]["units"]["description"] == "metric or imperial"
+
+
+@pep604
+def test_annotated_pep604_optional_is_not_required():
+    def f(city: str, units: typing.Annotated[str | None, Field(description="metric or imperial")]):
+        pass
+
+    assert build_schema(f)["parameters"]["required"] == ["city"]
