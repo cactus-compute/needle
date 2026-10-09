@@ -101,14 +101,28 @@ def _is_musl():
     return not libc
 
 
+# platform.machine() spellings of the two architectures the engine is built for.
+_ENGINE_ARCHES = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}
+
+
 def _platform_tag():
     machine = platform.machine().lower()
     if sys.platform == "darwin":
         arch = "arm64" if machine in ("arm64", "aarch64") else "x86_64"
         return "macosx_11_0_" + arch
+    arch = _ENGINE_ARCHES.get(machine)
+    if arch is None:
+        # Any other machine (32-bit ARM or x86, riscv64, a 32-bit Python on
+        # Windows) used to be handed the x86_64 build, which then failed to load
+        # with a wrong-ELF-class or "not a valid Win32 application" error, after
+        # a second download of the other libc's x86_64 build on Linux.
+        system = "Windows" if sys.platform == "win32" else "Linux"
+        raise RuntimeError(
+            f"no Needle engine is published for {system} on {platform.machine() or 'this machine'}; "
+            "the engine builds are for x86_64 and arm64. Build libneedle for this machine "
+            "and point NEEDLE3_LIB_PATH (NEEDLE2_LIB_PATH for Needle 2) at it.")
     if sys.platform == "win32":
-        return "win_arm64" if machine in ("arm64", "aarch64") else "win_amd64"
-    arch = "aarch64" if machine in ("aarch64", "arm64") else "x86_64"
+        return "win_arm64" if arch == "aarch64" else "win_amd64"
     family = "musllinux_1_2_" if _is_musl() else "manylinux2014_"
     return family + arch
 
