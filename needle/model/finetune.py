@@ -163,7 +163,7 @@ def _collect_tools(examples):
 
 
 def augment_jsonl(path, num_samples, model=DEFAULT_MODEL, batch_size=25, out_path=None, workers=8):
-    with open(path) as handle:
+    with open(path, encoding="utf-8") as handle:
         examples = [json.loads(line) for line in handle if line.strip()]
     tools = _collect_tools(examples)
     if not tools:
@@ -171,7 +171,7 @@ def augment_jsonl(path, num_samples, model=DEFAULT_MODEL, batch_size=25, out_pat
     out_path = out_path or path.replace(".jsonl", "") + ".augmented.jsonl"
     generated = generate_dataset(tools, num_samples, model=model or DEFAULT_MODEL,
                                  batch_size=batch_size, workers=workers)
-    with open(out_path, "w") as handle:
+    with open(out_path, "w", encoding="utf-8") as handle:
         for example in examples + generated:
             handle.write(json.dumps(example) + "\n")
     print(f"  {'wrote':<9} {len(examples) + len(generated)} examples  {out_path}")
@@ -182,12 +182,12 @@ def generate_main(args):
     model = args.model or DEFAULT_MODEL
     workers = getattr(args, "workers", 8)
     if args.tools:
-        with open(args.tools) as handle:
+        with open(args.tools, encoding="utf-8") as handle:
             tools = json.load(handle)
         out = args.output or "needle_data.jsonl"
         rows = generate_dataset(tools, args.num_samples, model=model,
                                 batch_size=args.batch_size, workers=workers)
-        with open(out, "w") as handle:
+        with open(out, "w", encoding="utf-8") as handle:
             for row in rows:
                 handle.write(json.dumps(row) + "\n")
         print(f"  {'wrote':<9} {len(rows)} examples  {out}")
@@ -253,7 +253,7 @@ def from_chat(example):
 
 def read_examples(path, report=False):
     skipped = 0
-    with open(path) as handle:
+    with open(path, encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
             if not line:
