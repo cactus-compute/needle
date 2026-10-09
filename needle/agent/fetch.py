@@ -105,11 +105,29 @@ def _is_musl():
 _ENGINE_ARCHES = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}
 
 
+def _is_android():
+    """Android reports itself as Linux but links Bionic, where no published engine loads.
+
+    Termux is the usual way this is reached.  ``platform.libc_ver()`` finds no glibc
+    there, so the Linux path would pick the musl aarch64 wheel and fail to load it.
+    """
+    if hasattr(sys, "getandroidapilevel"):
+        return True
+    return bool(os.environ.get("ANDROID_ROOT") and os.environ.get("ANDROID_DATA"))
+
+
 def _platform_tag():
     machine = platform.machine().lower()
     if sys.platform == "darwin":
         arch = "arm64" if machine in ("arm64", "aarch64") else "x86_64"
         return "macosx_11_0_" + arch
+    if _is_android():
+        raise RuntimeError(
+            "no Needle engine wheel is published for Android (Bionic): the Linux wheels link "
+            "glibc or musl, so libneedle fails to load with a missing libm.so.6. The Android "
+            "builds ship a static library and the needle CLI (needle download android-arm64), "
+            "not a shared library for ctypes; to use the Python API here, build a shared "
+            "libneedle for Bionic and point NEEDLE3_LIB_PATH (NEEDLE2_LIB_PATH for Needle 2) at it.")
     arch = _ENGINE_ARCHES.get(machine)
     if arch is None:
         # Any other machine (32-bit ARM or x86, riscv64, a 32-bit Python on

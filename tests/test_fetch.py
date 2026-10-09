@@ -241,6 +241,7 @@ def test_platform_tag_names_only_the_architectures_the_engine_is_built_for(monke
     from needle.agent import fetch
 
     monkeypatch.setattr(fetch, "_is_musl", lambda: False)
+    monkeypatch.setattr(fetch, "_is_android", lambda: False)
     for system, machine, tag in (("linux", "x86_64", "manylinux2014_x86_64"),
                                  ("linux", "aarch64", "manylinux2014_aarch64"),
                                  ("win32", "AMD64", "win_amd64"),
@@ -294,3 +295,39 @@ def test_engine_load_falls_back_to_the_other_libc(monkeypatch, tmp_path):
     with pytest.warns(UserWarning, match="using the musllinux"):
         assert needle._load_cdll(3) == "handle"
     assert loaded["path"].endswith("musl/libneedle.so")
+
+
+def test_android_is_refused_instead_of_being_handed_a_glibc_wheel(monkeypatch):
+    """Termux reports Linux/aarch64, so it used to download a wheel Bionic cannot load."""
+    import platform
+    from needle.agent import fetch
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(fetch, "_is_musl", lambda: False)
+
+    monkeypatch.setattr(fetch, "_is_android", lambda: False)
+    assert fetch._platform_tag() == "manylinux2014_aarch64"
+
+    monkeypatch.setattr(fetch, "_is_android", lambda: True)
+    with pytest.raises(RuntimeError, match="Android .Bionic.*libm.so.6.*NEEDLE3_LIB_PATH"):
+        fetch._platform_tag()
+
+
+def test_android_is_detected_from_the_api_level_or_the_runtime_env(monkeypatch):
+    from needle.agent import fetch
+
+    monkeypatch.delenv("ANDROID_ROOT", raising=False)
+    monkeypatch.delenv("ANDROID_DATA", raising=False)
+    monkeypatch.delattr(sys, "getandroidapilevel", raising=False)
+    assert fetch._is_android() is False
+
+    monkeypatch.setenv("ANDROID_ROOT", "/system")
+    assert fetch._is_android() is False, "one marker alone is not Android"
+    monkeypatch.setenv("ANDROID_DATA", "/data")
+    assert fetch._is_android() is True
+
+    monkeypatch.delenv("ANDROID_ROOT")
+    monkeypatch.delenv("ANDROID_DATA")
+    monkeypatch.setattr(sys, "getandroidapilevel", lambda: 34, raising=False)
+    assert fetch._is_android() is True
