@@ -44,6 +44,16 @@ print(agent.run("what's it like in Lagos right now?")["results"])
 
 Every turn returns one JSON object with `function_calls`, the model's `reasoning` and a calibrated `confidence`; an off-topic request returns an empty list rather than a guess. `needle.Needle(tools=[...], generation=2)` keeps running Needle 2 for existing deployments.
 
+### JavaScript / TypeScript
+
+The community-maintained [`cactus-needle`](https://github.com/afshinm/cactus-needle) package runs Needle and Whistle in Node.js and browsers using WebAssembly.
+
+```sh
+npm install cactus-needle
+```
+
+[Demo](https://afshinm.github.io/cactus-needle/) · [Examples](https://github.com/afshinm/cactus-needle/tree/main/examples) · [npm](https://www.npmjs.com/package/cactus-needle)
+
 ## Whistle
 
 ![One engine, three ways to load it](assets/whistle.svg)
