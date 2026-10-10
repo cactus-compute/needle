@@ -13,7 +13,7 @@ ENGINE_REPOS = {
 }
 ENGINE_VERSIONS = {
     2: "2.0.4",
-    3: "3.2.0",
+    3: "3.3.0",
     WHISTLE: "2.0.0",
 }
 

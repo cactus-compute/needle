@@ -206,14 +206,16 @@ def test_transcribe_returns_text_language_and_timed_words(tmp_path):
 
 
 @requires_whistle
-def test_embed_and_the_30_second_limit():
+def test_embed_keeps_its_window_and_transcribe_takes_long_audio():
     from needle import Whistle
 
     whistle = Whistle()
     embedding = whistle.embed(_tone(1))
     assert len(embedding) > 0 and all(isinstance(v, float) for v in embedding[:8])
     with pytest.raises(RuntimeError, match="30 s"):
-        whistle.transcribe([0.0] * (30 * 16000 + 1))
+        whistle.embed([0.0] * (30 * 16000 + 1))
+    long = whistle.transcribe([0.0] * (31 * 16000), word_timestamps=True)
+    assert long["text"] == "" and long["language"] == "" and long["words"] == []
 
 
 @requires_whistle
@@ -265,7 +267,7 @@ class _Microphone:
         return Stream()
 
 
-def test_record_resamples_the_microphone_to_16_khz_and_keeps_30_s(monkeypatch, capsys):
+def test_record_resamples_the_microphone_to_16_khz_and_keeps_everything(monkeypatch, capsys):
     numpy = pytest.importorskip("numpy")
     pytest.importorskip("soxr")
     from needle.agent.whistle import record
@@ -278,8 +280,7 @@ def test_record_resamples_the_microphone_to_16_khz_and_keeps_30_s(monkeypatch, c
     assert audio.dtype == numpy.float32 and len(audio) == 16000 and abs(float(audio[8000]) - 0.25) < 0.01
     assert "recording, Enter to stop" in capsys.readouterr().out
     monkeypatch.setitem(sys.modules, "sounddevice", _Microphone(16000, 31))
-    assert len(record()) == 30 * 16000
-    assert "keeping the first 30 s" in capsys.readouterr().out
+    assert len(record()) == 31 * 16000
 
 
 def test_record_says_what_is_missing(monkeypatch):

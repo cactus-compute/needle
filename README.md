@@ -48,7 +48,7 @@ Every turn returns one JSON object with `function_calls`, the model's `reasoning
 
 ![One engine, three ways to load it](assets/whistle.svg)
 
-Whistle is our speech-to-text model, one 16.9 MB file on the CPU: 16 kHz mono audio, up to 30 seconds in one pass, in English, German, French, Spanish, Italian, Dutch and Polish. It shares Needle's `.cact` container, its quantisation and its C++ engine, so the two are one runtime, and its decoder is laddered the same way, with `--audio-depth N` running the N-layer rung of the same weights.
+Whistle is our speech-to-text model, one 16.9 MB file on the CPU: 16 kHz mono audio of any length, one pass up to 30 seconds and windowed beyond it, in English, German, French, Spanish, Italian, Dutch and Polish. It shares Needle's `.cact` container, its quantisation and its C++ engine, so the two are one runtime, and its decoder is laddered the same way, with `--audio-depth N` running the N-layer rung of the same weights.
 
 ```python
 import needle

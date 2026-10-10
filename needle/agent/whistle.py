@@ -98,7 +98,7 @@ def _samples(audio):
 class Whistle:
     """Speech-to-text in English, German, French, Spanish, Italian, Dutch and Polish.
 
-    Audio is a WAV file path or 16 kHz mono float samples in [-1, 1], at most 30 s.
+    Audio is a WAV file path or 16 kHz mono float samples in [-1, 1], of any length.
     One model is loaded per process; it is not thread-safe.
     """
 
@@ -181,7 +181,7 @@ def _shared_model(weights):
 def transcribe(audio, language=None, keywords=None, word_timestamps=False, weights=None) -> dict:
     """Speech to text, on the model this process already has loaded.
 
-    audio is a WAV file path or 16 kHz mono float samples in [-1, 1], at most 30 s.
+    audio is a WAV file path or 16 kHz mono float samples in [-1, 1], of any length.
     Returns {"text", "language", "ttft_ms", "decode_tps"}, plus "words" with start,
     end and probability when word_timestamps is set. language is one of LANGUAGES,
     or None to detect it; keywords are words or phrases for keyword biasing.
@@ -220,7 +220,6 @@ COMPARE_INSTALL = 'pip install "cactus-needle[mic,compare]"'
 CLEAR_ABOVE = "\x1b[1A\x1b[2K"
 DIM = "\x1b[90m"
 PLAIN = "\x1b[0m"
-LIMIT_SECONDS = 30
 
 
 def audio_path(rest):
@@ -257,10 +256,7 @@ def record():
     except sounddevice.PortAudioError as error:
         raise RuntimeError(f"no microphone: {error}") from None
     print(CLEAR_ABOVE, end="", flush=True)
-    heard = numpy.concatenate(chunks)[:, 0] if chunks else numpy.zeros(0, numpy.float32)
-    audio = heard[:LIMIT_SECONDS * rate]
-    if len(audio) < len(heard):
-        print(f"  keeping the first {LIMIT_SECONDS} s")
+    audio = numpy.concatenate(chunks)[:, 0] if chunks else numpy.zeros(0, numpy.float32)
     return audio if rate == SAMPLE_RATE else soxr.resample(audio, rate, SAMPLE_RATE, quality="HQ")
 
 
