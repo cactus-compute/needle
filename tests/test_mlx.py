@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
+from conftest import import_mlx
 
-mx = pytest.importorskip("mlx.core")
+mx = import_mlx()
 jax = pytest.importorskip("jax")
 
 pytestmark = [pytest.mark.slow, pytest.mark.usefixtures("mlx_cpu")]

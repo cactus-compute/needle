@@ -28,6 +28,8 @@ metal = [
 mic = ["numpy", "soxr", "sounddevice"]
 compare = ["openai-whisper", "moonshine-voice"]
 test = ["pytest", "pydantic"]
+# mlx-cpu (the CPU backend Linux needs) is gated to Linux by mlx itself; macOS gets mlx + Metal.
+mlx = ["mlx[cpu]"]
 
 [project.scripts]
 needle = "needle.cli:main"
