@@ -43,6 +43,24 @@ jobs:
       - run: pip install -e ".[test,train]"
       - run: pytest -q -m "not slow"
 
+  # MLX parity against JAX (marked slow, run on the CPU device via mlx[cpu]).
+  # Kept out of `release`'s needs so a parity regression shows up nightly
+  # without blocking the publish.
+  test-mlx:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[test,train,mlx]"
+      # NEEDLE_REQUIRE_MLX turns a missing mlx into an error instead of a silent skip.
+      - run: pytest -q -m slow tests/test_mlx.py tests/test_quantize_mlx.py
+        env:
+          NEEDLE_REQUIRE_MLX: "1"
+
   release:
     needs: [gate, test]
     if: needs.gate.outputs.run == 'true'

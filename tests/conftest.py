@@ -38,6 +38,15 @@ requires_engine = pytest.mark.skipif(
     reason="needle C++ engine not installed (auto-fetched from HF on first real use)")
 
 
+def import_mlx():
+    """``mlx.core``, or skip the module; NEEDLE_REQUIRE_MLX=1 (CI) turns a missing mlx into an error."""
+    if os.environ.get("NEEDLE_REQUIRE_MLX") == "1":
+        import mlx.core
+
+        return mlx.core
+    return pytest.importorskip("mlx.core")
+
+
 @pytest.fixture(scope="session")
 def tiny_checkpoint(tmp_path_factory):
     import numpy as np
