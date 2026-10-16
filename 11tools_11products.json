@@ -1,0 +1,273 @@
+[
+  {
+    "name": "hf_hub_repo_search",
+    "description": "Search Hugging Face repositories with a shared query interface. You can target models, datasets, spaces, or aggregate across multiple repo types in one call. Use space_search for semantic-first discovery of Spaces. Include links to repositories in your response.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query keywords.",
+        "required": false
+      },
+      "author": {
+        "type": "string",
+        "description": "Organization or user who created the repository.",
+        "required": false
+      },
+      "types": {
+        "type": "array",
+        "description": "Target repository types to search (e.g., [\"models\", \"datasets\", \"spaces\"]).",
+        "required": false
+      },
+      "sort": {
+        "type": "string",
+        "description": "Sort order (e.g., trendingScore, downloads, likes, createdAt).",
+        "required": false
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of results to return (default: 10).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "kaggle_datasets_list",
+    "description": "Search and list Kaggle datasets.",
+    "parameters": {
+      "search": {
+        "type": "string",
+        "description": "Search term for datasets.",
+        "required": false
+      },
+      "sort_by": {
+        "type": "string",
+        "description": "Sort order (e.g., \"hottest\", \"votes\", \"updated\", \"active\").",
+        "required": false
+      },
+      "file_type": {
+        "type": "string",
+        "description": "Filter by file type (e.g., \"csv\", \"sqlite\", \"json\").",
+        "required": false
+      },
+      "page": {
+        "type": "integer",
+        "description": "Page number of results to return.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "github_search_repositories",
+    "description": "Search for GitHub repositories using a search query.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query (e.g., \"language:typescript topic:mcp\").",
+        "required": true
+      },
+      "page": {
+        "type": "integer",
+        "description": "Page number of the results.",
+        "required": false
+      },
+      "perPage": {
+        "type": "integer",
+        "description": "Number of results per page (default 30).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "arxiv_search_papers",
+    "description": "Search arXiv by query, category, date range, and sort order.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query keywords or boolean expression (e.g., \"KAN\" OR \"Kolmogorov-Arnold Networks\").",
+        "required": true
+      },
+      "categories": {
+        "type": "array",
+        "description": "List of arXiv categories to filter by (e.g., [\"cs.LG\", \"cs.AI\"]).",
+        "required": false
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Maximum number of search results to return.",
+        "required": false
+      },
+      "date_from": {
+        "type": "string",
+        "description": "Start date for publication filtering (e.g., \"2024-01-01\").",
+        "required": false
+      },
+      "date_to": {
+        "type": "string",
+        "description": "End date for publication filtering (e.g., \"2024-12-31\").",
+        "required": false
+      },
+      "sort_by": {
+        "type": "string",
+        "description": "Sort order for results - \"relevance\" or \"date\" (default: \"relevance\").",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "pubmed_search_articles",
+    "description": "Search PubMed for articles matching a query.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query (e.g., \"COVID-19 vaccines\", \"machine learning AND healthcare\")",
+        "required": true
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Maximum results to return (default: 20, max: 200)",
+        "required": false
+      },
+      "sort": {
+        "type": "string",
+        "description": "Sort order - \"relevance\", \"pub_date\", or \"first_author\" (default: \"relevance\")",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "semantic_scholar_search_papers",
+    "description": "Search for academic papers by keyword in Semantic Scholar.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query keywords.",
+        "required": true
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of results to return.",
+        "required": false
+      },
+      "year": {
+        "type": "string",
+        "description": "Publication year filter (e.g., \"2020\" or \"2015-2020\").",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "wikipedia_search_wikipedia",
+    "description": "Search Wikipedia for articles matching a query.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "The search query or term.",
+        "required": true
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of results to return (default: 10).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "google_web_search",
+    "description": "Search the web for current information using Google Custom Search.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "The search query.",
+        "required": true
+      },
+      "count": {
+        "type": "number",
+        "description": "Number of results to return (1-10, default 5).",
+        "required": false
+      },
+      "start": {
+        "type": "number",
+        "description": "Pagination start index (default 1).",
+        "required": false
+      },
+      "site": {
+        "type": "string",
+        "description": "Limit the search to a specific domain (e.g., 'example.com').",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "unpaywall_get_paper_by_doi",
+    "description": "Retrieve Open Access status and full-text links for a scholarly paper using its DOI via the Unpaywall API.",
+    "parameters": {
+      "doi": {
+        "type": "string",
+        "description": "The Digital Object Identifier (DOI) of the paper (e.g., \"10.1038/nature12345\").",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "crossref_search_works_by_query",
+    "description": "Search for scholarly works using keywords, titles, or authors in the Crossref database.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query for keywords, titles, or authors (e.g., \"machine learning in healthcare\").",
+        "required": true
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of results to return (default: 5).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "openalex_search_entities",
+    "description": "Search, filter, sort, or retrieve by ID across all 8 entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Primary discovery and lookup tool.",
+    "parameters": {
+      "entity_type": {
+        "type": "string",
+        "description": "The entity type to query (e.g., \"works\", \"authors\", \"sources\", \"institutions\", \"topics\", \"keywords\", \"publishers\", \"funders\").",
+        "required": true
+      },
+      "id": {
+        "type": "string",
+        "description": "Retrieve a single entity by its identifier (OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, ISSN). If provided, search/filters are ignored.",
+        "required": false
+      },
+      "search": {
+        "type": "string",
+        "description": "Keyword search across the entity type with support for boolean operators, quoted phrases, and wildcards.",
+        "required": false
+      },
+      "filters": {
+        "type": "object",
+        "description": "Key-value pairs for filtering results based on specific fields (e.g., {\"publication_year\": \"2023-2024\"}).",
+        "required": false
+      },
+      "sort": {
+        "type": "string",
+        "description": "Field to sort by, optionally prefixed with '-' for descending order (e.g., \"-cited_by_count\").",
+        "required": false
+      },
+      "select": {
+        "type": "array",
+        "description": "Specific fields to return in the response to reduce payload size. Use [\"*\"] for full records.",
+        "required": false
+      },
+      "per_page": {
+        "type": "integer",
+        "description": "Number of results to return per page (max 100).",
+        "required": false
+      },
+      "cursor": {
+        "type": "string",
+        "description": "Cursor for paginating through large result sets.",
+        "required": false
+      }
+    }
+  }
+]

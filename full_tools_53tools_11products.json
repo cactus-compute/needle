@@ -1,0 +1,1518 @@
+[
+  {
+    "name": "pubmed_search_articles",
+    "description": "Search PubMed for articles matching a query.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query (e.g., \"COVID-19 vaccines\", \"machine learning AND healthcare\")",
+        "required": true
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Maximum results to return (default: 20, max: 200)",
+        "required": false
+      },
+      "sort": {
+        "type": "string",
+        "description": "Sort order - \"relevance\", \"pub_date\", or \"first_author\" (default: \"relevance\")",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "pubmed_download_article",
+    "description": "Download article details by PubMed ID.",
+    "parameters": {
+      "pmid": {
+        "type": "string",
+        "description": "PubMed ID (e.g., \"33073741\")",
+        "required": true
+      },
+      "format_type": {
+        "type": "string",
+        "description": "Content format - \"abstract\", \"medline\", or \"full\" (default: \"abstract\")",
+        "required": false
+      },
+      "return_mode": {
+        "type": "string",
+        "description": "Return format - \"xml\", \"text\", or \"json\" (default: \"xml\")",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "pubmed_download_articles_batch",
+    "description": "Download multiple articles in a single request.",
+    "parameters": {
+      "pmids": {
+        "type": "array",
+        "description": "List of PubMed IDs.",
+        "required": true
+      },
+      "format_type": {
+        "type": "string",
+        "description": "Content format (default: \"abstract\")",
+        "required": false
+      },
+      "return_mode": {
+        "type": "string",
+        "description": "Return format (default: \"xml\")",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "pubmed_get_article_summaries",
+    "description": "Get document summaries for articles (metadata without full content).",
+    "parameters": {
+      "pmids": {
+        "type": "array",
+        "description": "List of PubMed IDs.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "arxiv_search_papers",
+    "description": "Search arXiv by query, category, date range, and sort order.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query keywords or boolean expression (e.g., \"KAN\" OR \"Kolmogorov-Arnold Networks\").",
+        "required": true
+      },
+      "categories": {
+        "type": "array",
+        "description": "List of arXiv categories to filter by (e.g., [\"cs.LG\", \"cs.AI\"]).",
+        "required": false
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Maximum number of search results to return.",
+        "required": false
+      },
+      "date_from": {
+        "type": "string",
+        "description": "Start date for publication filtering (e.g., \"2024-01-01\").",
+        "required": false
+      },
+      "date_to": {
+        "type": "string",
+        "description": "End date for publication filtering (e.g., \"2024-12-31\").",
+        "required": false
+      },
+      "sort_by": {
+        "type": "string",
+        "description": "Sort order for results - \"relevance\" or \"date\" (default: \"relevance\").",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "arxiv_get_abstract",
+    "description": "Fetch metadata and an abstract by arXiv ID without downloading the paper.",
+    "parameters": {
+      "paper_id": {
+        "type": "string",
+        "description": "arXiv paper ID (e.g., \"2404.19756\").",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "arxiv_download_paper",
+    "description": "Download and convert an arXiv paper to local Markdown (with HTML/PDF fallback) for offline reading.",
+    "parameters": {
+      "paper_id": {
+        "type": "string",
+        "description": "arXiv paper ID (e.g., \"2404.19756\").",
+        "required": true
+      },
+      "start": {
+        "type": "integer",
+        "description": "Character start offset for reading bounded chunks.",
+        "required": false
+      },
+      "max_chars": {
+        "type": "integer",
+        "description": "Maximum number of characters to return.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "arxiv_list_papers",
+    "description": "List all arXiv papers currently downloaded and stored locally.",
+    "parameters": {}
+  },
+  {
+    "name": "arxiv_read_paper",
+    "description": "Read the locally stored full text of an arXiv paper in Markdown format.",
+    "parameters": {
+      "paper_id": {
+        "type": "string",
+        "description": "arXiv paper ID (e.g., \"2404.19756\").",
+        "required": true
+      },
+      "start": {
+        "type": "integer",
+        "description": "Character start offset for pagination.",
+        "required": false
+      },
+      "max_chars": {
+        "type": "integer",
+        "description": "Maximum number of characters to read from the document.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "arxiv_get_paper_latex",
+    "description": "Retrieve and locally cache the author-submitted original LaTeX source archive for a paper.",
+    "parameters": {
+      "paper_id": {
+        "type": "string",
+        "description": "arXiv paper ID (e.g., \"1706.03762\").",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "arxiv_list_paper_latex_sections",
+    "description": "Return a paginated outline of sections from the paper's original LaTeX source.",
+    "parameters": {
+      "paper_id": {
+        "type": "string",
+        "description": "arXiv paper ID (e.g., \"1706.03762\").",
+        "required": true
+      },
+      "start": {
+        "type": "integer",
+        "description": "Section start index for pagination.",
+        "required": false
+      },
+      "max_sections": {
+        "type": "integer",
+        "description": "Maximum number of section items to return.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "arxiv_get_paper_latex_section",
+    "description": "Read the bounded LaTeX source content for a single specific section of a paper.",
+    "parameters": {
+      "paper_id": {
+        "type": "string",
+        "description": "arXiv paper ID (e.g., \"1706.03762\").",
+        "required": true
+      },
+      "section_id": {
+        "type": "string",
+        "description": "Section identifier from the LaTeX outline (e.g., \"3.2\") or exact section title.",
+        "required": true
+      },
+      "max_chars": {
+        "type": "integer",
+        "description": "Maximum number of characters to return for the section.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "arxiv_citation_graph",
+    "description": "Fetch references and citing papers for an arXiv paper via the Semantic Scholar API.",
+    "parameters": {
+      "paper_id": {
+        "type": "string",
+        "description": "arXiv paper ID (e.g., \"2401.12345\").",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "arxiv_export_citations",
+    "description": "Export authoritative BibTeX citation metadata for one or more arXiv paper IDs.",
+    "parameters": {
+      "paper_ids": {
+        "type": "array",
+        "description": "List of arXiv paper IDs to export citations for.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "arxiv_watch_topic",
+    "description": "Save or update a research topic watch to track newly published arXiv papers.",
+    "parameters": {
+      "topic": {
+        "type": "string",
+        "description": "Research topic query string (e.g., \"multi-agent reinforcement learning\").",
+        "required": true
+      },
+      "categories": {
+        "type": "array",
+        "description": "List of arXiv categories to monitor (e.g., [\"cs.AI\", \"cs.LG\"]).",
+        "required": false
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Maximum number of results to fetch during alert checks.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "arxiv_check_alerts",
+    "description": "Check saved topic watches for any newly published papers since the last check.",
+    "parameters": {
+      "topic": {
+        "type": "string",
+        "description": "Optional specific topic watch to check. If omitted, checks all saved watches.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "arxiv_semantic_search",
+    "description": "Search across locally downloaded papers by semantic similarity (requires pro dependencies).",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Text search query for finding semantically similar papers.",
+        "required": false
+      },
+      "paper_id": {
+        "type": "string",
+        "description": "Known arXiv ID to find similar papers to.",
+        "required": false
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Maximum number of similar papers to return.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "arxiv_reindex",
+    "description": "Rebuild the local semantic index for downloaded papers (requires pro dependencies).",
+    "parameters": {}
+  },
+  {
+    "name": "wikipedia_search_wikipedia",
+    "description": "Search Wikipedia for articles matching a query.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "The search query or term.",
+        "required": true
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of results to return (default: 10).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "wikipedia_get_article",
+    "description": "Get the full content of a Wikipedia article including text, summary, sections, links, and categories.",
+    "parameters": {
+      "title": {
+        "type": "string",
+        "description": "The title of the Wikipedia article.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "wikipedia_get_summary",
+    "description": "Get a concise summary of a Wikipedia article.",
+    "parameters": {
+      "title": {
+        "type": "string",
+        "description": "The title of the Wikipedia article.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "wikipedia_get_sections",
+    "description": "Get the sections and structure of a Wikipedia article.",
+    "parameters": {
+      "title": {
+        "type": "string",
+        "description": "The title of the Wikipedia article.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "wikipedia_get_links",
+    "description": "Get the links contained within a Wikipedia article to other Wikipedia topics.",
+    "parameters": {
+      "title": {
+        "type": "string",
+        "description": "The title of the Wikipedia article.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "wikipedia_get_related_topics",
+    "description": "Get topics related to a Wikipedia article based on links and categories.",
+    "parameters": {
+      "title": {
+        "type": "string",
+        "description": "The title of the Wikipedia article.",
+        "required": true
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of related topics to return (default: 10).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "wikipedia_summarize_article_for_query",
+    "description": "Get a summary of a Wikipedia article tailored to a specific query.",
+    "parameters": {
+      "title": {
+        "type": "string",
+        "description": "The title of the Wikipedia article.",
+        "required": true
+      },
+      "query": {
+        "type": "string",
+        "description": "The query to focus the summary on.",
+        "required": true
+      },
+      "max_length": {
+        "type": "integer",
+        "description": "Maximum length of the summary (default: 250).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "wikipedia_summarize_article_section",
+    "description": "Get a summary of a specific section within a Wikipedia article.",
+    "parameters": {
+      "title": {
+        "type": "string",
+        "description": "The title of the Wikipedia article.",
+        "required": true
+      },
+      "section_title": {
+        "type": "string",
+        "description": "The title of the section to summarize.",
+        "required": true
+      },
+      "max_length": {
+        "type": "integer",
+        "description": "Maximum length of the summary (default: 150).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "wikipedia_extract_key_facts",
+    "description": "Extract bulleted key facts from a Wikipedia article or a specific topic within it.",
+    "parameters": {
+      "title": {
+        "type": "string",
+        "description": "The title of the Wikipedia article.",
+        "required": true
+      },
+      "topic_within_article": {
+        "type": "string",
+        "description": "A specific topic within the article to focus fact extraction on.",
+        "required": false
+      },
+      "count": {
+        "type": "integer",
+        "description": "Number of key facts to extract (default: 5).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "wikipedia_test_wikipedia_connectivity",
+    "description": "Test connectivity to Wikipedia API and return network diagnostic metadata.",
+    "parameters": {}
+  },
+   {
+    "name": "hf_whoami",
+    "description": "Hugging Face tools are being used anonymously and may be rate limited. Call this tool for instructions on joining and authenticating.",
+    "parameters": {}
+  },
+  {
+    "name": "hf_hub_repo_search",
+    "description": "Search Hugging Face repositories with a shared query interface. You can target models, datasets, spaces, or aggregate across multiple repo types in one call. Use space_search for semantic-first discovery of Spaces. Include links to repositories in your response.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query keywords.",
+        "required": false
+      },
+      "author": {
+        "type": "string",
+        "description": "Organization or user who created the repository.",
+        "required": false
+      },
+      "types": {
+        "type": "array",
+        "description": "Target repository types to search (e.g., [\"models\", \"datasets\", \"spaces\"]).",
+        "required": false
+      },
+      "sort": {
+        "type": "string",
+        "description": "Sort order (e.g., trendingScore, downloads, likes, createdAt).",
+        "required": false
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of results to return (default: 10).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "hf_hub_repo_details",
+    "description": "Get details for one or more Hugging Face repos (model, dataset, or space). Auto-detects type unless specified. For datasets, use operations: overview, dataset_structure, dataset_preview.",
+    "parameters": {
+      "repo_ids": {
+        "type": "array",
+        "description": "Repo IDs for models/dataset/space in author/name format (e.g., [\"openai/gpt-oss-120b\"]).",
+        "required": true
+      },
+      "repo_type": {
+        "type": "string",
+        "description": "Specify lookup type; otherwise auto-detects.",
+        "required": false
+      },
+      "operation": {
+        "type": "string",
+        "description": "For datasets, specify operation (overview, dataset_structure, dataset_preview).",
+        "required": false
+      },
+      "config": {
+        "type": "string",
+        "description": "Dataset configuration name when using dataset_preview.",
+        "required": false
+      },
+      "split": {
+        "type": "string",
+        "description": "Dataset split name when using dataset_preview.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "hf_space_search",
+    "description": "Find Hugging Face Spaces using semantic search. IMPORTANT: Only MCP Servers can be used with the dynamic_space tool. Include links to the Space when presenting the results.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Semantic Search Query.",
+        "required": true
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Number of results to return.",
+        "required": false
+      },
+      "mcp": {
+        "type": "boolean",
+        "description": "Only return MCP Server enabled Spaces.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "hf_model_search",
+    "description": "Find Machine Learning models hosted on Hugging Face. Returns comprehensive information about matching models including downloads, likes, tags, and direct links. Include links to the models in your response.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search term. Leave blank and specify \"sort\" and \"limit\" to get e.g. \"Top 20 trending models\".",
+        "required": false
+      },
+      "author": {
+        "type": "string",
+        "description": "Organization or user who created the model (e.g., \"google\", \"meta-llama\", \"microsoft\").",
+        "required": false
+      },
+      "task": {
+        "type": "string",
+        "description": "Model task type (e.g., \"text-generation\", \"image-classification\", \"translation\").",
+        "required": false
+      },
+      "library": {
+        "type": "string",
+        "description": "Framework the model uses (e.g., \"transformers\", \"diffusers\", \"timm\").",
+        "required": false
+      },
+      "sort": {
+        "type": "string",
+        "description": "Sort order: trendingScore, downloads, likes, createdAt, lastModified.",
+        "required": false
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of results to return.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "hf_dataset_search",
+    "description": "Find Datasets hosted on the Hugging Face hub. Returns comprehensive information about matching datasets including downloads, likes, tags, and direct links. Include links to the datasets in your response.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search term. Leave blank and specify \"sort\" and \"limit\" to get e.g. \"Top 20 trending datasets\".",
+        "required": false
+      },
+      "author": {
+        "type": "string",
+        "description": "Organization or user who created the dataset (e.g., \"google\", \"facebook\", \"allenai\").",
+        "required": false
+      },
+      "tags": {
+        "type": "array",
+        "description": "Tags to filter datasets (e.g., [\"language:en\", \"size_categories:1M<n<10M\"]).",
+        "required": false
+      },
+      "sort": {
+        "type": "string",
+        "description": "Sort order: trendingScore, downloads, likes, createdAt, lastModified.",
+        "required": false
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of results to return.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "hf_paper_search",
+    "description": "Find Machine Learning research papers on the Hugging Face hub. Include 'Link to paper' when presenting the results. Consider whether tabulating results matches user intent.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Semantic Search query.",
+        "required": true
+      },
+      "results_limit": {
+        "type": "integer",
+        "description": "Number of results to return.",
+        "required": false
+      },
+      "concise_only": {
+        "type": "boolean",
+        "description": "Return a 2 sentence summary of the abstract. Use for broad search terms.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "hf_doc_search",
+    "description": "Search and Discover Hugging Face Product and Library documentation. Send an empty query to discover structure and navigation instructions. Combine with the Product filter to focus results.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Start with an empty query for structure, endpoint discovery and navigation tips. Use semantic queries for targeted searches.",
+        "required": true
+      },
+      "product": {
+        "type": "string",
+        "description": "Filter by Product. Supply when known for focused results.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "hf_doc_fetch",
+    "description": "Fetch a document from the Hugging Face or Gradio documentation library. For large documents, use offset to get subsequent chunks.",
+    "parameters": {
+      "doc_url": {
+        "type": "string",
+        "description": "Documentation URL (Hugging Face or Gradio).",
+        "required": true
+      },
+      "offset": {
+        "type": "integer",
+        "description": "Token offset for large documents (use the offset from truncation message).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "hf_dynamic_space",
+    "description": "Perform Tasks with Hugging Face Spaces. Use \"discover\" to view available Tasks. Examples are Image Generation/Editing, Background Removal, Text to Speech, OCR and many more. Call with no arguments for full usage instructions.",
+    "parameters": {
+      "operation": {
+        "type": "string",
+        "description": "Operation to perform (e.g., \"discover\", \"view_parameters\", \"invoke\").",
+        "required": false
+      },
+      "space_name": {
+        "type": "string",
+        "description": "Space ID (format: \"username/space-name\"). Required for \"view_parameters\" and \"invoke\" operations.",
+        "required": false
+      },
+      "parameters": {
+        "type": "string",
+        "description": "JSON object string of parameters. Only used for \"invoke\" operation.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "hf_fs",
+    "description": "Use to access the Hugging Face Hub filesystem. Navigate resources with ls, cat, find, stat, and search over hf:// URIs. Roots: hf://models, hf://datasets, hf://spaces, hf://buckets, hf://collections, hf://papers, hf://docs.",
+    "parameters": {
+      "command": {
+        "type": "string",
+        "description": "Sub-command to run (e.g., \"ls\", \"cat\", \"stat\", \"find\", \"search\").",
+        "required": true
+      },
+      "uri": {
+        "type": "string",
+        "description": "Target Hugging Face URI starting with \"hf://\" (e.g., \"hf://papers/2404.19756\").",
+        "required": true
+      },
+      "options": {
+        "type": "array",
+        "description": "Additional command line flags or arguments (e.g., [\"--limit\", \"10\"]).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "hf_hub_query",
+    "description": "Read-only Hugging Face Hub navigator for discovery, lookup, filtering, ranking, counts, field-constrained extraction, and relationship questions across users, orgs, models, datasets, spaces, collections, discussions, and daily papers.",
+    "parameters": {
+      "target": {
+        "type": "string",
+        "description": "Hub resource target to query (e.g., \"models\", \"datasets\", \"spaces\", \"papers\").",
+        "required": true
+      },
+      "filters": {
+        "type": "string",
+        "description": "Filter expression or conditions for the query.",
+        "required": false
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of items to return.",
+        "required": false
+      }
+    }
+  },
+
+  {
+    "name": "kaggle_datasets_list",
+    "description": "Search and list Kaggle datasets.",
+    "parameters": {
+      "search": {
+        "type": "string",
+        "description": "Search term for datasets.",
+        "required": false
+      },
+      "sort_by": {
+        "type": "string",
+        "description": "Sort order (e.g., \"hottest\", \"votes\", \"updated\", \"active\").",
+        "required": false
+      },
+      "file_type": {
+        "type": "string",
+        "description": "Filter by file type (e.g., \"csv\", \"sqlite\", \"json\").",
+        "required": false
+      },
+      "page": {
+        "type": "integer",
+        "description": "Page number of results to return.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "kaggle_dataset_files",
+    "description": "List files in a specific dataset.",
+    "parameters": {
+      "owner": {
+        "type": "string",
+        "description": "The Kaggle username or organization that owns the dataset.",
+        "required": true
+      },
+      "dataset_slug": {
+        "type": "string",
+        "description": "The URL slug of the dataset.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "kaggle_dataset_download",
+    "description": "Download dataset files (returns a download URL for all files or a specific file).",
+    "parameters": {
+      "owner": {
+        "type": "string",
+        "description": "The Kaggle username or organization that owns the dataset.",
+        "required": true
+      },
+      "dataset_slug": {
+        "type": "string",
+        "description": "The URL slug of the dataset.",
+        "required": true
+      },
+      "file_name": {
+        "type": "string",
+        "description": "Optional specific file name to download. If empty, all files are targeted.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "kaggle_dataset_metadata",
+    "description": "Get dataset metadata.",
+    "parameters": {
+      "owner": {
+        "type": "string",
+        "description": "The Kaggle username or organization that owns the dataset.",
+        "required": true
+      },
+      "dataset_slug": {
+        "type": "string",
+        "description": "The URL slug of the dataset.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "kaggle_dataset_create",
+    "description": "Create a new dataset on Kaggle.",
+    "parameters": {
+      "owner": {
+        "type": "string",
+        "description": "The Kaggle username or organization that will own the dataset.",
+        "required": true
+      },
+      "slug": {
+        "type": "string",
+        "description": "The desired URL slug for the dataset.",
+        "required": true
+      },
+      "title": {
+        "type": "string",
+        "description": "The title of the new dataset.",
+        "required": true
+      },
+      "file_tokens": {
+        "type": "array",
+        "description": "List of file tokens generated by the file_upload tool.",
+        "required": true
+      },
+      "license_name": {
+        "type": "string",
+        "description": "License for the dataset (e.g., \"CC0-1.0\", \"unknown\").",
+        "required": true
+      },
+      "is_private": {
+        "type": "boolean",
+        "description": "Whether the dataset should be kept private.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "kaggle_file_upload",
+    "description": "Upload a file to Kaggle to receive a file token for dataset creation.",
+    "parameters": {
+      "file_name": {
+        "type": "string",
+        "description": "The name of the file being uploaded.",
+        "required": true
+      },
+      "content": {
+        "type": "string",
+        "description": "The content to upload.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "kaggle_dataset_get",
+    "description": "Get full detailed information about a dataset.",
+    "parameters": {
+      "owner": {
+        "type": "string",
+        "description": "The Kaggle username or organization that owns the dataset.",
+        "required": true
+      },
+      "dataset_slug": {
+        "type": "string",
+        "description": "The URL slug of the dataset.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "kaggle_dataset_create_version",
+    "description": "Create a new version for an existing dataset.",
+    "parameters": {
+      "owner": {
+        "type": "string",
+        "description": "The Kaggle username or organization that owns the dataset.",
+        "required": true
+      },
+      "dataset_slug": {
+        "type": "string",
+        "description": "The URL slug of the dataset.",
+        "required": true
+      },
+      "version_notes": {
+        "type": "string",
+        "description": "Notes describing the changes in this version.",
+        "required": true
+      },
+      "file_tokens": {
+        "type": "array",
+        "description": "List of file tokens generated by the file_upload tool.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "kaggle_dataset_update_metadata",
+    "description": "Update the title or description metadata for an existing dataset.",
+    "parameters": {
+      "owner": {
+        "type": "string",
+        "description": "The Kaggle username or organization that owns the dataset.",
+        "required": true
+      },
+      "dataset_slug": {
+        "type": "string",
+        "description": "The URL slug of the dataset.",
+        "required": true
+      },
+      "title": {
+        "type": "string",
+        "description": "The updated title for the dataset.",
+        "required": true
+      },
+      "description": {
+        "type": "string",
+        "description": "The updated description for the dataset.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "kaggle_dataset_delete",
+    "description": "Delete a Kaggle dataset.",
+    "parameters": {
+      "owner": {
+        "type": "string",
+        "description": "The Kaggle username or organization that owns the dataset.",
+        "required": true
+      },
+      "dataset_slug": {
+        "type": "string",
+        "description": "The URL slug of the dataset.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "kaggle_dataset_download_file",
+    "description": "Download a single file from a dataset (returns a download URL).",
+    "parameters": {
+      "owner": {
+        "type": "string",
+        "description": "The Kaggle username or organization that owns the dataset.",
+        "required": true
+      },
+      "dataset_slug": {
+        "type": "string",
+        "description": "The URL slug of the dataset.",
+        "required": true
+      },
+      "file_name": {
+        "type": "string",
+        "description": "The specific file name to download.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "crossref_search_works_by_query",
+    "description": "Search for scholarly works using keywords, titles, or authors in the Crossref database.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query for keywords, titles, or authors (e.g., \"machine learning in healthcare\").",
+        "required": true
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of results to return (default: 5).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "crossref_get_work_metadata",
+    "description": "Get detailed metadata for a specific scholarly work using its DOI.",
+    "parameters": {
+      "doi": {
+        "type": "string",
+        "description": "The Digital Object Identifier (DOI) of the work (e.g., \"10.1038/nature14539\").",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "crossref_search_journals",
+    "description": "Search for journals in the Crossref database by name or topic.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query for journal title or subject (e.g., \"artificial intelligence\").",
+        "required": true
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of journal results to return (default: 5).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "crossref_search_funders",
+    "description": "Search for funding organizations and their supported research in the Crossref database.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query for funder name or keywords (e.g., \"National Science Foundation\").",
+        "required": true
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of funder results to return (default: 5).",
+        "required": false
+      }
+    }
+  },
+
+  {
+    "name": "openalex_search_entities",
+    "description": "Search, filter, sort, or retrieve by ID across all 8 entity types (works, authors, sources, institutions, topics, keywords, publishers, funders). Primary discovery and lookup tool.",
+    "parameters": {
+      "entity_type": {
+        "type": "string",
+        "description": "The entity type to query (e.g., \"works\", \"authors\", \"sources\", \"institutions\", \"topics\", \"keywords\", \"publishers\", \"funders\").",
+        "required": true
+      },
+      "id": {
+        "type": "string",
+        "description": "Retrieve a single entity by its identifier (OpenAlex ID, DOI, ORCID, ROR, PMID, PMCID, ISSN). If provided, search/filters are ignored.",
+        "required": false
+      },
+      "search": {
+        "type": "string",
+        "description": "Keyword search across the entity type with support for boolean operators, quoted phrases, and wildcards.",
+        "required": false
+      },
+      "filters": {
+        "type": "object",
+        "description": "Key-value pairs for filtering results based on specific fields (e.g., {\"publication_year\": \"2023-2024\"}).",
+        "required": false
+      },
+      "sort": {
+        "type": "string",
+        "description": "Field to sort by, optionally prefixed with '-' for descending order (e.g., \"-cited_by_count\").",
+        "required": false
+      },
+      "select": {
+        "type": "array",
+        "description": "Specific fields to return in the response to reduce payload size. Use [\"*\"] for full records.",
+        "required": false
+      },
+      "per_page": {
+        "type": "integer",
+        "description": "Number of results to return per page (max 100).",
+        "required": false
+      },
+      "cursor": {
+        "type": "string",
+        "description": "Cursor for paginating through large result sets.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "openalex_analyze_trends",
+    "description": "Aggregate entities into groups and count them for trend, distribution, and comparative analysis.",
+    "parameters": {
+      "entity_type": {
+        "type": "string",
+        "description": "The entity type to analyze.",
+        "required": true
+      },
+      "group_by": {
+        "type": "string",
+        "description": "The field to group entities by (e.g., \"publication_year\", \"institutions.country_code\", \"open_access.is_oa\").",
+        "required": true
+      },
+      "filters": {
+        "type": "object",
+        "description": "Filters to scope down the population before aggregation.",
+        "required": false
+      },
+      "include_unknown": {
+        "type": "boolean",
+        "description": "Whether to include a group representing entities that have no value for the grouped field.",
+        "required": false
+      },
+      "per_page": {
+        "type": "integer",
+        "description": "Number of groups to return per page (max 200).",
+        "required": false
+      },
+      "cursor": {
+        "type": "string",
+        "description": "Cursor for paginating through groups.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "openalex_resolve_name",
+    "description": "Resolve a name or partial name to an OpenAlex ID. Returns matches with disambiguation hints. Also accepts identifiers like DOIs directly.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "The name, partial name, or identifier to resolve.",
+        "required": true
+      },
+      "entity_type": {
+        "type": "string",
+        "description": "Narrow down autocomplete results to a specific entity type. Omit for cross-entity search.",
+        "required": false
+      },
+      "filters": {
+        "type": "object",
+        "description": "Filters to further narrow the disambiguation results (e.g., restricting to a specific country).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "openalex_get_citation_graph",
+    "description": "Walk the citation graph one hop from a seed work. Wraps cites, cited_by, or related_to queries.",
+    "parameters": {
+      "work_id": {
+        "type": "string",
+        "description": "The OpenAlex ID or DOI of the seed work.",
+        "required": true
+      },
+      "direction": {
+        "type": "string",
+        "description": "The direction of graph traversal. Must be one of \"cites\", \"cited_by\", or \"related_to\".",
+        "required": true
+      },
+      "filters": {
+        "type": "object",
+        "description": "Additional filters to apply to the retrieved neighboring works.",
+        "required": false
+      },
+      "select": {
+        "type": "array",
+        "description": "Specific fields to return for the neighboring works.",
+        "required": false
+      },
+      "per_page": {
+        "type": "integer",
+        "description": "Number of results to return per page.",
+        "required": false
+      },
+      "cursor": {
+        "type": "string",
+        "description": "Pagination cursor.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "openalex_describe_fields",
+    "description": "List valid filter, group_by, and select field names for a specific entity type. Call before building a query to avoid invalid-field errors.",
+    "parameters": {
+      "entity_type": {
+        "type": "string",
+        "description": "The entity type to describe (e.g., \"works\", \"authors\").",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "unpaywall_get_paper_by_doi",
+    "description": "Retrieve Open Access status and full-text links for a scholarly paper using its DOI via the Unpaywall API.",
+    "parameters": {
+      "doi": {
+        "type": "string",
+        "description": "The Digital Object Identifier (DOI) of the paper (e.g., \"10.1038/nature12345\").",
+        "required": true
+      }
+    }
+  },
+
+  {
+    "name": "semantic_scholar_search_papers",
+    "description": "Search for academic papers by keyword in Semantic Scholar.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query keywords.",
+        "required": true
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of results to return.",
+        "required": false
+      },
+      "year": {
+        "type": "string",
+        "description": "Publication year filter (e.g., \"2020\" or \"2015-2020\").",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "semantic_scholar_get_paper_details",
+    "description": "Get detailed metadata for a specific paper, including abstract, authors, and citation counts.",
+    "parameters": {
+      "paper_id": {
+        "type": "string",
+        "description": "Semantic Scholar Paper ID, DOI, ArXiv ID, or MAG ID.",
+        "required": true
+      }
+    }
+  },
+  {
+    "name": "semantic_scholar_get_paper_citations",
+    "description": "Retrieve citing papers for a given paper to walk forward in the citation graph.",
+    "parameters": {
+      "paper_id": {
+        "type": "string",
+        "description": "Semantic Scholar Paper ID or DOI.",
+        "required": true
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of citations to return.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "semantic_scholar_get_paper_references",
+    "description": "Retrieve papers referenced by a given paper to walk backward in the citation graph.",
+    "parameters": {
+      "paper_id": {
+        "type": "string",
+        "description": "Semantic Scholar Paper ID or DOI.",
+        "required": true
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of references to return.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "semantic_scholar_get_author",
+    "description": "Retrieve metadata and aggregate statistics for a specific author.",
+    "parameters": {
+      "author_id": {
+        "type": "string",
+        "description": "Semantic Scholar Author ID.",
+        "required": true
+      }
+    }
+  },
+
+  {
+    "name": "google_web_search",
+    "description": "Search the web for current information using Google Custom Search.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "The search query.",
+        "required": true
+      },
+      "count": {
+        "type": "number",
+        "description": "Number of results to return (1-10, default 5).",
+        "required": false
+      },
+      "start": {
+        "type": "number",
+        "description": "Pagination start index (default 1).",
+        "required": false
+      },
+      "site": {
+        "type": "string",
+        "description": "Limit the search to a specific domain (e.g., 'example.com').",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "google_image_search",
+    "description": "Find images related to queries using Google Custom Search.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "The image search query.",
+        "required": true
+      },
+      "count": {
+        "type": "number",
+        "description": "Number of results to return (1-10, default 5).",
+        "required": false
+      },
+      "start": {
+        "type": "number",
+        "description": "Pagination start index (default 1).",
+        "required": false
+      }
+    }
+  },
+
+  {
+    "name": "github_search_repositories",
+    "description": "Search for GitHub repositories using a search query.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query (e.g., \"language:typescript topic:mcp\").",
+        "required": true
+      },
+      "page": {
+        "type": "integer",
+        "description": "Page number of the results.",
+        "required": false
+      },
+      "perPage": {
+        "type": "integer",
+        "description": "Number of results per page (default 30).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "github_get_file_contents",
+    "description": "Retrieve the contents of a file or directory from a GitHub repository.",
+    "parameters": {
+      "owner": {
+        "type": "string",
+        "description": "Repository owner (username or organization).",
+        "required": true
+      },
+      "repo": {
+        "type": "string",
+        "description": "Repository name.",
+        "required": true
+      },
+      "path": {
+        "type": "string",
+        "description": "File or directory path.",
+        "required": true
+      },
+      "branch": {
+        "type": "string",
+        "description": "Branch name, commit SHA, or tag.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "github_create_or_update_file",
+    "description": "Create a new file or update an existing file in a GitHub repository.",
+    "parameters": {
+      "owner": {
+        "type": "string",
+        "description": "Repository owner.",
+        "required": true
+      },
+      "repo": {
+        "type": "string",
+        "description": "Repository name.",
+        "required": true
+      },
+      "path": {
+        "type": "string",
+        "description": "File path.",
+        "required": true
+      },
+      "content": {
+        "type": "string",
+        "description": "New content of the file.",
+        "required": true
+      },
+      "message": {
+        "type": "string",
+        "description": "Commit message.",
+        "required": true
+      },
+      "branch": {
+        "type": "string",
+        "description": "Branch to commit to.",
+        "required": true
+      },
+      "sha": {
+        "type": "string",
+        "description": "The blob SHA of the file being replaced (required if updating an existing file).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "github_create_issue",
+    "description": "Create a new issue in a GitHub repository.",
+    "parameters": {
+      "owner": {
+        "type": "string",
+        "description": "Repository owner.",
+        "required": true
+      },
+      "repo": {
+        "type": "string",
+        "description": "Repository name.",
+        "required": true
+      },
+      "title": {
+        "type": "string",
+        "description": "Title of the issue.",
+        "required": true
+      },
+      "body": {
+        "type": "string",
+        "description": "Body/content of the issue.",
+        "required": false
+      },
+      "assignees": {
+        "type": "array",
+        "description": "List of usernames to assign to the issue.",
+        "required": false
+      },
+      "labels": {
+        "type": "array",
+        "description": "List of label names to add.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "github_create_pull_request",
+    "description": "Create a new pull request in a GitHub repository.",
+    "parameters": {
+      "owner": {
+        "type": "string",
+        "description": "Repository owner.",
+        "required": true
+      },
+      "repo": {
+        "type": "string",
+        "description": "Repository name.",
+        "required": true
+      },
+      "title": {
+        "type": "string",
+        "description": "Title of the pull request.",
+        "required": true
+      },
+      "head": {
+        "type": "string",
+        "description": "The name of the branch where your changes are implemented.",
+        "required": true
+      },
+      "base": {
+        "type": "string",
+        "description": "The name of the branch you want the changes pulled into.",
+        "required": true
+      },
+      "body": {
+        "type": "string",
+        "description": "Description of the pull request.",
+        "required": false
+      },
+      "draft": {
+        "type": "boolean",
+        "description": "Indicates whether the pull request is a draft.",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "github_list_commits",
+    "description": "List commits for a GitHub repository.",
+    "parameters": {
+      "owner": {
+        "type": "string",
+        "description": "Repository owner.",
+        "required": true
+      },
+      "repo": {
+        "type": "string",
+        "description": "Repository name.",
+        "required": true
+      },
+      "sha": {
+        "type": "string",
+        "description": "SHA or branch to start listing commits from.",
+        "required": false
+      },
+      "path": {
+        "type": "string",
+        "description": "Only commits containing this file path will be returned.",
+        "required": false
+      },
+      "per_page": {
+        "type": "integer",
+        "description": "Results per page (max 100).",
+        "required": false
+      }
+    }
+  },
+  {
+    "name": "github_search_code",
+    "description": "Search for code across GitHub.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "The search query (e.g., \"auth repo:owner/repo\").",
+        "required": true
+      },
+      "per_page": {
+        "type": "integer",
+        "description": "Results per page (max 100).",
+        "required": false
+      },
+      "page": {
+        "type": "integer",
+        "description": "Page number of the results.",
+        "required": false
+      }
+    }
+  }
+]
