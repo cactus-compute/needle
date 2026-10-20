@@ -110,7 +110,14 @@ def _is_android():
 
     Termux is the usual way this is reached.  ``platform.libc_ver()`` finds no glibc
     there, so the Linux path would pick the musl aarch64 wheel and fail to load it.
+    
+    Proot-distro provides a glibc/musl userspace inside Termux.  In that case,
+    treat the environment as Linux when a supported libc is detected
     """
+    # check for termux proot-distro
+    if os.environ.get("PD_CONTAINER",None):
+        libc_name, _ = platform.libc_ver()
+        if libc_name in ("glibc","musl") : return False
     if hasattr(sys, "getandroidapilevel"):
         return True
     return bool(os.environ.get("ANDROID_ROOT") and os.environ.get("ANDROID_DATA"))
